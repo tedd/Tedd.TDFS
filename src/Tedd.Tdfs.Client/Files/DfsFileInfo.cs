@@ -1,6 +1,10 @@
 namespace Tedd.Tdfs;
 
-/// <summary>File metadata observed at <see cref="ObservedAt"/>.</summary>
+/// <summary>
+/// File metadata observed at <see cref="ObservedAt"/>. For a stream path (<c>/f:s</c>, Addendum A ADS-03) the length,
+/// revision, inline/sparse flags and extent count describe the addressed stream; identity, owner, times and policy are
+/// the file's.
+/// </summary>
 /// <param name="Path">Normalised path.</param>
 /// <param name="InodeId">Inode id (stable across in-place updates and renames).</param>
 /// <param name="Revision">Revision (log index of the last modification).</param>
@@ -14,6 +18,9 @@ namespace Tedd.Tdfs;
 /// <param name="IsSparse">True when the file has holes.</param>
 /// <param name="ExtentCount">Number of extents.</param>
 /// <param name="ObservedAt">Commit token at which this information was read.</param>
+/// <param name="IsStream">True when the information describes a named stream (the path addressed <c>file:stream</c>).</param>
+/// <param name="StreamName">The named stream's name, or null for the default stream.</param>
+/// <param name="StreamCount">Number of named streams of the file (excluding the default stream).</param>
 public sealed record DfsFileInfo(
     string Path,
     InodeId InodeId,
@@ -27,4 +34,7 @@ public sealed record DfsFileInfo(
     bool IsInline,
     bool IsSparse,
     int ExtentCount,
-    CommitToken ObservedAt);
+    CommitToken ObservedAt,
+    bool IsStream = false,
+    string? StreamName = null,
+    int StreamCount = 0);

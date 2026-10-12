@@ -19,13 +19,21 @@ public sealed record DfsStoragePolicy
     /// <summary>Distinct durable zones required before acknowledging a commit.</summary>
     public int DurableZonesBeforeAck { get; init; } = 2;
 
+    /// <summary>
+    /// Storage pool for inodes using this policy (Addendum A, POOL-02); null means the volume's pool. Objects are placed
+    /// only on nodes of that pool, and satisfiability is evaluated against the pool's nodes (POOL-03).
+    /// </summary>
+    public string? Pool { get; init; }
+
     /// <summary>The default policy (3 copies in 3 zones, acknowledge after 2 copies in 2 zones).</summary>
     public static DfsStoragePolicy Default { get; } = new();
 
     /// <summary>Validates internal consistency.</summary>
     /// <exception cref="DfsException">With <see cref="DfsErrorCode.InvalidPolicy"/> when any count is below 1, the
     /// acknowledgement count exceeds the target, the zone target exceeds the copy target, the acknowledgement zone count
-    /// exceeds the acknowledgement copy count, or the acknowledgement zone count exceeds the zone target.</exception>
+    /// exceeds the acknowledgement copy count, the acknowledgement zone count exceeds the zone target, or
+    /// <see cref="Pool"/> is not a valid pool name (<see cref="DfsPoolNames"/>). Pool existence and satisfiability are
+    /// checked by the server.</exception>
     public void Validate()
     {
         string? error = GetValidationError();
@@ -52,6 +60,8 @@ public sealed record DfsStoragePolicy
             return $"DurableZonesBeforeAck ({DurableZonesBeforeAck}) must not exceed DurableCopiesBeforeAck ({DurableCopiesBeforeAck}).";
         if (DurableZonesBeforeAck > TargetDistinctZones)
             return $"DurableZonesBeforeAck ({DurableZonesBeforeAck}) must not exceed TargetDistinctZones ({TargetDistinctZones}).";
+        if (Pool is not null && DfsPoolNames.GetError(Pool) is { } poolError)
+            return "Pool: " + poolError;
         return null;
     }
 }

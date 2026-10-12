@@ -59,3 +59,8 @@ Distributed filesystem with a .NET client SDK. Requirements: `docs/spec/distribu
   `ConfigureAwait(false)` (the sim reports the escape as a HAR-002 violation; see `SimReviewTests`).
 - `TimeProvider` subclasses: `System.X` resolves to the inherited `TimeProvider.System` property — add `using` directives
   instead of fully qualified `System.` names.
+- Addendum A: ':' is no longer a name character — `DfsPath.Normalize` treats it as the stream separator in the final
+  component (`/a/f:s`); split with `DfsStreamPath`. `DfsFileClient`, `DfsDirectoryClient` and `DfsAdminClient` are
+  `partial` (Addendum members live in `*.Security.cs` / `*.Addendum.cs`). ACL decisions go only through
+  `DfsAccessEvaluator`. `DfsFileSystemRights.ToString()` may print directory aliases (`CreateFiles` for `WriteData`);
+  use `DfsAccessRule.FormatRights` in messages.

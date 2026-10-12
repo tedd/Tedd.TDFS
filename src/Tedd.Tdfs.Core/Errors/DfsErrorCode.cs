@@ -102,4 +102,12 @@ public enum DfsErrorCode
     RetentionProtected = 46,
     /// <summary>Backup barrier not reached in time.</summary>
     BackupNotReached = 47,
+    /// <summary>Storage pool not found (Addendum A).</summary>
+    PoolNotFound = 48,
+    /// <summary>Storage pool is referenced by a volume or policy and cannot be deleted (Addendum A, POOL-04).</summary>
+    PoolInUse = 49,
+    /// <summary>Group not found (Addendum A).</summary>
+    GroupNotFound = 50,
+    /// <summary>Principal (user) not found (Addendum A).</summary>
+    PrincipalNotFound = 51,
 }

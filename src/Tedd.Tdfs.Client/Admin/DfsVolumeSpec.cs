@@ -20,4 +20,19 @@ public sealed record DfsVolumeSpec
 
     /// <summary>Volume limits.</summary>
     public DfsVolumeLimits Limits { get; init; } = new();
+
+    /// <summary>
+    /// Storage pool the volume is bound to (Addendum A, POOL-02): its data objects are placed only on the pool's nodes and
+    /// its metadata voters are chosen from them unless <see cref="DfsMetadataPolicy.ExplicitVoterNodes"/> is given.
+    /// </summary>
+    public string StoragePool { get; init; } = DfsPoolNames.Default;
+
+    /// <summary>
+    /// Security descriptor of the volume root (Addendum A, ACL-06); null means
+    /// <see cref="DfsSecurityDescriptor.DefaultRoot"/> owned by the creating principal.
+    /// </summary>
+    public DfsSecurityDescriptor? RootSecurity { get; init; }
+
+    /// <summary>When true, every access also requires Traverse on each ancestor directory (Addendum A, ACL-05).</summary>
+    public bool EnforceTraverseChecking { get; init; }
 }

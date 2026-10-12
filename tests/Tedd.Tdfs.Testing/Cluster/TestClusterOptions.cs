@@ -23,7 +23,7 @@ public sealed record TestClusterOptions
     /// <summary>Volumes created at startup.</summary>
     public IReadOnlyList<TestVolumeSpec> Volumes { get; init; } = [new("vol")];
 
-    /// <summary>Cluster default data policy; null derives one from the topology (see <see cref="GetEffectiveDefaultPolicy"/>).</summary>
+    /// <summary>Cluster default data policy; null derives one from the topology (see <see cref="GetEffectiveDefaultPolicy()"/>).</summary>
     public DfsStoragePolicy? DefaultPolicy { get; init; }
 
     /// <summary>Number of late-sync backup nodes (b0, b1, ...).</summary>
@@ -153,8 +153,32 @@ public sealed record TestClusterOptions
     {
         if (DefaultPolicy is not null)
             return DefaultPolicy;
+        return DerivePolicy(GetNodeSpecs());
+    }
 
-        IReadOnlyList<TestNodeSpec> specs = GetNodeSpecs();
+    /// <summary>
+    /// The default data policy for volumes bound to <paramref name="pool"/> (Addendum A, POOL-03): <see cref="DefaultPolicy"/>
+    /// when set, otherwise derived as in <see cref="GetEffectiveDefaultPolicy()"/> from the pool's nodes only
+    /// (<c>"default"</c> = every node).
+    /// </summary>
+    /// <exception cref="ArgumentException">No node of the layout belongs to <paramref name="pool"/>.</exception>
+    public DfsStoragePolicy GetEffectiveDefaultPolicy(string pool)
+    {
+        ArgumentNullException.ThrowIfNull(pool);
+        if (DefaultPolicy is not null)
+            return DefaultPolicy;
+        TestNodeSpec[] members = GetNodeSpecs().Where(s => s.IsInPool(pool)).ToArray();
+        if (members.Length == 0)
+            throw new ArgumentException($"No node belongs to pool '{pool}'.", nameof(pool));
+        return DerivePolicy(members);
+    }
+
+    /// <summary>Distinct pool names listed by the node layout (ordinal order, excluding <c>"default"</c>).</summary>
+    public IReadOnlyList<string> GetPoolNames() =>
+        GetNodeSpecs().SelectMany(s => s.EffectivePools).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+
+    private static DfsStoragePolicy DerivePolicy(IReadOnlyList<TestNodeSpec> specs)
+    {
         int hosts = Math.Max(1, specs.Select(s => s.EffectiveHost).Distinct(StringComparer.Ordinal).Count());
         int zones = Math.Max(1, specs.Select(s => s.Region + "\0" + s.Zone).Distinct(StringComparer.Ordinal).Count());
 
@@ -216,6 +240,13 @@ public sealed record TestClusterOptions
                     throw new ArgumentException("Every node needs a name and a zone.", nameof(Nodes));
                 if (!names.Add(spec.Name))
                     throw new ArgumentException($"Duplicate node name '{spec.Name}'.", nameof(Nodes));
+                foreach (string pool in spec.EffectivePools)
+                {
+                    if (!DfsPoolNames.IsValid(pool))
+                        throw new ArgumentException($"Node '{spec.Name}' lists invalid pool name '{pool}'.", nameof(Nodes));
+                    if (string.Equals(pool, DfsPoolNames.Default, StringComparison.Ordinal))
+                        throw new ArgumentException($"Node '{spec.Name}' lists '{DfsPoolNames.Default}', which is implicit.", nameof(Nodes));
+                }
             }
         }
 
@@ -234,6 +265,11 @@ public sealed record TestClusterOptions
                 throw new ArgumentException($"Volume '{volume.Name}' needs at least one voter.", nameof(Volumes));
             if (volume.InlineThreshold < 0)
                 throw new ArgumentException($"Volume '{volume.Name}' has a negative inline threshold.", nameof(Volumes));
+            if (volume.StoragePool is null || !DfsPoolNames.IsValid(volume.StoragePool))
+                throw new ArgumentException($"Volume '{volume.Name}' has an invalid storage pool name.", nameof(Volumes));
+            if (!GetNodeSpecs().Any(s => s.IsInPool(volume.StoragePool)))
+                throw new ArgumentException($"Volume '{volume.Name}' uses pool '{volume.StoragePool}', which no node belongs to.", nameof(Volumes));
+            volume.RootSecurity?.Validate();
         }
 
         if (BackupNodeCount < 0)

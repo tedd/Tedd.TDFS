@@ -1,7 +1,7 @@
 namespace Tedd.Tdfs;
 
 /// <summary>Cluster administration (requires administrative grants). Async-only.</summary>
-public sealed class DfsAdminClient
+public sealed partial class DfsAdminClient
 {
     internal DfsAdminClient(DfsClient client)
     {

@@ -19,6 +19,8 @@
   <ItemGroup>
     <!-- The test plan is the source of the named-case catalog (TestCatalog). -->
     <EmbeddedResource Include="..\..\docs\spec\distributed-filesystem-test-plan.md" LogicalName="test-plan.md" Link="Catalog\test-plan.md" />
+    <!-- Addendum A (ACL/POOL/ADS) catalog rows: TestCatalog.Addendum. -->
+    <EmbeddedResource Include="..\..\docs\spec\fsd-addendum-acl-pools-streams.md" LogicalName="fsd-addendum-acl-pools-streams.md" Link="Catalog\fsd-addendum-acl-pools-streams.md" />
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="Tedd.Tdfs.Tests.Unit" />
