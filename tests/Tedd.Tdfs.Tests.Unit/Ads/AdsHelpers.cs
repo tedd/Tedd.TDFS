@@ -119,13 +119,32 @@ internal static class AdsHelpers
         ? "no exception (the operation succeeded)"
         : $"{ex.GetType().FullName}{(ex is DfsException d ? $" [{d.ErrorCode}]" : string.Empty)}: {ex.Message}";
 
-    /// <summary>An invalid path surfaces as <see cref="ArgumentException"/> mapping to <see cref="DfsErrorCode.InvalidPath"/> (FSD §13, ADS-01).</summary>
+    /// <summary>
+    /// An invalid path surfaces as an <see cref="ArgumentException"/> that identifies the path (FSD §13, ADS-01): it maps to
+    /// <see cref="DfsErrorCode.InvalidPath"/> (canonical ParamName "path" or a tagged code), or — the ordinary .NET
+    /// convention for two-path operations, as accepted by the PATH suite — names the method's "sourcePath" or
+    /// "destinationPath" parameter.
+    /// </summary>
     public static void AssertInvalidPath(Exception? ex, string because)
     {
-        Assert.True(ex is ArgumentException, $"{because}: expected an ArgumentException (invalid path) but got {Describe(ex)}");
-        Assert.True(DfsErrors.ToCode(ex!) == DfsErrorCode.InvalidPath,
-            $"{because}: the argument exception must map to InvalidPath, got {DfsErrors.ToCode(ex!)} ({Describe(ex)})");
+        if (ex is not ArgumentException argument)
+        {
+            Assert.Fail($"{because}: expected an ArgumentException (invalid path) but got {Describe(ex)}");
+            return;
+        }
+
+        Assert.True(DfsErrors.ToCode(argument) == DfsErrorCode.InvalidPath || argument.ParamName is "path" or "sourcePath" or "destinationPath",
+            $"{because}: the argument exception must identify the path (InvalidPath, or ParamName path/sourcePath/destinationPath); got code {DfsErrors.ToCode(argument)}, ParamName '{argument.ParamName}' ({Describe(ex)})");
     }
+
+    /// <summary>
+    /// Absence of a path whose parent directory is itself gone: FSD §13 maps a missing file to
+    /// <see cref="FileNotFoundException"/> and a missing directory to <see cref="DirectoryNotFoundException"/>; either is
+    /// a correct report when the whole parent was removed.
+    /// </summary>
+    public static void AssertFileOrParentNotFound(Exception? ex, string because) =>
+        Assert.True(ex is FileNotFoundException or DirectoryNotFoundException,
+            $"{because}: expected FileNotFoundException or DirectoryNotFoundException but got {Describe(ex)}");
 
     /// <summary>A sharing/writer conflict surfaces as a retryable <see cref="DfsSharingViolationException"/> (FSD §13, LOCK-03).</summary>
     public static void AssertSharingViolation(Exception? ex, string because)

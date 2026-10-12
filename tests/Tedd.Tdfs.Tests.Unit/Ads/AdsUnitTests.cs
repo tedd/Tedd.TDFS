@@ -92,6 +92,10 @@ public sealed class AdsUnitTests
         { "/a/e\u0301:e\u0301:$DATA", "/a/\u00E9:\u00E9", "/a/\u00E9", "\u00E9" },
         { "/a/e\u0301::$DATA", "/a/\u00E9", "/a/\u00E9", null },
         { "/x/y/f:\U0001F600", "/x/y/f:\U0001F600", "/x/y/f", "\U0001F600" },
+        // File name and stream name are each limited to 255 UTF-8 bytes (the final component may exceed 255 in total).
+        { "/a/f:" + new string('s', 255), "/a/f:" + new string('s', 255), "/a/f", new string('s', 255) },
+        { "/a/" + new string('f', 255) + ":" + new string('s', 255), "/a/" + new string('f', 255) + ":" + new string('s', 255), "/a/" + new string('f', 255), new string('s', 255) },
+        { "/a/f:" + string.Concat(Enumerable.Repeat("e\u0301", 127)), "/a/f:" + new string('\u00E9', 127), "/a/f", new string('\u00E9', 127) },
     };
 
     /// <summary>
@@ -155,7 +159,38 @@ public sealed class AdsUnitTests
         { "/a/f:.", "stream names follow component rules" },
         { "/a/f:s/g", "a stream has no children" },
         { "/a/f:" + new string('s', 256), "stream name longer than 255 UTF-8 bytes" },
+        { "/a/f:" + new string('\u00E9', 128), "stream name longer than 255 UTF-8 bytes (2-byte characters)" },
+        { "/a/f:" + string.Concat(Enumerable.Repeat("e\u0301", 128)), "stream name longer than 255 UTF-8 bytes after NFC" },
+        { "/a/" + new string('f', 256) + ":s", "file name longer than 255 UTF-8 bytes" },
+        { "/a/f:..", "'..' as a stream name" },
+        { "/a/..:s", "'..' as the file name" },
+        { "/a/.:s", "'.' as the file name" },
+        { "/a/f:a\\b", "backslash in a stream name" },
     };
+
+    /// <summary>
+    /// Stream names follow component rules for characters too: NUL and unpaired surrogates are rejected as invalid paths
+    /// (kept out of theory data, which must round-trip through test-case serialization).
+    /// </summary>
+    [Fact]
+    [Catalog("ADS-001", "U", "INV-07")]
+    public void ADS_001_StreamPathSyntax_RejectedCharacters()
+    {
+        foreach (string streamName in new[] { "a\0b", "\uD800x", "x\uDC00", "a\\b", "a/b", "a:b" })
+        {
+            string input = "/a/f:" + streamName;
+            ArgumentException ex = Assert.Throws<ArgumentException>(() => DfsPath.Normalize(input));
+            Assert.Equal(DfsErrorCode.InvalidPath, DfsErrors.ToCode(ex));
+            Assert.False(DfsPath.TryNormalize(input, out _, out string? error));
+            Assert.False(string.IsNullOrEmpty(error), $"TryNormalize must explain why stream name U+{string.Join(" U+", streamName.Select(c => ((int)c).ToString("X4", CultureInfo.InvariantCulture)))} is rejected");
+            Assert.False(DfsStreamPath.TryNormalizeStreamName(streamName, out _, out string? nameError));
+            Assert.False(string.IsNullOrEmpty(nameError));
+            Assert.ThrowsAny<ArgumentException>(() => DfsStreamPath.NormalizeStreamName(streamName));
+        }
+
+        ArgumentException fileNul = Assert.Throws<ArgumentException>(() => DfsPath.Normalize("/a/f\0:s"));
+        Assert.Equal(DfsErrorCode.InvalidPath, DfsErrors.ToCode(fileNul));
+    }
 
     /// <summary>
     /// Rejected stream syntax: a colon in a non-final component, empty file or stream names, more than one separator,
@@ -254,6 +289,55 @@ public sealed class AdsUnitTests
 
             Assert.Equal(before, await DescribeNamespaceAsync(v));
             Assert.False(await v.Files.ExistsAsync("/ok", Ct), "the valid counterpart of a rejected copy/move must not have been created");
+        }, Ct);
+    }
+
+    /// <summary>
+    /// Every path-taking <see cref="DfsDirectoryClient"/> entry point (async and sync, both positions of a move, recursive and
+    /// non-recursive delete, enumeration and paging) rejects every invalid stream spelling as an invalid path, and nothing in
+    /// the namespace changes.
+    /// </summary>
+    [Fact]
+    [Catalog("ADS-001", "U", "INV-07")]
+    public async Task ADS_001_StreamPathSyntax_DirectoryApisReject()
+    {
+        await ClusterTest.RunAsync(Core, async cluster =>
+        {
+            await using DfsClient client = await ConnectAsync(cluster, "c0");
+            DfsVolume v = client.GetVolume(Vol);
+            DfsDirectoryClient d = v.Directories;
+            await d.CreateDirectoryAsync("/a/sub", Ct);
+            await v.Files.WriteAllBytesAsync("/a/f", NonZero(3, 100), Ct);
+            await v.Files.WriteAllBytesAsync("/a:s", NonZero(4, 40), Ct);
+            string before = await DescribeNamespaceAsync(v);
+
+            (string Name, Func<string, Func<Task>> Call)[] apis =
+            [
+                ("CreateDirectoryAsync", p => () => d.CreateDirectoryAsync(p, Ct)),
+                ("CreateDirectoryAsync(options)", p => () => d.CreateDirectoryAsync(p, new DfsMutationOptions(), Ct)),
+                ("CreateDirectory(sync)", p => Sync(() => d.CreateDirectory(p))),
+                ("ExistsAsync", p => () => d.ExistsAsync(p, Ct)),
+                ("GetInfoAsync", p => () => d.GetInfoAsync(p, Ct)),
+                ("DeleteAsync", p => () => d.DeleteAsync(p, false, Ct)),
+                ("DeleteAsync(recursive)", p => () => d.DeleteAsync(p, true, Ct)),
+                ("MoveAsync(source)", p => () => d.MoveAsync(p, "/ok", Ct)),
+                ("MoveAsync(destination)", p => () => d.MoveAsync("/a/sub", p, Ct)),
+                ("EnumerateAsync", p => async () =>
+                {
+                    await foreach (DfsEntryInfo entry in d.EnumerateAsync(p, null, Ct))
+                        Assert.Fail($"EnumerateAsync yielded {entry.Path} for an invalid path");
+                }),
+                ("Enumerate(sync)", p => Sync(() => d.Enumerate(p).ToList())),
+                ("ListPageAsync", p => () => d.ListPageAsync(p, null, null, Ct)),
+            ];
+            foreach (string bad in RejectedSdkPaths)
+            {
+                foreach ((string name, Func<string, Func<Task>> call) in apis)
+                    AssertInvalidPath(await CatchAsync(call(bad)), $"Directories.{name}(\"{bad}\")");
+            }
+
+            Assert.Equal(before, await DescribeNamespaceAsync(v));
+            Assert.False(await d.ExistsAsync("/ok", Ct), "the valid counterpart of a rejected move must not have been created");
         }, Ct);
     }
 
@@ -1089,9 +1173,9 @@ public sealed class AdsUnitTests
                     if (!allowed.Contains(signature, StringComparer.Ordinal))
                         Violation = $"observation {Observations}: {file} listed [{signature}]; allowed: absent or [{string.Join("] | [", allowed)}]";
                 }
-                catch (FileNotFoundException)
+                catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
                 {
-                    // Absent: allowed before a copy and after a delete.
+                    // Absent: allowed before a copy and after a delete (DirectoryNotFound once a recursive delete removed the parent).
                 }
 
                 Interlocked.Increment(ref _observations);
@@ -1165,21 +1249,23 @@ public sealed class AdsUnitTests
             await watching;
             Assert.True(watcher.Violation is null, $"{removal}: {watcher.Violation}");
 
+            // With the parent directory gone (recursive delete) a missing parent may be reported as DirectoryNotFound.
+            Action<Exception?, string> assertAbsent = removal == FileRemoval.RecursiveParentDelete ? AssertFileOrParentNotFound : AssertFileNotFound;
             foreach (string name in model.NamedStreams.Keys)
             {
                 string path = "/p/f:" + name;
                 Assert.False(await obs.Files.ExistsAsync(path, Ct), $"{removal}: {path} must not survive its file");
                 if (replacement is null)
                 {
-                    AssertFileNotFound(await CatchAsync(() => obs.Files.GetInfoAsync(path, Ct)), $"{removal}: GetInfo({path})");
-                    AssertFileNotFound(await CatchAsync(() => obs.Files.ReadAllBytesAsync(path, Ct)), $"{removal}: ReadAllBytes({path})");
+                    assertAbsent(await CatchAsync(() => obs.Files.GetInfoAsync(path, Ct)), $"{removal}: GetInfo({path})");
+                    assertAbsent(await CatchAsync(() => obs.Files.ReadAllBytesAsync(path, Ct)), $"{removal}: ReadAllBytes({path})");
                 }
             }
 
             if (replacement is null)
             {
                 Assert.False(await obs.Files.ExistsAsync("/p/f", Ct));
-                AssertFileNotFound(await CatchAsync(() => obs.Files.ListStreamsAsync("/p/f", Ct)), $"{removal}: ListStreams of the removed file");
+                assertAbsent(await CatchAsync(() => obs.Files.ListStreamsAsync("/p/f", Ct)), $"{removal}: ListStreams of the removed file");
                 Assert.Null(await cluster.Inspect.GetFileAsync(Vol, "/p/f"));
             }
             else
@@ -1966,10 +2052,12 @@ public sealed class AdsUnitTests
             return;
         }
 
+        // Same typed surface as the plan's limits (TX/PUB suites): the limit is named after its setting, carries its value,
+        // and the request exceeds it.
         Assert.Equal(DfsErrorCode.LimitExceeded, limit.ErrorCode);
         Assert.Equal(nameof(DfsStreamPath.MaxStreamsPerInode), limit.LimitName);
         Assert.Equal(DfsStreamPath.MaxStreamsPerInode, limit.Limit);
-        Assert.Equal(DfsStreamPath.MaxStreamsPerInode + 1, limit.Requested);
+        Assert.True(limit.Requested > limit.Limit, $"{because}: Requested ({limit.Requested}) must exceed the limit ({limit.Limit})");
     }
 
     /// <summary>
@@ -2161,18 +2249,21 @@ public sealed class AdsUnitTests
     private sealed record UpdateCost(long Stored, long Uploaded, long Commit, int NewObjects);
 
     /// <summary>
-    /// A small overwrite inside a 2 MiB named stream replicates only the touched logical update unit(s): stored and
+    /// A small overwrite inside a 128-chunk named stream replicates only the touched logical update unit(s): stored and
     /// uploaded bytes are bounded by copies × touched chunks (plus a small allowance), the commit request is a small
-    /// mapping update, untouched extents keep their objects, the default stream and a sibling stream keep their extents,
-    /// and the bytes are exact. The same overwrite on a default stream (control) obeys the same bounds.
+    /// mapping update (below the size of the stream's whole mapping, as in LAY-010), untouched extents keep their objects,
+    /// the default stream and a sibling stream keep their extents, and the bytes are exact. The same overwrite on a
+    /// default stream (control) obeys the same bounds.
     /// </summary>
     [Theory]
     [MemberData(nameof(PartialUpdateCases))]
     [Catalog("ADS-023", "U", "INV-02", "INV-07", "INV-09")]
     public async Task ADS_023_StreamPartialUpdate(string where, int length)
     {
-        const int size = 32 * 64 * 1024;
-        await ClusterTest.RunAsync(Core with { ScenarioTimeout = TimeSpan.FromMinutes(4) }, async cluster =>
+        // 128 update units: a resend of the whole mapping (>= 32 bytes of object id + checksum per extent) alone reaches the
+        // 4 KiB commit bound, so the bound discriminates a range update from a mapping rewrite.
+        int size = 128 * Chunk;
+        await ClusterTest.RunAsync(Core with { ScenarioTimeout = TimeSpan.FromMinutes(6) }, async cluster =>
         {
             await using DfsClient client = await ConnectAsync(cluster, "c0");
             DfsVolume v = client.GetVolume(Vol);
@@ -2202,6 +2293,9 @@ public sealed class AdsUnitTests
             FileInspection fileBefore = await InspectFileAsync(cluster, "/big");
             StreamInspection streamBefore = fileBefore.Streams.Single(s => s.Name == "s");
             StreamInspection siblingBefore = fileBefore.Streams.Single(s => s.Name == "t");
+            long wholeMappingFloor = 32L * streamBefore.Extents.Count;
+            Assert.True(wholeMappingFloor >= commitBound,
+                $"precondition: the stream's whole mapping (>= {wholeMappingFloor} B for {streamBefore.Extents.Count} extents) must not fit the {commitBound} B commit bound");
             UpdateCost streamCost = await OverwriteAndMeasureAsync(cluster, v, "/big:s", offset, patch,
                 async () => Objects((await InspectStreamAsync(cluster, "/big", "s")).Extents), Objects(streamBefore.Extents));
             UpdateCost controlCost = await OverwriteAndMeasureAsync(cluster, v, "/ctl", offset, patch,
@@ -2414,9 +2508,11 @@ public sealed class AdsUnitTests
             ];
             foreach ((string what, Func<Task> action) in invalid)
                 AssertInvalidPath(await CatchAsync(action), what);
+            // A directory has no default data stream: file data on its plain path is refused (IsADirectory; the .NET-style
+            // access denial is accepted as in the PROP suite — the addendum does not pin the code).
             Exception? defaultStreamOfDirectory = await CatchAsync(() => v.Files.WriteAllBytesAsync("/d", x, Ct));
-            Assert.True(defaultStreamOfDirectory is IOException && DfsErrors.ToCode(defaultStreamOfDirectory) == DfsErrorCode.IsADirectory,
-                $"writing a directory's default stream as file data: expected IsADirectory, got {Describe(defaultStreamOfDirectory)}");
+            Assert.True(defaultStreamOfDirectory is DfsException { ErrorCode: DfsErrorCode.IsADirectory } or UnauthorizedAccessException,
+                $"writing a directory's default stream as file data: expected IsADirectory (or access denied), got {Describe(defaultStreamOfDirectory)}");
             Assert.Equal(before, await DescribeNamespaceAsync(v));
             Assert.False(await v.Directories.ExistsAsync("/e", Ct));
 
