@@ -1,0 +1,430 @@
+using System.Buffers.Binary;
+using System.Collections.Immutable;
+using Tedd.Tdfs.Protocol;
+using Tedd.Tdfs.Protocol.Messages;
+using Tedd.Tdfs.Server.Control;
+using Tedd.Tdfs.Server.Raft;
+using Tedd.Tdfs.Server.Runtime;
+using Tedd.Tdfs.Server.Volumes.Apply;
+using Tedd.Tdfs.Server.Volumes.Commands;
+using Tedd.Tdfs.Server.Volumes.State;
+
+namespace Tedd.Tdfs.Server.Volumes.Service;
+
+/// <summary>
+/// Leader-side volume service (INTERNALS.md §1, ARCHITECTURE §5, §7): validates and authorizes requests, answers retries
+/// from retained outcomes, coalesces in-flight duplicates, prepares deterministic commands (receipt validation, inline
+/// materialization, the leader's clock and the caller's identity set), proposes them and replies; serves linearizable reads
+/// after a ReadIndex barrier; tracks leases, sessions and reader pins with the leader's monotonic clock and proposes their
+/// expiry; and serves inventory/GC classification. All non-replicated state here is leader-local and rebuilt after every
+/// leadership change. Everything runs on the node loop.
+/// </summary>
+internal sealed partial class VolumeService
+{
+    private readonly NodeServices _s;
+    private readonly VolumeHost _host;
+    private readonly VolumeStateMachine _sm;
+    private readonly Dictionary<DfsOperationId, InFlight> _inFlight = [];
+    private readonly Dictionary<StreamKey, Queue<TaskCompletionSource>> _publishLocks = [];
+    private ulong _readyTerm;
+    private bool _disposed;
+
+    public VolumeService(NodeServices services, VolumeHost host, VolumeStateMachine stateMachine)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(host);
+        ArgumentNullException.ThrowIfNull(stateMachine);
+        _s = services;
+        _host = host;
+        _sm = stateMachine;
+        Barrier = new ControlBarrier(services);
+        Io = new ObjectIo(services);
+    }
+
+    /// <summary>The applied state of this replica.</summary>
+    public VolumeState State => _sm.State;
+
+    /// <summary>The volume's control record.</summary>
+    public VolumeRecord Record => _host.Record;
+
+    /// <summary>The volume's Raft group.</summary>
+    public GroupRuntime Group => _host.Group;
+
+    /// <summary>The volume name.</summary>
+    public string Name => _host.Name;
+
+    private ControlBarrier Barrier { get; }
+
+    private ObjectIo Io { get; }
+
+    /// <summary>True while this node leads the group.</summary>
+    public bool IsLeader => _host.IsLeader && !_disposed;
+
+    /// <summary>Called when the role, leader or term changed (VolumeHost hook).</summary>
+    public void OnLeadershipChanged()
+    {
+        if (_host.IsLeader && Group.Term != _leaseTerm)
+            ResetLeaderState();
+        else if (!_host.IsLeader)
+            ClearLeaderState();
+    }
+
+    /// <summary>Called when the control record changed (VolumeHost hook).</summary>
+    public void OnRecordChanged()
+    {
+    }
+
+    /// <summary>Stops the service (group closing).</summary>
+    public void Dispose()
+    {
+        _disposed = true;
+        ClearLeaderState();
+    }
+
+    // ------------------------------------------------------------------------------------------------- request plumbing
+
+    /// <summary>The leader is serving: it applied every entry committed before its term (ReadIndex once per term).</summary>
+    private async Task EnsureLeaderReadyAsync(CancellationToken ct)
+    {
+        if (!IsLeader)
+            throw Group.NotLeader();
+        ulong term = Group.Term;
+        if (_readyTerm == term)
+            return;
+        await Group.ReadIndexAsync(ct);
+        if (Group.Term == term)
+            _readyTerm = term;
+    }
+
+    /// <summary>A linearizable read barrier (CON-008); returns the applied index the read observes.</summary>
+    private async Task<ulong> ReadBarrierAsync(CancellationToken ct)
+    {
+        if (!IsLeader)
+            throw Group.NotLeader();
+        if (_s.Mutations.AllowStaleLiveReads)
+            return Group.AppliedIndex;
+        ulong index = await Group.ReadIndexAsync(ct);
+        _readyTerm = Group.Term;
+        return index;
+    }
+
+    /// <summary>Transaction-bound requests are the next phase.</summary>
+    private static void RejectTransaction(IVolumeRequest request)
+    {
+        if (request.Header.Transaction is not null)
+        {
+            throw new NotSupportedException(
+                "NOT IMPLEMENTED (next phase): transaction-bound requests are not supported by this volume service yet.");
+        }
+    }
+
+    /// <summary>The caller's volume grants (control state).</summary>
+    private DfsPermissions GrantsOf(string principal) => _s.Control.State.GetPermissions(principal, Record.Id);
+
+    /// <summary>Requires a volume grant (the coarse gate, ACL-06).</summary>
+    private void RequireGrant(string principal, DfsPermissions permission, string what)
+    {
+        if ((GrantsOf(principal) & permission) != permission)
+        {
+            _s.Control.ReportSecurityEvent("volume:" + what, "denied", "volume=" + Name, principal);
+            throw new UnauthorizedAccessException($"Principal '{principal}' lacks the {permission} grant on volume '{Name}' ({what}).");
+        }
+    }
+
+    /// <summary>The caller identity set (ACL-01/08) resolved from the local control state.</summary>
+    private (ImmutableArray<string> Identities, bool IsAdmin) IdentitiesOf(string principal)
+    {
+        ControlState control = _s.Control.State;
+        bool admin = control.IsClusterAdmin(principal);
+        var identities = new List<string> { DfsIdentity.Everyone.ToString(), DfsIdentity.AuthenticatedUsers.ToString() };
+        if (DfsIdentity.TryParse("user:" + principal, out DfsIdentity user))
+            identities.Add(user.ToString());
+        foreach (string group in control.GroupsOf(principal))
+        {
+            if (DfsIdentity.IsValidName(group))
+                identities.Add(DfsIdentity.Group(group).ToString());
+        }
+
+        if (admin)
+            identities.Add(DfsIdentity.Administrators.ToString());
+        identities.Sort(StringComparer.Ordinal);
+        return ([.. identities.Distinct(StringComparer.Ordinal)], admin);
+    }
+
+    /// <summary>The caller's identity set for leader-side read authorization.</summary>
+    private (IReadOnlySet<DfsIdentity> Set, bool IsAdmin) IdentitySetOf(string principal)
+    {
+        (ImmutableArray<string> ids, bool admin) = IdentitiesOf(principal);
+        var set = new HashSet<DfsIdentity>();
+        foreach (string text in ids)
+        {
+            if (DfsIdentity.TryParse(text, out DfsIdentity id))
+                set.Add(id);
+        }
+
+        return (set, admin);
+    }
+
+    /// <summary>Builds the operation header of a request (payload identity, identities, grants, mutation flags).</summary>
+    private OperationHeader Header(RpcContext context, IVolumeRequest request, DfsOperationKind kind, DfsOperationId? id = null)
+    {
+        string principal = context.Principal ?? string.Empty;
+        (ImmutableArray<string> identities, bool admin) = IdentitiesOf(principal);
+        DfsOperationId op = id ?? request.Header.Operation;
+        UInt128 hash = op.IsEmpty ? UInt128.Zero : BinaryPrimitives.ReadUInt128LittleEndian(OperationPayload.ComputeHash(request));
+        return new OperationHeader(op, principal, kind, hash, request.Header.Session, request.Header.AckWatermark, identities, admin, GrantsOf(principal),
+            MutationFlags());
+    }
+
+    /// <summary>The negative-control mutation switches carried by commands (deterministic on every replica).</summary>
+    private CommandFlags MutationFlags()
+    {
+        CommandFlags flags = CommandFlags.None;
+        if (_s.Mutations.DisableOperationDedup)
+            flags |= CommandFlags.DisableDedup;
+        if (_s.Mutations.ForgetExpiredIdWatermark)
+            flags |= CommandFlags.ForgetWatermark;
+        if (_s.Mutations.SkipFencingCheck)
+            flags |= CommandFlags.SkipFencing;
+        return flags;
+    }
+
+    /// <summary>The header with identities and grants re-resolved from the (now current) control state.</summary>
+    private OperationHeader Refresh(OperationHeader op)
+    {
+        (ImmutableArray<string> identities, bool admin) = IdentitiesOf(op.Principal);
+        return op with { Identities = identities, IsAdmin = admin, Grants = GrantsOf(op.Principal) };
+    }
+
+    /// <summary>A command stamped with the leader clock and the operation header.</summary>
+    private T Stamp<T>(T command, OperationHeader? op)
+        where T : VolumeCommand
+        => command with { LeaderTime = _s.Time.GetUtcNow(), Op = op };
+
+    /// <summary>
+    /// Runs a command against the leader's applied state without changing it (leader-side validation: the same pure apply
+    /// logic, so a request apply would refuse is answered without a log entry).
+    /// </summary>
+    private VolumeApplyResult DryRun(VolumeCommand command)
+    {
+        VolumeState state = State;
+        ulong index = Math.Max(state.AppliedIndex, Group.LastIndex) + 1;
+        var ctx = new ApplyContext(index, Group.Term, command);
+        (_, VolumeApplyResult result) = VolumeStateMachine.ApplyCommand(state with { AppliedIndex = index, LeaderTime = command.LeaderTime },
+            ctx with { Command = command with { Op = command.Op is { } op ? op with { Id = default } : null } });
+        return result;
+    }
+
+    /// <summary>
+    /// Proposes a command and returns its apply result. After the F10 stage the control barrier runs, identities and grants
+    /// are re-resolved and the command is validated again, so authorization revoked while the request waited is honoured at
+    /// the authoritative decision (SEC-006, ACL-026).
+    /// </summary>
+    private async Task<VolumeApplyResult> ProposeAsync(VolumeCommand command, CancellationToken ct)
+    {
+        var context = new ProposalContext(command.OperationKind, command.Op is { HasOperation: true } op ? op.Id : null, command.Path);
+        VolumeCommand final = command;
+        ApplyOutcome outcome = await Group.ProposeAsync(async token =>
+        {
+            if (command.Op is { } header)
+            {
+                await Barrier.WaitAsync(token);
+                final = command with { Op = Refresh(header), LeaderTime = _s.Time.GetUtcNow() };
+                VolumeApplyResult check = DryRun(final);
+                if (!check.IsSuccess && IsAuthorizationFailure(check.Code))
+                    throw new UnauthorizedAccessException(check.Message);
+            }
+
+            return CommandCodec.Encode(final);
+        }, context, ct);
+        if (outcome.Value is VolumeApplyResult result)
+            return result;
+        return new VolumeApplyResult(outcome.Code, outcome.Message, new ErrorReplyMessage(outcome.Code, outcome.Message), null);
+    }
+
+    private static bool IsAuthorizationFailure(DfsErrorCode code) => code == DfsErrorCode.AccessDenied;
+
+    /// <summary>
+    /// The mutation pipeline (ARCHITECTURE §5.2, §7): leader readiness, the operation gate against applied state (stored
+    /// outcome, expired, mismatch), in-flight duplicate coalescing (OUT-005), preparation, dry-run validation and proposal.
+    /// The reply is the apply result's reply (an error reply for failures).
+    /// </summary>
+    private Task<IWireMessage> MutateAsync(RpcContext context, IVolumeRequest request, DfsOperationKind kind,
+        Func<OperationHeader, CancellationToken, Task<VolumeCommand>> prepare, Func<VolumeApplyResult, IWireMessage>? finish = null, bool requireOperation = true)
+        => MutateAsync(context, request, kind, async (op, ct) => new Prepared(await prepare(op, ct)), finish, requireOperation);
+
+    /// <summary>A prepared command and an optional hold (for example a per-stream publication lock) released after its proposal.</summary>
+    private readonly record struct Prepared(VolumeCommand Command, IDisposable? Hold = null);
+
+    /// <inheritdoc cref="MutateAsync(RpcContext, IVolumeRequest, DfsOperationKind, Func{OperationHeader, CancellationToken, Task{VolumeCommand}}, Func{VolumeApplyResult, IWireMessage}?, bool)"/>
+    private async Task<IWireMessage> MutateAsync(RpcContext context, IVolumeRequest request, DfsOperationKind kind,
+        Func<OperationHeader, CancellationToken, Task<Prepared>> prepare, Func<VolumeApplyResult, IWireMessage>? finish = null, bool requireOperation = true)
+    {
+        CancellationToken ct = context.Cancellation;
+        RejectTransaction(request);
+        await EnsureLeaderReadyAsync(ct);
+        OperationHeader op = Header(context, request, kind);
+        if (requireOperation && !op.HasOperation)
+            throw new ArgumentException($"{kind} requests must carry an operation id (OUT-001).");
+        if (!op.HasOperation)
+            return Finish(await ExecuteAsync(op, prepare, ct), finish);
+
+        GateDecision gate = OperationGate.Check(State, op);
+        switch (gate.Kind)
+        {
+            case GateKind.Stored:
+                return Finish(VolumeStateMachine.StoredResult(gate.Outcome!), finish);
+            case GateKind.Expired:
+                return new ErrorReplyMessage(DfsErrorCode.OperationExpired, gate.Message, op.Id);
+            case GateKind.Mismatch:
+                return new ErrorReplyMessage(DfsErrorCode.OperationIdMismatch, gate.Message, op.Id);
+            case GateKind.Invalid:
+                return new ErrorReplyMessage(DfsErrorCode.InvalidArgument, gate.Message, op.Id);
+        }
+
+        if (_inFlight.TryGetValue(op.Id, out InFlight? running))
+        {
+            if (running.PayloadHash != op.PayloadHash || running.Operation != op.Operation
+                || !string.Equals(running.Principal, op.Principal, StringComparison.Ordinal))
+            {
+                return new ErrorReplyMessage(DfsErrorCode.OperationIdMismatch, $"Operation {op.Id} is in flight for a different request.", op.Id);
+            }
+
+            return Finish(await running.Completion.Task.WaitAsync(ct), finish);
+        }
+
+        var entry = new InFlight(op.PayloadHash, op.Operation, op.Principal);
+        _inFlight[op.Id] = entry;
+        try
+        {
+            VolumeApplyResult result = await ExecuteAsync(op, prepare, ct);
+            entry.Completion.TrySetResult(result);
+            return Finish(result, finish);
+        }
+        catch (Exception ex)
+        {
+            entry.Completion.TrySetException(ex);
+            _ = entry.Completion.Task.Exception;
+            throw;
+        }
+        finally
+        {
+            if (_inFlight.TryGetValue(op.Id, out InFlight? current) && ReferenceEquals(current, entry))
+                _inFlight.Remove(op.Id);
+        }
+    }
+
+    private async Task<VolumeApplyResult> ExecuteAsync(OperationHeader op, Func<OperationHeader, CancellationToken, Task<Prepared>> prepare,
+        CancellationToken ct)
+    {
+        Prepared prepared = await prepare(op, ct);
+        try
+        {
+            VolumeApplyResult check = DryRun(prepared.Command);
+            if (!check.IsSuccess)
+            {
+                ErrorReplyMessage error = check.Reply as ErrorReplyMessage ?? new ErrorReplyMessage(check.Code, check.Message);
+                return check with { Reply = op.HasOperation ? error with { OperationId = op.Id } : error };
+            }
+
+            return await ProposeAsync(prepared.Command, ct);
+        }
+        finally
+        {
+            prepared.Hold?.Dispose();
+        }
+    }
+
+    private static IWireMessage Finish(VolumeApplyResult result, Func<VolumeApplyResult, IWireMessage>? finish)
+    {
+        if (!result.IsSuccess)
+            return result.Reply ?? new ErrorReplyMessage(result.Code, result.Message);
+        if (finish is not null)
+            return finish(result);
+        return result.Reply ?? throw new InvalidOperationException("The applied command produced no reply.");
+    }
+
+    /// <summary>Proposes a leader housekeeping command (expiry, pruning, staging) with a node-clock deadline.</summary>
+    private async Task<VolumeApplyResult?> ProposeHousekeepingAsync(VolumeCommand command)
+    {
+        if (!IsLeader)
+            return null;
+        using CancellationTokenSource deadline = _s.CreateDeadline();
+        try
+        {
+            ApplyOutcome outcome = await Group.ProposeAsync(CommandCodec.Encode(command with { LeaderTime = _s.Time.GetUtcNow() }),
+                new ProposalContext(command.OperationKind), deadline.Token);
+            return outcome.Value as VolumeApplyResult;
+        }
+        catch (Exception ex) when (ex is DfsException or OperationCanceledException or IOException)
+        {
+            _s.Debug("volume", NodeServices.Inv($"Volume {Name}: housekeeping {command.Kind} failed: {ex.Message}"));
+            return null;
+        }
+    }
+
+    /// <summary>Serializes leader-side planning and proposal of publications per stream (materialization stays consistent).</summary>
+    private async Task<IDisposable> LockStreamAsync(StreamKey key, CancellationToken ct)
+    {
+        if (_publishLocks.TryGetValue(key, out Queue<TaskCompletionSource>? queue))
+        {
+            var waiter = new TaskCompletionSource();
+            queue.Enqueue(waiter);
+            await waiter.Task.WaitAsync(ct);
+        }
+        else
+        {
+            _publishLocks[key] = new Queue<TaskCompletionSource>();
+        }
+
+        return new StreamLock(this, key);
+    }
+
+    private void UnlockStream(StreamKey key)
+    {
+        if (!_publishLocks.TryGetValue(key, out Queue<TaskCompletionSource>? queue))
+            return;
+        while (queue.Count > 0)
+        {
+            TaskCompletionSource next = queue.Dequeue();
+            if (next.TrySetResult())
+                return;
+        }
+
+        _publishLocks.Remove(key);
+    }
+
+    /// <summary>Normalizes a request path (InvalidPath on failure, PATH-012).</summary>
+    private static string NormalizePath(string path)
+    {
+        if (!DfsPath.TryNormalize(path, out string normalized, out string? error))
+            throw new ArgumentException(error ?? $"Invalid path '{path}'.", "path");
+        return normalized;
+    }
+
+    private CommitToken Token(ulong index) => State.TokenAt(index);
+
+    private sealed class InFlight(UInt128 payloadHash, DfsOperationKind operation, string principal)
+    {
+        public UInt128 PayloadHash { get; } = payloadHash;
+
+        public DfsOperationKind Operation { get; } = operation;
+
+        public string Principal { get; } = principal;
+
+        public TaskCompletionSource<VolumeApplyResult> Completion { get; } = new();
+    }
+
+    private sealed class StreamLock(VolumeService owner, StreamKey key) : IDisposable
+    {
+        private bool _released;
+
+        public void Dispose()
+        {
+            if (_released)
+                return;
+            _released = true;
+            owner.UnlockStream(key);
+        }
+    }
+}

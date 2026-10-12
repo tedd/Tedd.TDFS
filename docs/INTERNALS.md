@@ -26,7 +26,8 @@ Volumes/
                 .Snapshots.cs, .Gc.cs, .Backup.cs, .Policy.cs, .Security.cs
   Service/      VolumeService (leader-side RPC handlers) + partials per feature: VolumeService.Files.cs,
                 .Namespace.cs, .Handles.cs (lease tracking/expiry proposals), .Transactions.cs (working roots),
-                .Snapshots.cs, .Enumeration.cs (continuation cache), .Gc.cs, .Repair.cs, .Backup.cs, .Outcomes.cs
+                .Snapshots.cs, .Enumeration.cs (continuation cache), .Gc.cs, .Repair.cs, .Backup.cs, .Outcomes.cs,
+                .Restore.cs (snapshot restore coordinator + install target); RestoreControl (control-leader restore steps)
   VolumeHost    per-volume composition: group runtime + state machine + service + leader-only jobs
 Data/           ObjectService (PutObject/GetObject/Locate/Replicate/Delete/Copy handlers), Receipts (MAC),
                 Capabilities (staging + per-object read capabilities), InventoryReporter, Scrubber, RepairWorker

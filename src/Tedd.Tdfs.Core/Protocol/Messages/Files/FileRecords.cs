@@ -39,7 +39,17 @@ public sealed record FileInfoData(
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
 
     /// <inheritdoc />
-    public static int MinEncodedSize => 17;
+    public static int MinEncodedSize => 20;
+
+    /// <summary>True when <see cref="Path"/> addresses a named stream (Addendum A, ADS-024; trailing field): <see cref="Length"/>,
+    /// <see cref="Revision"/>, <see cref="IsInline"/>, <see cref="IsSparse"/> and <see cref="ExtentCount"/> then describe that stream.</summary>
+    public bool IsStream { get; init; }
+
+    /// <summary>Name of the addressed named stream, or null (Addendum A; trailing field).</summary>
+    public string? StreamName { get; init; }
+
+    /// <summary>Number of named streams of the inode (Addendum A, ADS-024; trailing field).</summary>
+    public int StreamCount { get; init; }
 
     /// <inheritdoc />
     public void Write(ref WireWriter writer)
@@ -60,6 +70,9 @@ public sealed record FileInfoData(
         writer.WriteVarInt32(ExtentCount);
         writer.WriteVarInt32(EntryCount);
         writer.WriteVarUInt(WriterGeneration);
+        writer.WriteBool(IsStream);
+        writer.WriteOptionalString(StreamName);
+        writer.WriteVarInt32(StreamCount);
         writer.WriteExtensionBlock(Extensions);
     }
 
@@ -82,10 +95,16 @@ public sealed record FileInfoData(
         int extentCount = reader.ReadVarInt32();
         int entryCount = reader.ReadVarInt32();
         ulong generation = reader.ReadVarUInt();
+        bool isStream = reader.ReadBool();
+        string? streamName = reader.ReadOptionalString();
+        int streamCount = reader.ReadVarInt32();
         IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
         return new FileInfoData(path, kind, inode, revision, length, created, modified, owner, ownerOnly, readOnlyForOthers, policy,
             isInline, isSparse, extentCount, entryCount, generation)
         {
+            IsStream = isStream,
+            StreamName = streamName,
+            StreamCount = streamCount,
             Extensions = extensions,
         };
     }

@@ -72,6 +72,10 @@ public static class MessageTypes
         MessageType.CreateDirectory or MessageType.CreateDirectoryResult => DfsOperationKind.CreateDirectory,
         MessageType.SetPolicy or MessageType.SetPolicyResult => DfsOperationKind.PolicyChange,
         MessageType.SetAccess or MessageType.SetAccessResult => DfsOperationKind.Admin,
+        MessageType.GetAccessControl or MessageType.GetAccessControlResult or MessageType.GetEffectiveRights or MessageType.GetEffectiveRightsResult
+            or MessageType.ListStreams or MessageType.ListStreamsResult => DfsOperationKind.GetInfo,
+        MessageType.SetAccessControl or MessageType.SetAccessControlResult or MessageType.SetOwner or MessageType.SetOwnerResult
+            => DfsOperationKind.Admin,
 
         MessageType.TxBegin or MessageType.TxBeginResult => DfsOperationKind.TxBegin,
         MessageType.TxOp or MessageType.TxOpResult => DfsOperationKind.TxOp,
@@ -84,7 +88,8 @@ public static class MessageTypes
         MessageType.OpenSnapshot or MessageType.OpenSnapshotResult or MessageType.CloseSnapshot or MessageType.CloseSnapshotResult
             => DfsOperationKind.OpenSnapshot,
         MessageType.SetRetention or MessageType.SetRetentionResult => DfsOperationKind.Admin,
-        MessageType.RestoreSnapshot or MessageType.RestoreSnapshotResult => DfsOperationKind.RestoreSnapshot,
+        MessageType.RestoreSnapshot or MessageType.RestoreSnapshotResult or MessageType.RestoreVolume or MessageType.RestoreVolumeResult
+            or MessageType.RestoreInstall or MessageType.RestoreInstallResult => DfsOperationKind.RestoreSnapshot,
 
         MessageType.PutObject or MessageType.PutObjectResult => DfsOperationKind.PutObject,
         MessageType.GetObject or MessageType.GetObjectResult or MessageType.LocateObject or MessageType.LocateObjectResult

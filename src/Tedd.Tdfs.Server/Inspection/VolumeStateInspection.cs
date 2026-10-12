@@ -17,11 +17,25 @@ public sealed record VolumeStateInspection(VolumeId Id, ulong Epoch, ulong Appli
     IReadOnlyList<PinInspection> Pins, IReadOnlyList<StagingInspection> Staging, int ActiveTransactions,
     IReadOnlyList<BackupProgressInspection> Backups)
 {
-    /// <summary>The file at <paramref name="path"/> in the current root, or null when absent (or a directory).</summary>
+    /// <summary>Resolves files in the inspected (immutable) state; set by the volume state machine.</summary>
+    internal Func<string, FileInspection?>? FileResolver { get; init; }
+
+    /// <summary>Computes the reachable object set of the inspected (immutable) state; set by the volume state machine.</summary>
+    internal Func<IReadOnlySet<ObjectId>>? ReachableResolver { get; init; }
+
+    /// <summary>
+    /// The file at <paramref name="path"/> in the current root (a stream path inspects its file), or null when absent (or a
+    /// directory).
+    /// </summary>
+    /// <exception cref="InvalidOperationException">The inspected state machine does not provide file inspection.</exception>
     public FileInspection? GetFile(string path)
-        => throw new NotImplementedException("VolumeStateInspection.GetFile: implemented in a later phase");
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        return (FileResolver ?? throw new InvalidOperationException("This volume state machine does not provide file inspection."))(path);
+    }
 
     /// <summary>Objects reachable from the current root, snapshot roots, transaction roots and pinned inode versions.</summary>
+    /// <exception cref="InvalidOperationException">The inspected state machine does not provide reachability.</exception>
     public IReadOnlySet<ObjectId> ReachableObjects()
-        => throw new NotImplementedException("VolumeStateInspection.ReachableObjects: implemented in a later phase");
+        => (ReachableResolver ?? throw new InvalidOperationException("This volume state machine does not provide reachability."))();
 }

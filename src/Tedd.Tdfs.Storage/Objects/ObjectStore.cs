@@ -4,7 +4,7 @@ namespace Tedd.Tdfs.Storage;
 
 /// <summary>
 /// Packed, append-only object store: objects are records in segment files with a self-describing, checksummed header;
-/// the index is rebuilt from the segments on open. Writes are durable when <see cref="PutAsync"/> returns.
+/// the index is rebuilt from the segments on open. Writes are durable when <see cref="PutAsync(ObjectId, VolumeId, StagingId, ReadOnlyMemory{byte}, CancellationToken)"/> returns.
 /// </summary>
 /// <remarks>
 /// <para><b>Records.</b> Each record header carries the object identity (id, volume, staging session), plaintext and
@@ -156,7 +156,18 @@ public sealed partial class ObjectStore : IAsyncDisposable
     /// <exception cref="DfsLimitExceededException">The object exceeds <see cref="ObjectStoreOptions.MaxObjectSize"/>.</exception>
     /// <exception cref="DfsIntegrityException">The id is stored with different content or volume.</exception>
     /// <exception cref="DfsCapacityException">Admission would consume the reserved capacity, or the device is full.</exception>
-    public async ValueTask<ObjectRecordInfo> PutAsync(ObjectId id, VolumeId volume, StagingId staging, ReadOnlyMemory<byte> plaintext, CancellationToken ct = default)
+    public ValueTask<ObjectRecordInfo> PutAsync(ObjectId id, VolumeId volume, StagingId staging, ReadOnlyMemory<byte> plaintext, CancellationToken ct = default)
+        => PutAsync(id, volume, staging, plaintext, DfsOperationKind.PutObject, ct);
+
+    /// <inheritdoc cref="PutAsync(ObjectId, VolumeId, StagingId, ReadOnlyMemory{byte}, CancellationToken)"/>
+    /// <param name="id">Object id.</param>
+    /// <param name="volume">Owning volume.</param>
+    /// <param name="staging">Staging session the copy is bound to.</param>
+    /// <param name="plaintext">Payload.</param>
+    /// <param name="operation">Operation kind reported by the object write fault sites (for example a restore's server-side copy).</param>
+    /// <param name="ct">Cancellation.</param>
+    public async ValueTask<ObjectRecordInfo> PutAsync(ObjectId id, VolumeId volume, StagingId staging, ReadOnlyMemory<byte> plaintext, DfsOperationKind operation,
+        CancellationToken ct = default)
     {
         if (id.IsEmpty)
             throw new ArgumentException("The object id must not be empty.", nameof(id));
@@ -165,7 +176,7 @@ public sealed partial class ObjectStore : IAsyncDisposable
         ThrowIfDisposed();
         UInt128 checksum = ObjectChecksum.Compute(plaintext.Span);
         if (_faults.IsEnabled)
-            await _faults.HitAsync(new FaultContext(FaultStage.F06, FaultSites.ObjectWrite, _options.NodeName, Operation: DfsOperationKind.PutObject, Object: id), ct);
+            await _faults.HitAsync(new FaultContext(FaultStage.F06, FaultSites.ObjectWrite, _options.NodeName, Operation: operation, Object: id), ct);
 
         SegmentFile segment;
         IndexEntry entry;
@@ -230,7 +241,7 @@ public sealed partial class ObjectStore : IAsyncDisposable
         try
         {
             if (_faults.IsEnabled)
-                await _faults.HitAsync(new FaultContext(FaultStage.F07, FaultSites.ObjectBeforeFlush, _options.NodeName, Operation: DfsOperationKind.PutObject, Object: id), ct);
+                await _faults.HitAsync(new FaultContext(FaultStage.F07, FaultSites.ObjectBeforeFlush, _options.NodeName, Operation: operation, Object: id), ct);
             try
             {
                 await FlushSegmentAsync(segment, ct);

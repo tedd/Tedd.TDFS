@@ -1,0 +1,124 @@
+using Tedd.Tdfs.Protocol;
+using Tedd.Tdfs.Protocol.Messages;
+using Tedd.Tdfs.Server.Runtime;
+using Tedd.Tdfs.Server.Volumes.Apply;
+using Tedd.Tdfs.Server.Volumes.Commands;
+using Tedd.Tdfs.Server.Volumes.State;
+
+namespace Tedd.Tdfs.Server.Volumes.Service;
+
+internal sealed partial class VolumeService
+{
+    /// <summary><c>OpenSession</c> (PROTOCOL.md §9.3): committed <c>OpenSession</c> entry; retries with the same nonce return the same session.</summary>
+    public async Task<IWireMessage> OpenSessionAsync(RpcContext context, OpenSessionMessage request)
+    {
+        CancellationToken ct = context.Cancellation;
+        RejectTransaction(request);
+        await EnsureLeaderReadyAsync(ct);
+        string principal = context.Principal ?? string.Empty;
+        if (GrantsOf(principal) == DfsPermissions.None)
+            throw new UnauthorizedAccessException($"Principal '{principal}' has no grant on volume '{Name}'.");
+        OperationHeader op = Header(context, request, DfsOperationKind.OpenSession, default);
+        NodeTimings t = _s.Timings;
+        var command = Stamp(new OpenSessionCommand(request.ClientName, request.Nonce, t.LeaseDuration, t.SessionTimeout, t.MaxOutcomesPerSession,
+            t.OutcomeRetention), op);
+        VolumeApplyResult result = await ProposeAsync(command, ct);
+        if (result.IsSuccess && result.Value is SessionRecord session)
+            RenewSession(session.Id);
+        return Finish(result, null);
+    }
+
+    /// <summary><c>KeepAlive</c>: committed entry renewing the session, its listed handles and reader pins; pin advances recorded.</summary>
+    public async Task<IWireMessage> KeepAliveAsync(RpcContext context, KeepAliveMessage request)
+    {
+        CancellationToken ct = context.Cancellation;
+        RejectTransaction(request);
+        await EnsureLeaderReadyAsync(ct);
+        OperationHeader op = Header(context, request, DfsOperationKind.KeepAlive, default);
+        var command = Stamp(new KeepAliveCommand(request.Header.Session, [.. request.Handles.Select(h => h.Value)],
+            [.. request.PinUpdates.Select(p => new PinAdvance(p.Handle.Value, p.PinIndex))], [.. request.ReaderPins]), op);
+
+        // Renew the leases before the entry commits: a renewal that arrives in time must not lose the race with an expiry
+        // proposed meanwhile by this leader (the reply reports what the committed state says).
+        if (State.Sessions.TryGetValue(request.Header.Session, out SessionRecord? known) && known.State == SessionState.Active
+            && string.Equals(known.Principal, op.Principal, StringComparison.Ordinal))
+        {
+            RenewSession(known.Id);
+            foreach (HandleId handle in request.Handles)
+            {
+                if (State.Handles.TryGetValue(handle.Value, out HandleRecord? h) && h.Session == known.Id)
+                    RenewHandle(handle.Value);
+            }
+
+            foreach (ulong pin in request.ReaderPins)
+            {
+                if (State.Pins.TryGetValue(pin, out PinRecord? p) && p.Session == known.Id)
+                    RenewPin(pin);
+            }
+        }
+
+        VolumeApplyResult result = await ProposeAsync(command, ct);
+        if (result.IsSuccess && result.Value is KeepAliveValue renewed && renewed.Session != 0)
+        {
+            RenewSession(renewed.Session);
+            foreach (ulong handle in renewed.RenewedHandles)
+                RenewHandle(handle);
+            foreach (ulong pin in renewed.RenewedPins)
+                RenewPin(pin);
+        }
+
+        return Finish(result, reply => reply.Reply is KeepAliveResultMessage k ? k with { LeaseDuration = _s.Timings.LeaseDuration, ServerWallClock = _s.Time.GetUtcNow() } : reply.Reply!);
+    }
+
+    /// <summary>
+    /// <c>QueryOperation</c> (PROTOCOL.md §5.1): retained outcome, Pending while in flight on this leader, NotFound or Expired;
+    /// with <c>Resolve</c> an id without outcome is fenced (committed <c>FenceOperation</c>) so the answer is definite.
+    /// </summary>
+    public async Task<IWireMessage> QueryOperationAsync(RpcContext context, QueryOperationMessage request)
+    {
+        CancellationToken ct = context.Cancellation;
+        RejectTransaction(request);
+        string principal = context.Principal ?? string.Empty;
+        if (GrantsOf(principal) == DfsPermissions.None)
+            throw new UnauthorizedAccessException($"Principal '{principal}' has no grant on volume '{Name}'.");
+        await ReadBarrierAsync(ct);
+        DfsOperationId target = request.Target;
+        if (_inFlight.TryGetValue(target, out InFlight? running))
+        {
+            if (!string.Equals(running.Principal, principal, StringComparison.Ordinal))
+                throw new DfsOperationIdMismatchException($"Operation {target} belongs to another principal.");
+            if (!request.Resolve)
+                return new QueryOperationResultMessage(target, WireOutcomeStatus.Pending, CommitToken.None, DfsErrorCode.None, "The operation is in flight.",
+                    running.Operation, ReadOnlyMemory<byte>.Empty);
+        }
+
+        QueryOperationResultMessage answer;
+        try
+        {
+            answer = VolumeStateMachine.QueryOutcome(State, target, principal, out _, out bool fenceable);
+            if (!request.Resolve || !fenceable)
+                return answer;
+        }
+        catch (ApplyFailure failure)
+        {
+            return new ErrorReplyMessage(failure.Code, failure.Message, target);
+        }
+
+        OperationHeader op = Header(context, request, DfsOperationKind.QueryOperation, default);
+        VolumeApplyResult result = await ProposeAsync(Stamp(new FenceOperationCommand(target, request.IsTransaction), op), ct);
+        return Finish(result, null);
+    }
+
+    /// <summary><c>ReserveOperationIds</c>: reserves a block of sequences in the caller's session (committed).</summary>
+    public async Task<IWireMessage> ReserveOperationIdsAsync(RpcContext context, ReserveOperationIdsMessage request)
+    {
+        CancellationToken ct = context.Cancellation;
+        RejectTransaction(request);
+        await EnsureLeaderReadyAsync(ct);
+        if (request.Count is < 1 or > 65536)
+            throw new ArgumentException("Between 1 and 65536 sequences can be reserved at once.");
+        OperationHeader op = Header(context, request, DfsOperationKind.OpenSession, default);
+        VolumeApplyResult result = await ProposeAsync(Stamp(new ReserveOperationIdsCommand(request.Header.Session, request.Count), op), ct);
+        return Finish(result, null);
+    }
+}
