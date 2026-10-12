@@ -22,3 +22,17 @@ Distributed filesystem with a .NET client SDK. Requirements: `docs/spec/distribu
 - Never weaken an FSD SHALL to make a test pass. Never fabricate success, zero-fill missing data, or report
   unknown outcomes as aborts.
 - Match the surrounding code style (file-scoped namespaces, nullable enabled, XML docs on public members).
+
+## Gotchas discovered so far
+- Product projects use `InvariantGlobalization=true`, so `string.Normalize` is a no-op there: product code must use
+  `Tedd.Tdfs.DfsUnicode.ToNfc/IsNfc` (pinned Unicode 16 tables). Test projects run with ICU
+  (`InvariantGlobalization=false`), so tests may use `string.Normalize` and real cultures (e.g. tr-TR) as oracles.
+- Harness classes (`TestCluster`, `TestNode`, `TestBackupNode`, `TestNetwork`, `TestFaults`, `ClusterInspector`,
+  `TestDisk`, `RawProtocolClient`, `RaftSimulation`, `HistoryRecorder`) and server `NodeInspector`/`BackupInspector`
+  are `partial` so additions can live in separate files.
+- `.gitignore` has VS rules like `Backup*/` and `[Ll]og/`; `src/**` and `tests/**` are re-included, but check
+  `git status` shows new folders before committing.
+- Shared public types needed by both Client and Server (e.g. `DfsRetention`, `DfsConsistencyLabel`,
+  `DfsBackupCheckpoint`) live in Core (namespace `Tedd.Tdfs`).
+- `MessageCodec` registrations go in `src/Tedd.Tdfs.Core/Protocol/MessageCodec.Registrations.cs`; message records
+  implement `IWireMessage<TSelf>`.

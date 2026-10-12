@@ -1,4 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!-- Tests run with full ICU globalization so culture-dependent behaviour (PATH-008) and NFC cross-checks are exercised. -->
+    <InvariantGlobalization>false</InvariantGlobalization>
+  </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="xunit.v3" />
     <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" />

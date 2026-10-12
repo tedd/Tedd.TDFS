@@ -1328,15 +1328,16 @@ public sealed class HistoryRecorder
 public sealed record CheckResult(bool IsValid, bool IsInconclusive, string Explanation, long StatesExplored)
 { public void AssertValid(); }   // fails the test unless IsValid && !IsInconclusive (HAR-017)
 
-public interface ISequentialModel<TState> where TState : notnull
+public interface ISequentialModel<TState>   // no `notnull` constraint: RegisterModel's state is byte[]? (nullable warnings are errors)
 {
     TState Initial { get; }
     bool Step(TState state, HistoryOp op, out TState next);   // false if op's output is impossible in state
+    string Key(TState state);                                 // canonical memo key: equal keys <=> behaviourally equal states
 }
 public static class LinearizabilityChecker
 {
     // Wing & Gong / Lowe search with memoisation; per-key partitioning when keys are independent.
-    public static CheckResult Check<TState>(IReadOnlyList<HistoryOp> history, ISequentialModel<TState> model, long maxStates = 5_000_000) where TState : notnull;
+    public static CheckResult Check<TState>(IReadOnlyList<HistoryOp> history, ISequentialModel<TState> model, long maxStates = 5_000_000);
 }
 public sealed class RegisterModel : ISequentialModel<byte[]?> { }            // kinds "write"(input byte[]), "read"(output byte[]?), "delete"
 public sealed class AppendLogModel : ISequentialModel<ImmutableList<byte[]>> { } // kinds "append", "read"
@@ -1500,6 +1501,43 @@ public IReadOnlyList<CapturedMessage> Captured { get; }
 public sealed record CapturedMessage(string From, string To, LinkDirection Direction, MessageType Type, ReadOnlyMemory<byte> Frame);
 // TestNetwork
 public Task<DfsErrorCode> ReplayAsync(CapturedMessage message);   // re-deliver a previously captured frame from its original sender identity
+
+// Added while implementing the harness (pure logic, usable by tests)
+// TestClock
+public TestClock(TimeProvider? baseProvider = null);   // starts at the base wall time; TimestampFrequency = TimeSpan.TicksPerSecond
+public double Rate { get; }
+// TestClusterOptions
+public const int MaxNodes = 10;
+public int EffectiveNodeCount { get; } public int EffectiveControlVoters { get; }
+public IReadOnlyList<TestNodeSpec> GetNodeSpecs();          // Nodes, or n0..n{N-1} laid out per Topology (TwoPlusOne: first ceil(2n/3) in z1)
+public DfsStoragePolicy GetEffectiveDefaultPolicy();        // DefaultPolicy, or min(3,hosts)/min(3,zones)/min(2,hosts)/min(2,zones) (clamped valid)
+public ulong ResolveSeed(string testName); public string ResolveDataRoot(); public void Validate();
+// TestNodeSpec: string EffectiveHost; DfsTopologyLabels ToLabels();   TestVolumeSpec: DfsVolumeSpec ToVolumeSpec(DfsStoragePolicy clusterDefault);
+// TestClientOptions: string NetworkName ("client:{Name}")
+// HistoryOp / TxRecord
+public long? ResolveTime { get; init; }      // set by HistoryRecorder.Resolve; an Ok op's effect lies in [InvokeTime, ResolveTime ?? CompleteTime]
+public long? EffectDeadline { get; }         // Ok: ResolveTime ?? CompleteTime; otherwise null (unbounded)
+public bool WasResolved { get; }             // HistoryOp only
+// HistoryRecorder
+public bool TrustCancellationAsAbort { get; set; }   // default false: OperationCanceledException after async start -> Unknown
+public int Count { get; } public HistoryOp Get(long id); public void AttachOperationId(long id, DfsOperationId operationId);
+public static OpOutcome Classify(Exception exception, bool requestMayHaveBeenSent = true, bool trustCancellation = false);
+// CheckResult: static Valid(...), Invalid(...), Inconclusive(...)
+// ReferenceFileModel: ReferenceFileModel(ReadOnlySpan<byte> initial); long CommittedLength, StagedLength; bool HasPendingChanges
+// ReferenceNamespaceModel (errors are DfsErrorCode names; root inode 1; new inodes monotonic from 2)
+public bool CreateDirectory(string path, bool recursive, out string? error);
+public bool CopyFile(string from, string to, bool overwrite, out string? error);   // overwrite keeps the destination inode
+public bool IsFile(string path); public bool IsDirectory(string path); public bool TryGetInode(string path, out long inode);
+public IReadOnlyList<string> AllPaths(); public int Count { get; } public long LastAllocatedInode { get; }
+// FaultMatch: void Validate(); bool MatchesSite(string site); bool Matches(in FaultContext context); bool TriggersOn(int matchingHit)
+// FaultAction cases (nested sealed records): CrashNodeFault(Mode), PauseNodeFault, BlockFault, ThrowFault(Factory), IoErrorFault,
+//   DiskFullFault, DelayFault(Duration), DropReplyFault, CancelCallerFault, CustomFault(Action)
+// MessageFilter: static Any; bool Matches(string from, string to, LinkDirection direction, ReadOnlySpan<byte> frame);
+//   bool Matches(string from, string to, LinkDirection direction, MessageType type, IWireMessage? message)
+// CampaignReport: int Unreached; bool IsComplete
+// CatalogAttribute: string TestId, Suite, Level; IReadOnlyList<string> Invariants
+// TestCatalog: const int ExpectedCount = 586; IReadOnlyList<string> Suites; CatalogEntry? Find(string id); IReadOnlyList<CatalogEntry> Parse(string markdown)
+// CatalogEntry: string MethodName ("OPEN_001_CreateNewAbsent")
 ```
 
 ## G. Test authoring conventions

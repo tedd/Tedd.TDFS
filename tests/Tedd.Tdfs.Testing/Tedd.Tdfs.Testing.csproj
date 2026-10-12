@@ -9,6 +9,18 @@
     <ProjectReference Include="..\..\src\Tedd.Tdfs.Server\Tedd.Tdfs.Server.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <!-- Assert + ITraitAttribute/TestContext; versions match xunit.v3 4.0.1's dependency graph. -->
+    <PackageReference Include="xunit.v3.assert" />
+    <PackageReference Include="xunit.v3.extensibility.core" />
+  </ItemGroup>
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The test plan is the source of the named-case catalog (TestCatalog). -->
+    <EmbeddedResource Include="..\..\docs\spec\distributed-filesystem-test-plan.md" LogicalName="test-plan.md" Link="Catalog\test-plan.md" />
+  </ItemGroup>
+  <ItemGroup>
     <InternalsVisibleTo Include="Tedd.Tdfs.Tests.Unit" />
     <InternalsVisibleTo Include="Tedd.Tdfs.Tests.Simulation" />
     <InternalsVisibleTo Include="Tedd.Tdfs.Tests.Integration" />
