@@ -80,12 +80,20 @@ internal static class BAKHelpers
 
     public static CancellationToken Ct => TestContext.Current.CancellationToken;
 
+    /// <summary>
+    /// Virtual-time budget of one BAK scenario. Several rows deliberately keep a target offline or disconnected for
+    /// minutes of virtual time (BAK-014: 2 min, BAK-029: 5 min, BAK-028: throttled transfer), which the default
+    /// 120 s <see cref="TestClusterOptions.ScenarioTimeout"/> would cut short and report as a failure.
+    /// </summary>
+    public static readonly TimeSpan ScenarioBudget = TimeSpan.FromMinutes(10);
+
     /// <summary>Deterministic simulation with backup nodes; volume voters clipped to the node count.</summary>
     public static TestClusterOptions Options(int nodeCount = 3, int backupCount = 1) => new()
     {
         NodeCount = nodeCount,
         BackupNodeCount = backupCount,
         Mode = ClusterMode.Deterministic,
+        ScenarioTimeout = ScenarioBudget,
         Volumes = [new TestVolumeSpec(Volume) { Metadata = new DfsMetadataPolicy { Voters = Math.Min(3, nodeCount) } }],
     };
 

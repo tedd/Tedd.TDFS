@@ -85,9 +85,24 @@ BAK-009 (duplicate deliveries), BAK-010 (object/manifest tampering).
   configuration/admin paths may instead throw `UnauthorizedAccessException`. The export principal may connect as a
   client but cannot delete or shorten retention (`DfsRetentionProtectedException` or other
   `UnauthorizedAccessException`); the retention-admin principal can extend/hold retention via
-  `DfsSnapshotClient.SetRetentionAsync` on the backup host.
+  `DfsSnapshotClient.SetRetentionAsync` on the backup host (the tests never require it to shorten an expiry). All
+  three backup principals (reader, export, retention admin) hold `Read` on the backup host (snapshot list/open/read).
+  Deleting an unprotected snapshot with the retention-admin principal is not required to fail (BAK-015 skips it).
 * Destination retention: a snapshot is prunable once it is outside `KeepLastSnapshots`, its retention expiry has
-  passed, it is not held and no valid reader pin exists; pruning removes it as a unit.
+  passed, it is not held and no valid reader pin exists; pruning removes it as a unit. `ExpiresUtc = null` (the
+  `BackupNodeOptions.DefaultRetention`) means "no time-based protection", so setting a finite expiry on such a
+  snapshot is an extension.
+* Source transfer pins and budgets: the exporter acquires the transfer pin before contacting the target (so a pin
+  exists while the target is unreachable, visible as `PinInspection.Kind == "Transfer"`). Budgets are evaluated while
+  the target is offline; `DfsBackupStatus.PinnedSourceBytes`/`MaxPinnedBytes` count source bytes retained only
+  because of that target's transfer pins. Deleting a user snapshot that a pending transfer still needs keeps its data
+  for the transfer (FSD §11.1). `ConfigureAsync` changes budgets without clearing `ReseedRequired`.
+* `FaultAction.Custom` callbacks may change the network and may crash any node, including the node that hit the
+  site (`TestNode`/`TestBackupNode.CrashAsync` must not wait on the crashed node's own loop). A node crashed while one
+  of its operations is held by `FaultAction.Block` discards that operation; a later `FaultArm.Release()` is a no-op
+  for it.
+* A crash at `BackupBeforePointer` may restart with either the previous pointer or (roll-forward of the complete,
+  durable staged snapshot) the new one; a crash at `BackupAfterPointer`/`BackupAck` must restart with the new one.
 * `MessageHold` keeps capturing after `ReleaseAll()` until disposed and `Captured` is cumulative;
   `TestNetwork.ReplayAsync` re-delivers a captured request and returns the receiver's error code.
 * `PinInspection.Kind` is `"Transfer"` for backup transfer pins. Setting `TestDisk.Faults.CapacityOverride = null`

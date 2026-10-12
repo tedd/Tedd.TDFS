@@ -80,15 +80,27 @@ public sealed class BAKUnitTests
         }
     }
 
+    /// <summary>
+    /// One live node (the reference backend, test plan §5) plus one backup node. Realtime mode on purpose: several
+    /// mutations go through the synchronous SDK wrappers, which block their thread (ARCHITECTURE §9.6) and therefore
+    /// cannot run inside the single-threaded deterministic scheduler.
+    /// </summary>
+    private static TestClusterOptions BackupHostOptions => TestClusterOptions.SingleNode with { BackupNodeCount = 1 };
+
     [Theory]
     [MemberData(nameof(AllMutations))]
     [Catalog("BAK-015", "U", "INV-15", "INV-12", "INV-13")]
     public Task BAK_015_AllMutationsOnBackupDenied(BackupMutation mutation) =>
-        ClusterTest.RunAsync(TestClusterOptions.ThreeZones with { BackupNodeCount = 1 }, async cluster =>
+        ClusterTest.RunAsync(BackupHostOptions, async cluster =>
         {
             (TestBackupNode b0, SortedDictionary<string, byte[]> files) = await PrepareAsync(cluster);
             foreach ((string principal, DfsCredentials credentials) in Principals(b0))
             {
+                // Deleting an unprotected snapshot is retention management, which the backup's own retention
+                // administrator may legitimately perform (FSD §12.4/§14); the row covers read-only client credentials.
+                if (mutation == BackupMutation.SnapshotDelete && principal == RetentionAdminPrincipal)
+                    continue;
+
                 string because = $"{mutation} through the backup host as {principal}";
                 await using DfsClient backup = await cluster.ConnectBackupAsync(0, new TestClientOptions { Name = "bk-" + principal, Credentials = credentials }, Ct);
                 DfsVolume bvol = backup.GetVolume(Volume);
@@ -124,7 +136,7 @@ public sealed class BAKUnitTests
     [InlineData(DfsOperationKind.GetInfo)]
     [Catalog("BAK-015", "U", "INV-15", "INV-12")]
     public Task BAK_015_AllMutationsOnBackupDenied_ServerSideEnforcement(DfsOperationKind kind) =>
-        ClusterTest.RunAsync(TestClusterOptions.ThreeZones with { BackupNodeCount = 1 }, async cluster =>
+        ClusterTest.RunAsync(BackupHostOptions, async cluster =>
         {
             (TestBackupNode b0, SortedDictionary<string, byte[]> files) = await PrepareAsync(cluster);
             (string path, string? path2) = kind switch
@@ -162,11 +174,13 @@ public sealed class BAKUnitTests
             }
         });
 
+    private const string RetentionAdminPrincipal = "retention-admin";
+
     private static IEnumerable<(string Principal, DfsCredentials Credentials)> Principals(TestBackupNode backup) =>
     [
         ("reader", backup.ReaderCredentials),
         ("export", backup.ExportCredentials),
-        ("retention-admin", backup.RetentionAdminCredentials),
+        (RetentionAdminPrincipal, backup.RetentionAdminCredentials),
     ];
 
     /// <summary>Writes a small tree on the live volume, snapshots it and waits until the backup published it exactly.</summary>
@@ -213,8 +227,10 @@ public sealed class BAKUnitTests
     /// <summary>Namespace, data, transaction and snapshot mutations are ReadOnly; configuration paths may also be authorization refusals.</summary>
     private static void AssertRefusalKind(BackupMutation mutation, Exception refusal, string because)
     {
-        bool configurationPath = mutation is BackupMutation.SnapshotDelete or BackupMutation.BackupsRegisterTarget or BackupMutation.BackupsRequestSync
-            or BackupMutation.AdminSetDefaultPolicy or BackupMutation.AdminDefinePolicy or BackupMutation.AdminCreateVolume or BackupMutation.AdminDeleteVolume;
+        // Restore creates a volume, so it is an administration path as much as a snapshot operation.
+        bool configurationPath = mutation is BackupMutation.SnapshotDelete or BackupMutation.SnapshotRestore or BackupMutation.BackupsRegisterTarget
+            or BackupMutation.BackupsRequestSync or BackupMutation.AdminSetDefaultPolicy or BackupMutation.AdminDefinePolicy
+            or BackupMutation.AdminCreateVolume or BackupMutation.AdminDeleteVolume;
         if (refusal is DfsReadOnlyException readOnly)
         {
             Assert.Equal(DfsErrorCode.ReadOnly, readOnly.ErrorCode);

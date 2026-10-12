@@ -766,13 +766,17 @@ public sealed class BAKSimulationTests
                 Assert.Equal(s2.Boundary, export.Boundary);
                 Assert.True(closure2.SetEquals(export.Closure), "the exported closure must equal the snapshot's extent references");
 
-                // Manifest/root first.
+                // Manifest/root first, while the inventory hint falsely claims the withheld dependency exists (§9.5).
                 Assert.Equal(DfsErrorCode.None, await export.BeginAsync());
+                await b0.SetFalseInventoryClaimsAsync(Volume, [withheld]);
+                IReadOnlySet<ObjectId> hint = await export.RequestInventoryAsync();
+                Assert.Contains(withheld, hint);
                 Assert.Equal(DfsErrorCode.None, await export.SendManifestAsync());
                 BackupReceiveInspection? recv = await b0.Inspect.GetReceiveStateAsync(Volume);
                 Assert.NotNull(recv);
                 Assert.True(recv.ManifestReceived);
-                Assert.True(recv.MissingObjects.SetEquals(needed), "the destination must compute the missing closure itself");
+                Assert.True(recv.MissingObjects.SetEquals(needed),
+                    "the destination must compute the missing closure itself, ignoring its own (false) inventory hint");
                 await AssertOnlyS1Async("manifest delivered before any new data");
                 await AssertPinnedS1Async(false, "pinned S1 after the S2 manifest arrived");
 
@@ -815,6 +819,7 @@ public sealed class BAKSimulationTests
             }
 
             await AssertPublishedStateAsync(b0, "s2", ["s1", "s2"], [], "after the full closure became durable");
+            await AssertPinnedS1Async(true, "pinned S1 reader after S2 was published");
             await using (DfsClient reader = await ConnectBackupReaderAsync(cluster, 0, NextClientName("bk")))
             {
                 await AssertBackupSnapshotAsync(reader, "s2", model, "S2 published after its closure became durable");
@@ -1238,26 +1243,38 @@ public sealed class BAKSimulationTests
                         cluster.Network.ResetConnections(b0.Name);
                         return Task.CompletedTask;
                     }))
-                : cluster.Faults.Arm(new FaultMatch(FaultSites.BackupBeforeClosureVerify, Node: b0.Name, Volume: Volume),
-                    FaultAction.CrashNode(CrashMode.LoseUnflushed));
+                : cluster.Faults.Arm(new FaultMatch(FaultSites.BackupBeforeClosureVerify, Node: b0.Name, Volume: Volume), FaultAction.Block());
             await vol.Backups.RequestSyncAsync(b0.TargetName, "s2", Ct);
             await arm.WaitTriggeredAsync(FaultTimeout);
             cluster.Faults.AssertReached(arm);
 
+            // The objects the destination itself reports as durably persisted and verified at the interruption. Only
+            // these are promised to be reusable: F18 lies before the destination flush, so others may be lost.
+            IReadOnlySet<ObjectId> durableAtInterruption;
             if (point == ResumePoint.AfterPartialReceive)
             {
                 BackupReceiveInspection? partial = await b0.Inspect.GetReceiveStateAsync(Volume);
                 Assert.NotNull(partial);
                 Assert.True(partial.DurableObjects.Count >= 2, $"two objects were durably received before the cut (got {partial.DurableObjects.Count})");
+                durableAtInterruption = partial.DurableObjects.ToHashSet();
                 await AssertPublishedStateAsync(b0, "s1", ["s1"], ["s2"], "partial receive, connection lost");
                 await cluster.DelayAsync(TimeSpan.FromSeconds(5), Ct);
                 cluster.Network.Heal();
             }
             else
             {
-                await cluster.WaitUntilAsync(() => Task.FromResult(b0.State == TestNodeState.Crashed), FaultTimeout, "the backup crashed before closure verification", Ct);
+                // Held at closure verification: capture the durable set, then cold-crash the backup before it verifies.
+                BackupReceiveInspection? verifying = await b0.Inspect.GetReceiveStateAsync(Volume);
+                Assert.NotNull(verifying);
+                Assert.True(verifying.ManifestReceived, "closure verification runs on a received manifest");
+                durableAtInterruption = verifying.DurableObjects.ToHashSet();
+                await AssertPublishedStateAsync(b0, "s1", ["s1"], ["s2"], "held before closure verification");
+                await b0.CrashAsync(CrashMode.LoseUnflushed);
+                arm.Release();
                 await b0.RestartAsync();
-                Assert.Subset(await BackupObjectsAsync(b0), fresh);
+                HashSet<ObjectId> survived = await BackupObjectsAsync(b0);
+                Assert.True(durableAtInterruption.All(survived.Contains),
+                    $"objects reported durable before the crash were lost: [{string.Join(", ", durableAtInterruption.Where(id => !survived.Contains(id)))}]");
                 await AssertPublishedStateAsync(b0, "s1", ["s1"], ["s2"], "crash before closure verification");
             }
 
@@ -1272,10 +1289,11 @@ public sealed class BAKSimulationTests
                 .ToDictionary(g => g.Key, g => g.Count());
             Assert.Subset(receipts.Keys.ToHashSet(), fresh);
             Assert.True(receipts.Keys.All(fresh.Contains), "objects retained from S1 must not be re-sent on resume");
+            var resentDurable = durableAtInterruption.Where(id => receipts.TryGetValue(id, out int n) && n > 1).ToList();
+            Assert.True(resentDurable.Count == 0,
+                $"objects already durable and verified on the destination must be reused, not re-sent: [{string.Join(", ", resentDurable)}]");
             int resent = receipts.Values.Sum() - receipts.Count;
-            if (point == ResumePoint.DuringClosureVerification)
-                Assert.True(resent == 0, $"every object was durably verified before the crash and must be reused, {resent} were resent");
-            else
+            if (point == ResumePoint.AfterPartialReceive)
                 Assert.True(resent <= maxConcurrent + 1, $"resumption may resend at most the in-flight window, {resent} were resent");
 
             await AssertBackupStoreConsistentAsync(b0, $"after resume ({point})");
@@ -1759,26 +1777,34 @@ public sealed class BAKSimulationTests
             // Restart with the source unreachable so only the durable image decides what is exposed.
             CutFromSources(cluster, b0.Name);
             await b0.RestartAsync();
-            bool expectNew = point != PointerCrashPoint.BeforePointer;
-            string expected = expectNew ? "s2" : "s1";
             string because = $"cold restart after a crash {point} ({mode})";
-            await AssertPublishedStateAsync(b0, expected, expectNew ? ["s1", "s2"] : ["s1"], expectNew ? [] : ["s2"], because);
+
+            // After the durable pointer replacement the new snapshot must be exposed. Before it, the previous snapshot
+            // or (if recovery rolls the fully verified, durable S2 forward) the complete new one - never anything else.
+            bool newExposed = (await b0.Inspect.GetPublishedSnapshotsAsync(Volume)).Contains("s2", StringComparer.Ordinal);
+            if (point != PointerCrashPoint.BeforePointer)
+                Assert.True(newExposed, $"{because}: the durably replaced pointer must survive the crash");
+            string expected = newExposed ? "s2" : "s1";
+            await AssertPublishedStateAsync(b0, expected, newExposed ? ["s1", "s2"] : ["s1"], newExposed ? [] : ["s2"], because);
             await using (DfsClient probe = await ConnectBackupReaderAsync(cluster, 0, NextClientName("probe")))
             {
                 IReadOnlyList<DfsSnapshotInfo> listed = await probe.GetVolume(Volume).Snapshots.ListAsync(Ct);
                 IReadOnlyList<string> published = await b0.Inspect.GetPublishedSnapshotsAsync(Volume);
                 Assert.Equal(published.Order(StringComparer.Ordinal), listed.Select(s => s.Name).Order(StringComparer.Ordinal));
                 await AssertBackupSnapshotAsync(probe, "s1", model1, because);
-                if (expectNew)
+                if (newExposed)
                     await AssertBackupSnapshotAsync(probe, "s2", model2, because);
                 else
                     await AssertNotSelectableAsync(probe, "s2", because);
             }
 
-            // A second cold restart exposes the same complete state (no flip-flop).
+            // A second cold restart never regresses an exposed S2 and only ever exposes complete snapshots.
             await b0.CrashAsync(mode);
             await b0.RestartAsync();
-            await AssertPublishedStateAsync(b0, expected, expectNew ? ["s1", "s2"] : ["s1"], expectNew ? [] : ["s2"], because + ", second restart");
+            bool newExposedAgain = (await b0.Inspect.GetPublishedSnapshotsAsync(Volume)).Contains("s2", StringComparer.Ordinal);
+            Assert.True(newExposedAgain || !newExposed, $"{because}: an exposed S2 disappeared after a second restart");
+            await AssertPublishedStateAsync(b0, newExposedAgain ? "s2" : "s1", newExposedAgain ? ["s1", "s2"] : ["s1"],
+                newExposedAgain ? [] : ["s2"], because + ", second restart");
 
             // Reconnected: the transfer converges and the source learns the actual published boundary.
             cluster.Network.Heal();
@@ -2552,7 +2578,9 @@ public sealed class BAKSimulationTests
     [InlineData(ExporterAttack.ExpireNow)]
     [Catalog("BAK-022", "S", "INV-13", "INV-12")]
     public Task BAK_022_ExporterCannotDeleteProtectedBackup(ExporterAttack attack) =>
-        ClusterTest.RunAsync(Options(), async cluster =>
+        // A synchronous SDK wrapper blocks its calling thread (ARCHITECTURE §9.6); inside the single-threaded
+        // deterministic scheduler that would starve the simulated reply, so the sync variant runs in real time.
+        ClusterTest.RunAsync(Options() with { Mode = attack == ExporterAttack.DeleteSnapshotSync ? ClusterMode.Realtime : ClusterMode.Deterministic }, async cluster =>
         {
             TestBackupNode b0 = cluster.BackupNodes[0];
             await using DfsClient live = await ConnectLiveAsync(cluster);
@@ -2633,30 +2661,40 @@ public sealed class BAKSimulationTests
             DfsBackupBudgets budgets = budget == PinBudget.Age
                 ? new DfsBackupBudgets(MaxPinAge: TimeSpan.FromSeconds(5), MaxPinnedBytes: 1L << 30)
                 : new DfsBackupBudgets(MaxPinAge: TimeSpan.FromHours(1), MaxPinnedBytes: 256 * 1024);
-            await RegisterAsync(b0, budgets);
+
+            // The initial full sync runs online under generous budgets; the tight budget applies from then on.
+            await RegisterAsync(b0);
             TreeModel model = InitialTree(29);
             await WriteTreeAsync(vol, model);
             (DfsSnapshotInfo s1, _) = await SnapshotAndSyncAsync(vol, b0.TargetName, "s1");
             TreeModel model1 = model.Clone();
             Guid oldLineage = (await vol.Backups.GetStatusAsync(b0.TargetName, Ct)).LineageId;
             Assert.NotEqual(Guid.Empty, oldLineage);
+            await vol.Backups.ConfigureAsync(b0.TargetName, ManualSchedule, budgets, Ct);
 
-            // The target goes offline while unpublished history accumulates.
+            // The target goes offline while unpublished history accumulates behind a source transfer pin.
             CutFromSources(cluster, b0.Name);
             await PutAsync(vol, model, "/off/a.bin", TestData.Bytes(260, 1024 * 1024));
-            DfsSnapshotInfo s2 = await SnapshotAsync(vol, "s2");
+            HashSet<ObjectId> pinnedObjects = await FileObjectsAsync(cluster, ["/off/a.bin"]);
+            await SnapshotAsync(vol, "s2");
             await vol.Backups.RequestSyncAsync(b0.TargetName, "s2", Ct);
-            var abandoned = new List<string> { "s2" };
+            await cluster.WaitUntilAsync(async () => (await cluster.Inspect.GetVolumeStateAsync(Volume)).Pins.Any(IsTransferPin),
+                FaultTimeout, "the exporter pins the requested snapshot on the source although the target is unreachable", Ct);
+            bool userSnapshotDeleted = false;
             if (budget == PinBudget.Age)
             {
                 await cluster.DelayAsync(TimeSpan.FromSeconds(10), Ct);
             }
             else
             {
-                await PutAsync(vol, model, "/off/b.bin", TestData.Bytes(261, 1024 * 1024));
-                await SnapshotAsync(vol, "s3");
-                await vol.Backups.RequestSyncAsync(b0.TargetName, "s3", Ct);
-                abandoned.Add("s3");
+                // Make well over 256 KiB retained *only* for the offline target, whatever the pin accounting: the live
+                // file moves on twice (the intermediate version is protected only by the pin's GC watermark) and the
+                // user snapshot is deleted (FSD §11.1 keeps data still needed by the transfer).
+                await PutAsync(vol, model, "/off/a.bin", TestData.Bytes(261, 1024 * 1024));
+                pinnedObjects.UnionWith(await FileObjectsAsync(cluster, ["/off/a.bin"]));
+                await PutAsync(vol, model, "/off/a.bin", TestData.Bytes(263, 1024 * 1024));
+                await vol.Snapshots.DeleteAsync("s2", Ct);
+                userSnapshotDeleted = true;
             }
 
             await cluster.WaitUntilAsync(async () => (await vol.Backups.GetStatusAsync(b0.TargetName, Ct)).ReseedRequired,
@@ -2670,18 +2708,26 @@ public sealed class BAKSimulationTests
             await cluster.WaitUntilAsync(async () => !(await cluster.Inspect.GetVolumeStateAsync(Volume)).Pins.Any(IsTransferPin),
                 TimeSpan.FromSeconds(10), "abandoning the lineage releases every transfer pin", Ct);
 
-            // Live work never depends on the offline target's history.
+            // Live work never depends on the offline target's history: commits proceed and source GC reclaims what
+            // only the abandoned lineage still pinned.
             await AssertLiveCommitUnblockedAsync(cluster, vol, model, "/off/live.bin", TestData.Bytes(262, 50 * 1024), "live commit with the target abandoned");
-            HashSet<ObjectId> abandonedObjects = await FileObjectsAsync(cluster, model.Files.Keys.Where(p => p.StartsWith("/off/", StringComparison.Ordinal) && p != "/off/live.bin"));
-            foreach (string name in abandoned)
-                await vol.Snapshots.DeleteAsync(name, Ct);
-            foreach (string path in model.Files.Keys.Where(p => p.StartsWith("/off/", StringComparison.Ordinal) && p != "/off/live.bin").ToList())
-                await DeleteFileAsync(vol, model, path);
+            if (budget == PinBudget.Bytes)
+            {
+                await cluster.WaitUntilAsync(async () => !(await cluster.Inspect.GetAllStoredObjectsAsync(Volume)).Overlaps(pinnedObjects),
+                    SyncTimeout, "source GC reclaims the data that only the abandoned transfer pin retained", Ct);
+            }
+
+            HashSet<ObjectId> abandonedObjects = [.. pinnedObjects, .. await FileObjectsAsync(cluster, ["/off/a.bin"])];
+            if (!userSnapshotDeleted)
+                await vol.Snapshots.DeleteAsync("s2", Ct);
+            await DeleteFileAsync(vol, model, "/off/a.bin");
             await cluster.WaitUntilAsync(async () => !(await cluster.Inspect.GetAllStoredObjectsAsync(Volume)).Overlaps(abandonedObjects),
                 SyncTimeout, "source GC is not blocked by the abandoned backup lineage", Ct);
 
-            // The destination keeps its last complete snapshot.
+            // The destination keeps its last complete snapshot and nothing of the abandoned lineage.
+            string[] abandoned = ["s2"];
             await AssertPublishedStateAsync(b0, "s1", ["s1"], abandoned, "target abandoned while offline");
+            Assert.Equal(["s1"], (await b0.Inspect.GetSnapshotsAsync(Volume)).Select(s => s.Name));
             await using (DfsClient probe = await ConnectBackupReaderAsync(cluster, 0, NextClientName("probe")))
                 await AssertBackupSnapshotAsync(probe, "s1", model1, "S1 kept while the lineage is abandoned");
 
@@ -2706,15 +2752,18 @@ public sealed class BAKSimulationTests
     // ------------------------------------------------------------------------------------------------------------
 
     /// <summary>
-    /// Reseed failures in execution order: object-receipt failures first (a resumable transfer keeps durable objects,
-    /// so later attempts may have no objects left to send), then verification and pointer-phase failures.
+    /// Reseed failures in execution order. Object-receipt failures come first (a resumable transfer keeps durable
+    /// objects, so each attempt consumes at most one more object with <c>MaxConcurrentObjects = 1</c>); every failure
+    /// before the last one strikes before the destination holds the publish request, so S3 cannot legally publish yet.
+    /// A network cut at or after the publish request would let the destination finish publishing on its own, which is
+    /// not a failed reseed, so connectivity failures are injected while objects are still flowing.
     /// </summary>
     public enum ReseedFailure
     {
         DiskFullOnObject,
         CrashOnObject,
+        NetworkCutOnObject,
         IoErrorBeforeVerify,
-        NetworkCutBeforePointer,
         TornCrashBeforePointer,
     }
 
@@ -2726,14 +2775,16 @@ public sealed class BAKSimulationTests
             TestBackupNode b0 = cluster.BackupNodes[0];
             await using DfsClient live = await ConnectLiveAsync(cluster);
             DfsVolume vol = live.GetVolume(Volume);
-            await RegisterAsync(b0, new DfsBackupBudgets(MaxPinAge: TimeSpan.FromSeconds(5), MaxPinnedBytes: 1L << 30));
+            DfsBackupBudgets serial = GenerousBudgets with { MaxConcurrentObjects = 1 };
+            await RegisterAsync(b0, serial);
             TreeModel model = InitialTree(30);
             await WriteTreeAsync(vol, model);
             (DfsSnapshotInfo s1, _) = await SnapshotAndSyncAsync(vol, b0.TargetName, "s1");
             TreeModel model1 = model.Clone();
             Guid oldLineage = (await vol.Backups.GetStatusAsync(b0.TargetName, Ct)).LineageId;
 
-            // Force the reseed: offline beyond the age budget.
+            // Force the reseed: offline beyond a (temporarily) tight age budget.
+            await vol.Backups.ConfigureAsync(b0.TargetName, ManualSchedule, serial with { MaxPinAge = TimeSpan.FromSeconds(5) }, Ct);
             CutFromSources(cluster, b0.Name);
             await PutAsync(vol, model, "/reseed/a.bin", TestData.Bytes(270, 512 * 1024));
             await SnapshotAsync(vol, "s2");
@@ -2741,9 +2792,15 @@ public sealed class BAKSimulationTests
             await cluster.DelayAsync(TimeSpan.FromSeconds(10), Ct);
             await cluster.WaitUntilAsync(async () => (await vol.Backups.GetStatusAsync(b0.TargetName, Ct)).ReseedRequired,
                 SyncTimeout, "the target is marked for reseed", Ct);
+
+            // From here on only the injected failures interrupt the reseed (no further budget abandonment).
+            await vol.Backups.ConfigureAsync(b0.TargetName, ManualSchedule, serial, Ct);
+            Assert.True((await vol.Backups.GetStatusAsync(b0.TargetName, Ct)).ReseedRequired, "reconfiguring budgets must not clear the reseed mark");
             cluster.Network.Heal();
             await PutAsync(vol, model, "/reseed/b.bin", TestData.Bytes(271, 300 * 1024));
             DfsSnapshotInfo s3 = await SnapshotAsync(vol, "s3");
+            int closureObjects = (await FileObjectsAsync(cluster, model.Files.Keys)).Count;
+            Assert.True(closureObjects >= 5, $"the reseed must need enough objects for every receipt-phase failure (has {closureObjects})");
 
             // Fail the reseed repeatedly, in different phases and ways.
             foreach (ReseedFailure failure in Enum.GetValues<ReseedFailure>())
@@ -2756,20 +2813,20 @@ public sealed class BAKSimulationTests
 
                 FaultArm arm = failure switch
                 {
+                    ReseedFailure.DiskFullOnObject => cluster.Faults.Arm(
+                        new FaultMatch(FaultSites.BackupObjectReceived, Node: b0.Name, Volume: Volume, Occurrence: 1),
+                        CutThenThrow(() => new IOException("injected ENOSPC", unchecked((int)0x80070070)))),
                     ReseedFailure.CrashOnObject => cluster.Faults.Arm(
                         new FaultMatch(FaultSites.BackupObjectReceived, Node: b0.Name, Volume: Volume, Occurrence: 2), FaultAction.CrashNode(CrashMode.LoseUnflushed)),
-                    ReseedFailure.IoErrorBeforeVerify => cluster.Faults.Arm(
-                        new FaultMatch(FaultSites.BackupBeforeClosureVerify, Node: b0.Name, Volume: Volume), CutThenThrow(() => new IOException("injected EIO before closure verification"))),
-                    ReseedFailure.NetworkCutBeforePointer => cluster.Faults.Arm(
-                        new FaultMatch(FaultSites.BackupBeforePointer, Node: b0.Name, Volume: Volume), FaultAction.Custom(_ =>
+                    ReseedFailure.NetworkCutOnObject => cluster.Faults.Arm(
+                        new FaultMatch(FaultSites.BackupObjectReceived, Node: b0.Name, Volume: Volume, Occurrence: 1), FaultAction.Custom(_ =>
                         {
                             CutFromSources(cluster, b0.Name);
                             cluster.Network.ResetConnections(b0.Name);
                             return Task.CompletedTask;
                         })),
-                    ReseedFailure.DiskFullOnObject => cluster.Faults.Arm(
-                        new FaultMatch(FaultSites.BackupObjectReceived, Node: b0.Name, Volume: Volume, Occurrence: 1),
-                        CutThenThrow(() => new IOException("injected ENOSPC", unchecked((int)0x80070070)))),
+                    ReseedFailure.IoErrorBeforeVerify => cluster.Faults.Arm(
+                        new FaultMatch(FaultSites.BackupBeforeClosureVerify, Node: b0.Name, Volume: Volume), CutThenThrow(() => new IOException("injected EIO before closure verification"))),
                     _ => cluster.Faults.Arm(
                         new FaultMatch(FaultSites.BackupBeforePointer, Node: b0.Name, Volume: Volume), FaultAction.CrashNode(CrashMode.TearLastWrite)),
                 };
@@ -2784,16 +2841,27 @@ public sealed class BAKSimulationTests
                     await b0.RestartAsync();
                 }
 
+                // The old recovery point is intact. S3 cannot be complete before the last failure; after a crash at the
+                // pointer step a restart may expose it only complete (BAK-012).
                 string because = $"reseed interrupted by {failure}";
-                await AssertPublishedStateAsync(b0, "s1", ["s1"], ["s2", "s3"], because);
+                bool s3Exposed = failure == ReseedFailure.TornCrashBeforePointer
+                    && (await b0.Inspect.GetPublishedSnapshotsAsync(Volume)).Contains("s3", StringComparer.Ordinal);
+                await AssertPublishedStateAsync(b0, s3Exposed ? "s3" : "s1", s3Exposed ? ["s1", "s3"] : ["s1"], s3Exposed ? ["s2"] : ["s2", "s3"], because);
                 IReadOnlyList<BackupSnapshotInspection> snaps = await b0.Inspect.GetSnapshotsAsync(Volume);
-                Assert.Equal(["s1"], snaps.Select(s => s.Name));
-                Assert.Equal(oldLineage, snaps[0].Lineage);
-                Assert.Equal(s1.Boundary, snaps[0].CoveredCommit);
+                Assert.Equal(s3Exposed ? ["s1", "s3"] : ["s1"], snaps.Select(s => s.Name));
+                BackupSnapshotInspection kept = snaps.Single(s => s.Name == "s1");
+                Assert.Equal(oldLineage, kept.Lineage);
+                Assert.Equal(s1.Boundary, kept.CoveredCommit);
+                if (s3Exposed)
+                    Assert.NotEqual(oldLineage, snaps.Single(s => s.Name == "s3").Lineage);
                 await using (DfsClient probe = await ConnectBackupReaderAsync(cluster, 0, NextClientName("probe")))
                 {
                     await AssertBackupSnapshotAsync(probe, "s1", model1, because);
-                    await AssertNotSelectableAsync(probe, "s3", because);
+                    await AssertNotSelectableAsync(probe, "s2", because);
+                    if (s3Exposed)
+                        await AssertBackupSnapshotAsync(probe, "s3", model, because + ": S3 exposed only complete");
+                    else
+                        await AssertNotSelectableAsync(probe, "s3", because);
                 }
 
                 DfsBackupStatus st = await vol.Backups.GetStatusAsync(b0.TargetName, Ct);
@@ -2828,12 +2896,13 @@ public sealed class BAKSimulationTests
             DfsVolume vol = live.GetVolume(Volume);
             var slowBudgets = new DfsBackupBudgets(MaxPinAge: TimeSpan.FromSeconds(5), MaxPinnedBytes: 256 * 1024, MaxConcurrentObjects: 2);
             await RegisterAsync(fast);
-            await RegisterAsync(slow, slowBudgets);
+            await RegisterAsync(slow);
             TreeModel model = InitialTree(31);
             await WriteTreeAsync(vol, model);
             DfsSnapshotInfo s1 = await SnapshotAsync(vol, "s1");
             await SyncExactAsync(vol, fast.TargetName, s1);
             await SyncExactAsync(vol, slow.TargetName, s1);
+            await vol.Backups.ConfigureAsync(slow.TargetName, ManualSchedule, slowBudgets, Ct);
             var models = new Dictionary<string, TreeModel>(StringComparer.Ordinal) { ["s1"] = model.Clone() };
             Guid fastLineage = (await vol.Backups.GetStatusAsync(fast.TargetName, Ct)).LineageId;
             Guid slowLineage = (await vol.Backups.GetStatusAsync(slow.TargetName, Ct)).LineageId;
@@ -3027,8 +3096,11 @@ public sealed class BAKSimulationTests
             await SnapshotAndSyncAsync(vol, b0.TargetName, "s1");
             TreeModel model1 = model.Clone();
             HashSet<ObjectId> s1Unique = await FileObjectsAsync(cluster, ["/r/u.bin"]);
-            // Protect S1 explicitly before S2 publishes (KeepLastSnapshots = 1 would otherwise not retain it).
-            await SetBackupRetentionAsync(cluster, b0, "s1", new DfsRetention(b0.Clock.GetUtcNow().AddHours(1), Hold: false));
+
+            // Protect S1 with a finite retention before S2 publishes (KeepLastSnapshots = 1 would otherwise not retain
+            // it). The expiry is set once, extending the default; the race below happens at exactly this instant.
+            DateTimeOffset expiry = b0.Clock.GetUtcNow() + TimeSpan.FromSeconds(30);
+            await SetBackupRetentionAsync(cluster, b0, "s1", new DfsRetention(expiry, Hold: false));
             await PutAsync(vol, model, "/r/u.bin", TestData.Bytes(302, 200 * 1024));
             await SnapshotAndSyncAsync(vol, b0.TargetName, "s2");
             TreeModel model2 = model.Clone();
@@ -3036,28 +3108,34 @@ public sealed class BAKSimulationTests
 
             // S1 is now protected only by a retention that is about to expire.
             await using DfsClient racer = await ConnectBackupReaderAsync(cluster, 0, NextClientName("racer"));
-            DateTimeOffset expiry = b0.Clock.GetUtcNow() + TimeSpan.FromSeconds(3);
-            await SetBackupRetentionAsync(cluster, b0, "s1", new DfsRetention(expiry, Hold: false));
-            TimeSpan wait = expiry - b0.Clock.GetUtcNow() + TimeSpan.FromMilliseconds(openOffsetMs);
+            TimeSpan remaining = expiry - b0.Clock.GetUtcNow();
+            Assert.True(remaining >= TimeSpan.FromSeconds(2), $"setup must finish well before S1's retention expires (remaining {remaining})");
+            TimeSpan wait = remaining + TimeSpan.FromMilliseconds(openOffsetMs);
             if (wait > TimeSpan.Zero)
                 await cluster.DelayAsync(wait, Ct);
             string because = $"open {openOffsetMs} ms relative to S1 retention expiry (backup clock)";
 
             DfsSnapshotView? view = null;
+            DfsException? refused = null;
             try
             {
                 view = await racer.GetVolume(Volume).Snapshots.OpenAsync("s1", Ct);
             }
-            catch (DfsException ex) when (ex.ErrorCode == DfsErrorCode.SnapshotNotFound)
+            catch (DfsException ex) when (ex.ErrorCode is DfsErrorCode.SnapshotNotFound or DfsErrorCode.PinExpired)
             {
+                // A clean refusal is legal once the retention may have expired (asserted below).
+                refused = ex;
             }
 
             if (view is null)
             {
-                // Lost the race cleanly: the snapshot is gone as a unit.
-                Assert.True(openOffsetMs >= 0, $"{because}: a snapshot whose retention has not yet expired must be openable");
-                await AssertNotSelectableAsync(racer, "s1", because);
-                Assert.DoesNotContain("s1", await b0.Inspect.GetPublishedSnapshotsAsync(Volume));
+                // Lost the race cleanly: no pin was granted and nothing partial was served.
+                Assert.True(openOffsetMs >= 0, $"{because}: a snapshot whose retention has not yet expired must be openable (got {refused?.ErrorCode})");
+                if (refused?.ErrorCode == DfsErrorCode.SnapshotNotFound)
+                {
+                    await AssertNotSelectableAsync(racer, "s1", because);
+                    Assert.DoesNotContain("s1", await b0.Inspect.GetPublishedSnapshotsAsync(Volume));
+                }
             }
             else
             {
