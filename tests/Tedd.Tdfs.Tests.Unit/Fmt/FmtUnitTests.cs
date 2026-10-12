@@ -283,24 +283,38 @@ public sealed class FmtUnitTests
 
     /// <summary>
     /// A newer peer may append optional fields: this reader decodes the message to exactly the same code, message,
-    /// operation identity, retryability, leader hint and transaction id, produces the same typed exception, and
-    /// re-encodes the defined fields byte-identically to the base frame (identity and checksum of the defined content
-    /// are unchanged).
+    /// operation identity, retryability, leader hint and transaction id as the extension-free base frame and produces the
+    /// same typed exception. The unknown optional fields are preserved rather than silently dropped: re-encoding the
+    /// decoded message (as a forwarding node does) reproduces the received frame byte for byte, so neither the defined
+    /// content nor the frame's identity/checksum is corrupted (PROTOCOL.md §§2.4, 2.5: <c>encode(decode(frame)) == frame</c>,
+    /// unknown optional extensions are preserved and re-emitted).
     /// </summary>
     [Theory, Catalog("FMT-003", "U", "INV-01", "INV-06", "INV-08", "INV-10", "INV-18")]
     [MemberData(nameof(OptionalExtensionShapes))]
     public void FMT_003_OptionalFieldsRemainCompatible(string shape)
     {
         WireExtension[] extensions = OptionalShape(shape);
-        byte[] frame = FmtHelpers.Concat(FmtGolden.OutcomeUnknownFrameWithoutExtensions, FmtHelpers.Encode((ref WireWriter w) => w.WriteExtensions(extensions)));
+        byte[] block = FmtHelpers.Encode((ref WireWriter w) => w.WriteExtensions(extensions));
+        byte[] frame = FmtHelpers.Concat(FmtGolden.OutcomeUnknownFrameWithoutExtensions, block);
 
         Assert.Equal(ErrorCodec.Decode(FmtGolden.OutcomeUnknownFrame), ErrorCodec.Decode(frame));
         ErrorReplyMessage reply = MessageCodec.Decode<ErrorReplyMessage>(frame);
         ErrorReplyMessage baseline = MessageCodec.Decode<ErrorReplyMessage>(FmtGolden.OutcomeUnknownFrame);
-        Assert.Equal(baseline, reply);
+        Assert.Equal(baseline.Code, reply.Code);
+        Assert.Equal(baseline.Message, reply.Message);
+        Assert.Equal(baseline.OperationId, reply.OperationId);
+        Assert.Equal(baseline.Retryable, reply.Retryable);
+        Assert.Equal(baseline.LeaderHint, reply.LeaderHint);
+        Assert.Equal(baseline.TransactionId, reply.TransactionId);
+
+        // Forwarding: the re-encoded frame is the received frame — defined fields unchanged, unknown optional fields
+        // re-emitted verbatim and in order — so its checksum (identity) is unchanged too.
         byte[] reencoded = MessageCodec.Encode(reply);
-        AssertEx.BytesEqual(FmtGolden.OutcomeUnknownFrame, reencoded, "defined fields re-encoded after ignoring optional extensions");
-        Assert.Equal(ObjectChecksum.Compute(FmtGolden.OutcomeUnknownFrame), ObjectChecksum.Compute(reencoded));
+        AssertEx.BytesEqual(frame, reencoded, $"re-encoding a frame carrying unknown optional extensions ({shape})");
+        Assert.Equal(ObjectChecksum.Compute(frame), ObjectChecksum.Compute(reencoded));
+        int defined = FmtGolden.OutcomeUnknownFrameWithoutExtensions.Length;
+        AssertEx.BytesEqual(FmtGolden.OutcomeUnknownFrameWithoutExtensions, reencoded[..defined], "defined fields of the re-encoded frame");
+        AssertEx.BytesEqual(block, reencoded[defined..], "extension block of the re-encoded frame");
 
         Exception ex = ErrorCodec.DecodeToException(frame);
         DfsCommitOutcomeUnknownException unknown = Assert.IsAssignableFrom<DfsCommitOutcomeUnknownException>(ex);
@@ -651,7 +665,7 @@ public sealed class FmtUnitTests
     [Fact, Catalog("FMT-004", "U", "INV-01", "INV-06", "INV-08", "INV-10", "INV-18")]
     public void FMT_004_EndianAndIntegerBoundaries_ErrorCodeRange()
     {
-        byte[] tail = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00]; // empty message, no op, not retryable, no hint, no tx, no extensions
+        byte[] tail = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]; // empty message, no op, not retryable, no hint, no tx, no detail, no extensions
         foreach (long code in new[] { (long)int.MinValue, -1L, 0L, (long)int.MaxValue })
         {
             byte[] frame = FmtHelpers.Concat([0x01, 0x00], FmtHelpers.Encode((ref WireWriter w) => w.WriteVarInt(code)), tail);
@@ -807,11 +821,15 @@ public sealed class FmtUnitTests
 
             DfsOperationId id = await vol.NewOperationIdAsync(Ct);
             byte[] payload = TestData.Bytes(12, 10_000);
-            // Every reply to c0 is lost (including any outcome query the SDK might try), so the client cannot learn the outcome.
-            MessageRule drop = cluster.Network.DropReplies(new MessageFilter(From: "client:c0"), count: 100_000);
+            // Every reply to c0's WriteAll (and to any outcome query the SDK might try) is lost after the server executed the
+            // request, so the client cannot learn the outcome. Session, staging and upload replies still arrive: the WriteAll
+            // request itself must be transmitted for its outcome to be uncertain.
+            MessageRule drop = cluster.Network.DropReplies(new MessageFilter(From: "client:c0", Type: MessageType.WriteAll), count: 100_000);
+            MessageRule dropQueries = cluster.Network.DropReplies(new MessageFilter(From: "client:c0", Type: MessageType.QueryOperation), count: 100_000);
             Exception? failure = await Record.ExceptionAsync(
                 () => vol.Files.WriteAllBytesAsync("/fmt011/unknown", payload, new DfsMutationOptions { OperationId = id }, Ct));
             drop.Cancel();
+            dropQueries.Cancel();
             Assert.True(drop.Matched >= 1, "the reply-drop rule must have matched the WriteAll request");
             Assert.True(cluster.Network.Log.CountMessages(new MessageFilter(From: "client:c0", Type: MessageType.WriteAll, Direction: LinkDirection.Request)) >= 1,
                 "the WriteAll request must have been sent");
@@ -837,28 +855,31 @@ public sealed class FmtUnitTests
 
     public static TheoryData<string, string, int> NoncanonicalFrames => new()
     {
-        // name, frame hex, expected error code. Canonical frame: 01002E017801B4240100000000.
-        { "non-minimal-code", "0100AE00017801B4240100000000", (int)DfsErrorCode.ProtocolError },
-        { "non-minimal-string-length", "01002E81007801B4240100000000", (int)DfsErrorCode.ProtocolError },
-        { "non-minimal-session", "01002E017801B4A4000100000000", (int)DfsErrorCode.ProtocolError },
-        { "presence-flag-2", "01002E017802B4240100000000", (int)DfsErrorCode.ProtocolError },
-        { "retryable-flag-2", "01002E017801B4240102000000", (int)DfsErrorCode.ProtocolError },
-        { "hint-flag-FF", "01002E017801B4240100FF0000", (int)DfsErrorCode.ProtocolError },
-        { "reserved-extension-flag", "01002E017801B4240100000001050200", (int)DfsErrorCode.ProtocolError },
-        { "duplicate-extension-id", "01002E017801B4240100000002050000050000", (int)DfsErrorCode.ProtocolError },
-        { "non-minimal-extension-count", "01002E017801B424010000008000", (int)DfsErrorCode.ProtocolError },
-        { "trailing-byte", "01002E017801B424010000000000", (int)DfsErrorCode.ProtocolError },
-        { "truncated", "01002E017801B42401000000", (int)DfsErrorCode.ProtocolError },
-        { "overlong-utf8-message", "01002E02C1B801B4240100000000", (int)DfsErrorCode.ProtocolError },
-        { "unknown-message-type", "FFFF2E017801B4240100000000", (int)DfsErrorCode.ProtocolError },
-        { "required-unknown-extension", "01002E017801B4240100000001050100", (int)DfsErrorCode.Unsupported },
+        // name, frame hex, expected error code. Each frame differs from the canonical golden frame in exactly one aspect.
+        // Canonical: 0100 2E 0178 01B42401 00 00 00 00 00 (type, code, message, op, retryable, hint, tx, detail, extensions).
+        { "non-minimal-code", "0100AE00017801B424010000000000", (int)DfsErrorCode.ProtocolError },
+        { "non-minimal-string-length", "01002E81007801B424010000000000", (int)DfsErrorCode.ProtocolError },
+        { "non-minimal-session", "01002E017801B4A400010000000000", (int)DfsErrorCode.ProtocolError },
+        { "presence-flag-2", "01002E017802B424010000000000", (int)DfsErrorCode.ProtocolError },
+        { "retryable-flag-2", "01002E017801B424010200000000", (int)DfsErrorCode.ProtocolError },
+        { "hint-flag-FF", "01002E017801B4240100FF000000", (int)DfsErrorCode.ProtocolError },
+        { "detail-flag-2", "01002E017801B424010000000200", (int)DfsErrorCode.ProtocolError },
+        { "reserved-extension-flag", "01002E017801B424010000000001050200", (int)DfsErrorCode.ProtocolError },
+        { "duplicate-extension-id", "01002E017801B424010000000002050000050000", (int)DfsErrorCode.ProtocolError },
+        { "non-minimal-extension-count", "01002E017801B42401000000008000", (int)DfsErrorCode.ProtocolError },
+        { "trailing-byte", "01002E017801B42401000000000000", (int)DfsErrorCode.ProtocolError },
+        { "truncated", "01002E017801B4240100000000", (int)DfsErrorCode.ProtocolError },
+        { "overlong-utf8-message", "01002E02C1B801B424010000000000", (int)DfsErrorCode.ProtocolError },
+        { "unknown-message-type", "FFFF2E017801B424010000000000", (int)DfsErrorCode.ProtocolError },
+        { "required-unknown-extension", "01002E017801B424010000000001050100", (int)DfsErrorCode.Unsupported },
     };
 
     /// <summary>
     /// The decoder accepts exactly one byte representation per message: each alternative encoding of the golden error
-    /// frame (non-minimal varints, flag bytes other than 0/1, reserved extension bits, duplicate extension ids, trailing
-    /// bytes, overlong UTF-8, unknown types, required unknown fields) is rejected, so two parsers can never disagree about
-    /// which bytes denote a given manifest/message.
+    /// frame (non-minimal varints, presence/flag bytes other than 0/1, reserved extension bits, duplicate extension ids,
+    /// trailing bytes, overlong UTF-8, unknown types, required unknown fields) is rejected, so two parsers can never
+    /// disagree about which bytes denote a given manifest/message. Each vector is the canonical frame with exactly one
+    /// change, so it is rejected for the intended reason rather than for an unrelated truncation.
     /// </summary>
     [Theory, Catalog("FMT-012", "U", "INV-01", "INV-06", "INV-08", "INV-10", "INV-18")]
     [MemberData(nameof(NoncanonicalFrames))]

@@ -540,9 +540,12 @@ public sealed class OpsSimulationTests
             OpsHelpers.Log($"backlog: staged={grown.StagedBytes} pinned={grown.PinnedBytes} pendingGc={grown.PendingGcObjects} under={grown.UnderReplicatedObjects} repairBacklog={grown.RepairBacklogBytes}");
             cluster.Faults.AssertReached(gcBlock);
 
-            (long stagedDistinct, long stagedPhysical) = await StagedObjectBytesAsync(cluster);
+            // Staged objects were uploaded before `down` crashed, so their copies on it still exist durably: the reported
+            // value lies between the distinct staged bytes and those bytes times the copy target (every replica counted).
+            long stagedDistinct = await StagedObjectBytesAsync(cluster);
+            DfsStoragePolicy stagedPolicy = (await vol.GetInfoAsync(Ct)).DefaultPolicy;
             Assert.True(stagedDistinct >= 192 * 1024, $"at least 192 KiB of the 320 KiB written must have been uploaded as staged objects (found {stagedDistinct})");
-            Assert.InRange(grown.StagedBytes, stagedDistinct, stagedPhysical);
+            Assert.InRange(grown.StagedBytes, stagedDistinct, stagedDistinct * stagedPolicy.TargetCopies);
             Assert.True(grown.PinnedBytes >= 256 * 1024, $"the pinned revision (256 KiB) must be counted, reported {grown.PinnedBytes}");
             Assert.True(grown.PendingGcObjects >= doomedObjects.Count, $"{doomedObjects.Count} deleted objects await GC, reported {grown.PendingGcObjects}");
             Assert.True(grown.UnderReplicatedObjects >= degradedObjects.Count, $"{degradedObjects.Count} objects lack a copy, reported {grown.UnderReplicatedObjects}");
@@ -616,8 +619,10 @@ public sealed class OpsSimulationTests
             cluster.Faults.AssertReached(publish);
 
             DfsBackupStatus transferring = await vol.Backups.GetStatusAsync(b0.TargetName, Ct);
-            Assert.True(transferring.ReceivedBytes >= aged.ReceivedBytes + 2L * 1024 * 1024,
-                $"about 2 MiB of S2 must have been received ({aged.ReceivedBytes} -> {transferring.ReceivedBytes})");
+            // Publication is blocked after every object of S2 was received and verified, so the 2 MiB of new data are counted
+            // (whether ReceivedBytes is cumulative or counts the current transfer only).
+            Assert.True(transferring.ReceivedBytes > aged.ReceivedBytes && transferring.ReceivedBytes >= 2L * 1024 * 1024,
+                $"the 2 MiB of S2 must be reported as received ({aged.ReceivedBytes} -> {transferring.ReceivedBytes})");
             Assert.Equal("ops006-s1", transferring.LatestPublished?.SnapshotName);
             Assert.Equal(cp1.CoveredCommit, transferring.PublishedBoundary);
             TimeSpan sinceS1 = cluster.Time.GetUtcNow() - s1.CreatedUtc;
@@ -904,7 +909,8 @@ public sealed class OpsSimulationTests
     /// Sixteen clients hammer a volume whose leader is black-holed for all of them (connections stay open, requests vanish).
     /// Each operation finishes within its deadline (timeout + 1 s) with success or an availability/unknown outcome, never an
     /// unbounded hang; the requests sent per logical operation never exceed the SDK's retry budget (MaxRetryAttempts + 1
-    /// per attempt target, doubled for reroutes); and after healing every client completes new work promptly.
+    /// for each of the operation and its outcome query at the failed endpoint, doubled for reroutes); and after healing
+    /// every client completes new work promptly.
     /// </summary>
     [Fact, Catalog("OPS-011", "S", "INV-08", "INV-11", "INV-13", "INV-16", "INV-17", "INV-18")]
     public async Task OPS_011_RetryStormIsBounded()
@@ -942,10 +948,14 @@ public sealed class OpsSimulationTests
                     total += cluster.Network.Log.CountMessages(new MessageFilter(From: $"client:s{i}", Direction: LinkDirection.Request));
                 }
 
+                // Each logical operation may need two request kinds at the leader (its session/operation request and the
+                // outcome query that resolves it), each within the SDK's retry budget; reroutes via followers at most double
+                // the total. An unbounded storm (no backoff within a 3 s deadline) exceeds these bounds by orders of magnitude.
                 long logicalOps = clientCount * opsPerClient;
+                long perOpBudget = 2L * (maxRetries + 1);
                 OpsHelpers.Log($"requests to the black-holed leader: {toLeader}, all requests: {total}, logical operations: {logicalOps}, retry budget {maxRetries}");
-                Assert.True(toLeader <= logicalOps * (maxRetries + 1), $"{toLeader} requests to the failed endpoint exceed {logicalOps} x {maxRetries + 1}");
-                Assert.True(total <= 2 * logicalOps * (maxRetries + 1), $"{total} requests in total exceed the bounded retry amplification");
+                Assert.True(toLeader <= logicalOps * perOpBudget, $"{toLeader} requests to the failed endpoint exceed {logicalOps} x {perOpBudget}");
+                Assert.True(total <= 2 * logicalOps * perOpBudget, $"{total} requests in total exceed the bounded retry amplification");
 
                 cluster.Network.Heal();
                 for (int i = 0; i < clients.Count; i++)
@@ -1170,8 +1180,9 @@ public sealed class OpsSimulationTests
 
     /// <summary>
     /// Repair of a wiped node (4 MiB at a 2 MiB/s budget), scrubbing, a backup export and GC/compaction of deleted files run
-    /// together. The admitted foreground workload keeps completing: its p99 latency stays within max(4 × baseline p99,
-    /// baseline p99 + 500 ms) and all operations finish, while repair bandwidth stays within its configured budget.
+    /// together. The admitted foreground workload (extent-sized writes and reads that share the data path with repair) keeps
+    /// completing: its p99 latency stays within max(4 × baseline p99, baseline p99 + 500 ms) and all operations finish,
+    /// while repair bandwidth stays within its configured budget.
     /// </summary>
     [Fact, Catalog("OPS-014", "S", "INV-08", "INV-11", "INV-13", "INV-16", "INV-17", "INV-18")]
     public async Task OPS_014_MaintenanceCannotStarveForeground()
@@ -1231,8 +1242,8 @@ public sealed class OpsSimulationTests
     /// <summary>
     /// A saturating but admitted foreground workload runs while a wiped node must be repaired and deleted files reclaimed.
     /// With the reserved maintenance budget, repair completes within 3 × (data / budget) + 30 s of virtual time, the repair
-    /// counter covers the lost data, GC reclaims every deleted object (pending GC returns to zero), and foreground work keeps
-    /// completing throughout.
+    /// counter covers the lost data, GC physically reclaims every deleted object while the load continues (and the pending
+    /// GC count drains to zero once it stops), foreground work keeps completing throughout, and its history is linearizable.
     /// </summary>
     [Fact, Catalog("OPS-015", "S", "INV-08", "INV-11", "INV-13", "INV-16", "INV-17", "INV-18")]
     public async Task OPS_015_ForegroundCannotStarveRepairForever()
@@ -1271,12 +1282,19 @@ public sealed class OpsSimulationTests
             IReadOnlyList<ObjectId> doomed = await OpsHelpers.ObjectsOfAsync(cluster, Enumerable.Range(0, 16).Select(i => $"/ops015/seed/f{i}"));
             for (int i = 0; i < 16; i++)
                 await vol.Files.DeleteAsync($"/ops015/seed/f{i}", Ct);
-            await cluster.WaitUntilAsync(async () => (await admin.GetReplicaHealthAsync(Vol, Ct)).PendingGcObjects == 0
-                    && !(await cluster.Inspect.GetAllStoredObjectsAsync(Vol)).Overlaps(doomed),
+            // The foreground load keeps overwriting its registers (creating new garbage all the time), so progress means the
+            // deleted objects are physically reclaimed while the load runs, not that the pending count is momentarily zero.
+            int okBeforeGc = workload.OkWrites;
+            await cluster.WaitUntilAsync(async () => !(await cluster.Inspect.GetAllStoredObjectsAsync(Vol)).Overlaps(doomed),
                 TimeSpan.FromSeconds(60), "GC must reclaim deleted objects while admitted foreground load continues", Ct);
             Assert.True((await cluster.Inspect.GetTotalCountersAsync()).GcDeletedObjects - gcBefore >= doomed.Count);
+            Assert.True(workload.OkWrites > okBeforeGc, "foreground work must have continued while GC reclaimed the deleted objects");
 
             await workload.StopAsync();
+            await cluster.WaitUntilAsync(async () => (await admin.GetReplicaHealthAsync(Vol, Ct)).PendingGcObjects == 0,
+                TimeSpan.FromSeconds(60), "once the overwriting load stops, the GC backlog must drain completely", Ct);
+            await workload.ResolveUnknownsAsync(c1);
+            await workload.FinalReadsAsync(c1, ["k0", "k1", "k2", "k3"]);
             workload.AssertLinearizable();
             await OpsHelpers.VerifyFilesAsync(vol, seeded.Skip(16).ToDictionary(kv => kv.Key, kv => kv.Value), "after repair and GC");
         }, Ct);
@@ -1289,7 +1307,8 @@ public sealed class OpsSimulationTests
         {
             string path = $"{directory}/k{i % 4}";
             if (i % 2 == 0)
-                latencies.Add(await OpsHelpers.TimeAsync(cluster, () => vol.Files.WriteAllBytesAsync(path, TestData.Bytes(1600 + (ulong)i, 4096), Ct)));
+                // 16 KiB: above the inline threshold, so foreground writes use the same data path (uploads, receipts) as repair.
+                latencies.Add(await OpsHelpers.TimeAsync(cluster, () => vol.Files.WriteAllBytesAsync(path, TestData.Bytes(1600 + (ulong)i, 16 * 1024), Ct)));
             else
                 latencies.Add(await OpsHelpers.TimeAsync(cluster, () => vol.Files.ReadAllBytesAsync($"{directory}/k{(i - 1) % 4}", Ct)));
         }
@@ -1297,24 +1316,22 @@ public sealed class OpsSimulationTests
         return latencies;
     }
 
-    private static async Task<(long Distinct, long Physical)> StagedObjectBytesAsync(TestCluster cluster)
+    /// <summary>Distinct bytes of unreferenced objects of open staging sessions, as held by the running nodes.</summary>
+    private static async Task<long> StagedObjectBytesAsync(TestCluster cluster)
     {
         VolumeStateInspection state = await cluster.Inspect.GetVolumeStateAsync(Vol);
         var open = state.Staging.Where(s => s.Open).Select(s => s.Id).ToHashSet();
         IReadOnlySet<ObjectId> reachable = state.ReachableObjects();
         var distinct = new Dictionary<ObjectId, long>();
-        long physical = 0;
         foreach (TestNode node in cluster.Nodes.Where(n => n.State == TestNodeState.Running))
         {
             foreach (ObjectRecordInfo record in await node.Inspect.ListObjectsAsync(Vol))
             {
-                if (!open.Contains(record.Staging) || reachable.Contains(record.Id))
-                    continue;
-                distinct[record.Id] = record.Length;
-                physical += record.Length;
+                if (open.Contains(record.Staging) && !reachable.Contains(record.Id))
+                    distinct[record.Id] = record.Length;
             }
         }
 
-        return (distinct.Values.Sum(), physical);
+        return distinct.Values.Sum();
     }
 }

@@ -21,68 +21,86 @@ public sealed class FmtSimulationTests
     // ============================================================================================================
 
     /// <summary>
-    /// The whole cluster starts on the oldest supported release; then nodes are upgraded one at a time (followers first,
-    /// leader last) under continuous register/append load. In every mixed state the active feature set is understood by
-    /// every running release, a newly connecting client negotiates a protocol version every member speaks, and there is
-    /// never more than one leader per term; quorum is retained throughout (writes keep completing while each node is
-    /// down). After the last upgrade the new-only feature can be activated, the full history is linearizable and replicas
-    /// converge.
+    /// The whole cluster starts on the oldest supported release; then, for every newer release of the supported window in
+    /// turn, nodes are upgraded one at a time (followers first, leader last) under continuous register/append load. In every
+    /// mixed state the active feature set is understood by every running release, a newly connecting client negotiates a
+    /// protocol version inside the members' advertised ranges and is never offered a feature an older member cannot
+    /// interpret, and there is never more than one leader per term; quorum is retained throughout (writes keep completing
+    /// while each node is down). After the last upgrade the new-only feature can be activated, the full history is
+    /// linearizable and replicas converge.
     /// </summary>
     [Theory, Catalog("FMT-007", "S", "INV-01", "INV-06", "INV-08", "INV-10", "INV-18")]
     [InlineData(3)]
     [InlineData(5)]
     public async Task FMT_007_RollingUpgradeMixedVersions(int nodes)
     {
-        SoftwareVersionProfile previous = SoftwareVersionProfile.Previous;
+        IReadOnlyList<SoftwareVersionProfile> window = SoftwareVersionProfile.SupportedWindow;
+        SoftwareVersionProfile oldest = window[0];
         SoftwareVersionProfile current = SoftwareVersionProfile.Current;
-        await VersionedClusterTest.RunAsync(FmtHelpers.Deterministic(nodes), previous, async cluster =>
+        Assert.Equal(SoftwareVersionProfile.Previous.Name, oldest.Name);
+        Assert.Equal(current.Name, window[^1].Name);
+        Assert.True(window.Count >= 2, "a rolling upgrade needs at least two releases in the supported window");
+        await VersionedClusterTest.RunAsync(FmtHelpers.Deterministic(nodes), oldest, async cluster =>
         {
-            FmtHelpers.Log($"window: {string.Join(", ", SoftwareVersionProfile.SupportedWindow)}");
-            Assert.All(cluster.Nodes, n => Assert.Equal(previous.Name, n.SoftwareVersion.Name));
+            FmtHelpers.Log($"window: {string.Join(", ", window)}");
+            Assert.All(cluster.Nodes, n => Assert.Equal(oldest.Name, n.SoftwareVersion.Name));
 
             await using DfsClient c0 = await cluster.ConnectAsync(new TestClientOptions { Name = "c0", OperationTimeout = TimeSpan.FromSeconds(5) }, Ct);
             await using DfsClient c1 = await cluster.ConnectAsync(new TestClientOptions { Name = "c1", OperationTimeout = TimeSpan.FromSeconds(5) }, Ct);
             await using DfsClient r0 = await cluster.ConnectAsync(new TestClientOptions { Name = "r0", OperationTimeout = TimeSpan.FromSeconds(5) }, Ct);
-            Assert.InRange(c0.Capabilities.ProtocolVersion, previous.ProtocolVersionMin, previous.ProtocolVersionMax);
+            Assert.InRange(c0.Capabilities.ProtocolVersion, oldest.ProtocolVersionMin, oldest.ProtocolVersionMax);
             Assert.DoesNotContain(SoftwareVersionProfile.ProbeFeature, (await cluster.Admin.GetClusterStatusAsync(Ct)).ActiveFeatures);
 
             await c0.GetVolume(Vol).Directories.CreateDirectoryAsync("/fmt007", Ct);
             var workload = new HistoryWorkload(cluster, "/fmt007");
             workload.Start([(c0, "k0"), (c1, "k1"), (c0, "log0")], r0, valueBytes: 4097, pause: TimeSpan.FromMilliseconds(50));
 
-            TestNode leader = await cluster.GetLeaderAsync(Vol, Ct);
-            IEnumerable<TestNode> order = cluster.Nodes.Where(n => n.Name != leader.Name).Append(leader).ToArray();
-            foreach (TestNode node in order)
+            foreach (SoftwareVersionProfile release in window.Skip(1))
             {
-                await node.StopAsync();
-                int okWhileDown = workload.OkWrites;
-                await cluster.WaitUntilAsync(() => Task.FromResult(workload.OkWrites > okWhileDown + 2), TimeSpan.FromSeconds(30),
-                    $"writes must keep completing while {node.Name} is down for its upgrade (quorum retained)", Ct);
-
-                await node.RestartAsSoftwareVersionAsync(current);
-                await cluster.WaitForStableAsync(TimeSpan.FromSeconds(60), Ct);
-                Assert.Equal(current.Name, node.SoftwareVersion.Name);
-                await cluster.Inspect.AssertNoSplitBrainAsync();
-
-                DfsClusterStatus status = await cluster.Admin.GetClusterStatusAsync(Ct);
-                foreach (string feature in status.ActiveFeatures)
+                TestNode leader = await cluster.GetLeaderAsync(Vol, Ct);
+                IEnumerable<TestNode> order = cluster.Nodes.Where(n => n.Name != leader.Name).Append(leader).ToArray();
+                foreach (TestNode node in order)
                 {
-                    foreach (TestNode member in cluster.Nodes)
-                        Assert.True(member.SoftwareVersion.Supports(feature), $"active feature {feature} is not understood by {member.Name} ({member.SoftwareVersion})");
+                    await node.StopAsync();
+                    int okWhileDown = workload.OkWrites;
+                    await cluster.WaitUntilAsync(() => Task.FromResult(workload.OkWrites > okWhileDown + 2), TimeSpan.FromSeconds(30),
+                        $"writes must keep completing while {node.Name} is down for its upgrade to {release.Name} (quorum retained)", Ct);
+
+                    await node.RestartAsSoftwareVersionAsync(release);
+                    await cluster.WaitForStableAsync(TimeSpan.FromSeconds(60), Ct);
+                    Assert.Equal(release.Name, node.SoftwareVersion.Name);
+                    await cluster.Inspect.AssertNoSplitBrainAsync();
+
+                    DfsClusterStatus status = await cluster.Admin.GetClusterStatusAsync(Ct);
+                    foreach (string feature in status.ActiveFeatures)
+                    {
+                        foreach (TestNode member in cluster.Nodes)
+                            Assert.True(member.SoftwareVersion.Supports(feature), $"active feature {feature} is not understood by {member.Name} ({member.SoftwareVersion})");
+                    }
+
+                    // Protocol versions are negotiated per connection (the highest version both ends speak); features are
+                    // cluster-wide and may only be offered when every member understands them.
+                    int lowestMin = cluster.Nodes.Min(n => n.SoftwareVersion.ProtocolVersionMin);
+                    int highestMax = cluster.Nodes.Max(n => n.SoftwareVersion.ProtocolVersionMax);
+                    await using (DfsClient probe = await cluster.ConnectAsync(new TestClientOptions { Name = $"probe-{release.Name}-{node.Name}" }, Ct))
+                    {
+                        Assert.InRange(probe.Capabilities.ProtocolVersion, lowestMin, highestMax);
+                        foreach (string feature in probe.Capabilities.Features)
+                        {
+                            foreach (TestNode member in cluster.Nodes)
+                                Assert.True(member.SoftwareVersion.Supports(feature), $"a client was offered feature {feature} that {member.Name} ({member.SoftwareVersion}) cannot interpret");
+                        }
+
+                        if (cluster.Nodes.Any(n => !n.SoftwareVersion.Supports(SoftwareVersionProfile.ProbeFeature)))
+                            Assert.DoesNotContain(SoftwareVersionProfile.ProbeFeature, probe.Capabilities.Features);
+                    }
+
+                    int okAfter = workload.OkWrites;
+                    await cluster.WaitUntilAsync(() => Task.FromResult(workload.OkWrites > okAfter + 2), TimeSpan.FromSeconds(30),
+                        $"writes must keep completing after {node.Name} rejoined on {release.Name}", Ct);
                 }
 
-                int highestMin = cluster.Nodes.Max(n => n.SoftwareVersion.ProtocolVersionMin);
-                int lowestMax = cluster.Nodes.Min(n => n.SoftwareVersion.ProtocolVersionMax);
-                await using (DfsClient probe = await cluster.ConnectAsync(new TestClientOptions { Name = $"probe-{node.Name}" }, Ct))
-                {
-                    Assert.InRange(probe.Capabilities.ProtocolVersion, highestMin, lowestMax);
-                    if (cluster.Nodes.Any(n => n.SoftwareVersion.Name == previous.Name))
-                        Assert.DoesNotContain(SoftwareVersionProfile.ProbeFeature, probe.Capabilities.Features);
-                }
-
-                int okAfter = workload.OkWrites;
-                await cluster.WaitUntilAsync(() => Task.FromResult(workload.OkWrites > okAfter + 2), TimeSpan.FromSeconds(30),
-                    $"writes must keep completing after {node.Name} rejoined on the new release", Ct);
+                Assert.All(cluster.Nodes, n => Assert.Equal(release.Name, n.SoftwareVersion.Name));
             }
 
             await cluster.Admin.SetFeatureAsync(SoftwareVersionProfile.ProbeFeature, true, Ct);
@@ -298,8 +316,11 @@ public sealed class FmtSimulationTests
                 Assert.Equal(DfsErrorCode.Unsupported, refusal.ErrorCode);
                 Assert.NotEqual(TestNodeState.Running, rolledBack.State);
             }
-            else
+            else if (rolledBack.State == TestNodeState.Running)
             {
+                // Let the old release finish replaying its own durable log before taking the baseline: only entries it
+                // receives from the upgraded majority afterwards would be state committed under the feature.
+                await cluster.DelayAsync(TimeSpan.FromSeconds(2), Ct);
                 ulong appliedAtStart = (await rolledBack.Inspect.GetGroupAsync(Vol))?.AppliedIndex ?? 0;
                 for (int i = 0; i < 10; i++)
                 {
@@ -314,6 +335,13 @@ public sealed class FmtSimulationTests
                     Assert.NotEqual(rolledBack.Name, (await admin.GetVolumeStatusAsync(Vol, Ct)).Group.Leader);
                     Assert.Equal(appliedAtStart, (await rolledBack.Inspect.GetGroupAsync(Vol))?.AppliedIndex ?? 0);
                 }
+            }
+            else
+            {
+                // The old release started and then shut itself down (refused registration): an explicit, visible exclusion
+                // too, as long as it never led the group.
+                Assert.NotEqual(rolledBack.Name, (await admin.GetVolumeStatusAsync(Vol, Ct)).Group.Leader);
+                FmtHelpers.Log($"{rolledBack.Name} on {SoftwareVersionProfile.Previous.Name} stopped by itself after start ({rolledBack.State})");
             }
 
             Assert.Contains(feature, (await admin.GetClusterStatusAsync(Ct)).ActiveFeatures);

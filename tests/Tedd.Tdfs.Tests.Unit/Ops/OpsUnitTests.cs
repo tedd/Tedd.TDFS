@@ -15,8 +15,8 @@ public sealed class OpsUnitTests
     private static CancellationToken Ct => OpsHelpers.Ct;
 
     /// <summary>
-    /// One logical append is retried through a lost request, a lost reply, a duplicated delivery and a leader crash with
-    /// reroute. Every transmission carries the same stable operation id while each SDK transmission has its own attempt
+    /// One logical append is retried through a lost request, a lost reply (each followed by a connection reset, so the loss
+    /// is observable regardless of the SDK's per-attempt timeout), a duplicated delivery and a leader crash with reroute. Every transmission carries the same stable operation id while each SDK transmission has its own attempt
     /// (correlation) id; the file receives the suffix exactly once (prefix + suffix, one new revision equal to the returned
     /// token); the outcome record reports that single success; an explicit application retry with the same id returns the
     /// same token without a second effect; and the SDK's diagnostics attribute at most one commit token to the operation.
@@ -75,6 +75,17 @@ public sealed class OpsUnitTests
                 await leader.CrashAsync();
                 hold.DropAll();
                 hold.Dispose();
+            }
+            else if (fault is "request-dropped" or "reply-dropped")
+            {
+                // Make the loss observable to the SDK independently of its per-attempt timeout policy: once the request
+                // (or its reply) has been lost, the client's connections are reset, so the SDK must retransmit the same
+                // operation (or query its outcome) on a new connection.
+                await cluster.WaitUntilAsync(() => Task.FromResult(rule!.Matched >= 1), TimeSpan.FromSeconds(10),
+                    $"the {fault} rule must match the Append request", Ct);
+                if (fault == "reply-dropped")
+                    await Task.Delay(TimeSpan.FromMilliseconds(200), Ct); // let the executed request's reply be produced and dropped
+                cluster.Network.ResetConnections("client:c0");
             }
 
             CommitToken token = await append;

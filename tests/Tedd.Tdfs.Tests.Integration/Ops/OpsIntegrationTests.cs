@@ -35,6 +35,9 @@ public sealed class OpsIntegrationTests
             await otherVol.Directories.CreateDirectoryAsync("/ops016", Ct);
             await otherVol.Files.WriteAllBytesAsync(path, original, Ct);
             await cluster.WaitForReplicationAsync(Vol, Ct);
+            // Quiesce background data movement first, so any receipt or object write during the polling window could only
+            // come from the health traffic.
+            await cluster.WaitForRepairAsync(Vol, TimeSpan.FromSeconds(60), Ct);
 
             HealthPoller poller = new([monitor.Admin, cluster.Admin], Vol);
             try

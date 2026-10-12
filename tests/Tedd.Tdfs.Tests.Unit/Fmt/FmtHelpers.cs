@@ -148,10 +148,12 @@ internal static class FmtHelpers
 }
 
 /// <summary>
-/// Golden vectors for the wire format (API.md C.1): little-endian fixed-width integers, LEB128 varints (zigzag for signed),
-/// varuint-length-prefixed UTF-8 strings and byte arrays, GUIDs in the standard little-endian layout, 128-bit ids
-/// little-endian, and the terminal extension block <c>{count, (fieldId, flags, bytes)*}</c>. Every expected byte array was
-/// computed by hand from those rules; none is produced by the encoder under test.
+/// Golden vectors for the wire format (API.md C.1, PROTOCOL.md §§2, 9.1): little-endian fixed-width integers, LEB128
+/// varints (zigzag for signed), varuint-length-prefixed UTF-8 strings and byte arrays, GUIDs in the standard little-endian
+/// layout, 128-bit ids little-endian, optional values as a 0/1 presence byte plus the value, the <c>ErrorReply</c> field
+/// order (code, message, operation id?, retryable, leader hint?, transaction id?, detail?, extensions) and the terminal
+/// extension block <c>{count, (fieldId, flags, bytes)*}</c>. Every expected byte array was computed by hand from those
+/// rules; none is produced by the encoder under test.
 /// </summary>
 internal static class FmtGolden
 {
@@ -173,14 +175,16 @@ internal static class FmtGolden
 
     public static readonly CommitToken SampleToken = new(SampleGuid, new VolumeId(SampleGuid2), 1, 300);
 
-    // ErrorCodec.Encode(OutcomeUnknown, "x", op:1234-1, retryable:false):
-    // [u16 type=1][varint zigzag(23)=0x2E]["x"=01 78][op present 01, session 0x1234=B4 24, seq 01][retryable 00][hint absent 00][tx absent 00][ext count 00]
+    // ErrorCodec.Encode(OutcomeUnknown, "x", op:1234-1, retryable:false), ErrorReply layout of PROTOCOL.md §9.1
+    // (Code, Message, OperationId?, Retryable, LeaderHint?, TransactionId?, Detail?, extensions):
+    // [u16 type=1][varint zigzag(23)=0x2E]["x"=01 78][op present 01, session 0x1234=B4 24, seq 01][retryable 00]
+    // [hint absent 00][tx absent 00][detail absent 00][ext count 00]
     public static readonly byte[] OutcomeUnknownFrame =
-        [0x01, 0x00, 0x2E, 0x01, 0x78, 0x01, 0xB4, 0x24, 0x01, 0x00, 0x00, 0x00, 0x00];
+        [0x01, 0x00, 0x2E, 0x01, 0x78, 0x01, 0xB4, 0x24, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00];
 
     // The same frame without its terminal extension count, for building frames with custom extension blocks.
     public static readonly byte[] OutcomeUnknownFrameWithoutExtensions =
-        [0x01, 0x00, 0x2E, 0x01, 0x78, 0x01, 0xB4, 0x24, 0x01, 0x00, 0x00, 0x00];
+        [0x01, 0x00, 0x2E, 0x01, 0x78, 0x01, 0xB4, 0x24, 0x01, 0x00, 0x00, 0x00, 0x00];
 
     private static readonly Lazy<IReadOnlyDictionary<string, WireVector>> WireVectorTable = new(BuildWireVectors);
     private static readonly Lazy<IReadOnlyDictionary<string, TextVector>> TextVectorTable = new(BuildTextVectors);
@@ -356,25 +360,25 @@ internal static class FmtGolden
             new("outcome-unknown", () => ErrorCodec.Encode(DfsErrorCode.OutcomeUnknown, "x", new DfsOperationId(0x1234, 1), retryable: false),
                 OutcomeUnknownFrame, DfsErrorCode.OutcomeUnknown, "x", new DfsOperationId(0x1234, 1), false, null, null),
 
-            // zigzag(4) = 0x08; empty message; no op; not retryable; no hint; no tx; no extensions.
+            // zigzag(4) = 0x08; empty message; no op; not retryable; no hint; no tx; no detail; no extensions.
             new("file-not-found", () => ErrorCodec.Encode(DfsErrorCode.FileNotFound, string.Empty, null, retryable: false),
-                [0x01, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], DfsErrorCode.FileNotFound, string.Empty, null, false, null, null),
+                [0x01, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], DfsErrorCode.FileNotFound, string.Empty, null, false, null, null),
 
-            // zigzag(12) = 0x18; "busy" = 62 75 73 79; retryable.
+            // zigzag(12) = 0x18; "busy" = 62 75 73 79; no op; retryable; no hint; no tx; no detail; no extensions.
             new("sharing-violation-retryable", () => ErrorCodec.Encode(DfsErrorCode.SharingViolation, "busy", null, retryable: true),
-                [0x01, 0x00, 0x18, 0x04, 0x62, 0x75, 0x73, 0x79, 0x00, 0x01, 0x00, 0x00, 0x00],
+                [0x01, 0x00, 0x18, 0x04, 0x62, 0x75, 0x73, 0x79, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
                 DfsErrorCode.SharingViolation, "busy", null, true, null, null),
 
-            // Unknown-outcome transaction commit with leader hint "n1" (6E 31) and transaction id tx:1-1.
+            // Unknown-outcome transaction commit with leader hint "n1" (6E 31) and transaction id tx:1-1; no detail; no extensions.
             new("outcome-unknown-transaction",
                 () => MessageCodec.Encode(new ErrorReplyMessage(DfsErrorCode.OutcomeUnknown, string.Empty, new DfsOperationId(1, 2), true, "n1",
                     new DfsTransactionId(new DfsOperationId(1, 1)))),
-                [0x01, 0x00, 0x2E, 0x00, 0x01, 0x01, 0x02, 0x01, 0x01, 0x02, 0x6E, 0x31, 0x01, 0x01, 0x01, 0x00],
+                [0x01, 0x00, 0x2E, 0x00, 0x01, 0x01, 0x02, 0x01, 0x01, 0x02, 0x6E, 0x31, 0x01, 0x01, 0x01, 0x00, 0x00],
                 DfsErrorCode.OutcomeUnknown, string.Empty, new DfsOperationId(1, 2), true, "n1", new DfsTransactionId(new DfsOperationId(1, 1))),
 
             // A code unknown to this version (1000): zigzag(1000) = 2000 = D0 0F; must be carried verbatim.
             new("future-code-1000", () => ErrorCodec.Encode((DfsErrorCode)1000, string.Empty, null, retryable: false),
-                [0x01, 0x00, 0xD0, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], (DfsErrorCode)1000, string.Empty, null, false, null, null),
+                [0x01, 0x00, 0xD0, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], (DfsErrorCode)1000, string.Empty, null, false, null, null),
         };
         return list.ToDictionary(v => v.Name, StringComparer.Ordinal);
     }
