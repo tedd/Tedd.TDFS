@@ -6,13 +6,14 @@ namespace Tedd.Tdfs.Tests.Unit.Internal.Transport;
 /// <summary>The thread-pool serial executor behind in-order inbound delivery.</summary>
 public sealed class SerialExecutorTests
 {
+    [ThreadStatic] private static bool t_insidePost;
+
     [Fact]
     public async Task Items_RunInPostingOrder_OneAtATime_OffThePostersStack()
     {
         var seen = new ConcurrentQueue<int>();
         int running = 0;
         int overlaps = 0;
-        int posterThread = Environment.CurrentManagedThreadId;
         int sameThread = 0;
         const int count = 5000; // more than one batch
         var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -20,7 +21,9 @@ public sealed class SerialExecutorTests
         {
             if (Interlocked.Increment(ref running) != 1)
                 Interlocked.Increment(ref overlaps);
-            if (Environment.CurrentManagedThreadId == posterThread)
+            // Reentrancy check: the item must never run inline inside Post on the posting thread's stack.
+            // (Thread ids are not used: the poster may legitimately return to the pool and run later items.)
+            if (t_insidePost)
                 Interlocked.Increment(ref sameThread);
             seen.Enqueue(item);
             Interlocked.Decrement(ref running);
@@ -28,8 +31,16 @@ public sealed class SerialExecutorTests
                 done.TrySetResult();
         }, _ => { });
 
-        for (int i = 0; i < count; i++)
-            executor.Post(i);
+        t_insidePost = true;
+        try
+        {
+            for (int i = 0; i < count; i++)
+                executor.Post(i);
+        }
+        finally
+        {
+            t_insidePost = false;
+        }
         await done.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
         Assert.Equal(Enumerable.Range(0, count), seen);
