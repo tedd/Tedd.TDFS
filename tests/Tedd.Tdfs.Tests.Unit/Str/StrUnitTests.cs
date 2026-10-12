@@ -445,18 +445,21 @@ public sealed class StrUnitTests
     {
         await ClusterTest.RunAsync(Core, async cluster =>
         {
-            await using DfsClient client = await ConnectAsync(cluster, "c0");
-            DfsVolume vol = client.GetVolume(Vol);
+            // Seeded by another client, so the reading client cannot hold the payload locally and every byte it returns
+            // comes through (shortened) backend read results.
+            await using DfsClient seeder = await ConnectAsync(cluster, "w");
             int[] lengths = maxBytesPerResult == 1 ? [3000, Inline + 1904] : [3000, 3 * Chunk + 777];
             var files = new List<(string Path, byte[] Data)>();
             foreach (int len in lengths)
             {
                 string path = $"/str004-{len}.bin";
                 byte[] data = TestData.Bytes(0x5004_0000UL + (ulong)len, len);
-                await vol.Files.WriteAllBytesAsync(path, data, Ct);
+                await seeder.GetVolume(Vol).Files.WriteAllBytesAsync(path, data, Ct);
                 files.Add((path, data));
             }
 
+            await using DfsClient client = await ConnectAsync(cluster, "c0");
+            DfsVolume vol = client.GetVolume(Vol);
             ReadResultLimitRule rule = cluster.Faults.LimitReadResultBytes(maxBytesPerResult, volume: Vol);
             int apiShortReads = 0;
             int calls = 0;
@@ -521,10 +524,14 @@ public sealed class StrUnitTests
     [Catalog("STR-005", "U", "INV-03", "INV-07")]
     public async Task STR_005_EofIsNotUnavailability(EofScenario scenario)
     {
+        // DataHoldersOffline: two data copies on five nodes, and five metadata voters for the volume, so crashing both
+        // holders (at most two nodes) never also removes the volume group's quorum — the failure must be about data, not
+        // authority (with the default three volume voters both holders could be voters, confounding the scenario).
         TestClusterOptions options = scenario == EofScenario.DataHoldersOffline
             ? TestClusterOptions.FiveNodes with
             {
                 DefaultPolicy = new DfsStoragePolicy { TargetCopies = 2, TargetDistinctZones = 2, DurableCopiesBeforeAck = 2, DurableZonesBeforeAck = 2 },
+                Volumes = [new TestVolumeSpec(Vol) { Metadata = new DfsMetadataPolicy { Voters = 5 } }],
             }
             : Core;
         await ClusterTest.RunAsync(options, async cluster =>
@@ -588,17 +595,18 @@ public sealed class StrUnitTests
                             await node.CrashAsync();
                     }
 
+                    // The outage outlasts the 2 s lease, so a typed lease-lost/pin-expired report is also an explicit failure.
                     foreach (ReadOverload overload in new[] { ReadOverload.ArraySync, ReadOverload.MemoryAsync, ReadOverload.ReadByte })
                     {
                         foreach (long position in new long[] { 100, data.Length })
-                            await AssertReadFailsWithoutEofAsync(s, overload, position, allowIntegrity: false, $"{scenario}, {overload} at {position}");
+                            await AssertReadFailsWithoutEofAsync(s, overload, position, allowIntegrity: false, $"{scenario}, {overload} at {position}", allowExpiry: true);
                     }
 
                     foreach (ReadOverload overload in new[] { ReadOverload.SpanSync, ReadOverload.ArrayAsync })
-                        await AssertReadFailsWithoutEofAsync(s, overload, 100, allowIntegrity: false, $"{scenario}, {overload} at 100");
+                        await AssertReadFailsWithoutEofAsync(s, overload, 100, allowIntegrity: false, $"{scenario}, {overload} at 100", allowExpiry: true);
 
                     AssertAvailabilityFailure(await Record.ExceptionAsync(() => s.GetLengthAsync(Ct).AsTask()), false,
-                        $"{scenario}: the live length cannot be answered without authority and must not be reported as 0 or stale");
+                        $"{scenario}: the live length cannot be answered without authority and must not be reported as 0 or stale", allowExpiry: true);
 
                     if (scenario == EofScenario.ClientIsolated)
                     {
@@ -639,6 +647,10 @@ public sealed class StrUnitTests
                             await node.CrashAsync();
                             crashed.Add(node);
                         }
+
+                        // Metadata authority must remain available (3 of 5 volume voters); wait for a leader in case a
+                        // crashed holder led the volume group.
+                        await cluster.GetLeaderAsync(Vol, Ct);
                     }
 
                     // A reader that never cached the object (fresh client).
@@ -690,14 +702,15 @@ public sealed class StrUnitTests
         Assert.Equal(position, s.Position);
     }
 
-    private static async Task AssertReadFailsWithoutEofAsync(DfsStream s, ReadOverload overload, long position, bool allowIntegrity, string because)
+    private static async Task AssertReadFailsWithoutEofAsync(DfsStream s, ReadOverload overload, long position, bool allowIntegrity, string because,
+        bool allowExpiry = false)
     {
         s.Seek(position, SeekOrigin.Begin);
         var buffer = new byte[64];
         int? returned = null;
         Exception? ex = await Record.ExceptionAsync(async () => returned = await ReadOnceAsync(s, overload, buffer, 0, buffer.Length));
         Assert.True(returned is null, $"The read must fail, but it returned {returned} ({because}); 0 would be a fabricated EOF.");
-        AssertAvailabilityFailure(ex, allowIntegrity, because);
+        AssertAvailabilityFailure(ex, allowIntegrity, because, allowExpiry);
         Assert.Equal(position, s.Position);
     }
 
@@ -778,12 +791,14 @@ public sealed class StrUnitTests
     {
         await ClusterTest.RunAsync(Core, async cluster =>
         {
-            await using DfsClient client = await ConnectAsync(cluster, "c0");
-            DfsVolume vol = client.GetVolume(Vol);
             const string path = "/str006.bin";
             int len = maxBytesPerResult == 1 ? Inline + 1904 : 2 * Chunk + 17;
             byte[] data = TestData.Bytes(0x5006_0000UL + (ulong)maxBytesPerResult, len);
-            await vol.Files.WriteAllBytesAsync(path, data, Ct);
+            // Seeded by another client, so the reading client cannot hold the payload locally.
+            await using (DfsClient seeder = await ConnectAsync(cluster, "w"))
+                await seeder.GetVolume(Vol).Files.WriteAllBytesAsync(path, data, Ct);
+            await using DfsClient client = await ConnectAsync(cluster, "c0");
+            DfsVolume vol = client.GetVolume(Vol);
             ReadResultLimitRule rule = cluster.Faults.LimitReadResultBytes(maxBytesPerResult, volume: Vol);
 
             await using DfsStream s = await vol.Files.OpenReadAsync(path, Ct);
@@ -835,8 +850,11 @@ public sealed class StrUnitTests
     }
 
     /// <summary>
-    /// STR-006 variant: when authority becomes unreachable in the middle of assembling, ReadExactly reports the
-    /// availability failure, never a premature EndOfStreamException, and no byte is consumed.
+    /// STR-006 variant: unavailability is never a premature EOF. (1) Authority unreachable before anything was
+    /// assembled: ReadExactly reports the availability failure and consumes nothing. (2) Connectivity lost in the middle of
+    /// assembling (right after the first forced-short backend result arrived): ReadExactly still reports the availability
+    /// failure, not EndOfStreamException; any bytes consumed by inner reads that succeeded are exactly the file's bytes and
+    /// the request was not completed.
     /// </summary>
     [Fact]
     [Catalog("STR-006", "U", "INV-07")]
@@ -853,16 +871,42 @@ public sealed class StrUnitTests
 
             await using DfsClient reader = await ConnectAsync(cluster, "r", operationTimeout: TimeSpan.FromSeconds(1));
             DfsVolume rv = reader.GetVolume(Vol);
+
+            // (1) Isolated before the call: nothing can be assembled.
             DfsStream s = await rv.Files.OpenReadAsync(path, Ct);
             s.Seek(len - 50, SeekOrigin.Begin);
             cluster.Network.Isolate("client:r");
             Exception? ex = await Record.ExceptionAsync(() => s.ReadExactlyAsync(new byte[50], Ct).AsTask());
             Assert.False(ex is EndOfStreamException, "Unavailability must never be reported as a premature EOF.");
-            AssertAvailabilityFailure(ex, false, "ReadExactly while the client is isolated");
+            AssertAvailabilityFailure(ex, false, "ReadExactly while the client is isolated", allowExpiry: true);
             Assert.Equal(len - 50, s.Position);
-
             cluster.Network.Heal();
             await AssertOldOrNewStreamRecoversAsync(cluster, rv, s, path, data, len - 50, "after healing the client partition");
+
+            // (2) Isolated in the middle of assembling: the first object reply (at most 100 bytes) arrives, then the
+            // client is cut off before the remaining >= 5 short results can be fetched.
+            const int Start = 1000;
+            const int Count = 600;
+            DfsStream s2 = await rv.Files.OpenReadAsync(path, Ct);
+            s2.Seek(Start, SeekOrigin.Begin);
+            FaultArm cut = cluster.Faults.Arm(new FaultMatch(FaultSites.ClientReplyReceived, Operation: DfsOperationKind.ReadObject),
+                FaultAction.Custom(_ =>
+                {
+                    cluster.Network.Isolate("client:r");
+                    return Task.CompletedTask;
+                }));
+            var assembled = new byte[Count];
+            assembled.AsSpan().Fill(0xEE);
+            Exception? mid = await Record.ExceptionAsync(() => s2.ReadExactlyAsync(assembled, Ct).AsTask());
+            cluster.Faults.AssertReached(cut);
+            Assert.False(mid is EndOfStreamException, "Losing connectivity mid-assembly must never be reported as a premature EOF.");
+            AssertAvailabilityFailure(mid, false, "ReadExactly that lost connectivity after its first short backend result", allowExpiry: true);
+            long consumed = s2.Position - Start;
+            Assert.True(consumed >= 0 && consumed < Count,
+                $"Position may only advance by the counts of inner reads that succeeded ({consumed} of {Count}); the request was not completed.");
+            BytesEqual(data.AsMemory(Start, (int)consumed), assembled.AsMemory(0, (int)consumed), "bytes consumed before the failure are the file's bytes");
+            cluster.Network.Heal();
+            await AssertOldOrNewStreamRecoversAsync(cluster, rv, s2, path, data, s2.Position, "after healing the mid-assembly partition");
             rule.Cancel();
         }, Ct);
     }
@@ -1974,22 +2018,21 @@ public sealed class StrUnitTests
     {
         await ClusterTest.RunAsync(Core, async cluster =>
         {
-            await using DfsClient client = await ConnectAsync(cluster, "c0");
             await using DfsClient observer = await ConnectAsync(cluster, "o");
-            DfsVolume vol = client.GetVolume(Vol);
             DfsVolume ov = observer.GetVolume(Vol);
             const string path = "/str019.bin";
             byte[] initial = NonZero(0x5019_0000, 3 * Chunk);
-            await vol.Files.WriteAllBytesAsync(path, initial, Ct);
+            await ov.Files.WriteAllBytesAsync(path, initial, Ct); // seeded by another client: the stream's client has no cached data
             var model = new ReferenceFileModel(initial);
             bool writeThrough = first is OverlapFirst.WriteAsyncWriteThrough or OverlapFirst.SetLengthAsyncWriteThrough;
-            DfsOperationKind blocked = first is OverlapFirst.ReadAsyncArray or OverlapFirst.ReadAsyncMemory or OverlapFirst.CopyToAsync
-                ? DfsOperationKind.Read
-                : DfsOperationKind.CommitFile;
+            bool readFirst = first is OverlapFirst.ReadAsyncArray or OverlapFirst.ReadAsyncMemory or OverlapFirst.CopyToAsync;
 
             for (int iteration = 0; iteration < 2; iteration++)
             {
                 string label = $"{first} overlapped by {second}, iteration {iteration}";
+                // A fresh client per iteration: nothing of the file is cached, so the first call must send a request.
+                await using DfsClient client = await ConnectAsync(cluster, $"c{iteration}");
+                DfsVolume vol = client.GetVolume(Vol);
                 DfsStream s = await vol.Files.OpenAsync(path,
                     Writer(FileMode.Open, FileAccess.ReadWrite, writeThrough ? DfsWriteMode.WriteThrough : DfsWriteMode.OnFlush), Ct);
                 s.Seek(1000 + iteration * 100, SeekOrigin.Begin);
@@ -2006,7 +2049,16 @@ public sealed class StrUnitTests
                 var copyTarget = new MemoryStream();
                 byte[] firstWrite = NonZero(0x5019_2000UL + (ulong)iteration, 64);
 
-                FaultArm arm = cluster.Faults.Arm(new FaultMatch(FaultSites.ClientRequestSend, Operation: blocked), FaultAction.Block());
+                // Reads block at whichever request the call sends first: a live ReadRange, or — for a writable handle that
+                // may serve its exclusively-held base revision without a revision round trip — the first object fetch.
+                // Publications block at their CommitFile request.
+                FaultArm[] arms = readFirst
+                    ?
+                    [
+                        cluster.Faults.Arm(new FaultMatch(FaultSites.ClientRequestSend, Operation: DfsOperationKind.Read), FaultAction.Block()),
+                        cluster.Faults.Arm(new FaultMatch(FaultSites.ClientRequestSend, Operation: DfsOperationKind.ReadObject), FaultAction.Block()),
+                    ]
+                    : [cluster.Faults.Arm(new FaultMatch(FaultSites.ClientRequestSend, Operation: DfsOperationKind.CommitFile), FaultAction.Block())];
                 Task<int> firstTask = first switch
                 {
                     OverlapFirst.ReadAsyncArray => s.ReadAsync(readBuffer, 0, readBuffer.Length, Ct),
@@ -2018,7 +2070,13 @@ public sealed class StrUnitTests
                     OverlapFirst.DisposeAsync => AsInt(s.DisposeAsync().AsTask()),
                     _ => throw new ArgumentOutOfRangeException(nameof(first), first, null),
                 };
-                await arm.WaitTriggeredAsync(Bounded);
+                await cluster.WaitUntilAsync(() => Task.FromResult(arms.Any(a => a.Triggered) || firstTask.IsCompleted), Bounded,
+                    $"{label}: the first call's request reaches the client send boundary", Ct);
+                FaultArm? triggered = arms.FirstOrDefault(a => a.Triggered);
+                Assert.True(triggered is not null, $"{label}: the first call completed without sending a request, so it could not be held in flight.");
+                FaultArm arm = triggered!;
+                foreach (FaultArm other in arms.Where(a => !ReferenceEquals(a, arm)))
+                    other.Disarm(); // the held call must not be blocked a second time after release
                 Assert.False(firstTask.IsCompleted, $"{label}: the first call must still be in flight while its request is blocked.");
 
                 // The overlapping call must be rejected immediately, not queued behind the in-flight call.
@@ -2278,7 +2336,8 @@ public sealed class StrUnitTests
 
     /// <summary>
     /// After a successful Dispose/DisposeAsync/Close (which first publishes pending writes), CanRead/CanWrite/CanSeek are
-    /// false, every further operation throws ObjectDisposedException, repeated disposal is a no-op, the server-side handle
+    /// false, every further operation throws ObjectDisposedException (a read-only handle's flush may instead remain the
+    /// FSD §6.4 no-op), repeated disposal is a no-op, the server-side handle
     /// is closed and its share reservation released (an exclusive open succeeds).
     /// </summary>
     [Theory]
@@ -2336,9 +2395,15 @@ public sealed class StrUnitTests
             Assert.False(s.CanWrite, $"{kind}/{method}: CanWrite after disposal");
             Assert.False(s.CanSeek, $"{kind}/{method}: CanSeek after disposal");
             Assert.False(s.CanTimeout);
+            bool readOnly = kind is DisposedKind.ReadOnlyLive or DisposedKind.ReadOnlyPinned;
             foreach ((string name, Func<DfsStream, Task> op) in DisposedOps)
             {
                 Exception? ex = await Record.ExceptionAsync(() => op(s));
+                // FSD §6.4 defines read-only flush as a no-op; after disposal it may stay a no-op (it publishes and claims
+                // nothing) or throw ObjectDisposedException. Every other operation (and any writable flush, which must not
+                // claim durability for a closed handle) reports the disposed state.
+                if (readOnly && name is ("Flush" or "FlushAsync") && ex is null)
+                    continue;
                 Assert.True(ex is ObjectDisposedException, $"{kind}/{method}: {name} after disposal must throw ObjectDisposedException, got {ex?.GetType().FullName ?? "success"}.");
             }
 
@@ -2389,7 +2454,10 @@ public sealed class StrUnitTests
     /// <summary>
     /// A read that fails without a successful return leaves Position unchanged and reports an error (never a count);
     /// whatever it wrote into the caller's buffer is never presented as data — the next successful read delivers the
-    /// correct bytes from the unchanged position. A mid-read failure may instead return a verified short prefix.
+    /// correct bytes from the unchanged position. Around a mid-read failure an implementation may first return verified
+    /// short counts (FSD §6.2); the call that finally fails still leaves Position where that call started.
+    /// The file is published one object per chunk (five objects) and the warm-up read touches only the last object, so
+    /// none of the target objects can already be cached by the reader (which would legitimately bypass the fault).
     /// </summary>
     [Theory]
     [MemberData(nameof(ReadFailureCases))]
@@ -2400,21 +2468,23 @@ public sealed class StrUnitTests
         {
             await using DfsClient writer = await ConnectAsync(cluster, "w");
             const string path = "/str026.bin";
-            int len = 3 * Chunk;
+            int len = 5 * Chunk;
             byte[] data = NonZero(0x5026_0000, len);
-            await writer.GetVolume(Vol).Files.WriteAllBytesAsync(path, data, Ct);
+            await SeedOneObjectPerChunkAsync(writer.GetVolume(Vol), path, data);
+            IReadOnlyList<ExtentRefInfo> extents = await GetExtentsAsync(cluster, path);
+            Assert.True(extents.Select(e => e.Object).Distinct().Count() >= 5,
+                $"precondition: one published object per chunk, got {extents.Count} extent(s)");
 
             TimeSpan? timeout = failure is ReadFailure.OperationTimeout or ReadFailure.ClientIsolated ? TimeSpan.FromSeconds(1) : null;
             await using DfsClient reader = await ConnectAsync(cluster, "r", operationTimeout: timeout);
             DfsVolume rv = reader.GetVolume(Vol);
             DfsStream s = await rv.Files.OpenReadAsync(path, Ct);
-            s.Seek(1000, SeekOrigin.Begin);
-            BytesEqual(data.AsMemory(1000, 10), await ReadUpToAsync(s, 10), "warm-up read in the first extent");
-            long before = Chunk + 10; // inside the second extent, which the reader has not fetched yet
+            s.Seek(len - 100, SeekOrigin.Begin);
+            BytesEqual(data.AsMemory(len - 100, 10), await ReadUpToAsync(s, 10), "warm-up read in the last object");
+            long before = Chunk + 10; // inside the second object, which the reader has never fetched
             s.Seek(before, SeekOrigin.Begin);
-            int request = failure == ReadFailure.TransportFaultMidMultiExtentRead ? Chunk + 4096 : 4096;
-            var buffer = new byte[request];
-            buffer.AsSpan().Fill(0xEE);
+            bool midRead = failure == ReadFailure.TransportFaultMidMultiExtentRead;
+            int request = midRead ? 2 * Chunk + 4096 : 4096; // the mid-read request spans objects 2, 3 and 4
 
             FaultArm? arm = null;
             MessageHold? hold = null;
@@ -2425,12 +2495,13 @@ public sealed class StrUnitTests
                         FaultAction.Throw(() => new IOException("injected: connection reset while receiving the read reply")));
                     break;
                 case ReadFailure.TransportFaultMidMultiExtentRead:
+                    // The first object reply succeeds; every later one (including retries on other replicas) fails.
                     arm = cluster.Faults.Arm(new FaultMatch(FaultSites.ClientReplyReceived, Operation: DfsOperationKind.ReadObject, Occurrence: 2, Count: int.MaxValue),
                         FaultAction.Throw(() => new IOException("injected: connection reset while receiving object data")));
                     break;
                 case ReadFailure.IntegrityOnAllReplicas:
                 {
-                    ExtentRefInfo extent = (await GetExtentsAsync(cluster, path)).Single(e => e.Offset <= before && before < e.Offset + e.Length);
+                    ExtentRefInfo extent = extents.Single(e => e.Offset <= before && before < e.Offset + e.Length);
                     IReadOnlyList<string> holders = await cluster.Inspect.GetObjectHoldersAsync(extent.Object);
                     Assert.True(holders.Count > 0, "precondition: the extent has holders");
                     foreach (string holder in holders)
@@ -2446,37 +2517,49 @@ public sealed class StrUnitTests
                     break;
             }
 
-            int? returned = null;
-            Exception? ex = await Record.ExceptionAsync(async () => returned = await ReadOnceAsync(s, overload, buffer, 0, request));
+            // Only the mid-read case may deliver verified short counts before the failing call; every other case must fail
+            // on its first call. The loop stops at the first failure.
             string label = $"{failure} via {overload}";
-            if (ex is null)
+            long callStart = before;
+            int remaining = request;
+            Exception? ex = null;
+            for (int call = 0; ex is null; call++)
             {
-                Assert.True(failure == ReadFailure.TransportFaultMidMultiExtentRead,
-                    $"{label}: the read must fail, but it returned {returned} (a count would present the caller buffer as valid data).");
+                var buffer = new byte[remaining];
+                buffer.AsSpan().Fill(0xEE);
+                int? returned = null;
+                ex = await Record.ExceptionAsync(async () => returned = await ReadOnceAsync(s, overload, buffer, 0, remaining));
+                if (ex is not null)
+                    break;
+                Assert.True(midRead, $"{label}: the read must fail, but it returned {returned} (a count would present the caller buffer as valid data).");
                 int n = returned!.Value;
-                Assert.InRange(n, 1, request);
-                BytesEqual(data.AsMemory((int)before, n), buffer.AsMemory(0, n), $"{label}: a successful short prefix is verified data");
-                Assert.Equal(before + n, s.Position);
+                Assert.InRange(n, 1, remaining);
+                BytesEqual(data.AsMemory((int)callStart, n), buffer.AsMemory(0, n), $"{label}: call #{call} returned a verified short prefix");
+                Assert.Equal(callStart + n, s.Position);
+                callStart += n;
+                remaining -= n;
+                Assert.True(remaining > 0,
+                    $"{label}: the whole range over three objects was delivered although every object reply after the first fails.");
             }
-            else
-            {
-                Assert.False(ex is EndOfStreamException, $"{label}: a failure is not EOF");
-                switch (failure)
-                {
-                    case ReadFailure.IntegrityOnAllReplicas:
-                        AssertAvailabilityFailure(ex, allowIntegrity: true, label);
-                        break;
-                    case ReadFailure.OperationTimeout:
-                    case ReadFailure.ClientIsolated:
-                        AssertAvailabilityFailure(ex, allowIntegrity: false, label);
-                        break;
-                    default:
-                        Assert.True(ex is IOException or TimeoutException, $"{label}: the transport failure surfaces as an I/O/availability error, got {ex.GetType().FullName}: {ex.Message}");
-                        break;
-                }
 
-                Assert.True(s.Position == before, $"{label}: a failed read must leave Position at {before}, found {s.Position}.");
+            Assert.False(ex is EndOfStreamException, $"{label}: a failure is not EOF");
+            switch (failure)
+            {
+                case ReadFailure.IntegrityOnAllReplicas:
+                    AssertAvailabilityFailure(ex, allowIntegrity: true, label);
+                    break;
+                case ReadFailure.OperationTimeout:
+                    AssertAvailabilityFailure(ex, allowIntegrity: false, label);
+                    break;
+                case ReadFailure.ClientIsolated:
+                    AssertAvailabilityFailure(ex, allowIntegrity: false, label, allowExpiry: true);
+                    break;
+                default:
+                    Assert.True(ex is IOException or TimeoutException, $"{label}: the transport failure surfaces as an I/O/availability error, got {ex.GetType().FullName}: {ex.Message}");
+                    break;
             }
+
+            Assert.True(s.Position == callStart, $"{label}: the failed read must leave Position at {callStart}, found {s.Position}.");
 
             if (arm is not null)
             {
@@ -2676,6 +2759,12 @@ public sealed class StrUnitTests
                     Assert.True(old || applied, $"{op}: committed state is either unchanged or has exactly the original payload (never bytes read from memory after completion).");
                     if (outcome is null)
                         Assert.True(applied, $"{op}: a successful WriteThrough call is published.");
+                    if (outcome is OperationCanceledException)
+                    {
+                        // OperationCanceledException is a definite "not published" (ARCHITECTURE §7): even after the held
+                        // request was released, the write must never take effect.
+                        Assert.True(old, $"{op}: a call reported as cancelled was published anyway (cancellation misreported an unknown/committed outcome).");
+                    }
                     await DisposeQuietlyAsync(s);
                     break;
                 }
@@ -2704,6 +2793,10 @@ public sealed class StrUnitTests
                     break;
                 }
             }
+
+            // A later flush/abort/dispose must work from the SDK's own copy, never from the returned application memory.
+            Assert.True(memory.Violations == 0, $"{op}: the SDK accessed application memory {memory.Violations} time(s) after ownership returned (during flush/abort/dispose).");
+            Assert.True(memory.OutstandingPins == 0, $"{op}: application memory is still pinned at the end of the scenario.");
         }, Ct);
     }
 

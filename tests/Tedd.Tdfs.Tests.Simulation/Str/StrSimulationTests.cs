@@ -58,9 +58,12 @@ public sealed class StrSimulationTests
             const string path = "/str014.bin";
             int lenA = 6 * Chunk + 123;
             byte[] a = NonZero(0x5014_0001, lenA);
-            await wv.Files.WriteAllBytesAsync(path, a, Ct);
+            // One object per chunk (seven objects): a single read call necessarily spans several extents/objects, whatever
+            // object packing WriteAll would choose.
+            await SeedOneObjectPerChunkAsync(wv, path, a);
             FileInspection? inspected = await cluster.Inspect.GetFileAsync(Vol, path);
-            Assert.True(inspected is { IsInline: false } && inspected.Extents.Count >= 2, "precondition: a multi-extent file");
+            Assert.True(inspected is { IsInline: false } && inspected.Extents.Select(e => e.Object).Distinct().Count() >= 2,
+                $"precondition: a multi-extent file backed by several objects (got {inspected?.Extents.Count ?? 0} extents)");
 
             // Calibrate the number of object fetches of one cold live read call (separate client, never reused).
             int fetches;
@@ -510,12 +513,26 @@ public sealed class StrSimulationTests
 
             if (cause != PinExpiryCause.ClientClockFrozen)
             {
-                // Safety during the outage: the cut-off reader returns nothing (it cannot validate its pin).
+                // Safety during the outage, before the server expired the pin: the pin is still valid, so the cut-off reader
+                // may only return verified bytes of the pinned revision A (for example from a client-side cache) or fail
+                // explicitly; it never returns B, zeroes or a fabricated EOF, and a failed read leaves Position unchanged.
                 pinned.Seek(1000, SeekOrigin.Begin);
+                var duringBuffer = new byte[4096];
                 int? during = null;
-                Exception? duringEx = await Record.ExceptionAsync(async () => during = await pinned.ReadAsync(new byte[4096], Ct));
-                Assert.True(during is null && duringEx is not null, $"a read during the outage must fail, returned {during}");
-                Assert.Equal(1000, pinned.Position);
+                Exception? duringEx = await Record.ExceptionAsync(async () => during = await pinned.ReadAsync(duringBuffer, Ct));
+                if (during is int got)
+                {
+                    Assert.InRange(got, 1, duringBuffer.Length);
+                    BytesEqual(a.AsMemory(1000, got), duringBuffer.AsMemory(0, got), "a read during the outage (pin not yet expired) returns only revision A");
+                    Assert.Equal(1000 + got, pinned.Position);
+                }
+                else
+                {
+                    Assert.True(duringEx is DfsException or TimeoutException,
+                        $"a read during the outage fails explicitly (availability or expiry), got {duringEx?.GetType().FullName}: {duringEx?.Message}");
+                    Assert.False(duringEx is EndOfStreamException, "an outage is not EOF");
+                    Assert.Equal(1000, pinned.Position);
+                }
             }
 
             await cluster.WaitUntilAsync(async () =>

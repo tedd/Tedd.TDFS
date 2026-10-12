@@ -53,3 +53,11 @@ These are not API additions but conventions the STR rows rely on; listed so impl
   range being read).
 - `ClusterInspector.GetAllStoredObjectsAsync` covers the stores of all running nodes (STR-016/STR-017 use it to check
   that pinned objects are retained and expired-pin objects are reclaimed).
+- `SeedOneObjectPerChunkAsync` (STR-014, STR-026) writes a file through one stream and flushes after every 64 KiB chunk;
+  it relies on each such flush publishing the newly written chunk as its own object(s) while untouched extents keep
+  their objects (AT-07), so the file is multi-object regardless of how `WriteAll*` would pack objects (up to 1 MiB).
+- `FaultAction.Custom` armed at `client.reply.received` runs on the client's request path before the reply is used and
+  may call harness network controls (STR-006 isolates the client after the first object reply to fail mid-assembly).
+- STR-019 holds a read either at its live `ReadRange` request (`Operation = Read`) or, when a writable handle serves its
+  exclusively held base revision without a revision round trip, at its first `GetObject` (`Operation = ReadObject`); it
+  uses a fresh client per iteration so no object data can already be cached.

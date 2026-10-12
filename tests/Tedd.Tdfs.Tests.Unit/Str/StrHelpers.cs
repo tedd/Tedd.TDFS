@@ -211,6 +211,20 @@ internal static class StrHelpers
         return await ReadWholeAsync(r);
     }
 
+    /// <summary>
+    /// Creates <paramref name="path"/> with <paramref name="data"/> published one <see cref="Chunk"/>-sized piece per flush,
+    /// so every chunk is a separate published object (the extent layout does not depend on how WriteAll packs objects).
+    /// </summary>
+    public static async Task SeedOneObjectPerChunkAsync(DfsVolume volume, string path, byte[] data)
+    {
+        await using DfsStream w = await volume.Files.OpenAsync(path, Writer(FileMode.CreateNew, FileAccess.Write), Ct);
+        for (int offset = 0; offset < data.Length; offset += Chunk)
+        {
+            await w.WriteAsync(data.AsMemory(offset, Math.Min(Chunk, data.Length - offset)), Ct);
+            await w.FlushAsync(Ct);
+        }
+    }
+
     /// <summary>Seeks to 0 and reads to EOF.</summary>
     public static async Task<byte[]> ReadWholeAsync(Stream s)
     {
@@ -232,14 +246,17 @@ internal static class StrHelpers
     /// <summary>
     /// Asserts that <paramref name="ex"/> is an explicit availability failure (or, when allowed, an integrity failure for
     /// data that cannot be produced) — never EOF, absence or a generic success substitute (FSD §§6.2, 13).
+    /// <paramref name="allowExpiry"/> additionally accepts a typed lease-lost/pin-expired failure: when the client is cut
+    /// off from authority for longer than the 2 s lease, reporting the handle's expiry is an equally explicit failure.
     /// </summary>
-    public static void AssertAvailabilityFailure(Exception? ex, bool allowIntegrity, string because)
+    public static void AssertAvailabilityFailure(Exception? ex, bool allowIntegrity, string because, bool allowExpiry = false)
     {
         Assert.True(ex is not null, $"Expected an availability failure but the call succeeded ({because}).");
         bool ok = ex switch
         {
             DfsUnavailableException => true,
             DfsIntegrityException => allowIntegrity,
+            DfsLeaseLostException or DfsPinExpiredException => allowExpiry,
             DfsException d => d.ErrorCode is DfsErrorCode.QuorumUnavailable or DfsErrorCode.NodeUnavailable
                 or DfsErrorCode.Unavailable or DfsErrorCode.Timeout or DfsErrorCode.NotLeader
                 || (allowIntegrity && d.ErrorCode == DfsErrorCode.Integrity),

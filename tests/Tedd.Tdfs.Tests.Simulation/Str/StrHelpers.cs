@@ -60,6 +60,20 @@ internal static class StrHelpers
         WriteMode = writeMode,
     };
 
+    /// <summary>
+    /// Creates <paramref name="path"/> with <paramref name="data"/> published one <see cref="Chunk"/>-sized piece per flush,
+    /// so every chunk is a separate published object (the extent layout does not depend on how WriteAll packs objects).
+    /// </summary>
+    public static async Task SeedOneObjectPerChunkAsync(DfsVolume volume, string path, byte[] data)
+    {
+        await using DfsStream w = await volume.Files.OpenAsync(path, Writer(FileMode.CreateNew, FileAccess.Write), Ct);
+        for (int offset = 0; offset < data.Length; offset += Chunk)
+        {
+            await w.WriteAsync(data.AsMemory(offset, Math.Min(Chunk, data.Length - offset)), Ct);
+            await w.FlushAsync(Ct);
+        }
+    }
+
     /// <summary>Reads from the current position until <paramref name="count"/> bytes or EOF, asserting Position tracks every call.</summary>
     public static async Task<byte[]> ReadUpToAsync(DfsStream s, int count)
     {
