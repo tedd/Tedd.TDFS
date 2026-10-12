@@ -1041,8 +1041,13 @@ Semantics (both transports): delivery is asynchronous (thread pool, never on the
 arrival order per connection (not awaited before the next message); a handler exception becomes an `ErrorCodec`
 `Internal` error reply and a request to a never-started transport an `Unavailable` one; replies after a timeout are
 discarded; closing fails pending calls with `RpcConnectionException`; `Closed` carries null only for a local
-`DisposeAsync`/transport dispose. QUIC: single-frame messages (≤ 60 KiB) keep send order on the ordered channel;
-fragmented ones use the unordered data channel and may be overtaken by later small messages.
+`DisposeAsync`/transport dispose. A remote close is ordered behind the messages already received on the connection (a reply
+that arrived before the close still completes its call). Closing cancels the handlers' token asynchronously: cancellation
+callbacks and the handler code they resume never run on the closing thread (or the QUIC pump). QUIC: single-frame messages
+(≤ 60 KiB) keep send order on the ordered channel; fragmented ones use the unordered data channel and may be overtaken by
+later small messages. A graceful close (`DisposeAsync` of a connection or transport) fails messages still queued in the
+transport but first lets everything already handed to QUIC (every message whose `SendAsync` completed) be acknowledged by
+the peer, bounded by a 2 s grace period, before the QUIC session is closed.
 
 ---
 

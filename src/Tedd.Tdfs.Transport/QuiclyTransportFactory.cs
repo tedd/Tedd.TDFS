@@ -18,6 +18,10 @@ namespace Tedd.Tdfs.Transport;
 /// client presents its network identity in the Quicly Hello (so the server can apply
 /// <see cref="ILinkPolicy.CanConnect"/> before admitting it); the server answers with a preamble frame carrying its own
 /// identity. The link policy is consulted by the receiving transport for every message.</para>
+/// <para>Close: a remote close is delivered behind the messages already received on the connection. A graceful local close
+/// (disposing a connection or the transport) fails messages still queued in the transport, but sends the QUIC close only
+/// once everything already handed to QUIC (every message whose <c>SendAsync</c> completed) was acknowledged by the peer,
+/// waiting at most 2 s.</para>
 /// </remarks>
 public sealed class QuiclyTransportFactory : IRpcTransportFactory
 {

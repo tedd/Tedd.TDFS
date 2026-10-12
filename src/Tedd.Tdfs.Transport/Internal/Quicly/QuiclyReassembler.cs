@@ -77,7 +77,7 @@ internal sealed class QuiclyReassembler
 
         if (partial.Chunks[header.FragmentIndex] is not null)
             throw new QuiclyProtocolException($"Fragment {header.FragmentIndex} of {header.Kind} {header.Correlation} arrived twice.");
-        if (partial.Total + chunk.Length > MaxMessageBytes)
+        if ((long)partial.Total + chunk.Length > MaxMessageBytes) // long: MaxMessageBytes may be close to int.MaxValue
             throw new QuiclyProtocolException($"A fragmented message exceeds {MaxMessageBytes} bytes.");
         if (_buffered + chunk.Length > MaxBufferedBytes)
             throw new QuiclyProtocolException($"Fragmented messages in progress exceed {MaxBufferedBytes} buffered bytes.");

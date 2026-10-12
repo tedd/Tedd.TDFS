@@ -62,8 +62,17 @@ internal sealed class QuiclyRpcConnection : RpcConnectionBase
     /// <summary>The client's reference on the shared client buffer pool.</summary>
     public ClientLease? Lease { get; set; }
 
-    /// <summary>Pump-clock deadline for a locally closed client to finish its graceful close.</summary>
+    /// <summary>
+    /// Pump-clock deadline of the current close step: the delivery wait of a graceful close (<see cref="PendingClose"/>),
+    /// then the Quicly close itself.
+    /// </summary>
     public long CloseDeadline { get; set; }
+
+    /// <summary>
+    /// The Quicly close reason of a graceful local close that waits until every message already handed to Quicly was
+    /// delivered (pump thread); null when no close is pending.
+    /// </summary>
+    public CloseReason? PendingClose { get; set; }
 
     /// <summary>True when the pump polled or sent to this client in the current pass, so it must flush it (pump thread).</summary>
     public bool NeedsFlush { get; set; }

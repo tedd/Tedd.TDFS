@@ -278,13 +278,22 @@ internal abstract class RpcConnectionBase : IRpcConnection
             _closed = null;
         }
 
-        try
+        // The token flips synchronously, but its callbacks run on the thread pool, and with them every handler continuation
+        // they resume inline (a handler awaiting a TaskCompletionSource it cancels from ct.Register, say): handler code must
+        // never run on the closing thread, which may be the QUIC pump or a caller disposing the connection.
+        Task cancelled = _closing.CancelAsync();
+        if (!cancelled.IsCompleted)
         {
-            _closing.Cancel();
+            _ = cancelled.ContinueWith(
+                static (task, state) => ((RpcConnectionBase)state!).ReportFault("A cancellation callback registered by a handler threw.", task.Exception),
+                this,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
         }
-        catch (AggregateException ex)
+        else if (cancelled.IsFaulted)
         {
-            ReportFault("A cancellation callback registered by a handler threw.", ex);
+            ReportFault("A cancellation callback registered by a handler threw.", cancelled.Exception);
         }
 
         RpcConnectionException failure = CreateClosedException();

@@ -74,6 +74,7 @@ internal sealed class QuiclyRpcTransport : IRpcTransport, IRpcTransportControl, 
     private QuiclyServer? _server;
     private readonly List<QuiclyRpcConnection> _clients = [];
     private readonly List<QuiclyRpcConnection> _closingClients = [];
+    private readonly List<QuiclyRpcConnection> _drainingPeers = [];
     private readonly Dictionary<QuiclyPeer, QuiclyRpcConnection> _serverConnections = new(ReferenceEqualityComparer.Instance);
     private readonly ConditionalWeakTable<QuiclyPeer, string> _admissionNames = new();
     private readonly List<QuiclyRpcConnection> _sending = [];
@@ -551,6 +552,10 @@ internal sealed class QuiclyRpcTransport : IRpcTransport, IRpcTransportControl, 
         catch (Exception ex)
         {
             Report("The QUIC pump failed unexpectedly; the transport stops.", ex);
+
+            // Nothing polls any more: actions that run inline from now on (attaching a client, starting a listener) must
+            // refuse instead of creating Quicly objects nobody drives.
+            _stopRequested = true;
             try
             {
                 foreach (QuiclyRpcConnection connection in _connections.Values)
@@ -597,6 +602,7 @@ internal sealed class QuiclyRpcTransport : IRpcTransport, IRpcTransportControl, 
 
         PollClients();
         SendPass();
+        CloseDrainedServerPeers(force: false);
         Flush();
     }
 
@@ -651,7 +657,10 @@ internal sealed class QuiclyRpcTransport : IRpcTransport, IRpcTransportControl, 
                 continue;
             _clients.RemoveAt(i);
             CloseReason reason = client.Peer?.CloseReason ?? default;
-            connection.TryClose(CreateRemoteCloseError(connection, reason), RpcCloseOrigin.Remote);
+
+            // Queued behind the messages this connection already received (replies, one-way messages), so they are still
+            // delivered, exactly as the in-memory transport does; it also keeps handler code off the pump thread.
+            connection.PostRemoteClose(CreateRemoteCloseError(connection, reason));
             ReleaseClient(connection);
         }
 
@@ -671,12 +680,86 @@ internal sealed class QuiclyRpcTransport : IRpcTransport, IRpcTransportControl, 
                     Report("QuiclyClient.Poll failed while closing.", ex);
                 }
 
+                if (connection.PendingClose is { } pending && client.State != PeerState.Closed)
+                {
+                    // Graceful close: Close only once what was handed to Quicly has been delivered (or the wait ran out).
+                    if (client.State == PeerState.Connected && client.Peer is { } peer && HasUndeliveredSends(peer) && now < connection.CloseDeadline)
+                        continue;
+                    connection.PendingClose = null;
+                    connection.CloseDeadline = now + ToTimestampTicks(CloseGrace);
+                    if (client.State == PeerState.Connected)
+                    {
+                        try
+                        {
+                            client.Close(pending);
+                        }
+                        catch (Exception ex)
+                        {
+                            Report("QuiclyClient.Close failed.", ex);
+                        }
+                    }
+
+                    continue;
+                }
+
                 if (client.State != PeerState.Closed && now < connection.CloseDeadline)
                     continue;
             }
 
+            connection.PendingClose = null;
             _closingClients.RemoveAt(i);
             ReleaseClient(connection);
+        }
+    }
+
+    /// <summary>
+    /// Sends the Quicly close of gracefully closed server connections once everything they handed to Quicly was delivered,
+    /// or when their delivery wait ran out (pump thread).
+    /// </summary>
+    private void CloseDrainedServerPeers(bool force)
+    {
+        if (_drainingPeers.Count == 0)
+            return;
+        long now = PumpClock.GetTimestamp();
+        for (int i = _drainingPeers.Count - 1; i >= 0; i--)
+        {
+            QuiclyRpcConnection connection = _drainingPeers[i];
+            QuiclyPeer? peer = connection.Peer; // cleared when the server reports the peer closed
+            bool usable = peer is not null && !peer.IsDisposed && peer.State is not (PeerState.Closing or PeerState.Closed);
+            if (usable && !force && HasUndeliveredSends(peer!) && now < connection.CloseDeadline)
+                continue;
+
+            _drainingPeers.RemoveAt(i);
+            CloseReason? pending = connection.PendingClose;
+            connection.PendingClose = null;
+            if (usable && pending is { } reason)
+                ClosePeer(peer!, reason);
+        }
+    }
+
+    /// <summary>
+    /// True while a message handed to Quicly on one of the RPC channels waits to be transmitted or acknowledged (MsQuic
+    /// runs without send buffering, so a reliable send completes when the peer acknowledged it). Pump thread.
+    /// </summary>
+    private static bool HasUndeliveredSends(QuiclyPeer peer)
+    {
+        if (peer.IsDisposed)
+            return false;
+        return Pending(peer, QuiclyEnvelope.ControlChannel) || Pending(peer, QuiclyEnvelope.DataChannel);
+
+        static bool Pending(QuiclyPeer peer, ushort channel)
+            => peer.GetChannelStatistics(channel, out ChannelStatistics statistics) && (statistics.QueuedMessages > 0 || statistics.InFlightMessages > 0);
+    }
+
+    private void ClosePeer(QuiclyPeer peer, CloseReason reason)
+    {
+        try
+        {
+            peer.Close(reason);
+        }
+        catch (Exception ex)
+        {
+            Report("QuiclyPeer.Close failed.", ex);
         }
     }
 
@@ -761,12 +844,20 @@ internal sealed class QuiclyRpcTransport : IRpcTransport, IRpcTransportControl, 
         }
     }
 
-    /// <summary>Closes the Quicly session of a connection that closed (pump thread).</summary>
+    /// <summary>
+    /// Closes the Quicly session of a connection that closed (pump thread). Frames still queued in the connection are
+    /// failed. A graceful local close (<see cref="RpcCloseOrigin.Local"/>, <see cref="RpcCloseOrigin.TransportDisposed"/>)
+    /// sends the Quicly close only once every message already handed to Quicly was delivered (bounded by
+    /// <see cref="CloseGrace"/>): Quicly's close travels on its own control stream and would otherwise end the session
+    /// while admitted data (up to the send budget) is still queued, losing messages whose <c>SendAsync</c> completed.
+    /// </summary>
     private void CloseSession(QuiclyRpcConnection connection, RpcCloseOrigin origin, Exception? error)
     {
         connection.FailOutbound();
         _sending.Remove(connection);
         CloseReason reason = CreateCloseReason(origin, error);
+        bool graceful = origin is RpcCloseOrigin.Local or RpcCloseOrigin.TransportDisposed;
+        long deadline = PumpClock.GetTimestamp() + ToTimestampTicks(CloseGrace);
         if (connection.IsClientSide)
         {
             // A client that is not attached is still driven by its connecting thread (which disposes it), so its
@@ -777,16 +868,23 @@ internal sealed class QuiclyRpcTransport : IRpcTransport, IRpcTransportControl, 
             _clients.Remove(connection);
             if (client.State == PeerState.Connected)
             {
+                connection.CloseDeadline = deadline;
+                if (!_closingClients.Contains(connection))
+                    _closingClients.Add(connection);
+                if (graceful && client.Peer is { } clientPeer && HasUndeliveredSends(clientPeer))
+                {
+                    connection.PendingClose = reason; // closed by PollClients once delivered
+                    return;
+                }
+
                 try
                 {
                     client.Close(reason);
-                    connection.CloseDeadline = PumpClock.GetTimestamp() + ToTimestampTicks(CloseGrace);
-                    if (!_closingClients.Contains(connection))
-                        _closingClients.Add(connection);
                     return;
                 }
                 catch (Exception ex)
                 {
+                    _closingClients.Remove(connection);
                     Report("QuiclyClient.Close failed.", ex);
                 }
             }
@@ -798,14 +896,15 @@ internal sealed class QuiclyRpcTransport : IRpcTransport, IRpcTransportControl, 
         connection.Reassembler.Clear(); // server peers are polled by this thread only
         if (connection.Peer is { } peer && !peer.IsDisposed && peer.State is not (PeerState.Closing or PeerState.Closed))
         {
-            try
+            if (graceful && HasUndeliveredSends(peer))
             {
-                peer.Close(reason);
+                connection.PendingClose = reason; // closed by CloseDrainedServerPeers once delivered
+                connection.CloseDeadline = deadline;
+                _drainingPeers.Add(connection);
+                return;
             }
-            catch (Exception ex)
-            {
-                Report("QuiclyPeer.Close failed.", ex);
-            }
+
+            ClosePeer(peer, reason);
         }
     }
 
@@ -843,6 +942,35 @@ internal sealed class QuiclyRpcTransport : IRpcTransport, IRpcTransportControl, 
             connection.TryClose(null, RpcCloseOrigin.TransportDisposed);
         RunActions();
 
+        // First let every graceful close deliver what was already handed to Quicly (the server's shutdown below would
+        // close its peers at once).
+        QuiclyServer? server = _server;
+        long drainDeadline = PumpClock.GetTimestamp() + ToTimestampTicks(CloseGrace);
+        while ((_drainingPeers.Count > 0 || _closingClients.Exists(static c => c.PendingClose is not null))
+               && PumpClock.GetTimestamp() < drainDeadline)
+        {
+            _wake.Reset();
+            RunActions();
+            if (server is not null)
+            {
+                try
+                {
+                    server.PollAll();
+                }
+                catch (Exception ex)
+                {
+                    Report("QuiclyServer.PollAll failed during shutdown.", ex);
+                }
+            }
+
+            PollClients();
+            CloseDrainedServerPeers(force: false);
+            Flush();
+            _wake.Wait(IdleWait);
+        }
+
+        CloseDrainedServerPeers(force: true);
+
         for (int i = _clients.Count - 1; i >= 0; i--)
         {
             QuiclyRpcConnection connection = _clients[i];
@@ -865,7 +993,6 @@ internal sealed class QuiclyRpcTransport : IRpcTransport, IRpcTransportControl, 
             ReleaseClient(connection);
         }
 
-        QuiclyServer? server = _server;
         if (server is not null)
         {
             try
@@ -1129,7 +1256,9 @@ internal sealed class QuiclyRpcTransport : IRpcTransport, IRpcTransportControl, 
         if (!_serverConnections.Remove(peer, out QuiclyRpcConnection? connection))
             return;
         connection.Peer = null;
-        connection.TryClose(CreateRemoteCloseError(connection, reason), RpcCloseOrigin.Remote);
+
+        // Behind every message already received from the peer (see PollClients).
+        connection.PostRemoteClose(CreateRemoteCloseError(connection, reason));
     }
 
     // ------------------------------------------------------------------ configuration
