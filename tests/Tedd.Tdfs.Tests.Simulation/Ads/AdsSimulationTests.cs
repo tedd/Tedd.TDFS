@@ -84,7 +84,7 @@ public sealed class AdsSimulationTests
             }, lease * 5, "A's writes beyond its buffer must be uploaded (unpublished) under A's own staging session", Ct);
             HashSet<ObjectId> uploadsA = await StoredObjectsOfStagingAsync(cluster, stagingA);
 
-            MessageHold queue = cluster.Network.Hold(new MessageFilter(From: Net("a")));
+            MessageHold queue = cluster.Network.Hold(new MessageFilter(From: NetName("a")));
             clockA.Freeze();
             Task<Exception?> staleFlush = CatchAsync(() => a.FlushAsync(Ct));
             await cluster.DelayAsync(lease / 4, Ct);

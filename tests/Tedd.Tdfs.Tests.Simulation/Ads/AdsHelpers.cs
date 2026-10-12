@@ -39,7 +39,7 @@ internal static class AdsHelpers
     public static void Log(string message) => TestContext.Current.TestOutputHelper?.WriteLine(message);
 
     /// <summary>Network identity of a test client ("client:{name}").</summary>
-    public static string Net(string clientName) => new TestClientOptions { Name = clientName }.NetworkName;
+    public static string NetName(string clientName) => new TestClientOptions { Name = clientName }.NetworkName;
 
     public static Task<DfsClient> ConnectAsync(TestCluster cluster, string name, TestClock? clock = null) =>
         cluster.ConnectAsync(new TestClientOptions { Name = name, Clock = clock }, Ct);

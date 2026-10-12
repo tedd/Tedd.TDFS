@@ -18,7 +18,7 @@ internal sealed class ProtocolSamples
     private const int MaxDepth = 4;
     // NullabilityInfoContext is not thread-safe (it caches per member); tests run in parallel.
     private static readonly NullabilityInfoContext Nullability = new();
-    private static readonly Lock NullabilityLock = new();
+    private static readonly System.Threading.Lock NullabilityLock = new();
     private static readonly string[] Words = ["a", "zone-1", "n0", "/docs/report.json", "ÆØÅ", "名前", "\U0001F600x", "", "%2F", "x y"];
 
     private readonly Random _random;
