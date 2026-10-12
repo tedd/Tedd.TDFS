@@ -64,4 +64,6 @@ Distributed filesystem with a .NET client SDK. Requirements: `docs/spec/distribu
   `partial` (Addendum members live in `*.Security.cs` / `*.Addendum.cs`). ACL decisions go only through
   `DfsAccessEvaluator`. `DfsFileSystemRights.ToString()` may print directory aliases (`CreateFiles` for `WriteData`);
   use `DfsAccessRule.FormatRights` in messages.
-- Test suite namespaces (`Tedd.Tdfs.Tests.<Level>.File`, `.Lock`, `.Net`, `.Tx`, `.Str` ...) shadow framework types and`r`n  helper names inside the test assemblies: write `System.IO.File`, `System.Threading.Lock` etc. explicitly there, and do not`r`n  name helper methods after a suite (e.g. a helper `Net(...)`).
+- Test suite namespaces (`Tedd.Tdfs.Tests.<Level>.File`, `.Lock`, `.Net`, `.Tx`, `.Str` ...) shadow framework types and
+  helper names inside the test assemblies: write `System.IO.File`, `System.Threading.Lock` etc. explicitly there, and do not
+  name helper methods after a suite (e.g. a helper `Net(...)`).
