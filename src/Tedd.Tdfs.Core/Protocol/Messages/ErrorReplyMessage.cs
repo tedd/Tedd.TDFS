@@ -21,6 +21,15 @@ public sealed record ErrorReplyMessage(
     /// <summary>The error message (null is stored as empty).</summary>
     public string Message { get; init; } = Message ?? string.Empty;
 
+    /// <summary>
+    /// Structured details of the error (placement shortfall, exceeded limit, integrity object, adapter phase), so the
+    /// recreated exception carries the same typed properties as the server's; null when the error has none.
+    /// </summary>
+    public ErrorDetailData? Detail { get; init; }
+
+    /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
+    public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
+
     /// <inheritdoc />
     public MessageType Type => MessageType.ErrorReply;
 
@@ -36,7 +45,8 @@ public sealed record ErrorReplyMessage(
         writer.WriteBool(Retryable);
         writer.WriteOptionalString(LeaderHint);
         writer.WriteOptionalOperationId(TransactionId?.Operation);
-        writer.WriteNoExtensions();
+        writer.WriteOptional(Detail);
+        writer.WriteExtensionBlock(Extensions);
     }
 
     /// <inheritdoc />
@@ -50,14 +60,19 @@ public sealed record ErrorReplyMessage(
         bool retryable = reader.ReadBool();
         string? leaderHint = reader.ReadOptionalString();
         DfsOperationId? tx = reader.ReadOptionalOperationId();
-        reader.ReadExtensions();
+        ErrorDetailData? detail = reader.ReadOptional<ErrorDetailData>();
+        IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
         return new ErrorReplyMessage(
             (DfsErrorCode)(int)code,
             message,
             op,
             retryable,
             leaderHint,
-            tx.HasValue ? new DfsTransactionId(tx.Value) : null);
+            tx.HasValue ? new DfsTransactionId(tx.Value) : null)
+        {
+            Detail = detail,
+            Extensions = extensions,
+        };
     }
 
     /// <summary>Creates an error reply describing <paramref name="exception"/> using the canonical mapping.</summary>
@@ -77,7 +92,10 @@ public sealed record ErrorReplyMessage(
             operationId ?? DfsErrors.GetOperationId(exception),
             DfsErrors.IsRetryable(exception),
             leaderHint,
-            tx);
+            tx)
+        {
+            Detail = ErrorDetailData.FromException(exception),
+        };
     }
 
     /// <summary>Recreates the canonical exception (see <see cref="DfsErrors"/>) for this reply.</summary>
@@ -85,6 +103,8 @@ public sealed record ErrorReplyMessage(
     public Exception ToException(string? path = null)
     {
         Exception ex = DfsErrors.ToException(Code, Message, path, OperationId, Retryable);
+        if (Detail is not null)
+            ex = Detail.ApplyTo(ex, Message);
         switch (ex)
         {
             case DfsCommitOutcomeUnknownException unknown when TransactionId.HasValue:

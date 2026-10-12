@@ -226,22 +226,29 @@ public ref struct WireReader
         return new DateTimeOffset(ticks, TimeSpan.Zero);
     }
 
-    /// <summary>Reads an enum value encoded as a zigzag varint and verifies it is a defined member.</summary>
+    /// <summary>
+    /// Reads an enum value encoded as a zigzag varint and verifies it fits the enum's underlying type and is a defined
+    /// member. Use for protocol enums whose unknown values are malformed input.
+    /// </summary>
     public TEnum ReadEnum<TEnum>() where TEnum : struct, Enum
     {
-        long raw = ReadVarInt();
-        TEnum value;
-        try
-        {
-            value = (TEnum)Enum.ToObject(typeof(TEnum), raw);
-        }
-        catch (ArgumentException ex)
-        {
-            throw Malformed($"Invalid {typeof(TEnum).Name} value {raw}.", ex);
-        }
-
+        TEnum value = ReadEnumRaw<TEnum>();
         if (!Enum.IsDefined(value))
-            throw Malformed($"Undefined {typeof(TEnum).Name} value {raw}.");
+            throw Malformed($"Undefined {typeof(TEnum).Name} value {WireEnum<TEnum>.ToInt64(value)}.");
+        return value;
+    }
+
+    /// <summary>
+    /// Reads an enum value encoded as a zigzag varint and verifies only that it fits the enum's underlying type. Use for
+    /// flag enums and for enums whose value the receiver validates semantically (for example <see cref="FileMode"/> or
+    /// <see cref="FileShare"/>, where an invalid value must produce <see cref="DfsErrorCode.InvalidArgument"/> rather than
+    /// a protocol error).
+    /// </summary>
+    public TEnum ReadEnumRaw<TEnum>() where TEnum : struct, Enum
+    {
+        long raw = ReadVarInt();
+        if (!WireEnum<TEnum>.TryFromInt64(raw, out TEnum value))
+            throw Malformed($"Value {raw} does not fit the underlying type of {typeof(TEnum).Name}.");
         return value;
     }
 
@@ -286,6 +293,21 @@ public ref struct WireReader
 
     /// <summary>Reads the terminal extension block, ignoring optional extensions and rejecting any required one.</summary>
     public void ReadExtensions() => ReadExtensions(FrozenSet<uint>.Empty);
+
+    /// <summary>
+    /// Consumes an empty extension block (a single zero count byte) when one is next, without allocating; returns false
+    /// and consumes nothing otherwise.
+    /// </summary>
+    internal bool TryReadEmptyExtensions()
+    {
+        if (_position < _input.Length && _input[_position] == 0)
+        {
+            _position++;
+            return true;
+        }
+
+        return false;
+    }
 
     /// <summary>Throws <see cref="DfsProtocolException"/> when unread bytes remain.</summary>
     public readonly void EnsureEnd()
