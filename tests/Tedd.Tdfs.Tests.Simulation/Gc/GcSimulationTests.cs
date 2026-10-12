@@ -579,12 +579,14 @@ public sealed class GcSimulationTests
                 ? (await ov.Transactions.QueryOutcomeAsync(id, resolve: false, Ct)).Status
                 : (await ov.QueryOperationAsync(unknown.OperationId, resolve: false, Ct)).Status;
 
-            // Phase 1 — time alone: wall clocks jump, staging ages, GC sweeps repeatedly.
+            // Phase 1 — time alone: wall clocks jump, staging ages, GC sweeps and compaction run repeatedly (§9.7).
             int sweeps = SweepHits(cluster);
             for (int round = 0; round < 4; round++)
             {
                 JumpWallClocks(cluster, TimeSpan.FromDays(7));
                 await cluster.DelayAsync(TimeSpan.FromSeconds(15), Ct);
+                foreach (TestNode node in cluster.Nodes.Where(n => n.State == TestNodeState.Running))
+                    await node.CompactStorageAsync();
                 DfsOutcomeStatus status = await PeekAsync();
                 if (branch == UnknownCommitBranch.Committed)
                     Assert.Equal(DfsOutcomeStatus.Committed, status);
@@ -603,6 +605,8 @@ public sealed class GcSimulationTests
             await leader.RestartAsync();
             await cluster.WaitForStableAsync(TimeSpan.FromSeconds(30), Ct);
             await QuiesceGcAsync(cluster);
+            foreach (TestNode node in cluster.Nodes)
+                await node.CompactStorageAsync();
             DfsOutcomeStatus afterRestart = await PeekAsync();
             if (branch == UnknownCommitBranch.Committed)
                 Assert.Equal(DfsOutcomeStatus.Committed, afterRestart);
@@ -697,13 +701,19 @@ public sealed class GcSimulationTests
             cluster.Faults.AssertReached(arm);
             DfsOperationId? opId = (failure as DfsCommitOutcomeUnknownException)?.OperationId;
             if (failure is not null && opId is null)
-                Assert.True(site == FaultSites.CommitReceiptValidated && failure is DfsUnavailableException,
+            {
+                // Before a quorum commit, an SDK retry of the same operation at the new leader may obtain a definite
+                // availability refusal (for example a receipt from the crashed node's old incarnation). That is the only
+                // ordinary failure allowed, and it is checked below against the bytes (the old revision must remain).
+                Assert.True((site is FaultSites.CommitReceiptValidated or FaultSites.RaftAfterLocalAppend) && failure is DfsUnavailableException,
                     $"a coordinator crash at {site} may only surface as an unknown outcome, got {failure.GetType().Name}: {failure.Message}");
+            }
 
-            // While the coordinator is down: one complete version, never a dangling/partial root.
+            // While the coordinator is down: one complete version, never a dangling/partial root. Copies on the crashed
+            // node do not count, so a reachable object must keep at least one verified copy fewer than the ack count.
             byte[] seen = await ov.Files.ReadAllBytesAsync("/f", Ct);
             Assert.True(seen.AsSpan().SequenceEqual(old) || seen.AsSpan().SequenceEqual(next), "an observer saw neither the old nor the new complete revision");
-            await AssertReachableHeldAsync(cluster, "every reachable object while the coordinator is down");
+            await AssertReachableHeldAsync(cluster, "every reachable object while the coordinator is down", minHolders: Math.Max(1, AckCopies(cluster) - 1));
 
             await leader.RestartAsync();
             await cluster.WaitForStableAsync(TimeSpan.FromSeconds(30), Ct);
@@ -1292,6 +1302,8 @@ public sealed class GcSimulationTests
             byte[] v2 = TestData.Bytes(12_002, 3 * chunk);
             await v.Files.WriteAllBytesAsync("/f", v2, Ct);
             Assert.True(dupCommit.Matched > 0 && lostCommit.Matched > 0, "commit duplication/reply loss was not exercised");
+            dupCommit.Cancel();
+            lostCommit.Cancel();
             AssertBytes(v2, await v.Files.ReadAllBytesAsync("/f", Ct), "/f after duplicated and retried commit");
 
             // 2. Snapshot delete: duplicated and retried (sx), then replayed after the name is reused (s1).
@@ -1329,7 +1341,8 @@ public sealed class GcSimulationTests
             // 4. Copy retried after lost replies.
             MessageRule lostCopy = cluster.Network.DropReplies(new MessageFilter(From: "client:c0", Type: MessageType.Copy), 2);
             await v.Files.CopyAsync("/f", "/h", false, Ct);
-            Assert.True(lostCopy.Matched > 0);
+            Assert.True(lostCopy.Matched > 0, "copy reply loss was not exercised");
+            lostCopy.Cancel();
 
             await QuiesceGcAsync(cluster, 20);
             await AssertHeldAsync(cluster, v1Objects, AckCopies(cluster), "objects still shared by s2 and /g after replayed reference events");
@@ -1507,16 +1520,48 @@ public sealed class GcSimulationTests
             TestNode leader = await cluster.GetLeaderAsync(Volume, Ct);
             TestNode node = cluster.Nodes.First(n => n.Name != leader.Name);
             TestNode reference = cluster.Nodes.First(n => n.Name != node.Name);
-            FaultArm arm = cluster.Faults.Arm(new FaultMatch(site, Node: node.Name), FaultAction.CrashNode(mode));
+
+            // The pass is held at the stage under test, so collection provably overlaps the relocation instead of
+            // racing a pass that may finish (or crash) before any sweep runs.
+            FaultArm arm = cluster.Faults.Arm(new FaultMatch(site, Node: node.Name), FaultAction.Block());
             Task compaction = node.CompactStorageAsync();
-            await QuiesceGcAsync(cluster, 2); // collection runs while the compaction relocates records
             await arm.WaitTriggeredAsync(TimeSpan.FromSeconds(30));
             cluster.Faults.AssertReached(arm);
-            await Record.ExceptionAsync(() => compaction);
-            await WaitAsync(cluster, () => Task.FromResult(node.State == TestNodeState.Crashed), TimeSpan.FromSeconds(10), "the compacting node crashed");
+
+            // While the pass is mid-flight, live records it may be relocating become garbage (superseded files) and GC
+            // passes run, so reachability deletion interleaves with compaction on this node.
+            int sweepsBefore = SweepHits(cluster);
+            for (int i = 0; i < 4; i++)
+            {
+                live[$"/f{i}"] = TestData.Bytes(14_200 + (ulong)i, (2 * chunk) + 2);
+                await v.Files.WriteAllBytesAsync($"/f{i}", live[$"/f{i}"], Ct);
+            }
+
+            HashSet<ObjectId> moreGarbage = await StoredAsync(cluster);
+            moreGarbage.ExceptWith(await ReachableAsync(cluster));
+            garbage.UnionWith(moreGarbage);
+            await QuiesceGcAsync(cluster, 8);
+            Assert.True(SweepHits(cluster) > sweepsBefore, $"no GC sweep ran while the compaction pass was held at {site}");
+            Assert.False(compaction.IsCompleted, $"the compaction pass completed although it was held at {site}");
+
+            // Power is lost while the pass is at the stage, after the interleaved collection. Every record the node held
+            // for a reachable object at that moment was durable and must survive the interrupted relocation.
+            HashSet<ObjectId> reachableAtCrash = await ReachableAsync(cluster);
+            IReadOnlyList<ObjectRecordInfo> nodeIndex = await node.Inspect.ListObjectsAsync(Volume);
+            List<ObjectRecordInfo> indexAtCrash = [.. nodeIndex.Where(r => reachableAtCrash.Contains(r.Id))];
+            TestContext.Current.TestOutputHelper?.WriteLine(
+                $"{site}: {garbage.Count(id => !nodeIndex.Any(r => r.Id == id))} of {garbage.Count} garbage object(s) already reclaimed from {node.Name} while its compaction was held");
+            await node.CrashAsync(mode);
+            arm.Release();
             arm.Disarm();
+            Exception? interrupted = await Record.ExceptionAsync(() => compaction);
+            Assert.NotNull(interrupted); // a pass cut short by the crash must not report completion
 
             await node.RestartAsync();
+            HashSet<ObjectId> stillReachable = await ReachableAsync(cluster);
+            List<ObjectRecordInfo> recovered = [.. await node.Inspect.ListObjectsAsync(Volume)];
+            foreach (ObjectRecordInfo record in indexAtCrash.Where(r => stillReachable.Contains(r.Id)))
+                Assert.True(recovered.Contains(record), $"{node.Name}: the durable record of reachable object {record.Id} was lost by the interrupted compaction ({site}, {mode}).");
             await cluster.WaitForStableAsync(TimeSpan.FromSeconds(30), Ct);
             await QuiesceGcAsync(cluster, 10);
             await node.CompactStorageAsync();
@@ -1600,7 +1645,7 @@ public sealed class GcSimulationTests
 
             // Admission counts those bytes: only what really fits is accepted.
             long accepted = 0;
-            DfsCapacityException? refused = null;
+            Exception? refused = null;
             for (int i = 0; i < 40 && refused is null; i++)
             {
                 try
@@ -1608,14 +1653,13 @@ public sealed class GcSimulationTests
                     await v.Files.WriteAllBytesAsync($"/fill{i}", TestData.Bytes(15_300 + (ulong)i, (int)(2 * mib)), Ct);
                     accepted += 2 * mib;
                 }
-                catch (DfsCapacityException ex)
+                catch (DfsUnavailableException ex) when (IsCapacityRefusal(ex))
                 {
                     refused = ex;
                 }
             }
 
-            Assert.NotNull(refused);
-            Assert.Equal(DfsErrorCode.CapacityExhausted, refused.ErrorCode);
+            Assert.True(refused is not null, "admission never refused although pinned, staged and new bytes exceed the capacity");
             Assert.True(accepted <= capacity - reserve - (9 * mib) + (2 * mib),
                 $"admission accepted {accepted / mib} MiB of new data as if pinned/staged bytes were free (limit {(capacity - reserve - (9 * mib)) / mib} MiB + one write).");
 
@@ -1633,7 +1677,7 @@ public sealed class GcSimulationTests
                     await v.Files.WriteAllBytesAsync("/after-release", TestData.Bytes(15_400, (int)(4 * mib)), Ct);
                     return true;
                 }
-                catch (DfsCapacityException)
+                catch (DfsUnavailableException ex) when (IsCapacityRefusal(ex))
                 {
                     return false;
                 }
@@ -1657,7 +1701,7 @@ public sealed class GcSimulationTests
             await using DfsClient client = await cluster.ConnectAsync(ct: Ct);
             DfsVolume v = client.GetVolume(Volume);
             var filled = new List<string>();
-            DfsCapacityException? refused = null;
+            Exception? refused = null;
             for (int i = 0; i < 64 && refused is null; i++)
             {
                 try
@@ -1665,14 +1709,14 @@ public sealed class GcSimulationTests
                     await v.Files.WriteAllBytesAsync($"/fill{i}", TestData.Bytes(16_000 + (ulong)i, (int)mib), Ct);
                     filled.Add($"/fill{i}");
                 }
-                catch (DfsCapacityException ex)
+                catch (DfsUnavailableException ex) when (IsCapacityRefusal(ex))
                 {
                     refused = ex;
                 }
             }
 
-            Assert.NotNull(refused);
-            Assert.Equal(DfsErrorCode.CapacityExhausted, refused.ErrorCode);
+            Assert.True(refused is not null, "payload admission never stopped before the capacity limit");
+            Assert.True(filled.Count >= 2, $"only {filled.Count} payload write(s) were admitted before the reserve limit");
             long maxObject = cluster.Options.Timings.MaxObjectSize;
             foreach (TestNode node in cluster.Nodes)
                 Assert.True(node.Disk.UsedBytes <= capacity - reserve + maxObject + mib,
@@ -1711,7 +1755,7 @@ public sealed class GcSimulationTests
                     await v.Files.WriteAllBytesAsync("/after", TestData.Bytes(16_500, (int)mib), Ct);
                     return true;
                 }
-                catch (DfsCapacityException)
+                catch (DfsUnavailableException ex) when (IsCapacityRefusal(ex))
                 {
                     return false;
                 }
@@ -1730,12 +1774,14 @@ public sealed class GcSimulationTests
     public async Task GC_017_RepairReserveIsNotUserCapacity()
     {
         const long mib = 1L << 20;
-        await ClusterTest.RunAsync(Det(4) with { NodeCapacityBytes = 48 * mib, ReservedBytes = 20 * mib }, async cluster =>
+        const long capacity = 48 * mib;
+        const long reserve = 20 * mib;
+        await ClusterTest.RunAsync(Det(4) with { NodeCapacityBytes = capacity, ReservedBytes = reserve }, async cluster =>
         {
             await using DfsClient client = await cluster.ConnectAsync(ct: Ct);
             DfsVolume v = client.GetVolume(Volume);
             var files = new Dictionary<string, byte[]>(StringComparer.Ordinal);
-            DfsCapacityException? refused = null;
+            Exception? refused = null;
             for (int i = 0; i < 80 && refused is null; i++)
             {
                 byte[] data = TestData.Bytes(17_000 + (ulong)i, (int)mib);
@@ -1744,14 +1790,21 @@ public sealed class GcSimulationTests
                     await v.Files.WriteAllBytesAsync($"/f{i}", data, Ct);
                     files[$"/f{i}"] = data;
                 }
-                catch (DfsCapacityException ex)
+                catch (DfsUnavailableException ex) when (IsCapacityRefusal(ex))
                 {
                     refused = ex;
                 }
             }
 
-            Assert.NotNull(refused);
+            Assert.True(refused is not null, "payload admission never stopped before the repair reserve");
             Assert.NotEmpty(files);
+
+            // Before the failure the reserve is intact: admission stopped at capacity minus the reserve (plus at most one
+            // object in flight and metadata slack), so the configured repair guarantee is real.
+            long maxObject = cluster.Options.Timings.MaxObjectSize;
+            foreach (TestNode node in cluster.Nodes)
+                Assert.True(node.Disk.UsedBytes <= capacity - reserve + maxObject + mib,
+                    $"{node.Name}: normal admission pre-consumed the repair reserve ({node.Disk.UsedBytes / mib} MiB used of {capacity / mib} MiB with a {reserve / mib} MiB reserve)");
 
             TestNode lost = cluster.Nodes[^1];
             await lost.CrashAsync(CrashMode.LoseUnflushed);
@@ -1760,13 +1813,21 @@ public sealed class GcSimulationTests
                 (await cluster.Inspect.GetTotalCountersAsync()).RepairBytes > 0, TimeSpan.FromSeconds(30), "the loss is detected as a replica deficit");
 
             // Normal admission cannot take the space reserved for this repair.
-            await AssertEx.ThrowsDfsAsync<DfsCapacityException>(() => v.Files.WriteAllBytesAsync("/during-repair", TestData.Bytes(17_500, (int)mib), Ct), DfsErrorCode.CapacityExhausted);
+            DfsException duringRepair = await AssertEx.ThrowsDfsAsync<DfsException>(() => v.Files.WriteAllBytesAsync("/during-repair", TestData.Bytes(17_500, (int)mib), Ct));
+            Assert.True(IsCapacityRefusal(duringRepair), $"a payload write during repair must be refused for capacity, got {duringRepair.GetType().Name} ({duringRepair.ErrorCode})");
+            Assert.False(await v.Files.ExistsAsync("/during-repair", Ct));
 
             await cluster.WaitForRepairAsync(Volume, TimeSpan.FromMinutes(3), Ct);
             DfsReplicaHealth health = await cluster.Inspect.GetReplicaHealthAsync(Volume);
             Assert.Equal(0, health.UnderReplicatedObjects);
             Assert.Equal(0, health.ZoneDeficitObjects);
             Assert.Equal(0, health.MissingObjects);
+
+            // The repair really ran in the reserve (the scenario exercised it), without exceeding the device.
+            TestNode[] survivors = [.. cluster.Nodes.Where(n => n.Name != lost.Name)];
+            Assert.Contains(survivors, n => n.Disk.UsedBytes > capacity - reserve);
+            foreach (TestNode node in survivors)
+                Assert.True(node.Disk.UsedBytes <= capacity, $"{node.Name} exceeds its device capacity after repair");
             foreach ((string path, byte[] data) in files.Take(6))
                 AssertBytes(data, await v.Files.ReadAllBytesAsync(path, Ct), $"{path} after repair into the reserve");
             await AssertReachableHeldAsync(cluster, "after repair");

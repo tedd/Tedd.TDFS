@@ -21,12 +21,15 @@ Behaviour:
   collection, repair and client traffic in the same way as a background pass, including in deterministic mode.
 * Every compaction fault site (`FaultSites.CompactionCopy`, `CompactionPublish`, `CompactionDelete`) is reported to
   the node's fault injector, so faults armed with `TestFaults.Arm` fire inside the pass.
-* If an armed fault crashes the node during the pass, the returned task faults (with any exception) instead of
-  hanging.
+* If the node crashes or stops while the pass is in progress (an armed fault, or `CrashAsync`/`StopAsync` while the
+  pass is held by a `Block` fault at a compaction site), the returned task faults (with any exception) instead of
+  hanging; an interrupted pass never reports completion.
 * Compacting a store that has no dead records is a no-op that still completes.
 * Throws `InvalidOperationException` unless the node is `Running`.
 
-Needed by: `GC_014_CrashDuringCompactionAndGc`. Without it there is no deterministic way to make compaction overlap
+Needed by: `GC_014_CrashDuringCompactionAndGc` (holds a pass at each compaction stage with a `Block` fault while GC
+sweeps run, then crashes the node) and `GC_005_UnknownTransactionIsNotAbortedByAge` (compaction runs repeatedly inside
+the unknown-outcome window, test plan §9.7). Without it there is no deterministic way to make compaction overlap
 collection. Background compaction depends on thresholds the API does not expose, so a fault armed at a compaction
 site might never be reached.
 

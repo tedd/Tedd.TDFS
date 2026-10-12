@@ -866,8 +866,17 @@ internal static class DskHelpers
         yield return (DskMediumKind.FileSystem, CrashMode.KeepUnflushed);
     }
 
-    public static ObjectStoreOptions SmallStoreOptions(long segmentSize = 64 << 10, long reserved = 0, IRecordCipher? cipher = null) =>
-        new(SegmentSize: segmentSize, ReservedBytes: reserved, MaxObjectSize: 1 << 20, Cipher: cipher);
+    /// <summary>
+    /// Small-segment store options. The object-size limit is kept at half a segment (at most 1 MiB) so a maximal record
+    /// (header, payload and per-unit tags) always fits one segment; the API does not define what a store does with an
+    /// object larger than its segment size, so no test relies on that.
+    /// </summary>
+    public static ObjectStoreOptions SmallStoreOptions(long segmentSize = 512 << 10, long reserved = 0, IRecordCipher? cipher = null) =>
+        new(SegmentSize: segmentSize, ReservedBytes: reserved, MaxObjectSize: (int)Math.Min(1 << 20, segmentSize / 2), Cipher: cipher);
+
+    /// <summary>True for the typed capacity failure, or a disk-full I/O error (ENOSPC), possibly wrapped.</summary>
+    public static bool IsCapacityFailure(Exception? ex) =>
+        ex is DfsCapacityException or DfsException { ErrorCode: DfsErrorCode.CapacityExhausted } || StorageErrors.IsDiskFull(ex);
 
     public static ObjectId Oid(ulong n) => new(((UInt128)0xD5C0_0000_0000_0000UL << 64) | n);
 
@@ -1169,6 +1178,16 @@ internal static class DskHelpers
         using var ms = new MemoryStream();
         await stream.CopyToAsync(ms, Ct);
         return ms.ToArray();
+    }
+
+    /// <summary>Restarts every node that is not running (a node may stop itself after a fatal local I/O error).</summary>
+    public static async Task RestartStoppedNodesAsync(TestCluster cluster)
+    {
+        foreach (TestNode node in cluster.Nodes)
+        {
+            if (node.State is TestNodeState.Crashed or TestNodeState.Stopped)
+                await node.RestartAsync();
+        }
     }
 
     /// <summary>Asserts <paramref name="ex"/> is an explicit (typed) failure of a read, never a silent success.</summary>

@@ -50,9 +50,32 @@ internal static class GcHelpers
         }
     }
 
-    /// <summary>Every object reachable from an authoritative root (current, snapshots, pins, transactions) is still held.</summary>
-    public static async Task AssertReachableHeldAsync(TestCluster cluster, string because, string volume = Volume) =>
-        await AssertHeldAsync(cluster, await ReachableAsync(cluster, volume), AckCopies(cluster), because);
+    /// <summary>
+    /// Every object reachable from an authoritative root (current, snapshots, pins, transactions) is still held by at least
+    /// <paramref name="minHolders"/> nodes (default: the acknowledgement copy count). Safe to call while writers run: an
+    /// object found under-held is re-checked against a fresh reachable set taken after its holders were counted. Reachability
+    /// is lost only once (an unreachable object id is never referenced again), so an object still reachable then was
+    /// reachable throughout and its missing copies are a violation, whereas one superseded meanwhile may legitimately have
+    /// been collected.
+    /// </summary>
+    public static async Task AssertReachableHeldAsync(TestCluster cluster, string because, string volume = Volume, int? minHolders = null)
+    {
+        int min = minHolders ?? AckCopies(cluster);
+        foreach (ObjectId id in await ReachableAsync(cluster, volume))
+        {
+            IReadOnlyList<string> holders = await cluster.Inspect.GetObjectHoldersAsync(id);
+            if (holders.Count >= min || !(await ReachableAsync(cluster, volume)).Contains(id))
+                continue;
+            Assert.Fail($"{because}: reachable object {id} has {holders.Count} verified holder(s) [{string.Join(",", holders)}], at least {min} required (INV-09).");
+        }
+    }
+
+    /// <summary>
+    /// True for an admission refusal caused by full storage: the typed capacity error, or the placement error it turns
+    /// into when too few placement targets can accept the upload.
+    /// </summary>
+    public static bool IsCapacityRefusal(Exception ex) =>
+        ex is DfsCapacityException { ErrorCode: DfsErrorCode.CapacityExhausted } or DfsPlacementUnavailableException;
 
     /// <summary>Lets several GC/inventory passes run (virtual time in deterministic mode).</summary>
     public static Task QuiesceGcAsync(TestCluster cluster, int passes = 12) =>

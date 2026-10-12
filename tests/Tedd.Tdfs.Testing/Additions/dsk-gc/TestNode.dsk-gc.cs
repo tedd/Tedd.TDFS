@@ -12,8 +12,9 @@ public sealed partial class TestNode
     /// with garbage collection, repair and client traffic exactly like a background pass, including in deterministic
     /// mode); every compaction fault site (<see cref="FaultSites.CompactionCopy"/>, <see cref="FaultSites.CompactionPublish"/>,
     /// <see cref="FaultSites.CompactionDelete"/>) is reported to the node's fault injector, so armed faults fire inside
-    /// it; when an armed fault crashes the node during the pass, the returned task faults (with any exception) instead
-    /// of hanging. Compacting a store without dead records is a no-op that still completes.
+    /// it; when the node crashes or stops during the pass (an armed fault, or <see cref="CrashAsync"/>/<see cref="StopAsync"/>
+    /// while the pass is held by a Block fault), the returned task faults (with any exception) instead of hanging, so an
+    /// interrupted pass never reports completion. Compacting a store without dead records is a no-op that still completes.
     /// </remarks>
     /// <exception cref="InvalidOperationException">The node is not <see cref="TestNodeState.Running"/>.</exception>
     public Task CompactStorageAsync() => throw Stub.NotYet("TestNode.CompactStorageAsync");
