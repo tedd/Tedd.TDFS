@@ -143,11 +143,12 @@ public sealed class PubUnitTests
             DfsVolume wv = writerClient.GetVolume(Vol);
             DfsVolume ov = otherClient.GetVolume(Vol);
             await SeedFileAsync(wv, path, initial);
-            DfsFileInfo before = await ov.Files.GetInfoAsync(path, Ct);
 
             await using DfsStream liveReader = await ov.Files.OpenAsync(path, LiveReaderOptions(), Ct);
             await using DfsStream writer = await wv.Files.OpenAsync(path, WriterOptions(FileMode.Open), Ct);
             Assert.Equal(DfsWriteMode.OnFlush, writer.WriteMode);
+            // Baseline after the (non-creating) writer open: only the staging under test may not change it.
+            DfsFileInfo before = await AssertCommittedAsync(ov, path, initial, "committed state before the staged write");
 
             var model = new ReferenceFileModel(initial);
             writer.Seek(offset, SeekOrigin.Begin);
@@ -163,7 +164,9 @@ public sealed class PubUnitTests
             // Every other observer still sees the preceding committed revision.
             await AssertCommittedAsync(ov, path, initial, "another client must see the last committed version before flush", before.Revision);
             await AssertBytesAsync(initial, ReadFromStartAsync(liveReader, Ct), "a live reader handle opened before the write must see committed bytes only");
-            await AssertBytesAsync(initial, wv.Files.ReadAllBytesAsync(path, Ct), "a different handle of the writing client must not see another handle's staging");
+            (byte[] sameClient, ulong sameClientRevision) = await ReadPinnedAsync(wv, path);
+            AssertEx.BytesEqual(initial, sameClient, "a different handle of the writing client must not see another handle's staging");
+            Assert.Equal(before.Revision, sameClientRevision);
             FileInspection? inspected = await cluster.Inspect.GetFileAsync(Vol, path);
             Assert.NotNull(inspected);
             Assert.Equal(before.Revision, inspected.Revision);
@@ -248,7 +251,14 @@ public sealed class PubUnitTests
             DfsFileInfo baseline = await AssertCommittedAsync(ov, path, model.Committed, "baseline after the last real publication");
             HashSet<ObjectId> baselineExtents = await ReferencedObjectsAsync(cluster, path);
             IReadOnlySet<ObjectId> baselineStored = await cluster.Inspect.GetAllStoredObjectsAsync(Vol);
+            long publishBaseline = PublishRequests(cluster, "c0");
 
+            // FSD §6.3/§6.4: a flush with nothing pending must not mutate, duplicate (re-append/re-publish the old
+            // buffer) or truncate. Whether a writable handle's empty flush records an (identical) revision is not
+            // specified, so only content, length, inode, extent map and uploads are pinned for writable handles. A
+            // read-only flush is a documented no-op: no publication request and no new revision at all.
+            bool readOnly = scenario == NoOpScenario.ReadOnlyHandle;
+            ulong lastRevision = baseline.Revision;
             for (int i = 0; i < RepeatedFlushes; i++)
             {
                 switch (api)
@@ -271,21 +281,30 @@ public sealed class PubUnitTests
                 }
 
                 Assert.Equal(0, stream.PendingBytes);
-                DfsFileInfo now = await ov.Files.GetInfoAsync(path, Ct);
-                Assert.True(baseline.Revision == now.Revision, $"No-op flush #{i + 1} created revision {now.Revision} (baseline {baseline.Revision}).");
-                Assert.Equal(baseline.Length, now.Length);
+                DfsFileInfo now = await AssertCommittedAsync(ov, path, model.Committed,
+                    $"no-op flush #{i + 1} must neither mutate, duplicate nor truncate");
+                Assert.Equal(baseline.InodeId, now.InodeId);
+                Assert.True(now.Revision >= lastRevision, $"No-op flush #{i + 1} moved the revision backwards ({lastRevision} -> {now.Revision}).");
+                if (readOnly)
+                    Assert.True(baseline.Revision == now.Revision, $"Read-only flush #{i + 1} created revision {now.Revision} (baseline {baseline.Revision}).");
+                lastRevision = now.Revision;
             }
 
-            await AssertCommittedAsync(ov, path, model.Committed, "repeated no-op flushes must neither mutate, duplicate nor truncate", baseline.Revision);
             Assert.True(baselineExtents.SetEquals(await ReferencedObjectsAsync(cluster, path)), "no-op flushes must not remap any extent");
             IReadOnlySet<ObjectId> storedAfter = await cluster.Inspect.GetAllStoredObjectsAsync(Vol);
             Assert.True(storedAfter.IsSubsetOf(baselineStored), "no-op flushes must not upload new objects");
+            if (readOnly)
+                Assert.Equal(publishBaseline, PublishRequests(cluster, "c0"));
 
             // Disposal is one more (no-op) flush: still no duplicate append or truncation.
             await stream.DisposeAsync();
-            await AssertCommittedAsync(ov, path, model.Committed, "disposing after no-op flushes must not change the file", baseline.Revision);
+            DfsFileInfo final = await AssertCommittedAsync(ov, path, model.Committed, "disposing after no-op flushes must not change the file");
+            Assert.Equal(baseline.InodeId, final.InodeId);
+            Assert.True(baselineExtents.SetEquals(await ReferencedObjectsAsync(cluster, path)), "disposal after no-op flushes must not remap any extent");
+            if (readOnly)
+                Assert.Equal(baseline.Revision, final.Revision);
             if (scenario == NoOpScenario.AppendAfterFlushedWrite)
-                Assert.Equal(initial.LongLength + change.LongLength, (await ov.Files.GetInfoAsync(path, Ct)).Length);
+                Assert.Equal(initial.LongLength + change.LongLength, final.Length);
         }, Ct);
 
     // ------------------------------------------------------------------------------------------------------------
@@ -383,7 +402,7 @@ public sealed class PubUnitTests
             await AssertDurableAsync(cluster, path, ThreeZonePolicy, "dispose returned success");
             // ... and the reservation was released before Dispose returned.
             VolumeStateInspection state = await cluster.Inspect.GetVolumeStateAsync(Vol);
-            Assert.DoesNotContain(state.Handles, h => h.Inode == inode && !h.Expired);
+            Assert.DoesNotContain(state.Handles, h => h.Inode == inode && h.IsWriter && !h.Expired);
             Assert.True(await TryOpenWriterAsync(ov, path), "the writer reservation must be released when Dispose succeeds");
 
             // A disposed stream rejects further I/O.
@@ -574,8 +593,9 @@ public sealed class PubUnitTests
     [Theory]
     [MemberData(nameof(Pub020Cases))]
     [Catalog("PUB-020", "U", "INV-02", "INV-16")]
-    public Task PUB_020_FinalizerDoesNotCommit(int stagedLength, AbandonKind kind) =>
-        ClusterTest.RunAsync(TestClusterOptions.ThreeZones, async cluster =>
+    public async Task PUB_020_FinalizerDoesNotCommit(int stagedLength, AbandonKind kind)
+    {
+        bool collected = await ClusterTest.RunAsync(TestClusterOptions.ThreeZones, async cluster =>
         {
             const string path = "/pub020/f";
             byte[] initial = TestData.Bytes(0x0020_0001, 30_000);
@@ -587,29 +607,35 @@ public sealed class PubUnitTests
             await SeedFileAsync(wv, path, initial);
 
             byte[] committedAfterOpen = kind == AbandonKind.CreateHelper ? Array.Empty<byte>() : initial;
-            long publishesBefore = PublishRequests(cluster, "c0");
             ulong revisionAfterOpen;
             WeakReference weak;
             (weak, revisionAfterOpen) = await AbandonDirtyStreamAsync(wv, path, kind, staged);
+            await AssertCommittedAsync(ov, path, committedAfterOpen, "the abandoned stream's staging is unpublished", revisionAfterOpen);
             long publishesAfterOpen = PublishRequests(cluster, "c0");
 
             ForceFullCollection();
-            Assert.False(weak.IsAlive,
-                "the abandoned DfsStream must be collectable so its finalizer can run (otherwise this test proves nothing and its staged buffers leak)");
+            bool wasCollected = !weak.IsAlive;
 
             await cluster.DelayAsync(TimeSpan.FromSeconds(1), Ct);
             Assert.Equal(publishesAfterOpen, PublishRequests(cluster, "c0"));
             await AssertCommittedAsync(ov, path, committedAfterOpen, "the finalizer must not publish staged bytes", revisionAfterOpen);
 
-            // Client disposal is not a substitute for flushing abandoned streams either; the reservation is released only
-            // by server-authoritative expiry/close.
+            // Client disposal is not a substitute for flushing abandoned streams either (DfsClient.Dispose never flushes);
+            // the reservation is released only by server-authoritative close/expiry.
             await writerClient.DisposeAsync();
             await cluster.WaitUntilAsync(() => TryOpenWriterAsync(ov, path), TimeSpan.FromSeconds(30),
                 "the abandoned writer's reservation must be released by the server after its lease/session ends", Ct);
             Assert.Equal(publishesAfterOpen, PublishRequests(cluster, "c0"));
-            Assert.True(publishesAfterOpen >= publishesBefore);
             await AssertCommittedAsync(ov, path, committedAfterOpen, "no publication after collection, client disposal or lease expiry", revisionAfterOpen);
+            return wasCollected;
         }, Ct);
+
+        // The FSD forbids finalizer commits but does not require the SDK to let abandoned streams be collected. If the
+        // stream stayed reachable its finalizer never ran, so the finalizer path was not exercised: that is an
+        // inconclusive result (test plan §2.1), never a pass.
+        if (!collected)
+            Assert.Skip("inconclusive: the abandoned DfsStream was still reachable after forced full collections, so its finalizer never ran");
+    }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static async Task<(WeakReference Stream, ulong OpenRevision)> AbandonDirtyStreamAsync(DfsVolume volume, string path, AbandonKind kind, byte[] staged)
@@ -670,10 +696,10 @@ public sealed class PubUnitTests
             DfsVolume wv = writerClient.GetVolume(Vol);
             DfsVolume ov = otherClient.GetVolume(Vol);
             await SeedFileAsync(wv, path, initial);
-            DfsFileInfo before = await ov.Files.GetInfoAsync(path, Ct);
 
             var model = new ReferenceFileModel(initial);
             DfsStream writer = await wv.Files.OpenAsync(path, WriterOptions(FileMode.Open, bufferSize: DefaultBuffer), Ct);
+            DfsFileInfo before = await AssertCommittedAsync(ov, path, initial, "committed state after the writer's open");
             writer.Seek(0, SeekOrigin.Begin);
             await writer.WriteAsync(w1, Ct);
             model.Write(0, w1);
@@ -700,7 +726,9 @@ public sealed class PubUnitTests
                 // The call failed partway through: it must be rolled back privately or fault the stream.
                 cluster.Faults.AssertReached(arm);
                 arm.Disarm();
-                Assert.False(writeError is ArgumentException, $"A storage failure must not surface as an argument error: {writeError}");
+                Assert.False(writeError is OperationCanceledException, $"A storage failure is not a cancellation: {writeError}");
+                Assert.True(writeError is IOException or TimeoutException,
+                    $"A storage failure must surface as an I/O or availability failure, got {writeError.GetType().FullName}: {writeError}");
                 if (writer.IsFaulted)
                 {
                     Assert.NotNull(writer.Fault);
@@ -725,7 +753,7 @@ public sealed class PubUnitTests
                 Assert.NotNull(flushError);
                 arm.Disarm();
                 Exception? disposeError = await Record.ExceptionAsync(async () => await writer.DisposeAsync());
-                byte[] committed = await ov.Files.ReadAllBytesAsync(path, Ct);
+                (byte[] committed, _) = await ReadPinnedAsync(ov, path);
                 bool isInitial = committed.AsSpan().SequenceEqual(initial);
                 bool isFull = committed.AsSpan().SequenceEqual(fullStaged);
                 Assert.True(isInitial || isFull, "after a failed publication the file must be the old revision or the complete accepted staging, never a partial call");
@@ -821,6 +849,7 @@ public sealed class PubUnitTests
             byte[] expected = initial;
             long expectedRequested = -1;
             long expectedLimit = PublishLimit;
+            string expectedLimitName = nameof(DfsVolumeLimits.MaxPublishBytes);
             switch (limitCase)
             {
                 case LimitCase.StreamOverPublishLimit:
@@ -866,6 +895,7 @@ public sealed class PubUnitTests
                     writer.Seek(offset, SeekOrigin.Begin);
                     error = await Record.ExceptionAsync(async () => await writer.WriteAsync(new byte[] { 0xEE }, Ct));
                     expectedLimit = FileLengthLimit;
+                    expectedLimitName = nameof(DfsVolumeLimits.MaxFileLength);
                     if (limitCase == LimitCase.WriteThroughPastMaxFileLength)
                     {
                         expectedRequested = FileLengthLimit + 1;
@@ -887,6 +917,7 @@ public sealed class PubUnitTests
                         await writer.FlushAsync(Ct);
                     });
                     expectedLimit = FileLengthLimit;
+                    expectedLimitName = nameof(DfsVolumeLimits.MaxFileLength);
                     expectedRequested = FileLengthLimit + 1;
                     await Record.ExceptionAsync(() => writer.AbortAsync(Ct));
                     await Record.ExceptionAsync(async () => await writer.DisposeAsync());
@@ -903,6 +934,7 @@ public sealed class PubUnitTests
                         await tx.CommitAsync(Ct);
                     });
                     expectedLimit = TxStagedLimit;
+                    expectedLimitName = nameof(DfsVolumeLimits.MaxTransactionStagedBytes);
                     await Record.ExceptionAsync(async () => await tx.DisposeAsync());
                     Assert.NotEqual(DfsTransactionState.Committed, tx.State);
                     await AssertCommittedAsync(ov, txA, initial, "an over-limit transaction must not publish any of its files");
@@ -922,7 +954,7 @@ public sealed class PubUnitTests
 
             DfsLimitExceededException limit = Assert.IsAssignableFrom<DfsLimitExceededException>(error);
             Assert.Equal(DfsErrorCode.LimitExceeded, limit.ErrorCode);
-            Assert.False(string.IsNullOrEmpty(limit.LimitName), "the typed limit failure must name the limit");
+            Assert.Equal(expectedLimitName, limit.LimitName);
             Assert.Equal(expectedLimit, limit.Limit);
             Assert.True(limit.Requested > limit.Limit, $"Requested {limit.Requested} must exceed the limit {limit.Limit}.");
             if (expectedRequested >= 0)

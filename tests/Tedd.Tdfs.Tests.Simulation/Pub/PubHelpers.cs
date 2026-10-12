@@ -56,6 +56,76 @@ internal sealed class Publication
     public DfsOperationKind OperationKind => PubHelpers.OperationKindOf(Kind);
 }
 
+/// <summary>
+/// A <see cref="FaultAction.Custom"/> gate for a storage durability site: the <c>ordinal</c>-th distinct object (by
+/// <see cref="FaultContext.Object"/>) to reach the site is held on every node until <see cref="Release"/>; all other
+/// objects pass. Deterministic-simulation safe: held hits only await a <see cref="TaskCompletionSource"/> that the
+/// scenario completes.
+/// </summary>
+internal sealed class ObjectDurabilityGate
+{
+    private readonly object _lock = new();
+    private readonly int _ordinal;
+    private readonly List<ObjectId> _seen = [];
+    private readonly TaskCompletionSource _release = new();
+    private ObjectId? _withheld;
+    private int _heldHits;
+
+    public ObjectDurabilityGate(int ordinal)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(ordinal, 1);
+        _ordinal = ordinal;
+    }
+
+    /// <summary>The object being withheld, once identified.</summary>
+    public ObjectId? Withheld
+    {
+        get
+        {
+            lock (_lock)
+                return _withheld;
+        }
+    }
+
+    /// <summary>Hits (replica writes) of the withheld object that were held.</summary>
+    public int HeldHits
+    {
+        get
+        {
+            lock (_lock)
+                return _heldHits;
+        }
+    }
+
+    /// <summary>The harness action.</summary>
+    public FaultAction Action => FaultAction.Custom(async context =>
+    {
+        bool hold = false;
+        lock (_lock)
+        {
+            if (context.Object is { } id)
+            {
+                if (!_seen.Contains(id))
+                {
+                    _seen.Add(id);
+                    if (_seen.Count == _ordinal)
+                        _withheld = id;
+                }
+
+                hold = _withheld == id;
+                if (hold)
+                    _heldHits++;
+            }
+        }
+
+        if (hold)
+            await _release.Task;
+    });
+
+    /// <summary>Lets every held hit continue.</summary>
+    public void Release() => _release.TrySetResult();
+}
+
 /// <summary>Shared helpers for the PUB simulation tests (FSD §§6.3–6.4, 10.3, 13).</summary>
 internal static class PubHelpers
 {
@@ -134,6 +204,24 @@ internal static class PubHelpers
     /// <summary>A version-pinned reader that tolerates a concurrent writer.</summary>
     public static DfsOpenOptions PinnedReaderOptions() => LiveReaderOptions() with { ReadView = DfsReadView.VersionPinned };
 
+    /// <summary>
+    /// An independent observer: a version-pinned read handle granting <c>ReadWrite | Delete</c>, compatible with any
+    /// active writer (test plan §5). Observations use this explicit handle instead of the <c>ReadAll*</c> helpers, whose
+    /// sharing mode is unspecified and may legitimately conflict with an open (or abandoned, not yet expired) writer.
+    /// </summary>
+    public static DfsOpenOptions ObserverOptions() => PinnedReaderOptions() with { Share = FileShare.ReadWrite | FileShare.Delete };
+
+    /// <summary>Reads the whole committed file through one pinned observer handle: one revision, bytes and revision together.</summary>
+    public static async Task<(byte[] Bytes, ulong Revision)> ReadPinnedAsync(DfsVolume volume, string path)
+    {
+        await using DfsStream reader = await volume.Files.OpenAsync(path, ObserverOptions(), Ct);
+        byte[] bytes = await ReadFromStartAsync(reader);
+        return (bytes, reader.OpenRevision);
+    }
+
+    /// <summary>The committed bytes of <paramref name="path"/> as one pinned observation.</summary>
+    public static async Task<byte[]> ReadCommittedAsync(DfsVolume volume, string path) => (await ReadPinnedAsync(volume, path)).Bytes;
+
     /// <summary>Creates the parent directory (if needed) and commits <paramref name="content"/>.</summary>
     public static async Task<CommitToken> SeedFileAsync(DfsVolume volume, string path, byte[] content)
     {
@@ -195,14 +283,19 @@ internal static class PubHelpers
         AssertEx.BytesEqual(expected, bytes, because);
     }
 
-    /// <summary>Asserts the committed bytes/length (and optionally revision) seen by an independent observer.</summary>
+    /// <summary>
+    /// Asserts the committed bytes/length (and optionally revision) seen by an independent observer. The bytes come from
+    /// one pinned observer handle (<see cref="ObserverOptions"/>) and must belong to the revision GetInfo reports.
+    /// </summary>
     public static async Task<DfsFileInfo> AssertCommittedAsync(DfsVolume observer, string path, byte[] expected, string because,
         ulong? expectedRevision = null)
     {
-        byte[] actual = await observer.Files.ReadAllBytesAsync(path, Ct);
+        (byte[] actual, ulong pinnedRevision) = await ReadPinnedAsync(observer, path);
         AssertEx.BytesEqual(expected, actual, because);
         DfsFileInfo info = await observer.Files.GetInfoAsync(path, Ct);
         Assert.True(expected.LongLength == info.Length, $"Expected length {expected.LongLength} but observed {info.Length}: {because}");
+        Assert.True(pinnedRevision == info.Revision,
+            $"The pinned read observed revision {pinnedRevision} but GetInfo reports {info.Revision} with no concurrent writer: {because}");
         if (expectedRevision is { } revision)
             Assert.True(revision == info.Revision, $"Expected revision {revision} but observed {info.Revision}: {because}");
         return info;

@@ -95,6 +95,15 @@ public enum LengthChange
     ShrinkThenExtend,
 }
 
+/// <summary>Where PUB-011 delays one newly referenced object.</summary>
+public enum DelayedAt
+{
+    /// <summary>The client holds the upload of one chunk before sending it (F03).</summary>
+    ClientUploadSend,
+    /// <summary>Every storage node receives the object but its durability primitive is withheld (F07).</summary>
+    StorageDurability,
+}
+
 /// <summary>Staging step at which PUB-012 crashes.</summary>
 public enum StagingCrashPoint
 {
@@ -162,11 +171,11 @@ public enum DisposeFailure
 {
     /// <summary>Every storage node fails the object durability primitive.</summary>
     StorageFlushFails,
-    /// <summary>Two of three storage nodes are full.</summary>
+    /// <summary>Two of three storage nodes report ENOSPC for object data.</summary>
     DisksFull,
     /// <summary>The commit is applied but its reply is withheld and the client is cut off.</summary>
     CommitReplyWithheld,
-    /// <summary>The metadata group loses its majority before disposal.</summary>
+    /// <summary>Three of five metadata voters become unreachable before disposal; data placement stays possible.</summary>
     QuorumLost,
 }
 
@@ -199,7 +208,7 @@ public enum Withheld
     RequiredZoneForStrongPolicy,
     /// <summary>Two of three nodes never complete the object durability primitive (ack-2 policy).</summary>
     RequiredDiskDurability,
-    /// <summary>A node required by an ack-3/3 policy is out of space.</summary>
+    /// <summary>A node required by an ack-3/3 policy reports ENOSPC for object data.</summary>
     RequiredDiskFull,
 }
 
@@ -236,13 +245,13 @@ public sealed class PubSimulationTests
             DfsVolume wv = writerClient.GetVolume(Vol);
             DfsVolume rv = readerClient.GetVolume(Vol);
             await SeedFileAsync(wv, path, initial);
-            DfsFileInfo before = await rv.Files.GetInfoAsync(path, Ct);
-            IReadOnlySet<ObjectId> storedBefore = await cluster.Inspect.GetAllStoredObjectsAsync(Vol);
-            long putsBefore = PutObjectsFrom(cluster, "c0");
-            long publishBefore = PublishRequests(cluster, "c0");
 
             await using DfsStream liveReader = await rv.Files.OpenAsync(path, LiveReaderOptions(), Ct);
             await using DfsStream writer = await wv.Files.OpenAsync(path, WriterOptions(FileMode.Open, bufferSize: bufferSize), Ct);
+            DfsFileInfo before = await AssertCommittedAsync(rv, path, initial, "committed state after the writer's open");
+            IReadOnlySet<ObjectId> storedBefore = await cluster.Inspect.GetAllStoredObjectsAsync(Vol);
+            long putsBefore = PutObjectsFrom(cluster, "c0");
+            long publishBefore = PublishRequests(cluster, "c0");
             var model = new ReferenceFileModel(initial);
             if (!scattered)
             {
@@ -264,8 +273,11 @@ public sealed class PubSimulationTests
                 }
             }
 
-            // Precondition: the buffer overflowed, so staged data was uploaded early.
-            Assert.True(PutObjectsFrom(cluster, "c0") > putsBefore, "exceeding the client buffer must upload staged data before publication");
+            // Precondition (bounded wait, not a timing claim): exceeding the client buffer uploads staged data before any
+            // publication, and the upload reaches storage.
+            await cluster.WaitUntilAsync(async () => PutObjectsFrom(cluster, "c0") > putsBefore
+                    && (await NewObjectsSinceAsync(cluster, storedBefore)).Count > 0, TimeSpan.FromSeconds(10),
+                "exceeding the client buffer must upload staged data to storage before publication", Ct);
             HashSet<ObjectId> uploaded = await NewObjectsSinceAsync(cluster, storedBefore);
             Assert.NotEmpty(uploaded);
             Assert.True(writer.PendingBytes > bufferSize, $"PendingBytes {writer.PendingBytes} must count uploaded-but-unpublished bytes");
@@ -411,10 +423,12 @@ public sealed class PubSimulationTests
 
     private static async Task ReadUntilPublishedAsync(TestCluster cluster, DfsVolume volume, string path, Task publication, string process)
     {
+        // Each observation is one pinned observer handle (one revision for the whole file), opened with sharing that is
+        // compatible with the active writer (test plan §5).
         for (int i = 0; i < 10_000; i++)
         {
             bool last = publication.IsCompleted;
-            await cluster.History.RecordAsync(process, "read", path, null, () => volume.Files.ReadAllBytesAsync(path, Ct));
+            await cluster.History.RecordAsync(process, "read", path, null, () => ReadCommittedAsync(volume, path));
             if (last)
                 return;
         }
@@ -453,9 +467,9 @@ public sealed class PubSimulationTests
             DfsVolume wv = writerClient.GetVolume(Vol);
             DfsVolume rv = readerClient.GetVolume(Vol);
             await SeedFileAsync(wv, path, initial);
-            DfsFileInfo before = await rv.Files.GetInfoAsync(path, Ct);
 
             await using DfsStream writer = await wv.Files.OpenAsync(path, WriterOptions(FileMode.Open, bufferSize: LargeBuffer), Ct);
+            DfsFileInfo before = await AssertCommittedAsync(rv, path, initial, "committed state after the writer's open");
             var model = new ReferenceFileModel(initial);
             await WriteAtAsync(writer, 0, data);
             model.Write(0, data);
@@ -574,8 +588,10 @@ public sealed class PubSimulationTests
                 return (await wv.GetInfoAsync(Ct)).LastCommit;
             }
 
+            // The bound is well below the client's operation deadline (10 s): a publication that waited for the backup
+            // until some timeout and then succeeded anyway would still be caught.
             Task<CommitToken> publication = PublishAsync();
-            Exception? error = await CaptureWithinAsync(cluster, publication, TimeSpan.FromSeconds(15),
+            Exception? error = await CaptureWithinAsync(cluster, publication, TimeSpan.FromSeconds(5),
                 "live publication must not wait for a disconnected late-sync host");
             Assert.Null(error);
             CommitToken token = await publication;
@@ -652,6 +668,8 @@ public sealed class PubSimulationTests
                 : new (long, int)[] { (0, 100), (100, 5_000), (65_000, 2_000), (300_000, 10), (50, 10) };
 
             var model = new ReferenceFileModel(initial);
+            // A live reader handle opened before the writes: every new read call selects the latest committed revision.
+            DfsStream liveReader = await rv.Files.OpenAsync(path, LiveReaderOptions(), Ct);
             DfsStream writer = await wv.Files.OpenAsync(path, WriterOptions(FileMode.Open, DfsWriteMode.WriteThrough), Ct);
             for (int i = 0; i < calls.Length; i++)
             {
@@ -662,6 +680,8 @@ public sealed class PubSimulationTests
                 model.Flush();
 
                 Assert.Equal(0, writer.PendingBytes);
+                await AssertBytesAsync(model.Committed, ReadFromStartAsync(liveReader),
+                    $"WriteThrough call #{i} must be visible to an existing live reader handle when it returns");
                 DfsFileInfo info = await AssertCommittedAsync(rv, path, model.Committed,
                     $"WriteThrough call #{i} must be completely visible to independent live reads when it returns");
                 Assert.True(info.Revision > lastRevision, $"call #{i} must publish its own revision");
@@ -669,6 +689,7 @@ public sealed class PubSimulationTests
                 await AssertDurableAsync(cluster, path, ThreeZonePolicy, $"WriteThrough call #{i} returned");
             }
             await writer.DisposeAsync();
+            await liveReader.DisposeAsync();
 
             // Each call met durability: a cold restart from durable images keeps the final state.
             await CrashAndRestartAllAsync(cluster);
@@ -841,8 +862,6 @@ public sealed class PubSimulationTests
             DfsVolume wv = writerClient.GetVolume(Vol);
             DfsVolume rv = readerClient.GetVolume(Vol);
             await SeedFileAsync(wv, path, initial);
-            DfsFileInfo before = await rv.Files.GetInfoAsync(path, Ct);
-            ulong lastRevision = before.Revision;
 
             long[] lengths = change switch
             {
@@ -855,6 +874,8 @@ public sealed class PubSimulationTests
 
             var model = new ReferenceFileModel(initial);
             DfsStream writer = await wv.Files.OpenAsync(path, WriterOptions(FileMode.Open, mode), Ct);
+            DfsFileInfo before = await AssertCommittedAsync(rv, path, initial, "committed state after the writer's open");
+            ulong lastRevision = before.Revision;
             writer.Seek(position, SeekOrigin.Begin);
             foreach (long length in lengths)
             {
@@ -1011,23 +1032,33 @@ public sealed class PubSimulationTests
     // PUB-011
     // ------------------------------------------------------------------------------------------------------------
 
-    /// <summary>(publication path, 1-based chunk whose upload is held). Each payload is exactly four aligned chunks.</summary>
-    public static TheoryData<PublishPath, int> Pub011Cases => new()
+    /// <summary>
+    /// (publication path, where one newly referenced object is delayed, ordinal). For <see cref="DelayedAt.ClientUploadSend"/>
+    /// the ordinal is the 1-based chunk whose upload is held at the client; for <see cref="DelayedAt.StorageDurability"/> it
+    /// is the 1-based distinct object, in order of reaching a storage node's durability primitive, whose durability is
+    /// withheld on every node. Each payload is exactly four aligned chunks.
+    /// </summary>
+    public static TheoryData<PublishPath, DelayedAt, int> Pub011Cases => new()
     {
-        { PublishPath.StreamFlush, 1 },
-        { PublishPath.StreamFlush, 2 },
-        { PublishPath.StreamFlush, 4 },
-        { PublishPath.StreamCommit, 4 },
-        { PublishPath.WriteThroughWrite, 3 },
-        { PublishPath.WriteAllHelper, 1 },
-        { PublishPath.WriteAllHelper, 3 },
-        { PublishPath.AppendHelper, 2 },
+        { PublishPath.StreamFlush, DelayedAt.ClientUploadSend, 1 },
+        { PublishPath.StreamFlush, DelayedAt.ClientUploadSend, 2 },
+        { PublishPath.StreamFlush, DelayedAt.ClientUploadSend, 4 },
+        { PublishPath.StreamCommit, DelayedAt.ClientUploadSend, 4 },
+        { PublishPath.WriteThroughWrite, DelayedAt.ClientUploadSend, 3 },
+        { PublishPath.WriteAllHelper, DelayedAt.ClientUploadSend, 1 },
+        { PublishPath.WriteAllHelper, DelayedAt.ClientUploadSend, 3 },
+        { PublishPath.AppendHelper, DelayedAt.ClientUploadSend, 2 },
+        { PublishPath.StreamFlush, DelayedAt.StorageDurability, 1 },
+        { PublishPath.StreamCommit, DelayedAt.StorageDurability, 3 },
+        { PublishPath.WriteThroughWrite, DelayedAt.StorageDurability, 2 },
+        { PublishPath.WriteAllHelper, DelayedAt.StorageDurability, 4 },
+        { PublishPath.AppendHelper, DelayedAt.StorageDurability, 1 },
     };
 
     [Theory]
     [MemberData(nameof(Pub011Cases))]
     [Catalog("PUB-011", "S", "INV-01", "INV-02", "INV-08")]
-    public Task PUB_011_DataBeforeMetadataPublication(PublishPath kind, int heldChunk) =>
+    public Task PUB_011_DataBeforeMetadataPublication(PublishPath kind, DelayedAt delayedAt, int ordinal) =>
         ClusterTest.RunAsync(Deterministic(), async cluster =>
         {
             const string path = "/pub011/f";
@@ -1038,24 +1069,49 @@ public sealed class PubSimulationTests
             DfsVolume wv = writerClient.GetVolume(Vol);
             DfsVolume rv = readerClient.GetVolume(Vol);
             Publication publication = await PreparePublicationAsync(wv, path, kind, initial, payload, aligned: true);
-            DfsFileInfo before = await rv.Files.GetInfoAsync(path, Ct);
+            DfsFileInfo before = await AssertCommittedAsync(rv, path, initial, "committed state before the publication");
             IReadOnlySet<ObjectId> storedBefore = await cluster.Inspect.GetAllStoredObjectsAsync(Vol);
             long publishBefore = PublishRequests(cluster, "c0");
 
-            FaultArm arm = cluster.Faults.Arm(new FaultMatch(FaultSites.ClientUploadChunk, Occurrence: heldChunk), FaultAction.Block());
+            FaultArm arm;
+            ObjectDurabilityGate? gate = null;
+            if (delayedAt == DelayedAt.ClientUploadSend)
+            {
+                arm = cluster.Faults.Arm(new FaultMatch(FaultSites.ClientUploadChunk, Occurrence: ordinal), FaultAction.Block());
+            }
+            else
+            {
+                // The object travels to every storage node, but none of them may complete its durability primitive.
+                gate = new ObjectDurabilityGate(ordinal);
+                arm = cluster.Faults.Arm(new FaultMatch(FaultSites.ObjectBeforeFlush, Operation: DfsOperationKind.PutObject, Count: 1_000_000),
+                    gate.Action);
+            }
+
             Task<CommitToken> task = publication.RunAsync(Ct);
-            await arm.WaitTriggeredAsync(TimeSpan.FromSeconds(30));
+            if (gate is null)
+                await arm.WaitTriggeredAsync(TimeSpan.FromSeconds(30));
+            else
+                await cluster.WaitUntilAsync(() => Task.FromResult(gate.HeldHits > 0), TimeSpan.FromSeconds(30),
+                    $"object #{ordinal} of the publication must reach a storage node's durability primitive", Ct);
             cluster.Faults.AssertReached(arm);
 
-            // The other chunks may finish; the held one cannot. Metadata publication and success stay prohibited.
+            // The other objects may become durable; the delayed one cannot. Metadata publication and success stay prohibited.
             await AssertStillPendingAsync(cluster, task, TimeSpan.FromSeconds(3), "publication must wait for every newly referenced object");
             Assert.Equal(publishBefore, PublishRequests(cluster, "c0"));
             await AssertCommittedAsync(rv, path, initial, "no metadata publication while an object lacks durable receipts", before.Revision);
             await AssertReplicasAtRevisionAsync(cluster, path, before.Revision, initial.LongLength, "no replica references the incomplete object set");
             await AssertUnreachableAsync(cluster, await NewObjectsSinceAsync(cluster, storedBefore), "the already-uploaded objects are still unpublished");
+            if (gate is not null)
+            {
+                Assert.True(gate.Withheld is not null && gate.HeldHits >= 1, "the withheld object reached storage over the network");
+                await AssertUnreachableAsync(cluster, [gate.Withheld!.Value], "the object whose durability is withheld is not referenced");
+            }
 
             arm.Disarm();
-            arm.Release();
+            if (gate is null)
+                arm.Release();
+            else
+                gate.Release();
             Exception? error = await CaptureWithinAsync(cluster, task, TimeSpan.FromSeconds(30), "publication completes once the held object is durable");
             Assert.Null(error);
             await AssertCommittedAsync(rv, path, publication.Expected, "the complete revision is published after the delayed object");
@@ -1260,7 +1316,7 @@ public sealed class PubSimulationTests
             await cluster.Inspect.AssertReplicasConvergedAsync(Vol);
             await AssertDurableAsync(cluster, path, ThreeZonePolicy, "the committed objects survived the crash");
 
-            await cluster.History.RecordAsync("c1", "read", path, null, () => rv.Files.ReadAllBytesAsync(path, Ct));
+            await cluster.History.RecordAsync("c1", "read", path, null, () => ReadCommittedAsync(rv, path));
             LinearizabilityChecker.Check(cluster.History.Operations, new RegisterModel(initial)).AssertValid();
             await Record.ExceptionAsync(async () => await writer.DisposeAsync());
         }, Ct);
@@ -1393,9 +1449,16 @@ public sealed class PubSimulationTests
                 UncertainPoint.ProposalNeverMade => FaultSites.RaftBeforePropose,
                 _ => throw new ArgumentOutOfRangeException(nameof(point)),
             };
-            FaultArm arm = point == UncertainPoint.CommittedReplyDropped
-                ? cluster.Faults.Arm(new FaultMatch(site, Node: leader.Name, Operation: publication.OperationKind, Count: 1_000), FaultAction.DropReply())
-                : cluster.Faults.Arm(new FaultMatch(site, Node: leader.Name, Operation: publication.OperationKind), FaultAction.Block());
+            // ProposalNeverMade blocks every delivery (including SDK retries of the same id) before proposing, so nothing
+            // can reach the log of the leader that is then crashed: the only legal resolution is Aborted.
+            FaultArm arm = point switch
+            {
+                UncertainPoint.CommittedReplyDropped =>
+                    cluster.Faults.Arm(new FaultMatch(site, Node: leader.Name, Operation: publication.OperationKind, Count: 1_000), FaultAction.DropReply()),
+                UncertainPoint.ProposalNeverMade =>
+                    cluster.Faults.Arm(new FaultMatch(site, Node: leader.Name, Operation: publication.OperationKind, Count: 1_000), FaultAction.Block()),
+                _ => cluster.Faults.Arm(new FaultMatch(site, Node: leader.Name, Operation: publication.OperationKind), FaultAction.Block()),
+            };
 
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(Ct);
             long writeId = cluster.History.Invoke("c0", "write", path, publication.Expected, publication.ReservedId);
@@ -1445,7 +1508,7 @@ public sealed class PubSimulationTests
                 await AssertCommittedAsync(rv, path, initial, "the fenced operation cannot commit when the old leader returns");
             }
 
-            await cluster.History.RecordAsync("c1", "read", path, null, () => rv.Files.ReadAllBytesAsync(path, Ct));
+            await cluster.History.RecordAsync("c1", "read", path, null, () => ReadCommittedAsync(rv, path));
             LinearizabilityChecker.Check(cluster.History.Operations, new RegisterModel(initial)).AssertValid();
             if (publication.Writer is not null)
                 await Record.ExceptionAsync(async () => await publication.Writer.DisposeAsync());
@@ -1471,7 +1534,7 @@ public sealed class PubSimulationTests
     [MemberData(nameof(Pub017Cases))]
     [Catalog("PUB-017", "S", "INV-01", "INV-06", "INV-08")]
     public Task PUB_017_DisposeFlushFailureIsVisible(DisposeFailure failure, bool asyncDispose) =>
-        ClusterTest.RunAsync(SimOrRealtime(!asyncDispose), async cluster =>
+        ClusterTest.RunAsync(SimOrRealtime(!asyncDispose, failure == DisposeFailure.QuorumLost ? TestClusterOptions.FiveNodes : null), async cluster =>
         {
             const string path = "/pub017/f";
             byte[] initial = TestData.Bytes(0x0017_0001, 100_000);
@@ -1482,26 +1545,32 @@ public sealed class PubSimulationTests
             DfsVolume rv = readerClient.GetVolume(Vol);
             Publication publication = await PreparePublicationAsync(wv, path, PublishPath.StreamFlush, initial, payload);
             DfsStream writer = publication.Writer!;
-            DfsFileInfo before = await rv.Files.GetInfoAsync(path, Ct);
+            DfsFileInfo before = await AssertCommittedAsync(rv, path, initial, "committed state before disposal");
             TestNode leader = await cluster.GetLeaderAsync(Vol, Ct);
             TestNode[] followers = cluster.Nodes.Where(n => n.Name != leader.Name).ToArray();
 
             FaultArm? arm = null;
+            var diskFullArms = new List<FaultArm>();
             switch (failure)
             {
                 case DisposeFailure.StorageFlushFails:
                     arm = cluster.Faults.Arm(new FaultMatch(FaultSites.ObjectBeforeFlush, Operation: DfsOperationKind.PutObject, Count: 100_000), FaultAction.IoError());
                     break;
                 case DisposeFailure.DisksFull:
+                    // ENOSPC for object data on two of three nodes (their Raft journals keep working, so the cluster stays
+                    // available and the fault can be lifted afterwards).
                     foreach (TestNode node in followers)
-                        node.Disk.Fill();
+                        diskFullArms.Add(cluster.Faults.Arm(new FaultMatch(FaultSites.ObjectWrite, Node: node.Name, Operation: DfsOperationKind.PutObject, Count: 100_000),
+                            FaultAction.DiskFull()));
                     break;
                 case DisposeFailure.CommitReplyWithheld:
                     arm = cluster.Faults.Arm(new FaultMatch(FaultSites.ApplyAfterBeforeReply, Node: leader.Name, Operation: DfsOperationKind.CommitFile), FaultAction.Block());
                     break;
                 case DisposeFailure.QuorumLost:
-                    foreach (TestNode node in followers)
-                        await node.CrashAsync();
+                    // Five volume voters; three become unreachable. The leader and one follower (two zones) can still make
+                    // the data durable, so the commit request is sent but cannot gain a metadata majority.
+                    foreach (TestNode node in followers.Take(3))
+                        cluster.Network.Isolate(node.Name);
                     break;
             }
 
@@ -1517,6 +1586,8 @@ public sealed class PubSimulationTests
             Exception? error = await CaptureWithinAsync(cluster, dispose, TimeSpan.FromSeconds(60), "disposal must terminate and surface the failure");
             if (arm is not null)
                 cluster.Faults.AssertReached(arm);
+            foreach (FaultArm full in diskFullArms)
+                cluster.Faults.AssertReached(full);
 
             Assert.True(error is not null, "Dispose must surface the failed flush; it must never report a successful commit");
             Assert.False(error is OperationCanceledException, $"a persistence failure is not a cancellation: {error}");
@@ -1528,12 +1599,13 @@ public sealed class PubSimulationTests
                 case DisposeFailure.StorageFlushFails:
                     arm!.Disarm();
                     break;
-                case DisposeFailure.CommitReplyWithheld:
-                    cluster.Network.Heal();
+                case DisposeFailure.DisksFull:
+                    foreach (FaultArm full in diskFullArms)
+                        full.Disarm();
                     break;
+                case DisposeFailure.CommitReplyWithheld:
                 case DisposeFailure.QuorumLost:
-                    foreach (TestNode node in followers)
-                        await node.RestartAsync();
+                    cluster.Network.Heal();
                     break;
             }
             await cluster.WaitForStableAsync(TimeSpan.FromSeconds(60), Ct);
@@ -1670,6 +1742,12 @@ public sealed class PubSimulationTests
                 Assert.Equal(b.WriterGeneration, only.Generation);
             }
             await AssertUnreachableAsync(cluster, aUploads, "the expired writer's uploads are not published");
+            // Uploads A made later (background staging) are covered too: every object stored since the seed that is
+            // reachable must belong to the current (replacement) revision, never to A's stale staging.
+            HashSet<ObjectId> currentRefs = await ReferencedObjectsAsync(cluster, path);
+            HashSet<ObjectId> newSinceSeed = await NewObjectsSinceAsync(cluster, storedBefore);
+            await AssertUnreachableAsync(cluster, newSinceSeed.Where(o => !currentRefs.Contains(o)),
+                "no object outside the current revision (in particular none of A's staging) is reachable");
 
             // The replacement remains the valid writer.
             if (b is not null)
@@ -1726,7 +1804,7 @@ public sealed class PubSimulationTests
             DfsVolume wv = writerClient.GetVolume(Vol);
             DfsVolume rv = readerClient.GetVolume(Vol);
             Publication publication = await PreparePublicationAsync(wv, path, kind, initial, payload);
-            DfsFileInfo before = await rv.Files.GetInfoAsync(path, Ct);
+            DfsFileInfo before = await AssertCommittedAsync(rv, path, initial, "committed state before the publication");
             await AssertDurableAsync(cluster, path, policy, "precondition: the committed revision meets the policy");
             TestNode leader = await cluster.GetLeaderAsync(Vol, Ct);
             TestNode[] others = cluster.Nodes.Where(n => n.Name != leader.Name).ToArray();
@@ -1747,7 +1825,10 @@ public sealed class PubSimulationTests
                         arms.Add(cluster.Faults.Arm(new FaultMatch(FaultSites.ObjectBeforeFlush, Node: node.Name, Operation: DfsOperationKind.PutObject, Count: 100_000), FaultAction.Block()));
                     break;
                 case Withheld.RequiredDiskFull:
-                    others[0].Disk.Fill();
+                    // ENOSPC for object data on one node required by the 3/3 policy. Its Raft journal keeps working, so
+                    // the metadata group stays healthy and the condition can be lifted afterwards.
+                    arms.Add(cluster.Faults.Arm(new FaultMatch(FaultSites.ObjectWrite, Node: others[0].Name, Operation: DfsOperationKind.PutObject, Count: 100_000),
+                        FaultAction.DiskFull()));
                     break;
             }
 
@@ -1801,7 +1882,7 @@ public sealed class PubSimulationTests
                 await AssertDurableAsync(cluster, path, policy, "the visible revision still meets the full policy");
             }
 
-            // Restore the prerequisite (a full disk cannot be emptied, so that variant stays withheld).
+            // Restore the prerequisite.
             switch (withheld)
             {
                 case Withheld.MetadataQuorum:
@@ -1815,6 +1896,10 @@ public sealed class PubSimulationTests
                         arm.Release();
                     }
                     break;
+                case Withheld.RequiredDiskFull:
+                    foreach (FaultArm arm in arms)
+                        arm.Disarm();
+                    break;
             }
             await cluster.WaitForStableAsync(TimeSpan.FromSeconds(60), Ct);
 
@@ -1826,9 +1911,6 @@ public sealed class PubSimulationTests
             {
                 await AssertCommittedAsync(rv, path, initial, "a definite failure is never published later", before.Revision);
             }
-
-            if (withheld == Withheld.RequiredDiskFull)
-                return;
 
             // The policy was never relaxed: with prerequisites restored the same publication meets it in full.
             if (publication.Writer is not null)

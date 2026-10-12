@@ -66,6 +66,27 @@ internal static class PubHelpers
         ReadView = DfsReadView.Live,
     };
 
+    /// <summary>
+    /// An independent observer: a version-pinned read handle that grants <c>ReadWrite | Delete</c>, so it is compatible
+    /// with any active writer (test plan §5). Observations go through this explicit handle instead of the
+    /// <c>ReadAll*</c> helpers, whose sharing mode is not specified and may legitimately conflict with an open writer.
+    /// </summary>
+    public static DfsOpenOptions ObserverOptions() => new()
+    {
+        Mode = FileMode.Open,
+        Access = FileAccess.Read,
+        Share = FileShare.ReadWrite | FileShare.Delete,
+        ReadView = DfsReadView.VersionPinned,
+    };
+
+    /// <summary>Reads the whole committed file through one pinned observer handle: one revision, bytes and revision together.</summary>
+    public static async Task<(byte[] Bytes, ulong Revision)> ReadPinnedAsync(DfsVolume volume, string path)
+    {
+        await using DfsStream reader = await volume.Files.OpenAsync(path, ObserverOptions(), Ct);
+        byte[] bytes = await ReadFromStartAsync(reader, Ct);
+        return (bytes, reader.OpenRevision);
+    }
+
     /// <summary>Connects a named client.</summary>
     public static Task<DfsClient> ConnectAsync(TestCluster cluster, string name, int? bufferSize = null, TimeSpan? operationTimeout = null) =>
         cluster.ConnectAsync(new TestClientOptions { Name = name, BufferSize = bufferSize, OperationTimeout = operationTimeout }, Ct);
@@ -124,14 +145,19 @@ internal static class PubHelpers
         AssertEx.BytesEqual(expected, bytes, because);
     }
 
-    /// <summary>Asserts the committed bytes and length (and optionally the revision) seen by an independent observer.</summary>
+    /// <summary>
+    /// Asserts the committed bytes and length (and optionally the revision) seen by an independent observer. The bytes
+    /// come from one pinned observer handle (<see cref="ObserverOptions"/>) and must belong to the revision GetInfo reports.
+    /// </summary>
     public static async Task<DfsFileInfo> AssertCommittedAsync(DfsVolume observer, string path, byte[] expected, string because,
         ulong? expectedRevision = null)
     {
-        byte[] actual = await observer.Files.ReadAllBytesAsync(path, Ct);
+        (byte[] actual, ulong pinnedRevision) = await ReadPinnedAsync(observer, path);
         AssertEx.BytesEqual(expected, actual, because);
         DfsFileInfo info = await observer.Files.GetInfoAsync(path, Ct);
-        Assert.Equal(expected.LongLength, info.Length);
+        Assert.True(expected.LongLength == info.Length, $"Expected length {expected.LongLength} but observed {info.Length}: {because}");
+        Assert.True(pinnedRevision == info.Revision,
+            $"The pinned read observed revision {pinnedRevision} but GetInfo reports {info.Revision} with no concurrent writer: {because}");
         if (expectedRevision is { } revision)
             Assert.True(revision == info.Revision, $"Expected revision {revision} but observed {info.Revision}: {because}");
         return info;
