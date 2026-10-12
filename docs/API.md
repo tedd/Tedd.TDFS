@@ -901,6 +901,28 @@ public sealed class NodeEnvironment
 public interface INodeLog { void Write(NodeLogLevel level, string node, string category, string message); }
 public enum NodeLogLevel { Trace, Debug, Info, Warn, Error }
 
+// Node event loop (ARCHITECTURE §3). FIFO; Pause holds work; Stop = crash (queued work discarded, later posts dropped);
+// DrainAsync = graceful (runs queued work and work it posts until the queue is observed empty, then stops).
+public interface INodeLoopFactory { INodeLoop Create(string nodeName); }
+public interface INodeLoop
+{
+    string Name { get; } SynchronizationContext Context { get; } bool IsOnLoop { get; } bool IsPaused { get; } bool IsStopped { get; }
+    Task Completion { get; }                                     // completes once stopped (production: thread exited)
+    event Action<INodeLoop, Exception>? UnhandledException;      // work-item exceptions are reported, never fatal
+    void Post(Action work);
+    Task InvokeAsync(Action work); Task<T> InvokeAsync<T>(Func<T> work);              // always queued; NodeLoopStoppedException
+    Task InvokeAsync(Func<Task> work); Task<T> InvokeAsync<T>(Func<Task<T>> work);    // if the loop stops first
+    void Pause(); void Resume(); void Stop();
+    Task DrainAsync(CancellationToken ct = default);             // ct cancelled -> abrupt Stop, task cancelled
+}
+public sealed class NodeLoopStoppedException : InvalidOperationException { public NodeLoopStoppedException(string loopName); public string LoopName { get; } }
+public sealed class ThreadNodeLoopFactory : INodeLoopFactory    // one dedicated background thread per node ("tdfs-loop:{name}")
+{
+    public static readonly ThreadNodeLoopFactory Instance;
+    public ThreadNodeLoopFactory(INodeLog log);                  // logs unhandled work-item exceptions (category "loop")
+    public INodeLog Log { get; }
+}
+
 public sealed class NodeHost : IAsyncDisposable
 {
     public static Task<NodeHost> StartAsync(NodeOptions options, NodeEnvironment environment, CancellationToken ct = default);
@@ -1446,6 +1468,99 @@ public static class AssertEx
 ```
 
 ---
+
+### D.9 Deterministic simulation — `Tedd.Tdfs.Testing.Simulation`
+
+```csharp
+public enum SimScheduleMode { Random, Fifo }          // seeded choice among runnable lanes (each lane FIFO) / global FIFO
+public sealed record SimSchedulerOptions { Mode; StartTimeUtc; StartTimestamp; ThrowOnViolation = true; ThrowOnUnhandledException = true;
+    StrictThreadAffinity = true; RecordSteps; MaxTraceEntries; MaxStepsPerInstant; StallGracePeriod; DefaultRunTimeout; MaxRealTimePerRun;
+    ClientProcessName = "client"; void Validate(); }
+public sealed class SimScheduler                       // one OS thread runs everything; virtual time jumps to the next timer when idle
+{
+    public SimScheduler(ulong seed, SimSchedulerOptions? options = null);
+    public ulong Seed { get; } public SimSchedulerOptions Options { get; }
+    public SimTimeProvider Clock { get; }              // global virtual clock
+    public TimeSpan Now { get; } public DateTimeOffset UtcNow { get; }
+    public SimProcess ClientProcess { get; } public SynchronizationContext ClientContext { get; }
+    public SimNodeLoopFactory LoopFactory { get; }     // for NodeEnvironment.LoopFactory
+    public IReadOnlyList<SimProcess> Processes { get; } public SimProcess? CurrentProcess { get; }
+    public bool IsDriving { get; } public bool IsOnSimulationThread { get; }
+    public IReadOnlyList<SimViolation> Violations { get; }               // HAR-002 uncontrolled dependencies
+    public IReadOnlyList<SimUnhandledError> UnhandledExceptions { get; }
+    public IReadOnlyList<string> Trace { get; } public bool TraceTruncated { get; } public long StepCount { get; } public ulong ScheduleFingerprint { get; }
+    public event Action<SimProcess>? ProcessKilled; public event Action<SimUnhandledError>? UnhandledException;
+    public SimProcess CreateProcess(string name); public SimProcess GetOrCreateProcess(string name); public SimProcess? FindProcess(string name);
+    public SimTimeProvider CreateClock(string name, SimClockOptions? options = null); public SimTimeProvider GetOrCreateClock(string name); public SimTimeProvider? FindClock(string name);
+    public IRandomSource ForkRandom(string purpose);
+    public void AddTrace(string message); public void Post(Action work, string? description = null);
+    public IDisposable Schedule(TimeSpan delay, Action work, SimProcess? owner = null, string? description = null);
+    public Task DelayAsync(TimeSpan delay, CancellationToken ct = default);
+    public void ReportViolation(string description); public void ReportUnhandledException(Exception exception, string? where = null);
+    public bool RunOne(); public long RunUntilIdle(TimeSpan? virtualTimeout = null); public void RunFor(TimeSpan duration);
+    public void RunUntil(Func<bool> condition, TimeSpan? virtualTimeout = null, string? because = null);   // SimulationTimeoutException / SimulationStalledException
+    public void RunUntil(Task task, TimeSpan? virtualTimeout = null, string? because = null);
+    public Task RunAsync(Func<Task> body, TimeSpan? virtualTimeout = null);          // body on the client context; returns a completed task
+    public Task<T> RunAsync<T>(Func<Task<T>> body, TimeSpan? virtualTimeout = null);
+    public void Run(Func<Task> body, TimeSpan? virtualTimeout = null); public T Run<T>(Func<Task<T>> body, TimeSpan? virtualTimeout = null);
+    public string DescribeState();
+    public static string FormatTime(TimeSpan time);
+    public static void CompleteWithoutContext(Action completion);   // complete TCSs so ConfigureAwait(false) continuations inline
+}
+public enum SimProcessState { Running, Paused, Killed }
+public sealed class SimProcess                          // a node incarnation or client: main lane (Context) + background lanes
+{
+    public SimScheduler Scheduler { get; } public string Name { get; } public int Incarnation { get; } public string Id { get; }  // "n0#2"
+    public SynchronizationContext Context { get; } public SimProcessState State { get; } public bool IsRunning/IsPaused/IsKilled { get; }
+    public bool IsCurrent { get; } public bool IsOnMainLane { get; } public SimNodeLoop? Loop { get; } public Task Exited { get; }
+    public long DiscardedWorkCount { get; } public int QueuedWorkCount { get; }
+    public void Post(Action work, string? description = null); public void Pause(); public void Resume(); public void Kill();
+    public void Crash();                                  // Kill + throw SimProcessKilledException when called from its own work
+}
+public sealed class SimNodeLoopFactory : INodeLoopFactory { public SimNodeLoopFactory(SimScheduler s); public SimScheduler Scheduler { get; }
+    public SimNodeLoop Create(string nodeName); public event Action<SimNodeLoop>? LoopCreated; }
+public sealed class SimNodeLoop : INodeLoop { public SimProcess Process { get; } public int PendingInvocationCount { get; } }  // Stop = Process.Kill
+public sealed record SimClockOptions { TimeSpan WallOffset; TimeSpan MonotonicOffset; double Rate = 1.0; bool BindToProcess = true; static Default; void Validate(); }
+public sealed class SimTimeProvider : TimeProvider       // per-node clock; timers run as background work of the bound process
+{
+    public SimScheduler Scheduler { get; } public string Name { get; } public bool IsGlobal { get; } public string? ProcessName { get; }
+    public double Rate { get; } public bool IsFrozen { get; } public TimeSpan WallOffset { get; } public TimeSpan Elapsed { get; } public int ActiveTimerCount { get; }
+    public void Advance(TimeSpan delta); public void JumpWall(TimeSpan delta); public void Freeze(); public void Unfreeze(); public void SetRate(double rate);
+}
+public sealed record SimNetworkOptions { MinLatency; MaxLatency; BlockedConnectTimeout; ResetPeersOnProcessDeath = true; void Validate(); }
+public sealed record SimLinkSettings(TimeSpan MinLatency, TimeSpan MaxLatency, long BytesPerSecond = 0);
+public readonly record struct SimMessageEvent(long ConnectionId, string From, string To, LinkDirection Direction, ReadOnlyMemory<byte> Payload, LinkDecision Decision, TimeSpan VirtualTime);
+public sealed class SimNetwork : IRpcTransportFactory    // FIFO per connection direction; ILinkPolicy; caller-clock timeouts
+{
+    public SimNetwork(SimScheduler scheduler, SimNetworkOptions? options = null, ILinkPolicy? policy = null);
+    public SimScheduler Scheduler { get; } public SimNetworkOptions Options { get; } public IRpcTransportFactory Factory { get; } public ILinkPolicy Policy { get; set; }
+    public IRpcTransport Create(string localName, string listenEndpoint);   // localName = policy identity = owning process name
+    public void SetClock(string localName, TimeProvider clock); public TimeProvider GetClock(string localName);
+    public void SetLink(string from, string to, SimLinkSettings settings); public SimLinkSettings GetLink(string from, string to);
+    public void SetLatency(string from, string to, TimeSpan latency); public void SetBandwidth(string from, string to, long bytesPerSecond);
+    public void ClearLink(string from, string to); public void ClearLinks(); public void ResetConnections(string name);
+    public IReadOnlyList<string> ListeningEndpoints { get; } public int OpenConnectionCount { get; }
+    public long MessagesSent/MessagesDelivered/MessagesDropped/MessagesDuplicated/MessagesDelayed/LateReplies/BytesSent/ConnectionsOpened/ConnectionsFailed { get; }
+    public event Action<SimMessageEvent>? MessageSent;
+}
+public enum SimViolationKind { ForeignThread, Reported }
+public sealed record SimViolation(SimViolationKind Kind, string Operation, string Description, int ThreadId, string? ThreadName, bool IsThreadPoolThread, TimeSpan VirtualTime, string? StackTrace);
+public sealed record SimUnhandledError(string Process, string Lane, TimeSpan VirtualTime, Exception Exception);
+public class SimulationException : Exception; public sealed class SimulationStalledException : SimulationException;
+public sealed class SimulationViolationException : SimulationException { public SimViolation Violation { get; } }
+public sealed class SimulationTimeoutException : TimeoutException { public TimeSpan VirtualTime { get; } }
+public sealed class SimProcessKilledException : Exception { public string ProcessId { get; } }
+public sealed record SimRunRecord(ulong Seed, IReadOnlyList<string> Trace, ulong ScheduleFingerprint, long Steps, TimeSpan VirtualTime, string Digest)
+{ public static SimRunRecord Capture(SimScheduler scheduler, string digest = ""); public string? FirstDifference(SimRunRecord other); }
+public static class SimDeterminism
+{
+    public static SimRunRecord AssertReplayIsExact(Func<ulong, SimRunRecord> scenario, ulong seed, int runs = 2);       // HAR-001
+    public static IReadOnlyList<SimRunRecord> AssertSeedsDiverge(Func<ulong, SimRunRecord> scenario, params ulong[] seeds);
+}
+public sealed record SimPingWorkloadOptions { Nodes = 3; RoundsPerNode = 12; ClientCalls = 6; Mode; PingInterval; CallTimeout; RecordSteps = true;
+    Network; Func<SimScheduler, ILinkPolicy>? LinkPolicy; VirtualTimeout; void Validate(); }
+public static class SimPingWorkload { public static SimRunRecord Run(ulong seed, SimPingWorkloadOptions? options = null); }   // toy multi-node workload
+```
 
 ## E. Protocol message catalogue — `Tedd.Tdfs.Protocol.MessageType` (Core)
 

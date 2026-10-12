@@ -47,3 +47,15 @@ Distributed filesystem with a .NET client SDK. Requirements: `docs/spec/distribu
 - Transport threads (QUIC pump, inbound executors) must not run handler code: cancel handler tokens with
   `CancellationTokenSource.CancelAsync()`, since `Cancel()` runs `ct.Register` callbacks, and the handler code they resume,
   inline on the cancelling thread.
+- Simulation (`Tedd.Tdfs.Testing.Simulation`): the runtime only inlines `ConfigureAwait(false)` continuations when the
+  completing thread has **no custom `SynchronizationContext`**; completing a TCS (or cancelling a CTS) inside a node-loop
+  or client-context work item queues SDK-style continuations to the thread pool, which `SimScheduler` reports as a
+  violation. Complete such tasks via `SimScheduler.CompleteWithoutContext(...)` (the sim's own loops/network already do).
+  Inside the sim never block on simulated work (`.Result`, `Wait()`, SDK sync wrappers): the single sim thread deadlocks.
+- A `Task.Delay(..., ct)` completed by **cancelling its token** runs `ConfigureAwait(false)` continuations on the thread
+  pool on .NET 10 even when the cancelling thread has no synchronization context (timer completion inlines fine). SDK code
+  that must stay simulation-compatible should implement cancellable waits as a TCS completed by the injected
+  `TimeProvider`'s timer plus `ct.UnsafeRegister(...)`, not as a cancellable `Task.Delay` awaited with
+  `ConfigureAwait(false)` (the sim reports the escape as a HAR-002 violation; see `SimReviewTests`).
+- `TimeProvider` subclasses: `System.X` resolves to the inherited `TimeProvider.System` property — add `using` directives
+  instead of fully qualified `System.` names.
