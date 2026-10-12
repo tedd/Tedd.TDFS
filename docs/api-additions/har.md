@@ -69,7 +69,9 @@ Required behaviour:
   (visible immediately after the crash call returns).
 * **Behaviour of the existing `ClusterTest.RunAsync` (both overloads):** when `AssumptionViolations` is non-empty at the
   end of the run it throws `AssumptionViolatedException` (inner = scenario failure, if any) — the run is labelled
-  out-of-model, never a pass and never a protocol failure.
+  out-of-model, never a pass and never a protocol failure. This takes precedence over the end-of-run harness invariant
+  checks (split brain, replica convergence, history checks): their failures are also wrapped as the inner exception,
+  because evidence gathered under a violated assumption cannot refute the protocol either.
 
 Used by: `HAR_018_AssumptionViolationIsLabelled` (None / One / All dishonest devices).
 
@@ -102,7 +104,8 @@ Used by: `HAR_014_TraceMinimizationPreservesFailure_Minimizer` (pure), `HAR_014_
   cannot mask the rebooted image).
 * `FaultContext` produced at `object.*` sites carries `Object`, `Node` and `Volume`; client sites (`client.*`) carry the
   user path in `Path`; request sites (`rpc.request.accepted`, `commit.receipt-validated`, `apply.after`,
-  `rpc.reply.send`) carry `Volume` and the user operation kind (`DfsOperationKind.WriteAll` for a whole-file write).
+  `rpc.reply.send`) carry `Volume` and the user operation kind (`DfsOperationKind.WriteAll` for a whole-file write);
+  node-local metadata sites (`staging.registered`, `raft.*`) carry the hitting `Node` and, for volume groups, `Volume`.
 * `TestCluster.Trace` contains node lifecycle events that name the node and the action ("pause"/"crash", any case).
 * `FaultAction.PauseNode()` puts the hitting node into `TestNodeState.Paused` (same `Host` instance) until
   `FaultArm.Release()`; `FaultAction.CrashNode()` puts it into `TestNodeState.Crashed` (`Host == null`).
@@ -112,3 +115,15 @@ Used by: `HAR_014_TraceMinimizationPreservesFailure_Minimizer` (pure), `HAR_014_
   `TestFaults.AssertReached` throws an xunit assertion exception (`XunitException`).
 * Concurrently running clusters get distinct, non-nested `DataRoot` directories and distinct cluster/node identities;
   in deterministic mode `ClusterId`, node ids and every replayed observable derive from the seed.
+* `TestNetwork.BlackHole(from, to)` and `TestNetwork.Cut(from, to)` affect only the `from -> to` direction;
+  `TestNetwork.Restore(from, to)` removes either kind of rule on that direction (HAR-006).
+* `FaultCoverageRegistry.Hits` lists every hit in the order the arms observed them (deterministic mode), so the
+  `Occurrence`-th hit matching an arm's `FaultMatch` is the one its action ran on (HAR-013).
+* `FaultCoverageRegistry.CreateReport(campaign, generated, applicable, excluded)` counts as `Reached` only arms of this
+  run whose trigger window was actually hit (`FaultArm.Triggered`), capped at `applicable`; an armed-but-never-triggered
+  arm, or a site hit outside every arm's occurrence window, is not reached, so `IsComplete` is false (HAR-013).
+* `MessageHold` holds every matching transmission (including SDK retries with the same operation id) until
+  `ReleaseAll`; two holds with disjoint filters are independent, so releasing one delivers only its messages (HAR-007).
+* `TestDisk.Faults.CapacityOverride` on a simulated disk caps the medium's capacity (ENOSPC beyond it); HAR-015 sets it
+  to `UsedBytes + TestClusterOptions.ReservedBytes`, which must leave metadata progress (journal, checkpoints) possible
+  while object-store admission rejects new payloads (ARCHITECTURE §8).

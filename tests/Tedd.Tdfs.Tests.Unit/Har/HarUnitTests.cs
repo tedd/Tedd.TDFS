@@ -37,6 +37,9 @@ public sealed class HarUnitTests
         // The schedule really exercised faults, retries and operations; an empty replay would be trivially identical.
         Assert.Equal(seed, first.Seed);
         Assert.Equal(nodeCount, first.Nodes.Count);
+        // The fault points were reached (HAR-013), not just armed.
+        Assert.Contains(first.ArmEvents, e => e.StartsWith("crash hits=", StringComparison.Ordinal) && e.EndsWith(" triggered=True", StringComparison.Ordinal));
+        Assert.Contains(first.ArmEvents, e => e.StartsWith("delay hits=", StringComparison.Ordinal) && e.EndsWith(" triggered=True", StringComparison.Ordinal));
         Assert.Contains(first.ArmEvents, e => e.StartsWith("crash@", StringComparison.Ordinal));
         Assert.Contains(first.ArmEvents, e => e.StartsWith("delay@", StringComparison.Ordinal));
         Assert.Contains("drop-reply matched=1 remaining=0", first.ArmEvents);
@@ -519,7 +522,10 @@ public sealed class HarUnitTests
     public async Task HAR_005_FlushFailureNeverPersistsByAssumption(FlushFault fault)
     {
         CancellationToken ct = Ct;
-        var medium = new SimulatedMedium("har005", 1 << 20, new SeededRandom(5));
+        // I/O delays run on a manual clock: a delayed flush stays pending until the test advances time (no real-time race).
+        var clock = new TestClock();
+        clock.Freeze();
+        var medium = new SimulatedMedium("har005", 1 << 20, new SeededRandom(5), clock);
         byte[] a = TestData.Bytes(51, 4096);
         byte[] x = TestData.Bytes(52, 4096);
         await medium.CreateDirectoryAsync("d", ct);
@@ -588,9 +594,11 @@ public sealed class HarUnitTests
                 await f.WriteFullyAsync(0, x, ct);
                 medium.Faults.IoDelay = TimeSpan.FromMilliseconds(300);
                 Task pending = f.FlushAsync(ct).AsTask();
-                Assert.False(pending.IsCompleted);
+                Assert.False(pending.IsCompleted); // the clock is frozen: the barrier cannot have completed
                 AssertEx.BytesEqual(a, medium.ReadDurable("d/f"), "an in-flight flush is not a completed barrier");
                 medium.Crash(CrashMode.LoseUnflushed);
+                Assert.False(pending.IsCompleted);
+                clock.Advance(TimeSpan.FromMilliseconds(300)); // the delayed device completes only after the power cut
                 await Assert.ThrowsAsync<ObjectDisposedException>(() => pending); // the interrupted barrier never reports success
                 medium.Faults.IoDelay = null;
                 AssertEx.BytesEqual(a, medium.ReadDurable("d/f"));
@@ -724,6 +732,7 @@ public sealed class HarUnitTests
                 cluster.Network.Cut(from, to);
             else
                 cluster.Network.BlackHole(from, to);
+            await cluster.DelayAsync(TimeSpan.FromMilliseconds(250), ct); // let messages already in flight before the cut drain
             log.Reset();
             await cluster.DelayAsync(TimeSpan.FromSeconds(2), ct);
 
@@ -768,21 +777,22 @@ public sealed class HarUnitTests
             }
 
             MessageLog log = cluster.Network.Log;
+            await cluster.DelayAsync(TimeSpan.FromMilliseconds(100), ct); // drain messages that were in flight before the cut
             log.Reset();
             Exception? failure = await Record.ExceptionAsync(() => vol.Files.WriteAllBytesAsync(path, payload, new DfsMutationOptions { OperationId = id }, ct));
-            long requestsDelivered = log.CountMessages(new MessageFilter(From: client0, Direction: LinkDirection.Request));
+            long requestsDelivered = log.CountMessages(new MessageFilter(From: client0, Operation: DfsOperationKind.WriteAll, Direction: LinkDirection.Request));
             long deliveredToClient = log.CountMessages(new MessageFilter(To: client0));
 
             Assert.NotNull(failure); // no reply can reach the client: success would be fabricated
             Assert.True(IsAvailabilityFailure(failure), $"expected an honest unavailability/unknown-outcome error, got {failure}");
-            Assert.Equal(0L, deliveredToClient);
             if (cut == ClientCut.ClientToCluster)
             {
-                Assert.Equal(0L, requestsDelivered);
+                Assert.Equal(0L, requestsDelivered); // the cut direction delivers nothing
                 Assert.False(await observed.Files.ExistsAsync(path, ct), "a request that was never delivered cannot have executed");
             }
             else
             {
+                Assert.Equal(0L, deliveredToClient); // the cut direction delivers nothing, replies included
                 Assert.True(requestsDelivered > 0, "requests still travel client-to-cluster");
                 Assert.Equal(OpOutcome.Unknown, HistoryRecorder.Classify(failure)); // executed but unacknowledged: never reported as rolled back
                 await BytesEqualAsync(payload, observed.Files.ReadAllBytesAsync(path, ct), "the delivered request executed as sent");
@@ -900,6 +910,44 @@ public sealed class HarUnitTests
             Assert.Contains(outcome.Status, new[] { DfsOutcomeStatus.Committed, DfsOutcomeStatus.Expired });
             if (outcome.Status == DfsOutcomeStatus.Committed)
                 Assert.Equal(t1, outcome.Token);
+        }, Ct);
+
+    [Fact]
+    [Catalog("HAR-007", "U", "INV-02", "INV-07", "INV-20")]
+    public Task HAR_007_TransportFidelity_IndependentRequestsReorderAcrossStreams() =>
+        ClusterTest.RunAsync(Deterministic(), async cluster =>
+        {
+            CancellationToken ct = Ct;
+            await using DfsClient c0 = await cluster.ConnectAsync(new TestClientOptions { Name = "c0" }, ct);
+            await using DfsClient c1 = await cluster.ConnectAsync(new TestClientOptions { Name = "c1" }, ct);
+            DfsVolume vol0 = c0.GetVolume(Vol);
+            DfsVolume vol1 = c1.GetVolume(Vol);
+
+            // Warm both clients (sessions, routes), so the next write of each is one WriteAll request on its own stream.
+            await vol0.Files.WriteAllBytesAsync("/har007-warm-0", TestData.Bytes(7300, 10), ct);
+            await vol1.Files.WriteAllBytesAsync("/har007-warm-1", TestData.Bytes(7301, 10), ct);
+            byte[] a = TestData.Bytes(7302, 1500);
+            byte[] b = TestData.Bytes(7303, 1500);
+
+            using MessageHold holdA = cluster.Network.Hold(new MessageFilter(From: "client:c0", Operation: DfsOperationKind.WriteAll, Direction: LinkDirection.Request));
+            using MessageHold holdB = cluster.Network.Hold(new MessageFilter(From: "client:c1", Operation: DfsOperationKind.WriteAll, Direction: LinkDirection.Request));
+
+            // A is issued first, B second; the network delivers B (and lets it commit) while A is still in flight.
+            Task<CommitToken> writeA = vol0.Files.WriteAllBytesAsync("/har007-order-a", a, ct);
+            await holdA.WaitForAsync(1, TimeSpan.FromSeconds(5));
+            Task<CommitToken> writeB = vol1.Files.WriteAllBytesAsync("/har007-order-b", b, ct);
+            await holdB.WaitForAsync(1, TimeSpan.FromSeconds(5));
+            holdB.ReleaseAll();
+            CommitToken tB = await writeB;
+            Assert.False(writeA.IsCompleted, "every transmission of A is still held");
+            Assert.False(await vol1.Files.ExistsAsync("/har007-order-a", ct), "A cannot take effect before it is delivered");
+
+            holdA.ReleaseAll(); // the original and any retries of A (same operation identity) now arrive after B
+            CommitToken tA = await writeA;
+            Assert.True(tB.CompareTo(tA) < 0, $"the later-issued independent request committed first (B {tB}, A {tA})");
+            Assert.All(holdA.Captured, m => Assert.Equal("client:c0", m.From));
+            await BytesEqualAsync(a, vol1.Files.ReadAllBytesAsync("/har007-order-a", ct), "reordered requests keep their payload intact");
+            await BytesEqualAsync(b, vol0.Files.ReadAllBytesAsync("/har007-order-b", ct), "reordered requests keep their payload intact");
         }, Ct);
 
     [Theory]
@@ -1299,7 +1347,10 @@ public sealed class HarUnitTests
             ByteCorruption.TornMix => [.. correct.AsSpan(0, 4500), .. Pad(model.Committed, 9000).AsSpan(4500)],
             _ => throw new ArgumentOutOfRangeException(nameof(corruption), corruption, null),
         };
-        Assert.False(corrupted.AsSpan().SequenceEqual(correct), $"{corruption}: the corrupted implementation output must disagree with the oracle");
+        // The comparison every test uses against the oracle rejects the corrupted output, including pure length changes
+        // (a prefix-only comparison would accept TruncatedTail/ExtraTrailingBytes).
+        XunitException rejected = Assert.ThrowsAny<XunitException>(() => AssertEx.BytesEqual(model.Read(0, 9000, staged: true), corrupted, "implementation output"));
+        Assert.Contains("differ", rejected.Message, StringComparison.Ordinal);
         AssertEx.BytesEqual(expected, correct);
 
         model.Flush();
@@ -1724,6 +1775,7 @@ public sealed class HarUnitTests
         { FaultSites.CommitReceiptValidated, 1 },
         { FaultSites.ApplyAfterBeforeReply, 1 },
         { FaultSites.RpcReplySend, 1 },
+        { FaultSites.StagingRegistered, 1 },
         { FaultSites.ObjectWrite, 1 },
         { FaultSites.ObjectBeforeFlush, 1 },
         { FaultSites.ObjectAfterFlushBeforeReceipt, 1 },
@@ -1766,6 +1818,11 @@ public sealed class HarUnitTests
             FaultContext hit = Assert.Single(arm.Contexts);
             Assert.Equal(site, hit.Site);
             Assert.Equal(stage, hit.Stage);
+
+            // Event identity + hit count: the action ran on exactly the occurrence-th recorded event matching the identity.
+            FaultContext[] matching = cluster.Faults.Coverage.Hits.Where(h => match.Matches(h)).ToArray();
+            Assert.True(matching.Length >= occurrence, $"{site}: only {matching.Length} matching events recorded for occurrence {occurrence}");
+            Assert.Equal(matching[occurrence - 1], hit);
             if (clientSite)
             {
                 Assert.StartsWith(path, hit.Path);
@@ -1970,7 +2027,9 @@ public sealed class HarUnitTests
         Assert.All(states.Take(states.Count - 1), s => Assert.Null(s.Check())); // every strict prefix is still safe
 
         // Minimal: no counterexample exists within one step less, and no single step can be dropped.
-        Assert.Null(ModelChecker.Explore(FenceState.Initial, s => s.Next(), s => s.Check(), s => s.Key, maxDepth: trace.Count - 1, maxStates: 100_000).Violation);
+        ModelCheckResult shallower = ModelChecker.Explore(FenceState.Initial, s => s.Next(), s => s.Check(), s => s.Key, maxDepth: trace.Count - 1, maxStates: 100_000);
+        Assert.Null(shallower.Violation);
+        Assert.True(shallower.StatesExplored < 100_000, "the shorter search was cut by the state bound, so it proves nothing about minimality");
         for (int i = 0; i < trace.Count; i++)
             Assert.NotEqual(FenceState.Invariant, FenceState.Replay(trace.Where((_, j) => j != i).ToList(), out _));
 
@@ -2106,8 +2165,12 @@ public sealed class HarUnitTests
                     cluster.Network.Partition([leader.Name, "client:c0"], [followers[0].Name], [followers[1].Name]);
                     break;
                 case WithheldPrerequisite.Capacity:
+                    // No payload capacity on any device, but the configured recovery reserve stays available (ARCHITECTURE
+                    // §8: admission rejects uploads before touching the reserve). Exhausting the reserve as well would be an
+                    // out-of-envelope ENOSPC on the journal, after which a node may legitimately fail-stop; restoring capacity
+                    // alone would then not restore the stated prerequisites and the liveness assertion below would be unfounded.
                     foreach (TestNode node in cluster.Nodes)
-                        node.Disk.Faults.CapacityOverride = node.Disk.UsedBytes;
+                        node.Disk.Faults.CapacityOverride = node.Disk.UsedBytes + cluster.Options.ReservedBytes;
                     break;
             }
 
@@ -2220,7 +2283,6 @@ public sealed class HarUnitTests
         Assert.Equal(42UL, (options with { Seed = 42 }).ResolveSeed("Suite.TestA"));
         string explicitRoot = Path.Combine(options.ResolveDataRoot(), "har016-explicit");
         Assert.Equal(explicitRoot, (options with { DataRoot = explicitRoot }).ResolveDataRoot());
-        Assert.NotSame(TestClusterOptions.ThreeZones, TestClusterOptions.ThreeZones);
         _ = TestClusterOptions.ThreeZones with { NodeCount = 7 };
         Assert.Equal(3, TestClusterOptions.ThreeZones.NodeCount);
     }

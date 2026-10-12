@@ -539,7 +539,10 @@ internal static class HarHelpers
         }
 
         await Step("write", "/har001-a", () => vol.Files.WriteAllBytesAsync("/har001-a", TestData.Bytes(1, 1000), ct));
-        await Step("write", "/har001-big", () => vol.Files.WriteAllBytesAsync("/har001-big", TestData.Bytes(2, 200 * 1024 + 7), ct));
+        // 1 MiB + 7 = 17 upload chunks (64 KiB). With 5 nodes and 3 target copies a given follower is a placement target of
+        // each object with probability 3/5, so the crash point on that follower is reached with probability > 1 - 0.4^17;
+        // a 4-object file would leave a ~2.6 % chance (per seed) that the armed fault is never reached.
+        await Step("write", "/har001-big", () => vol.Files.WriteAllBytesAsync("/har001-big", TestData.Bytes(2, (1024 * 1024) + 7), ct));
         for (int i = 0; i < 3; i++)
         {
             byte[] entry = TestData.Bytes(10 + (ulong)i, 300);
