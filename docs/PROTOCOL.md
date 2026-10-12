@@ -75,6 +75,9 @@ tables in §9–§10 are generated from those records (wire order and wire types
 | `Retention` (`DfsRetention`) | `timestamp?` ExpiresUtc, `bool` Hold. |
 | `BackupCheckpoint` (`DfsBackupCheckpoint`) | `string` Target, `SnapshotId`, `string` SnapshotName, `CommitToken` CoveredCommit, `timestamp?` RetentionExpiryUtc, `bool` Held, `bool` IsExactSnapshot. |
 | `Credentials` (`DfsCredentials`) | `string` Principal, `string` Secret. Only inside TLS-protected administrative requests; never logged (record `ToString` overrides redact secrets, SEC-016). |
+| `Identity` (`DfsIdentity`, Addendum A) | `string` text form (`user:x`, `group:x`, `Everyone`, `AuthenticatedUsers`, `Administrators`, `CreatorOwner`); text that does not parse is malformed. |
+| `AccessRule` (`DfsAccessRule`) | `Identity`, `varuint` rights (raw `DfsFileSystemRights` bits; receivers validate), `enum DfsAccessControlType (raw)`, `enum DfsInheritanceFlags (raw)`, `enum DfsPropagationFlags (raw)`, `bool` IsInherited, `string?` InheritedFrom. |
+| `SecurityDescriptor` (`DfsSecurityDescriptor`) | `Identity` owner, `bool` AreAccessRulesProtected, `list<AccessRule>` rules. Not validated by the codec (receivers answer `InvalidArgument`). |
 
 ### 2.4 Canonical form
 
@@ -160,6 +163,11 @@ peer                                         server (live node or backup node)
   incarnation is accepted, **including its Raft traffic**: committing the registration needs a control quorum, and
   after a full-cluster restart every voter is in that state. Its receipts are not trusted, and the node issues none,
   until `RegisterIncarnation` committed the (incarnation, boot id) pair (RCV-02).
+* **Lagging views**: membership is judged against the receiver's local applied control state, which may lag (a new
+  learner's view is empty until the log reaches it). Raft traffic (`RaftBatch`, `RaftSnapshotChunk`) is therefore also
+  accepted from node ids that proved the cluster secret but are unknown to the receiver's view; removed and stale node
+  identities are always rejected, and the Raft core itself ignores non-leader traffic from non-members. A node that knows
+  no endpoint for a peer (a learner with an empty view) answers over the authenticated connection the peer opened.
 * **Result**: on success the connection identity (`RpcPeerIdentity`: principal or node id/name/incarnation, role) is
   fixed and every later request is authorized against it, on every request (SEC-003). On rejection
   `HelloResult.Accepted = false` carries the error code and the server closes the connection.
@@ -485,6 +493,19 @@ answered with `Unsupported`.
 | `RestoreFromBackup` (60) | `AdminRestoreFromBackupBody` | `AdminVolumeInfoBody` | control leader | ClusterAdmin |
 | `SetFeature` (70) | `AdminSetFeatureBody` | `AdminEmptyBody` | control leader | ClusterAdmin |
 | `AuditLog` (71) | `AdminAuditLogRequestBody` | `AdminNameListBody` | any node | ClusterAdmin |
+| `CreateGroup` / `DeleteGroup` (80/81) | `AdminGroupNameBody` | `AdminEmptyBody` | control leader | ClusterAdmin |
+| `AddGroupMember` / `RemoveGroupMember` (82/83) | `AdminGroupMemberBody` | `AdminEmptyBody` | control leader | ClusterAdmin |
+| `ListGroups` (84) | `AdminEmptyBody` | `AdminGroupListBody` | any node | ClusterAdmin |
+| `CreatePool` / `SetPoolMembers` (90/91) | `AdminPoolMembersBody` | `AdminEmptyBody` | control leader | ClusterAdmin |
+| `DeletePool` (92) | `AdminPoolNameBody` | `AdminEmptyBody` | control leader | ClusterAdmin |
+| `ListPools` (93) | `AdminEmptyBody` | `AdminPoolListBody` | any node | ClusterAdmin |
+| `PoolStatus` (94) | `AdminPoolNameBody` | `AdminPoolStatusBody` | any node | ClusterAdmin |
+
+Operations 80–94 belong to Addendum A (groups and storage pools); pool and group changes are audited and pool changes
+advance the placement epoch. Volume-scoped operations (`VolumeStatus`, `PolicyMigrationStatus`, `StartScrub`,
+`StartRepair`, `ReplicaHealth`, `RestoreFromBackup`) are dispatched by the receiving node to the volume service; a node
+without it answers `Unsupported`. Mutating operations are deduplicated by `RequestId` in the control state (the retained
+outcome is returned for a retry).
 
 Administrative changes are audited with principal, operation, outcome and scope, never secrets (SEC-016/018).
 
@@ -2031,6 +2052,34 @@ Request of `AdminOp.ExportRecoveryKey`.
 | 1 | `Passphrase` | `string` | Passphrase the escrow is wrapped under (never logged). |
 | 2 | — | `extensions` | Terminal extension block. |
 
+#### `AdminGroupListBody`
+
+Result of `AdminOp.ListGroups`.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Groups` | `list<GroupInfoData>` | Groups ordered by name (ordinal). |
+| 2 | — | `extensions` | Terminal extension block. |
+
+#### `AdminGroupMemberBody`
+
+Request of `AdminOp.AddGroupMember` and `AdminOp.RemoveGroupMember`.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Group` | `string` | Group name. |
+| 2 | `Principal` | `string` | Principal name. |
+| 3 | — | `extensions` | Terminal extension block. |
+
+#### `AdminGroupNameBody`
+
+Request of `AdminOp.CreateGroup` and `AdminOp.DeleteGroup`.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Group` | `string` | Group name (a valid `DfsIdentity` name). |
+| 2 | — | `extensions` | Terminal extension block. |
+
 #### `AdminGrantBody`
 
 Request of `AdminOp.Grant` and `AdminOp.Revoke`.
@@ -2090,6 +2139,45 @@ Result of `AdminOp.PolicyMigrationStatus`.
 | 3 | `Effective` | `bool` | True once migration has completed. |
 | 4 | `PendingObjects` | `varint` | Objects still to migrate. |
 | 5 | — | `extensions` | Terminal extension block. |
+
+#### `AdminPoolListBody`
+
+Result of `AdminOp.ListPools`.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Pools` | `list<PoolInfoData>` | Pools ordered by name (ordinal), the implicit `default` pool included. |
+| 2 | — | `extensions` | Terminal extension block. |
+
+#### `AdminPoolMembersBody`
+
+Request of `AdminOp.CreatePool` and `AdminOp.SetPoolMembers`.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Pool` | `string` | Pool name (`DfsPoolNames` rules; `default` is implicit and cannot be set). |
+| 2 | `Nodes` | `list<string>` | Member node names (non-empty, live members). |
+| 3 | — | `extensions` | Terminal extension block. |
+
+#### `AdminPoolNameBody`
+
+Request of `AdminOp.DeletePool` and `AdminOp.PoolStatus`.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Pool` | `string` | Pool name. |
+| 2 | — | `extensions` | Terminal extension block. |
+
+#### `AdminPoolStatusBody`
+
+Result of `AdminOp.PoolStatus` (mirrors the SDK's `DfsPoolStatus`).
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Info` | `PoolInfoData` | The pool. |
+| 2 | `Replicas` | `ReplicaHealthData` | Replica health aggregated over the pool's volumes. |
+| 3 | `DrainingNodes` | `list<string>` | Member nodes being drained (ordinal order). |
+| 4 | — | `extensions` | Terminal extension block. |
 
 #### `AdminPrincipalNameBody`
 
@@ -2204,7 +2292,10 @@ Request of `AdminOp.CreateVolume` (mirrors the SDK's `DfsVolumeSpec`).
 | 4 | `NamedPolicies` | `map<string, StoragePolicy>` | Named storage policies. |
 | 5 | `InlineThreshold` | `varint32` | Inline threshold in bytes. |
 | 6 | `Limits` | `VolumeLimits` | Volume limits. |
-| 7 | — | `extensions` | Terminal extension block. |
+| 7 | `StoragePool` | `string` | Storage pool the volume is bound to (Addendum A, POOL-02; `default` when unspecified). |
+| 8 | `RootSecurity` | `SecurityDescriptor?` | Root security descriptor; null = `DfsSecurityDescriptor.DefaultRoot(creator)` (ACL-06). |
+| 9 | `EnforceTraverseChecking` | `bool` | Require Traverse on every ancestor directory (ACL-05). |
+| 10 | — | `extensions` | Terminal extension block. |
 
 #### `AdminVolumeStatusBody`
 
@@ -2408,6 +2499,16 @@ Metadata of a file or directory (FSD NS-04), used by open, get-info and create-d
 | 16 | `WriterGeneration` | `varuint` | Current writer fencing generation of the inode (files only). |
 | 17 | — | `extensions` | Terminal extension block. |
 
+#### `GroupInfoData`
+
+One principal group (mirrors the SDK's `DfsGroupInfo`).
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Name` | `string` | Group name. |
+| 2 | `Members` | `list<string>` | Member principals (ordinal order). |
+| 3 | — | `extensions` | Terminal extension block. |
+
 #### `GroupStatusData`
 
 Status of one Raft group (control or volume).
@@ -2518,6 +2619,19 @@ A stored copy identified by object and staging session: the unit of garbage-coll
 | 1 | `Object` | `ObjectId` | Stored object. |
 | 2 | `Staging` | `StagingId` | Staging session the decision was taken for. |
 | 3 | — | `extensions` | Terminal extension block. |
+
+#### `PoolInfoData`
+
+One storage pool (mirrors the SDK's `DfsPoolInfo`).
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Name` | `string` | Pool name. |
+| 2 | `Nodes` | `list<string>` | Member node names (ordinal order). |
+| 3 | `Volumes` | `list<string>` | Names of volumes bound to the pool (ordinal order). |
+| 4 | `CapacityBytes` | `varint` | Sum of the members' configured capacities. |
+| 5 | `UsedBytes` | `varint` | Sum of the members' last reported usage (advisory). |
+| 6 | — | `extensions` | Terminal extension block. |
 
 #### `RaftEnvelope`
 
@@ -2662,7 +2776,9 @@ One volume of the cluster map: identity, authority epoch, routing and policies.
 | 10 | `NamedPolicies` | `map<string, StoragePolicy>` | Named alternative storage policies (ordinal names). |
 | 11 | `InlineThreshold` | `varint32` | Largest file length stored inline in metadata. |
 | 12 | `Limits` | `VolumeLimits` | Volume limits. |
-| 13 | — | `extensions` | Terminal extension block. |
+| 13 | `StoragePool` | `string` | Storage pool the volume is bound to (Addendum A). |
+| 14 | `EnforceTraverseChecking` | `bool` | True when the volume enforces Traverse on ancestor directories. |
+| 15 | — | `extensions` | Terminal extension block. |
 
 
 ## 11. Errors

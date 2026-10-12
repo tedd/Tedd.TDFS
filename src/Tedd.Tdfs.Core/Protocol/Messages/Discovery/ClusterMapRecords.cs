@@ -105,7 +105,13 @@ public sealed record VolumeEntry(
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
 
     /// <inheritdoc />
-    public static int MinEncodedSize => 16 + 1 + 1 + 1 + 1 + 1 + 1 + 3 + 4 + 1 + 1 + 8 + 1;
+    public static int MinEncodedSize => 16 + 1 + 1 + 1 + 1 + 1 + 1 + 3 + 5 + 1 + 1 + 8 + 1 + 1 + 1;
+
+    /// <summary>Storage pool the volume is bound to (Addendum A, POOL-02; trailing field).</summary>
+    public string StoragePool { get; init; } = DfsPoolNames.Default;
+
+    /// <summary>True when the volume enforces Traverse on ancestor directories (Addendum A, ACL-05; trailing field).</summary>
+    public bool EnforceTraverseChecking { get; init; }
 
     /// <inheritdoc />
     public void Write(ref WireWriter writer)
@@ -122,6 +128,8 @@ public sealed record VolumeEntry(
         writer.WritePolicyMap(NamedPolicies);
         writer.WriteVarInt32(InlineThreshold);
         writer.WriteVolumeLimits(Limits);
+        writer.WriteString(StoragePool ?? DfsPoolNames.Default);
+        writer.WriteBool(EnforceTraverseChecking);
         writer.WriteExtensionBlock(Extensions);
     }
 
@@ -140,9 +148,13 @@ public sealed record VolumeEntry(
         IReadOnlyDictionary<string, DfsStoragePolicy> named = reader.ReadPolicyMap();
         int inline = reader.ReadVarInt32();
         DfsVolumeLimits limits = reader.ReadVolumeLimits();
+        string pool = reader.ReadString();
+        bool enforceTraverse = reader.ReadBool();
         IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
         return new VolumeEntry(id, name, epoch, state, voters, learners, leader, metadata, defaultPolicy, named, inline, limits)
         {
+            StoragePool = pool,
+            EnforceTraverseChecking = enforceTraverse,
             Extensions = extensions,
         };
     }

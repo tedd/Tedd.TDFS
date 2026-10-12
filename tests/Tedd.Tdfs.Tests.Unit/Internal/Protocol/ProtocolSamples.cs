@@ -16,7 +16,9 @@ namespace Tedd.Tdfs.Tests.Unit.Internal.Protocol;
 internal sealed class ProtocolSamples
 {
     private const int MaxDepth = 4;
+    // NullabilityInfoContext is not thread-safe (it caches per member); tests run in parallel.
     private static readonly NullabilityInfoContext Nullability = new();
+    private static readonly Lock NullabilityLock = new();
     private static readonly string[] Words = ["a", "zone-1", "n0", "/docs/report.json", "ÆØÅ", "名前", "\U0001F600x", "", "%2F", "x y"];
 
     private readonly Random _random;
@@ -77,6 +79,18 @@ internal sealed class ProtocolSamples
         if (type == typeof(ReadOnlyMemory<byte>)) return NextBytes(name);
         if (type.IsEnum) return NextEnum(type);
 
+        if (type == typeof(DfsIdentity))
+        {
+            return _minimal
+                ? DfsIdentity.Everyone
+                : _random.Next(3) switch
+                {
+                    0 => DfsIdentity.User("u" + _random.Next(1000).ToString(System.Globalization.CultureInfo.InvariantCulture)),
+                    1 => DfsIdentity.Group("g" + _random.Next(1000).ToString(System.Globalization.CultureInfo.InvariantCulture)),
+                    _ => DfsIdentity.AuthenticatedUsers,
+                };
+        }
+
         if (type == typeof(NodeId)) return new NodeId((Guid)Create(typeof(Guid), name, depth)!);
         if (type == typeof(VolumeId)) return new VolumeId((Guid)Create(typeof(Guid), name, depth)!);
         if (type == typeof(SnapshotId)) return new SnapshotId((Guid)Create(typeof(Guid), name, depth)!);
@@ -128,21 +142,28 @@ internal sealed class ProtocolSamples
                 {
                     if (property.SetMethod is null || !property.SetMethod.IsPublic || property.GetIndexParameters().Length > 0)
                         continue;
-                    property.SetValue(instance, CreateForMember(property.PropertyType, property.Name, Nullability.Create(property), depth + 1));
+                    property.SetValue(instance, CreateForMember(property.PropertyType, property.Name, NullabilityOf(property), depth + 1));
                 }
             }
         }
         else
         {
             object?[] values = parameters
-                .Select(p => CreateForMember(p.ParameterType, p.Name!, Nullability.Create(p), depth + 1))
+                .Select(p => CreateForMember(p.ParameterType, p.Name!, NullabilityOf(p), depth + 1))
                 .ToArray();
             instance = primary.Invoke(values);
         }
 
-        // Wire fields added as init-only properties rather than constructor parameters.
-        if (!_minimal && instance is ErrorReplyMessage && _random.Next(2) == 0)
-            type.GetProperty(nameof(ErrorReplyMessage.Detail))!.SetValue(instance, Create(typeof(ErrorDetailData), nameof(ErrorReplyMessage.Detail), depth + 1));
+        // Wire fields added as init-only properties rather than constructor parameters (ErrorReplyMessage.Detail, the
+        // Addendum A trailing fields of AdminVolumeSpecBody and VolumeEntry).
+        if (!_minimal && IsProtocolRecord(type))
+        {
+            foreach (PropertyInfo property in InitOnlyWireFields(type))
+            {
+                if (_random.Next(2) == 0)
+                    property.SetValue(instance, CreateForMember(property.PropertyType, property.Name, NullabilityOf(property), depth + 1));
+            }
+        }
 
         if (!_minimal && IsProtocolRecord(type) && _random.Next(4) == 0)
         {
@@ -284,6 +305,37 @@ internal sealed class ProtocolSamples
         Span<byte> bytes = stackalloc byte[16];
         _random.NextBytes(bytes);
         return new Guid(bytes);
+    }
+
+    /// <summary>
+    /// Wire fields declared as public init-only properties of a protocol record (beyond its primary constructor
+    /// parameters and the extension block), in declaration order.
+    /// </summary>
+    public static IReadOnlyList<PropertyInfo> InitOnlyWireFields(Type type)
+    {
+        ConstructorInfo primary = type.GetConstructors(BindingFlags.Public | BindingFlags.Instance)
+            .Where(c => !(c.GetParameters().Length == 1 && c.GetParameters()[0].ParameterType == type))
+            .OrderByDescending(c => c.GetParameters().Length)
+            .First();
+        var parameters = new HashSet<string>(primary.GetParameters().Select(p => p.Name!), StringComparer.Ordinal);
+        return type.GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .Where(p => p.SetMethod is { IsPublic: true } && p.GetIndexParameters().Length == 0
+                && p.Name != "Extensions" && !parameters.Contains(p.Name)
+                && p.SetMethod.ReturnParameter.GetRequiredCustomModifiers().Any(m => m.FullName == "System.Runtime.CompilerServices.IsExternalInit"))
+            .OrderBy(p => p.MetadataToken)
+            .ToArray();
+    }
+
+    private static NullabilityInfo NullabilityOf(PropertyInfo property)
+    {
+        lock (NullabilityLock)
+            return Nullability.Create(property);
+    }
+
+    private static NullabilityInfo NullabilityOf(ParameterInfo parameter)
+    {
+        lock (NullabilityLock)
+            return Nullability.Create(parameter);
     }
 
     private static bool IsProtocolRecord(Type type)

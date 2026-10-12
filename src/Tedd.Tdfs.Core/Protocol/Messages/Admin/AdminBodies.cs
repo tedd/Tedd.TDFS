@@ -260,8 +260,17 @@ public sealed record AdminVolumeSpecBody(
     /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
 
+    /// <summary>Storage pool the volume is bound to (Addendum A, POOL-02; trailing field).</summary>
+    public string StoragePool { get; init; } = DfsPoolNames.Default;
+
+    /// <summary>Root security descriptor; null = <see cref="DfsSecurityDescriptor.DefaultRoot"/> of the creator (trailing field).</summary>
+    public DfsSecurityDescriptor? RootSecurity { get; init; }
+
+    /// <summary>Require Traverse on every ancestor directory (Addendum A, ACL-05; trailing field).</summary>
+    public bool EnforceTraverseChecking { get; init; }
+
     /// <inheritdoc />
-    public static int MinEncodedSize => 19;
+    public static int MinEncodedSize => 22;
 
     /// <inheritdoc />
     public void Write(ref WireWriter writer)
@@ -272,6 +281,9 @@ public sealed record AdminVolumeSpecBody(
         writer.WritePolicyMap(NamedPolicies);
         writer.WriteVarInt32(InlineThreshold);
         writer.WriteVolumeLimits(Limits);
+        writer.WriteString(StoragePool ?? DfsPoolNames.Default);
+        writer.WriteOptionalSecurityDescriptor(RootSecurity);
+        writer.WriteBool(EnforceTraverseChecking);
         writer.WriteExtensionBlock(Extensions);
     }
 
@@ -284,8 +296,17 @@ public sealed record AdminVolumeSpecBody(
         IReadOnlyDictionary<string, DfsStoragePolicy> namedPolicies = reader.ReadPolicyMap();
         int inlineThreshold = reader.ReadVarInt32();
         DfsVolumeLimits limits = reader.ReadVolumeLimits();
+        string pool = reader.ReadString();
+        DfsSecurityDescriptor? rootSecurity = reader.ReadOptionalSecurityDescriptor();
+        bool enforceTraverse = reader.ReadBool();
         IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
-        return new AdminVolumeSpecBody(name, metadata, defaultPolicy, namedPolicies, inlineThreshold, limits) { Extensions = extensions };
+        return new AdminVolumeSpecBody(name, metadata, defaultPolicy, namedPolicies, inlineThreshold, limits)
+        {
+            StoragePool = pool,
+            RootSecurity = rootSecurity,
+            EnforceTraverseChecking = enforceTraverse,
+            Extensions = extensions,
+        };
     }
 }
 

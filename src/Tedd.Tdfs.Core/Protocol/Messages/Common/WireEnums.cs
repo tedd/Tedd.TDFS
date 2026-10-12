@@ -286,6 +286,36 @@ public enum AdminOp : ushort
 
     /// <summary>Read the audit log (<see cref="AdminAuditLogRequestBody"/> → <see cref="AdminNameListBody"/>).</summary>
     AuditLog = 71,
+
+    /// <summary>Create a principal group (<see cref="AdminGroupNameBody"/> → <see cref="AdminEmptyBody"/>; Addendum A).</summary>
+    CreateGroup = 80,
+
+    /// <summary>Delete a principal group (<see cref="AdminGroupNameBody"/> → <see cref="AdminEmptyBody"/>).</summary>
+    DeleteGroup = 81,
+
+    /// <summary>Add a principal to a group (<see cref="AdminGroupMemberBody"/> → <see cref="AdminEmptyBody"/>).</summary>
+    AddGroupMember = 82,
+
+    /// <summary>Remove a principal from a group (<see cref="AdminGroupMemberBody"/> → <see cref="AdminEmptyBody"/>).</summary>
+    RemoveGroupMember = 83,
+
+    /// <summary>List groups (<see cref="AdminEmptyBody"/> → <see cref="AdminGroupListBody"/>).</summary>
+    ListGroups = 84,
+
+    /// <summary>Create a storage pool (<see cref="AdminPoolMembersBody"/> → <see cref="AdminEmptyBody"/>; Addendum A).</summary>
+    CreatePool = 90,
+
+    /// <summary>Replace a pool's node set (<see cref="AdminPoolMembersBody"/> → <see cref="AdminEmptyBody"/>).</summary>
+    SetPoolMembers = 91,
+
+    /// <summary>Delete an unreferenced pool (<see cref="AdminPoolNameBody"/> → <see cref="AdminEmptyBody"/>).</summary>
+    DeletePool = 92,
+
+    /// <summary>List pools (<see cref="AdminEmptyBody"/> → <see cref="AdminPoolListBody"/>).</summary>
+    ListPools = 93,
+
+    /// <summary>Status of one pool (<see cref="AdminPoolNameBody"/> → <see cref="AdminPoolStatusBody"/>).</summary>
+    PoolStatus = 94,
 }
 
 /// <summary>Object payload encodings (the <c>Encoding</c> byte of objects, extents, changes and receipts).</summary>
