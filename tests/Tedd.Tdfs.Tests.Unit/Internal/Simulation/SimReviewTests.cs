@@ -325,7 +325,7 @@ public sealed class SimReviewTests
                     await transport.StartAsync(new DelegateHandler((_, request, expectsReply, _) =>
                     {
                         served[name] = served.GetValueOrDefault(name) + 1;
-                        return new ValueTask<ReadOnlyMemory<byte>?>(expectsReply ? Bytes(loop.Process.Id + ":" + Str(request)) : null);
+                        return new ValueTask<ReadOnlyMemory<byte>?>(expectsReply ? Bytes(loop.Process.Id + ":" + SimText.Str(request)) : null);
                     }));
                     IRandomSource random = s.ForkRandom("node/" + loop.Process.Id);
                     for (int round = 0; round < 20; round++)
@@ -336,7 +336,7 @@ public sealed class SimReviewTests
                         {
                             IRpcConnection connection = await transport.ConnectAsync("mem://" + peer);
                             ReadOnlyMemory<byte> reply = await connection.CallAsync(Bytes(name + "/" + round), 20 * Ms);
-                            s.AddTrace($"{loop.Process.Id} got {Str(reply)}");
+                            s.AddTrace($"{loop.Process.Id} got {SimText.Str(reply)}");
                             await connection.DisposeAsync();
                         }
                         catch (Exception ex) when (ex is TimeoutException or RpcConnectionException)

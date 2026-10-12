@@ -75,11 +75,11 @@ public sealed class FileSystemHost : MediumHost
         return _medium;
     }
 
-    public override byte[] ReadRaw(string path) => File.ReadAllBytes(_medium.GetFullPath(path));
+    public override byte[] ReadRaw(string path) => System.IO.File.ReadAllBytes(_medium.GetFullPath(path));
 
     public override void Corrupt(string path, long offset, byte xorMask = 0xFF)
     {
-        using FileStream stream = File.Open(_medium.GetFullPath(path), FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+        using FileStream stream = System.IO.File.Open(_medium.GetFullPath(path), FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
         stream.Position = offset;
         int value = stream.ReadByte();
         if (value < 0)

@@ -210,7 +210,7 @@ public sealed class RaftSafetyCampaignTests
             if (!string.IsNullOrEmpty(dir))
             {
                 Directory.CreateDirectory(dir);
-                File.WriteAllLines(Path.Combine(dir, $"raft-v{voters}-s{seed}-m{(mutations.Any ? 1 : 0)}-c{(membershipChurn ? 1 : 0)}-d{deferReadies}.log"), [what, .. sim.Trace]);
+                System.IO.File.WriteAllLines(Path.Combine(dir, $"raft-v{voters}-s{seed}-m{(mutations.Any ? 1 : 0)}-c{(membershipChurn ? 1 : 0)}-d{deferReadies}.log"), [what, .. sim.Trace]);
             }
 
             return $"voters={voters} seed={seed} mutations={mutations.Any}: {what}\n{string.Join("\n", sim.Trace.Skip(Math.Max(0, sim.Trace.Count - 80)))}";

@@ -1690,6 +1690,13 @@ public IReadOnlyList<string> AllPaths(); public int Count { get; } public long L
   `Open/OpenUnitTests.cs`), namespace `Tedd.Tdfs.Tests.<Level>.<Suite>`, class `<Suite><Level>Tests`
   (e.g. `OpenUnitTests`, `OpenSimulationTests`). Shared helpers for a suite go in `<Suite>/<Suite>Helpers.cs` of the
   same project (internal static).
+* Suite namespaces are visible to every other suite of the same project and win over `using` directives: `File`,
+  `Tx`, `Str` and `Lock` shadow `System.IO.File`, `System.Threading.Lock` and `using static` helpers named
+  `Tx(...)`/`Str(...)`, so qualify those (`System.IO.File.ReadAllText`, `System.Threading.Lock`, `HarHelpers.Tx(...)`). The PATH suite uses
+  namespace `…Paths` because `Path` would shadow `System.IO.Path`. The CON suite lives in folder `Consensus/` (`Con` is a
+  reserved Windows device name); namespace and class names are unchanged.
+* `CatalogCoverageTests` (Unit) fails when a test-plan case has no `[Catalog]` test or a `[Catalog]` id is neither a
+  test-plan case, an Addendum A case nor a MESH row of `docs/test-notes/mesh.md`.
 * One test method per catalog row (more allowed for variants), name `{SUITE}_{NNN}_{CatalogName}` (e.g.
   `OPEN_001_CreateNewAbsent`), attributed `[Fact]` or `[Theory]` + `[Catalog("OPEN-001", "U", "INV-02", "INV-07")]`.
 * Every cluster scenario runs through `ClusterTest.RunAsync(options, async cluster => { ... })`. Use
@@ -1905,3 +1912,312 @@ public static IReadOnlyList<CatalogEntry> ParseAddendum(string markdown);
 // FileInspection gains (appended): IReadOnlyList<StreamInspection> Streams = null! (normalized to empty, never null)
 public sealed record StreamInspection(string Name, long Length, ulong Revision, IReadOnlyList<ExtentInspection> Extents);   // namespace Tedd.Tdfs.Server
 ```
+
+---
+
+## I. Test-requested harness and API additions
+
+Members and types the test suites (branches `tests/*`, integrated on `integrate/tests`) added because §§A–H could not
+express a required test. They are binding like §F: the harness and server must implement them with exactly the behaviour
+summarised here; the XML docs on each member are the full specification. Until implemented, harness members throw
+`NotImplementedException` (`Stub.NotYet`) and server inspector members throw `NotImplementedException`, so tests that reach
+them fail and never pass. Sources: `tests/Tedd.Tdfs.Testing/Additions/<suite>/` and `src/Tedd.Tdfs.Server/Additions/<suite>/`.
+The per-suite notes `docs/api-additions/<suite>.md` are kept: besides these members they list the behaviour of *existing*
+members each suite relies on (fault-context fields, counters, inspector semantics, error mappings), which implementers
+must read too.
+
+Suites that added no members: OPEN, FILE, NS (`file-ns.md`), PUB (`pub.md`), TX (`tx.md`), PROP, MOD. MESH, SNP and APP
+added only implemented test-side helper libraries (§I.9).
+
+### I.1 `TestCluster` (partial)
+
+```csharp
+// HAR — Additions/har/TestCluster.har.cs
+public IReadOnlyList<UncontrolledDependency> UncontrolledDependencies { get; }
+public IReadOnlyList<AssumptionViolation> AssumptionViolations { get; }
+// SDK/PATH — Additions/sdk-path/TestCluster.sdk-path.cs
+public Task<DfsClient> ConnectAsync(TestClientOptions? options, Func<DfsClientOptions, DfsClientOptions> configure, CancellationToken ct = default);
+// LOCK — Additions/lock/TestCluster.lock.cs
+public Task<RawProtocolClient> ConnectRawAsBackupAsync(int backupIndex, string nodeName, CancellationToken ct = default);
+// BAK — Additions/bak/TestCluster.bak.cs
+public Task<ManualBackupExport> BeginManualBackupExportAsync(string volume, string snapshotName, int backupIndex = 0, CancellationToken ct = default);
+public Task<RawProtocolClient> ConnectRawBackupAsync(int backupIndex = 0, CancellationToken ct = default);
+// CON/NET + RSY — Additions/con-net/TestCluster.con-net.cs
+public Task<TestNode> TransferLeadershipAsync(string group, string targetNode, TimeSpan? timeout = null, bool waitUntilServing = true, CancellationToken ct = default);
+public Task<NodeHost> StartForeignClusterNodeAsync(string listenEndpoint, CancellationToken ct = default);
+// RST/SEC + CHA — Additions/rst-sec/TestCluster.rst-sec.cs
+public Task<TestCluster> StartRecoveryClusterAsync(TestClusterOptions options, CancellationToken ct = default);
+public Task<TestNode> AddNodeAsync(TestNodeSpec spec, Func<NodeOptions, NodeOptions> configure, bool join = true, CancellationToken ct = default);
+```
+
+| Member | Required behaviour | Tests |
+|---|---|---|
+| `UncontrolledDependencies` | Deterministic mode: every post to a simulation `SynchronizationContext` (node loops, scenario/client context) from a thread other than the scheduler thread is recorded as `UncontrolledDependency(ForeignThreadPost, component = "n0".../"scenario", detail = thread + stack)`; the work still runs (no deadlock). Harness facilities (`Time`, `DelayAsync`, `Task.Delay(…, Time)`, timers of `Time`) record nothing. **`ClusterTest.RunAsync` (both overloads) throws `UncontrolledDependencyException` with every entry (inner = scenario failure, if any) when the list is non-empty at the end.** Realtime mode: always empty. | HAR-002 |
+| `AssumptionViolations` | One `AssumptionViolation(DurableFlush, node, detail)` per node and crash whenever a crash (any `CrashMode`, `CrashNode` fault, disk replacement) discards bytes or namespace changes whose flush reported success on a disk made dishonest with `TestDisk.SetDishonestFlush`; visible as soon as the crash call returns. **`ClusterTest.RunAsync` throws `AssumptionViolatedException` (inner = scenario or end-of-run invariant failure) when non-empty at the end; this takes precedence over the end-of-run invariant checks.** | HAR-018 |
+| `ConnectAsync(options, configure)` | Exactly `ConnectAsync(options)` (identity `client:{Name}`, harness transport, randomness, client clock, fault injector, mutations), but the public `DfsClientOptions` the harness built (`CreateClientOptions`) go through `configure` first; the SDK validates the result as on the public path (invalid → SDK `ArgumentException`); the harness never overrides values the callback changed. | SDK-012 |
+| `ConnectRawAsBackupAsync` | Raw client to live node `nodeName` whose handshake presents backup node `b{backupIndex}`'s node-level identity (name, role backup, backup credentials), so the live side sees `RpcPeerIdentity.IsBackup = true`; network identity = the backup's name. A refused handshake still returns a client (`IsConnected = false`, every call returns the refusal code). No `AuthenticateAsync` needed. `ArgumentOutOfRangeException` unknown backup index, `ArgumentException` unknown node. | LOCK-020 |
+| `BeginManualBackupExportAsync` | Step-by-step driver of the real late-sync export (same wire messages, credentials, encryption, lineage) for an existing live snapshot towards a registered backup target. Acquires a logged source transfer pin and suspends the automatic exporter for that (volume, target) until disposed; continues the target's lineage (new lineage when marked for reseed); a successful publish records backup progress exactly like the exporter. | BAK-006, 007, 009, 010 |
+| `ConnectRawBackupAsync` | Raw client to backup node `backupIndex` (identity `client:raw-b{index}`), unauthenticated until `AuthenticateAsync`; all raw members behave as for a live node, so mutations exercise the backup host's own read-only enforcement (`ReadOnly`). | BAK-002, 015, 029 |
+| `TransferLeadershipAsync` | **Consolidated** (CON/NET `Task …(group, targetNode, ct)` + RSY `Task<TestNode> …(group, nodeName, timeout, ct)`). Moves leadership of `"control"` or a volume group to `targetNode` through the production transfer (`RaftNode.TransferLeadership`: `TimeoutNow` once caught up, election in a higher term); never forces a role, edits persisted state or bypasses vote/log checks. `waitUntilServing = true`: completes when the target is leader, every reachable voter reports it, and it applied its own no-op of the new term. `false`: completes as soon as the target reports `Leader` in a higher term than observed before the call, **without** waiting for it to apply earlier committed entries. Returns the target; immediate when it already leads. `timeout` null = max(10 s, 10 maximum election timeouts), cluster time. `ArgumentException` unknown group/node; `InvalidOperationException` target not running or not a voter; `TimeoutException` naming group, target and observed leader/term. Recorded in `Trace`. | CON-009, 012, 013, 015, NET-014 (`waitUntilServing: false`); RSY-001, 002, 004–013, 018, 026 |
+| `StartForeignClusterNodeAsync` | Single-node cluster with a fresh `ClusterId` and secret listening on `listenEndpoint` (typically a crashed node's endpoint) on this cluster's transport, with the same `NodeTimings`, clock mode and fault/network controls, a volume named like this cluster's first volume and the same principal names/secrets (incl. `admin`), so only the cluster-identity check tells them apart. A `TestClientOptions.SeedNodes` entry naming the displaced node resolves to it. Disposed with the cluster. `InvalidOperationException` if a running node still listens there. | NET-014 |
+| `StartRecoveryClusterAsync` | **Consolidated** (RST/SEC + CHA). Brand-new "clean host" cluster: new `ClusterId`, secret, key hierarchy, control group and `admin` principal, fresh disks in a new subfolder of `DataRoot`, only the volumes in `options`; shares no state, sessions, caches, connections, credentials, keys or disks with this cluster. Same execution context (deterministic: same scheduler, virtual clock, simulated network; realtime: same process unless `OutOfProcess`) and same transport fabric (reaches this cluster's backup nodes; QUIC trusts only the backup hosts' pinned certificates). Names default to `r0..`/`rb0..`; collisions → `ArgumentException`; either cluster's `Network` addresses every endpoint of the fabric. Mode, transport and (in-process) storage must match; `OutOfProcess = true` starts real `Tedd.Tdfs.Host` processes with only runbook configuration; `DataRoot` is ignored. Returns when stable; own `Faults`/`Inspect`/`History`/`Admin`; disposing it never affects this cluster; disposing this cluster disposes it. | RST-001–006, 008, 010, 011, 014–016; CHA-006, 010, 016 |
+| `AddNodeAsync(spec, configure, join)` | Adds a live node whose `NodeOptions` are transformed before start (wrong `ClusterSecret`, foreign `Bootstrap`, explicit `JoinSeeds`, …). Does not throw when the cluster rejects it: completes when the join was admitted, definitively rejected (recorded in `Trace`) or timed out; the node is always added to `Nodes`. Throws only for harness errors (duplicate name, invalid spec). | SEC-001 |
+
+### I.2 `TestNode` (partial)
+
+```csharp
+public Task CompactStorageAsync(CancellationToken ct = default);                                              // Additions/dsk-gc
+public SoftwareVersionProfile SoftwareVersion { get; }                                                         // Additions/fmt-ops-perf
+public Task RestartAsSoftwareVersionAsync(SoftwareVersionProfile profile, Func<NodeOptions, NodeOptions>? reconfigure = null);
+```
+
+| Member | Required behaviour | Tests |
+|---|---|---|
+| `CompactStorageAsync` | **Consolidated** (DSK/GC `CompactStorageAsync()` + CHA `CompactObjectStoreAsync(ct)`). One full compaction pass of every object store, posted to the node loop (interleaves with GC, repair and traffic like a background pass, also in deterministic mode). Every segment with at least one dead record — including the active one, sealed first — is copied, flushed, published and deleted, hitting `CompactionCopy`/`CompactionPublish`/`CompactionDelete` per segment; nothing to compact → completes immediately without hitting them. If the node crashes or stops during the pass the task **faults** (never hangs or reports completion). `ct` only cancels the wait. `InvalidOperationException` unless `Running`. | GC-005, GC-014, CHA-009 |
+| `SoftwareVersion` | The release the node runs or last ran; harness-started nodes run `SoftwareVersionProfile.Current` (or `VersionedClusterTest`'s initial release). Returns the cached profile instance it was (re)started with. | FMT-005–010, CHA-011 |
+| `RestartAsSoftwareVersionAsync` | **Replaces CHA's `RestartWithSoftwareAsync`.** Stops a running/paused node gracefully, then restarts it from its durable image as `profile` (incarnation + 1, optional `reconfigure`): it negotiates only the profile's protocol range, advertises only its features in every handshake and to the control group, writes its disk format, reads only images it can read and refuses messages/entries/checkpoints needing features outside its set (`Unsupported` / stops serving that group). Completes when running and registered. Refusal: `DfsException(Unsupported)`, node stays `Stopped`, medium untouched. Startup faults apply; a crash during startup completes the task without throwing (`State == Crashed`). | FMT-005–010, CHA-011 |
+
+### I.3 `TestBackupNode` (partial)
+
+```csharp
+public Task SetFalseInventoryClaimsAsync(string volume, IReadOnlyCollection<ObjectId> objectIds);   // Additions/bak
+public Task RestartAsync(Func<BackupNodeOptions, BackupNodeOptions> reconfigure);
+public SoftwareVersionProfile SoftwareVersion { get; }                                               // Additions/fmt-ops-perf
+public Task RestartAsSoftwareVersionAsync(SoftwareVersionProfile profile);
+```
+
+* `SetFalseInventoryClaimsAsync` — every `BackupInventory` reply for `volume` additionally claims the ids (simulated Bloom
+  false positives); nothing is stored; closure verification, receive and published state are unaffected; an empty set
+  clears; a restart clears. BAK-007.
+* `RestartAsync(reconfigure)` — graceful stop when running (no-op when crashed/stopped), then restart from the durable image
+  with transformed options that persist for later `RestartAsync()` calls; completes when serving. BAK-018, BAK-027.
+* `SoftwareVersion` / `RestartAsSoftwareVersionAsync` — the `TestNode` contract for backup nodes (backup format, retained
+  image including key material); name, endpoint and credentials unchanged. FMT-010.
+
+### I.4 `TestDisk` (partial) — Additions/har
+
+```csharp
+public bool IsDishonestFlush { get; }
+public void SetDishonestFlush(bool dishonest);
+```
+
+While dishonest, file and directory flushes report success but leave writes and namespace changes volatile, so a later
+crash or disk replacement loses them; turning it off persists nothing retroactively. Simulated and wrapped real disks,
+node running or not. Feeds `TestCluster.AssumptionViolations`. HAR-018.
+
+### I.5 `TestNetwork` (partial)
+
+```csharp
+public int CountOpenConnections(string name);                                                   // Additions/sdk-path
+public MessageRule TruncateNext(MessageFilter filter, int keepBytes, int count = 1);            // Additions/con-net
+public void KillConnectionsSilently(string name);
+public long CountAttemptsTo(string name);                                                       // Additions/rst-sec
+public MessageRule TamperNext(MessageFilter filter, TransportTamper mode, int count = 1);
+public IReadOnlyList<MessageAttempt> GetMessageAttempts(MessageFilter filter);                  // Additions/fmt-ops-perf
+```
+
+| Member | Required behaviour | Tests |
+|---|---|---|
+| `CountOpenConnections` | Connections currently open with `name` as either endpoint, from "established" until either side closes/disposes (graceful close, `ResetConnections`, crash/stop, client disposal); half-open connections behind partitions/black holes still count; incomplete attempts do not; unknown name → 0. InMemory and QUIC (the harness wraps every transport factory). | SDK-005, 006, 008, 009, 011, 012 |
+| `TruncateNext` | For the next `count` matching frames only the first `keepBytes` bytes reach the receiver, then the connection closes (in-memory: partial frame + close to the receiver's transport; QUIC: partial bytes written, sender closes); `keepBytes` ≥ length delivers then closes. `Matched` counts truncations; recorded in `Trace`; `ArgumentOutOfRangeException` for negative `keepBytes` / nonpositive `count`. | NET-007 |
+| `KillConnectionsSilently` | Every current connection of `name` dies silently: no close/reset delivered, later frames vanish both ways, objects still report open until the owner's own deadline/keep-alive notices; new connections work. Recorded in `Trace`; unknown name → `ArgumentException`. | NET-016 |
+| `CountAttemptsTo` | Every connection attempt and message addressed to `name` since the fabric was created, counted when handed to the transport whatever happened to it (delivered, dropped, delayed, black-holed, refused by cuts, or sent to a crashed/destroyed endpoint), from any sender on the fabric (recovery clusters, backup nodes, test clients); only the owning cluster's own harness traffic (`Admin`, inspectors, invariant checks) is excluded. | RST-001–006, 014–016 (`RecoveryScenario.AssertNoSourceContact`) |
+| `TamperNext` | Tampers with the next `count` matching transmissions **below** integrity protection (QUIC: a datagram interposer mutates the encrypted packets; in-memory/simulated: the protected envelope after the sender's MAC); the application frame is never mutated before protection. `Matched` counts tampered transmissions. `TransportTamper { FlipBit, Truncate, AppendGarbage, Replay, Scramble }` (seeded). | SEC-011 |
+| `GetMessageAttempts` | Snapshot of every transmission matching the filter that the link policy observed since start or the last `MessageLog.Reset` (incl. dropped, delayed, duplicated, held, black-holed), in order; a duplicate appears once per delivered copy with the same correlation id. | OPS-007 |
+
+### I.6 `TestFaults` (partial)
+
+```csharp
+public FaultArm Arm(FaultMatch match, Func<FaultContext, bool> predicate, FaultAction action);                     // Additions/rsy
+public ReadResultLimitRule LimitReadResultBytes(int maxBytesPerResult, string? node = null, string? volume = null); // Additions/str
+```
+
+* `Arm(match, predicate, action)` — like `Arm(match, action)` but a hit matches only when `predicate(ctx)` also holds;
+  `Occurrence`/`Count`, `Contexts`, `Hits`, `Triggered`, `WaitTriggeredAsync` and `AssertReached` consider only such hits;
+  the predicate runs on the hitting node's loop (pure, non-blocking); `Coverage` still records every hit. RSY-012, RSY-013.
+* `LimitReadResultBytes` — while active, every read result returning payload to a client (`ReadRange` inline bytes,
+  `GetObject` ranges) carries at most `maxBytesPerResult` bytes: a correct, integrity-covered prefix that never claims EOF.
+  The SDK must treat it as an ordinary short result (FSD §6.2): never pad, zero-fill, report EOF or fail. Optional
+  `node`/`volume` scope; applies to later requests from any client until `Cancel()` or disposal; never affects
+  replication, repair or backup traffic; `Applied` counts shortened replies; `maxBytesPerResult < 1` →
+  `ArgumentOutOfRangeException`. STR-004, STR-006.
+
+### I.7 `RawProtocolClient` (partial)
+
+```csharp
+// LOCK (+ PATH) — Additions/lock/RawProtocolClient.lock.cs
+public Task<RawOpenHandleResult> OpenHandleAsync(string volume, string path, FileMode mode, FileAccess access, FileShare share, bool autoRenew = false);
+public Task<DfsErrorCode> KeepAliveAsync(string volume, IReadOnlyList<HandleId> handles);
+public Task<DfsErrorCode> CloseHandleAsync(string volume, HandleId handle);
+// SDK/PATH — Additions/sdk-path/RawProtocolClient.sdk-path.cs
+public Task<DfsErrorCode> SendHandleOperationAsync(string volume, DfsOperationKind kind, HandleId handle);
+// NET — Additions/con-net/RawProtocolClient.con-net.cs
+public Task<DfsErrorCode> SendFrameInPiecesAsync(ReadOnlyMemory<byte> frame, IReadOnlyList<int> splitOffsets);
+public Task<DfsErrorCode> SendPartialFrameAndCloseAsync(ReadOnlyMemory<byte> frame, int deliveredBytes);
+// FMT — Additions/fmt-ops-perf/RawProtocolClient.fmt-ops-perf.cs
+public Task<DfsErrorCode> SendPathOperationWithExtensionsAsync(string volume, DfsOperationKind kind, string rawPath, IReadOnlyList<WireExtension> extensions, string? rawPath2 = null);
+// LAY/REP — Additions/lay-rep/RawProtocolClient.lay-rep.cs
+public Task<DfsErrorCode> SendReadRangeAsync(string volume, string path, long offset, long length);
+public Task<RawStagedWriter> OpenStagedWriterAsync(string volume, string path, FileMode mode = FileMode.OpenOrCreate);
+```
+
+| Member | Required behaviour | Tests |
+|---|---|---|
+| `OpenHandleAsync` | **Consolidated** (LOCK's `RawOpenHandleResult` form + SDK/PATH's tuple form, which is removed). `OpenHandle` straight to the volume leader (following `NotLeader`), bypassing SDK checks; one lazily opened session per volume (several volumes per raw client), fresh operation id per call; `mode`/`access`/`share` and the path (wire UTF-8, unnormalised) sent verbatim, undefined values included. Never throws for server refusals: `Code` carries the reply's (or the failed handshake/session step's) code, transport loss → `Unavailable`; `Handle` is the server-issued id exactly as on the wire (null unless granted); `WriterGeneration` for writable grants. Renewal: `autoRenew = false` → only via `KeepAliveAsync` or `SendHandleOperationAsync(KeepAlive)`, released by close or expiry; `autoRenew = true` → the raw session's keep-alive renews it until closed or disposed. | LOCK-005, 007, 020; PATH-014 (`autoRenew: true`) |
+| `KeepAliveAsync` | One `KeepAlive` of this raw session listing exactly `handles` (which may belong to other sessions); `None` only when every listed handle was renewed by this request, else the first per-handle/request code (`InvalidHandle`, `LeaseLost`, `AccessDenied`, handshake refusal). | LOCK-020 |
+| `CloseHandleAsync` | `CloseHandle` in this raw session; returns the reply's code. | LOCK-005, 007 |
+| `SendHandleOperationAsync` | One handle-addressed request to `volume`'s leader with the handle number verbatim (never translated through the raw client's own table): `Read` (ReadRange offset 0, length 1), `KeepAlive` (only that handle), `CloseHandle`, `CommitFile` (empty commit with the last reported writer generation, or 0); other kinds → `ArgumentOutOfRangeException`. | PATH-014 |
+| `SendFrameInPiecesAsync` | One logical request (one correlation id) whose frame is written in pieces at strictly increasing offsets in (0, length), each processed before the next (in-memory: one fragment per piece with a scheduler turn; QUIC: write + flush per piece); returns the reply's code (`ProtocolError` when the server closes); bad offsets → `ArgumentException`; an empty list = `SendFrameAsync`. | NET-006 |
+| `SendPartialFrameAndCloseAsync` | Writes only the first `deliveredBytes` of a frame announcing its full length, then closes; completes after the server observed the close; returns the code reported before closing or `ProtocolError`; afterwards `IsConnected` is false; `deliveredBytes` outside [0, length) → `ArgumentOutOfRangeException`. | NET-007 |
+| `SendPathOperationWithExtensionsAsync` | `SendPathOperationAsync` whose terminal extension block additionally carries exactly `extensions` in order (encoded with `WireWriter.WriteExtensions`; colliding field ids → `ArgumentException` before sending). The server must refuse an unknown *required* extension with `Unsupported` and no effect, and ignore unknown *optional* ones. | FMT-002, 003 |
+| `SendReadRangeAsync` | Opens a read handle (`FileShare.ReadWrite`), sends one `ReadRange` with `offset`/`length` verbatim (negative/overflowing included), closes, returns the code; never allocates by `length`. | LAY-018 |
+| `OpenStagedWriterAsync` | Writable handle (`Write`, `Share.Read`) + staging session through the leader, returned as a `RawStagedWriter`; open/staging failures throw the mapped SDK exception. | LAY-018, 019, REP-012, 013, 017 |
+
+### I.8 New harness types (namespace `Tedd.Tdfs.Testing`)
+
+```csharp
+public sealed record RawOpenHandleResult(DfsErrorCode Code, HandleId? Handle, ulong WriterGeneration) { public bool Granted { get; } }
+public sealed class RawStagedWriter : IAsyncDisposable          // lease kept alive (KeepAlive every LeaseDuration/3, follows leader changes)
+{
+    public HandleId Handle { get; } public InodeId Inode { get; } public ulong WriterGeneration { get; }
+    public ulong BaseRevision { get; }                          // advances after a successful CommitExtentsAsync
+    public StagingId Staging { get; }
+    public Task<RawPutResult> PutObjectAsync(string nodeName, ObjectId id, ReadOnlyMemory<byte> data);   // payload verbatim, staging capability
+    public Task<DfsErrorCode> CommitExtentsAsync(long newLength, IReadOnlyList<RawExtentSpec> extents, IReadOnlyList<RawReceipt> receipts); // all verbatim
+    public ValueTask DisposeAsync();                            // closes the handle (and its staging session); idempotent
+}
+public sealed record RawReceipt(ObjectId Object, UInt128 Checksum, long Length, byte Encoding, NodeId Node, string NodeName,
+    ulong Incarnation, ulong PlacementEpoch, ReadOnlyMemory<byte> Wire) { public RawReceipt WithTamperedMac(); }   // implemented
+public sealed record RawPutResult(DfsErrorCode Error, RawReceipt? Receipt);
+public sealed record RawExtentSpec(long Offset, long Length, ObjectId Object, long ObjectOffset, long ObjectLength, UInt128 Checksum, byte Encoding)
+{ public static RawExtentSpec FromReceipt(RawReceipt receipt, long offset, long length, long objectOffset = 0); }  // implemented
+
+public sealed class ManualBackupExport : IAsyncDisposable      // BAK: drives the real export messages in a test-chosen order
+{
+    public string Volume { get; } public string SnapshotName { get; } public SnapshotId SnapshotId { get; } public CommitToken Boundary { get; }
+    public string TargetName { get; } public Guid LineageId { get; } public IReadOnlyList<ObjectId> Closure { get; }
+    public Task<DfsErrorCode> BeginAsync(); public Task<IReadOnlySet<ObjectId>> RequestInventoryAsync();
+    public Task<DfsErrorCode> SendManifestAsync(BackupManifestTamper tamper = BackupManifestTamper.None);
+    public Task<DfsErrorCode> SendObjectAsync(ObjectId id, BackupObjectTamper tamper = BackupObjectTamper.None);  // id outside Closure -> ArgumentException
+    public Task<BackupPublishAttempt> PublishAsync();           // the destination verifies the closure itself
+    public ValueTask DisposeAsync();                            // abandon if unpublished, release the pin, resume the exporter
+}
+public enum BackupObjectTamper { None, FlipPayloadByte, WrongObjectId, WrongEncoding, TruncatedPayload, WrongChecksum }
+public enum BackupManifestTamper { None, DanglingObjectReference, AlteredExtentChecksum, FlipCiphertextByte, DroppedFileRecord }
+public sealed record BackupPublishAttempt(DfsErrorCode Error, bool Published, IReadOnlyList<ObjectId> MissingObjects, DfsBackupCheckpoint? Checkpoint);
+
+public enum UncontrolledDependencyKind { ForeignThreadPost, WallClock, Random, Timer, ThreadPool, Thread, Socket, Disk, ContextEscape }   // HAR
+public sealed record UncontrolledDependency(UncontrolledDependencyKind Kind, string Component, string Detail);
+public sealed class UncontrolledDependencyException : Exception
+{ public UncontrolledDependencyException(IReadOnlyList<UncontrolledDependency> dependencies, Exception? inner = null); public IReadOnlyList<UncontrolledDependency> Dependencies { get; } }
+public sealed record AssumptionViolation(string Assumption, string Node, string Detail) { public const string DurableFlush = "storage.flush-durability"; }
+public sealed class AssumptionViolatedException : Exception
+{ public AssumptionViolatedException(IReadOnlyList<AssumptionViolation> violations, Exception? inner = null); public IReadOnlyList<AssumptionViolation> Violations { get; } }
+public sealed record TraceMinimizationResult<TStep>(IReadOnlyList<TStep> Original, IReadOnlyList<TStep> Minimal, string Invariant, int Runs, bool IsOneMinimal, bool BudgetExhausted);
+public static class TraceMinimizer    // HAR-014 (ddmin)
+{
+    public static Task<TraceMinimizationResult<TStep>> MinimizeAsync<TStep>(IReadOnlyList<TStep> failingTrace,
+        Func<IReadOnlyList<TStep>, Task<string?>> run, int maxRuns, CancellationToken ct = default);
+}
+
+public static class ResyncStageDetails { public const string Receive, Verify, Install, Suffix, Activate; public static IReadOnlyList<string> All { get; } }   // RSY
+public enum TransportTamper { FlipBit, Truncate, AppendGarbage, Replay, Scramble }                                                                       // SEC-011
+public sealed class ReadResultLimitRule                                                                                                                 // STR
+{ public int MaxBytesPerResult { get; } public string? Node { get; } public string? Volume { get; } public int Applied { get; } public bool IsActive { get; } public void Cancel(); }
+public sealed record MessageAttempt(long Sequence, string From, string To, LinkDirection Direction, MessageType Type, ulong CorrelationId,
+    DfsOperationId? OperationId, int Bytes, LinkDecisionKind Decision);                                                                                  // OPS-007
+
+public sealed record SoftwareVersionProfile(string Name, int ProtocolVersionMin, int ProtocolVersionMax, int DiskFormatVersion,
+    int MaxReadableDiskFormatVersion, IReadOnlySet<string> Features, IReadOnlySet<string> IrreversibleFeatures, bool IsEmulated)   // FMT + CHA
+{
+    public const string ProbeFeature = "tdfs.test.probe";                          // reversible; understood by Current, not Previous
+    public const string IrreversibleProbeFeature = "tdfs.test.irreversible-probe"; // irreversible; understood by Current, not Previous
+    public const string NextFeature = "test.next-format";                          // irreversible; understood only by Next (CHA-011)
+    public static SoftwareVersionProfile Current { get; }                          // the build under test
+    public static SoftwareVersionProfile Previous { get; }                         // oldest supported release (emulated while the window has one)
+    public static SoftwareVersionProfile BelowSupportedWindow { get; }             // must refuse every current image
+    public static SoftwareVersionProfile Next { get; }                             // emulated newer build: Current's min protocol, max + 1, Current's features + NextFeature
+    public static IReadOnlyList<SoftwareVersionProfile> SupportedWindow { get; }   // oldest first: Previous .. Current (Next is not in it)
+    public static SoftwareVersionProfile Get(string name);                         // "Current", "Previous", "BelowSupportedWindow", "Next" (implemented)
+    public bool Supports(string feature);                                          // implemented
+}
+public static class VersionedClusterTest
+{   // ClusterTest.RunAsync, but every live and backup node is created and bootstrapped by initialRelease (must be in SupportedWindow)
+    public static Task RunAsync(TestClusterOptions options, SoftwareVersionProfile initialRelease, Func<TestCluster, Task> scenario, CancellationToken ct = default);
+}
+```
+
+Behaviour notes:
+
+* `SoftwareVersionProfile` refusal contract: a node started as a profile that cannot read its durable image
+  (minimum-reader marker or format above `MaxReadableDiskFormatVersion`, or an activated irreversible feature it lacks)
+  fails with `DfsException(Unsupported)` before writing anything. Activating a test feature with
+  `DfsAdminClient.SetFeatureAsync` is refused (`Unsupported`/`InvalidArgument`) until every live member (voters, learners,
+  data nodes) runs a release that understands it; irreversible features can never be deactivated and raise the durable
+  minimum-reader marker (FMT-006, FMT-009, CHA-011).
+* `TraceMinimizer`: a passing original → `ArgumentException`; only order-preserving subsequences reporting the **same**
+  invariant id (ordinal) are accepted; complements first, then subsets, refining granularity; deterministic candidate
+  order, no candidate run twice; 1-minimality verified by running every single-step removal; stops at `maxRuns` (counting
+  the initial run) with `BudgetExhausted = true` and `IsOneMinimal = false`.
+* `ResyncStageDetails` (server requirement): on the replica receiving a peer checkpoint the server hits
+  `FaultSites.RaftSnapshotInstall` with `Node`, `Volume` (null for the control group), `Operation = RaftSnapshot` and
+  `Detail` = `receive` (each chunk, `Occurrence` = chunk number, before persisting), `verify` (all chunks durable, before
+  verification), `install` (before replacing local state/log prefix), `suffix` (before each post-checkpoint entry of the
+  same catch-up), `activate` (before the new state is served); each precedes its durable/visible effect.
+
+### I.9 Implemented test-side helper libraries
+
+Not stubs; built only on the public SDK and harness, so they serve as independent oracles.
+
+* `Tedd.Tdfs.Testing.Mesh` (`Additions/mesh/`): `MeshConfig`/`MeshBoot`, `MeshPairwise`, `MeshNetworkModel`,
+  `MeshExpectation`, `MeshOracle`, `MeshRenameModel`, `MeshWorkload`, `MeshNamespaceScript`, `MeshScenario` — matrix
+  generation, availability oracle and workloads for MESH-001..038 (rows defined in `docs/test-notes/mesh.md`, not in
+  `TestCatalog`).
+* `Tedd.Tdfs.Testing.SnpApp` (`Additions/snp-app/`): `AdapterTimeline`, `RecordingSnapshotAdapter` (+ `AdapterPhaseBehavior`,
+  `AdapterInjectedFailureException`), `LogSampleApp`, `SnapshotTree`, `CommitHistoryOracle` — SNP-001..018, APP-001..012.
+* `Additions/rst-sec/`: `VolumeContentFixture` (+ `ExpectedVolumeContent`, `ObservedVolumeContent`, …) and
+  `RecoveryScenario` (+ `BackedUpSource`) — RST-001..016, SEC-005..018.
+
+### I.10 Server inspection additions (namespace `Tedd.Tdfs.Server`)
+
+```csharp
+// BackupInspector (partial) — src/Tedd.Tdfs.Server/Additions/bak; read-only, executed on the backup node loop
+public Task<IReadOnlyList<BackupSnapshotInspection>> GetSnapshotsAsync(string volume);
+public Task<BackupReceiveInspection?> GetReceiveStateAsync(string volume);
+public Task<IReadOnlyDictionary<ObjectId, int>> GetObjectReferenceCountsAsync();
+public Task<IReadOnlyList<ObjectId>> VerifyClosureAsync(string volume, string snapshotName);
+public sealed record BackupSnapshotInspection(string Name, SnapshotId Id, CommitToken CoveredCommit, Guid Lineage, bool IsPublishedPointer,
+    DfsRetention Retention, IReadOnlyList<ObjectId> Closure, int ReaderPins);
+public sealed record BackupReceiveInspection(string SnapshotName, Guid Lineage, ulong VolumeEpoch, bool ManifestReceived,
+    IReadOnlySet<ObjectId> ReceivedObjects, IReadOnlySet<ObjectId> DurableObjects, IReadOnlySet<ObjectId> MissingObjects, long ReceivedBytes);
+// NodeInspector (partial) — src/Tedd.Tdfs.Server/Additions/rsy and /fmt-ops-perf
+public Task<RaftGroupStats?> GetRaftGroupStatsAsync(string group);     // null when the node does not host the group
+public sealed record RaftGroupStats(string Group, ulong StartIndex, ulong AppliedIndex, ulong SnapshotIndex, ulong LogFirstIndex,
+    long EntriesAppended, long EntriesApplied, long EntriesCoveredByInstall, long SnapshotsInstalled, long SnapshotInstallsAborted,
+    long SnapshotsRejectedStale, long SnapshotVerificationFailures);
+public Task<DiskFormatInspection> GetDiskFormatAsync();
+public sealed record DiskFormatInspection(int SuperblockVersion, int JournalFormatVersion, int CheckpointFormatVersion,
+    int ObjectSegmentFormatVersion, int MinimumReaderVersion, IReadOnlyList<string> ActivatedIrreversibleFeatures) { public int HighestComponentVersion { get; } }
+```
+
+| Member | Required behaviour | Tests |
+|---|---|---|
+| `GetSnapshotsAsync` | Every retained snapshot of the source volume across lineages/epochs (incl. ones kept only by a reader pin), ordered by (lineage start, covered commit); only fully verified, durable snapshots published at least once; `Closure` from the persisted manifest (sorted, distinct); durable `Retention`; valid `ReaderPins`; `IsPublishedPointer`; empty for unknown volumes. | BAK-004, 005, 009, 013, 017, 020, 023, 024, 026, 027, 030 |
+| `GetReceiveStateAsync` | The staged, unpublished incoming transfer or null: `ReceivedObjects` (bytes arrived), `DurableObjects` (flushed **and** verified), `MissingObjects` computed by the node from the received manifest (never from hints; empty before it arrives), `ReceivedBytes`. | BAK-004, 006, 007, 009, 016, 028 |
+| `GetObjectReferenceCountsAsync` | Per stored object, the number of retained snapshots (all volumes and lineages, published or staged manifest) referencing it as retention/GC accounts it (0 if unreferenced); duplicate deliveries never change counts. | BAK-009, 010, 024, 026, 027 |
+| `VerifyClosureAsync` | Re-reads and verifies (identity, length, encoding, checksum) every closure object of the retained snapshot; returns missing/corrupt ids; `DfsException(SnapshotNotFound)` when not retained. | BAK-004–014, 018, 020–027 |
+| `GetRaftGroupStatsAsync` | Atomic (node-loop) snapshot of one group's catch-up counters for the current incarnation (they start at 0 and never decrease): `StartIndex` (applied index loaded at startup), `AppliedIndex`, `SnapshotIndex`, `LogFirstIndex` (first index still in the log; `LastIndex + 1` when empty), `EntriesAppended` (replay excluded), `EntriesApplied` (individually applied, replay included), `EntriesCoveredByInstall` (Σ installed index − applied index before the install), `SnapshotsInstalled`, `SnapshotInstallsAborted`, `SnapshotsRejectedStale`, `SnapshotVerificationFailures`. Invariant: `EntriesApplied + EntriesCoveredByInstall == AppliedIndex − StartIndex`. | RSY-001, 002, 004–015, 022, 026 |
+| `GetDiskFormatAsync` | Format versions durably recorded on the medium (superblock, journal segments, newest checkpoint, object segments; 0 when absent), the never-lowered minimum-reader marker and the activated irreversible features (ordinal); never in-memory intent. | FMT-005, 006, 008 |
+
+### I.11 Consolidation record
+
+Members requested independently by two suites were merged into one definition each; the other names no longer exist and
+the tests were adapted without weakening their assertions:
+
+| Kept (location) | Removed | Notes |
+|---|---|---|
+| `RawProtocolClient.OpenHandleAsync(…, bool autoRenew = false)` → `RawOpenHandleResult` (`Additions/lock`) | SDK/PATH `Task<(DfsErrorCode Code, HandleId Handle)> OpenHandleAsync(…)` | PATH-014 passes `autoRenew: true` (it relied on session keep-alive renewal; LOCK relies on renewal only through `KeepAliveAsync`). |
+| `TestCluster.TransferLeadershipAsync(…, TimeSpan? timeout, bool waitUntilServing = true, ct)` → `Task<TestNode>` (`Additions/con-net`) | CON/NET `Task TransferLeadershipAsync(group, targetNode, ct)`; RSY `Task<TestNode> TransferLeadershipAsync(group, nodeName, timeout, ct)` | The two had conflicting completion rules; CON/NET callers pass `waitUntilServing: false`. |
+| `TestCluster.StartRecoveryClusterAsync` (`Additions/rst-sec`) | identical CHA declaration | Docs merged (execution context, naming, lifetime, `OutOfProcess`). |
+| `TestNode.CompactStorageAsync(CancellationToken ct = default)` (`Additions/dsk-gc`) | CHA `TestNode.CompactObjectStoreAsync(ct)` | GC-014 asserts an interrupted pass faults; CHA-009 now tolerates that fault only for a node its armed crash took down. |
+| `SoftwareVersionProfile` (+ `Next`, `NextFeature`), `TestNode.SoftwareVersion`, `TestNode.RestartAsSoftwareVersionAsync` (`Additions/fmt-ops-perf`) | CHA `TestSoftwareVersion`, its `TestNode.SoftwareVersion`, `TestNode.RestartWithSoftwareAsync` | CHA-011 uses `SoftwareVersionProfile.Current/Next/NextFeature`. |

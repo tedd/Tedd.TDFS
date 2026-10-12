@@ -224,7 +224,7 @@ public sealed class ProtocolReviewTests
         string? path = FindProtocolDocument();
         if (path is null)
             Assert.Skip("docs/PROTOCOL.md is not reachable from the test output directory.");
-        string text = File.ReadAllText(path);
+        string text = System.IO.File.ReadAllText(path);
         Assert.DoesNotContain("///", text, StringComparison.Ordinal);
         Assert.DoesNotContain("<see", text, StringComparison.Ordinal);
         Dictionary<string, List<string>> sections = ParseFieldTables(text);
@@ -301,7 +301,7 @@ public sealed class ProtocolReviewTests
         for (DirectoryInfo? dir = new(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
         {
             string candidate = Path.Combine(dir.FullName, "docs", "PROTOCOL.md");
-            if (File.Exists(candidate) && File.Exists(Path.Combine(dir.FullName, "Tedd.Tdfs.slnx")))
+            if (System.IO.File.Exists(candidate) && System.IO.File.Exists(Path.Combine(dir.FullName, "Tedd.Tdfs.slnx")))
                 return candidate;
         }
 
