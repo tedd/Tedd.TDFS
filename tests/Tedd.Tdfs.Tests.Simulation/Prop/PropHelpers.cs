@@ -700,8 +700,10 @@ internal static class ViewChecker
                     if (op.Outcome != OpOutcome.Ok)
                         continue;
                     string pin = label.StartsWith("backup:", StringComparison.Ordinal) ? "snapshot:" + label["backup:".Length..] : label;
-                    if (!establishments.ContainsKey(pin))
+                    if (!establishments.TryGetValue(pin, out HistoryOp? establishment))
                         return (result, $"read #{op.Id} uses view '{label}' that was never established");
+                    if (!string.Equals(establishment.Key, op.Key, StringComparison.Ordinal))
+                        return (result, $"read #{op.Id} of '{op.Key}' uses view '{label}' that was established for '{establishment.Key}'");
                     byte[]? value = op.Output as byte[];
                     if (pinnedValues.TryGetValue(pin, out var seen))
                     {

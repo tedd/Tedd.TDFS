@@ -51,10 +51,12 @@ public sealed class PropSimulationTests
             DfsFileInfo baseline = await rv.Files.GetInfoAsync(path, Ct);
             Assert.Equal(initial.LongLength, baseline.Length);
             InodeId inode = baseline.InodeId;
-            ulong revision = baseline.Revision;
 
             DfsStream writer = await OpenWriterAsync(wv, path);
             Assert.Equal(inode, writer.InodeId);
+            // A writable open may itself advance the inode record (writer generation, ARCHITECTURE §5.3), so the baseline
+            // revision for "publication creates a new revision" / "pins see the latest revision" is taken after the open.
+            ulong revision = await RevisionAfterOpenAsync(rv, path, baseline.Revision, initial.LongLength);
             DfsStream live = await rv.Files.OpenAsync(path, new DfsOpenOptions { Mode = FileMode.Open, Access = FileAccess.Read, Share = FileShare.ReadWrite }, Ct);
             var pins = new List<(DfsStream Stream, byte[] Image)>();
             int dataId = 1;
@@ -146,6 +148,7 @@ public sealed class PropSimulationTests
                         Assert.Equal(inode, writer.InodeId);
                         Assert.Equal(0, writer.Position);
                         Assert.Equal(model.StagedLength, await writer.GetLengthAsync(Ct));
+                        revision = await RevisionAfterOpenAsync(rv, path, revision, model.CommittedLength);
                     }
                     else if (roll < 73)
                     {
@@ -217,6 +220,18 @@ public sealed class PropSimulationTests
 
     private static Task<DfsStream> OpenWriterAsync(DfsVolume volume, string path) =>
         volume.Files.OpenAsync(path, new DfsOpenOptions { Mode = FileMode.Open, Access = FileAccess.ReadWrite, Share = FileShare.Read }, Ct);
+
+    /// <summary>
+    /// The committed revision right after a (non-truncating) writable open: never older than <paramref name="previous"/>,
+    /// and the open published no bytes (same committed length).
+    /// </summary>
+    private static async Task<ulong> RevisionAfterOpenAsync(DfsVolume reader, string path, ulong previous, long committedLength)
+    {
+        DfsFileInfo info = await reader.Files.GetInfoAsync(path, Ct);
+        Assert.True(info.Revision >= previous, $"revision went backwards after a writable open ({info.Revision} < {previous})");
+        Assert.Equal(committedLength, info.Length);
+        return info.Revision;
+    }
 
     /// <summary>Writes through one of the asynchronous overloads (whole array, memory, or many fragments).</summary>
     private static async Task WriteWithRandomOverloadAsync(Stream stream, byte[] data, IRandomSource random)
@@ -350,6 +365,13 @@ public sealed class PropSimulationTests
                             Assert.True(model.Delete(op.Path, recursive: false, out _));
                             await volume.Files.DeleteAsync(op.Path, Ct);
                         }
+                        else if (model.IsDirectory(op.Path))
+                        {
+                            // The file API on an existing directory must fail (IsADirectory; .NET-style access denial is
+                            // tolerated) and must not remove it: "success" here would be a false success (INV-08).
+                            await ExpectFailureAsync(() => volume.Files.DeleteAsync(op.Path, Ct), $"file delete of the directory {op.Path}",
+                                DfsErrorCode.IsADirectory, DfsErrorCode.AccessDenied);
+                        }
                         else if (!model.Exists(op.Path) && model.IsDirectory(DfsPath.GetParent(op.Path)))
                         {
                             await volume.Files.DeleteAsync(op.Path, Ct); // absent file: success, no change (FSD §5.4)
@@ -436,6 +458,8 @@ public sealed class PropSimulationTests
                     return new NsOp(NsKind.CreateDirectory, NewPath());
                 string from = nonRootDirs[random.Next(nonRootDirs.Length)];
                 string to = random.Next(5) == 0 ? DfsPath.Combine(from, "inside") : NewPath(); // moving into itself must fail
+                if (to == from)
+                    to = DfsPath.Combine(from, "inside"); // a directory move onto itself has no specified outcome; use the descendant case
                 return new NsOp(NsKind.MoveDirectory, from, to);
             case 7:
                 return new NsOp(NsKind.DeleteFile, files.Length > 0 && random.Next(4) != 0 ? files[random.Next(files.Length)] : NewPath());
@@ -1317,7 +1341,35 @@ public sealed class PropSimulationTests
                     < 88 => "retention-hold",
                     _ => reseeded ? "sync" : "offline-beyond-budget",
                 };
-                kinds[kind] = kinds.GetValueOrDefault(kind) + 1;
+                await RunStepAsync(kind, $"step {step}");
+            }
+
+            // Every ingredient the row requires (transfer interruption, retention, reseed, source loss) must really be part
+            // of each generated history; a seed whose random steps missed one gets it appended deterministically.
+            string[] requiredKinds = ["interrupted-transfer", "source-leader-loss", "retention-hold", "offline-beyond-budget"];
+            foreach (string kind in requiredKinds.Where(k => kinds.GetValueOrDefault(k) == 0).ToArray())
+            {
+                trace.Step($"coverage: the generated steps contained no {kind}; appending one");
+                await RunStepAsync(kind, "coverage");
+            }
+
+            foreach (string kind in requiredKinds)
+                Assert.True(kinds.GetValueOrDefault(kind) > 0, $"the generated backup history never performed '{kind}'");
+
+            // Source loss: every published snapshot stays complete and readable with no source service reachable.
+            trace.Step("crash every source node");
+            foreach (TestNode node in cluster.Nodes)
+                await node.CrashAsync();
+            await VerifyBackupAsync("with every source node down");
+            foreach (TestNode node in cluster.Nodes)
+                await node.RestartAsync();
+            await cluster.WaitForStableAsync(TimeSpan.FromSeconds(30), Ct);
+            Log($"PROP-006 seed {seed}: {acknowledged.Count} acknowledged snapshots, {held.Count} held, steps {string.Join(", ", kinds.Select(k => $"{k.Key}={k.Value}"))}");
+            Assert.True(acknowledged.Count >= 3, "too few acknowledged backup snapshots for a meaningful history");
+
+            async Task RunStepAsync(string kind, string label)
+            {
+                bool performed = true;
                 switch (kind)
                 {
                     case "mutate":
@@ -1373,7 +1425,11 @@ public sealed class PropSimulationTests
                     {
                         string? name = acknowledged.FirstOrDefault(a => !held.Contains(a));
                         if (name is null)
+                        {
+                            performed = false;
                             break;
+                        }
+
                         trace.Step($"hold {name} on the backup");
                         await using (DfsClient admin = await cluster.ConnectBackupAsync(0, new TestClientOptions { Name = "bk-retention", Credentials = backup.RetentionAdminCredentials }, Ct))
                             await admin.GetVolume(Vol).Snapshots.SetRetentionAsync(name, new DfsRetention(null, Hold: true), Ct);
@@ -1423,19 +1479,10 @@ public sealed class PropSimulationTests
                     }
                 }
 
-                await VerifyBackupAsync($"after step {step} ({kind})");
+                if (performed)
+                    kinds[kind] = kinds.GetValueOrDefault(kind) + 1;
+                await VerifyBackupAsync($"after {label} ({kind})");
             }
-
-            // Source loss: every published snapshot stays complete and readable with no source service reachable.
-            trace.Step("crash every source node");
-            foreach (TestNode node in cluster.Nodes)
-                await node.CrashAsync();
-            await VerifyBackupAsync("with every source node down");
-            foreach (TestNode node in cluster.Nodes)
-                await node.RestartAsync();
-            await cluster.WaitForStableAsync(TimeSpan.FromSeconds(30), Ct);
-            Log($"PROP-006 seed {seed}: {acknowledged.Count} acknowledged snapshots, {held.Count} held, steps {string.Join(", ", kinds.Select(k => $"{k.Key}={k.Value}"))}");
-            Assert.True(acknowledged.Count >= 3, "too few acknowledged backup snapshots for a meaningful history");
 
             async Task MutateAsync()
             {
@@ -1629,7 +1676,62 @@ public sealed class PropSimulationTests
                 Assert.True(first.ClusterTrace[i] == second.ClusterTrace[i], $"replay diverged at trace line {i}: '{first.ClusterTrace[i]}' vs '{second.ClusterTrace[i]}'");
         });
 
-    private static Task<CrossProductResult> RunCrossProductAsync(ulong workloadSeed, ulong faultSeed, PropertyTrace trace)
+    /// <summary>Marker of the deliberately injected oracle violation used by the PROP-007 artifact check.</summary>
+    private const string InjectedCrossProductViolation = "injected oracle violation (PROP-007 replay-artifact check)";
+
+    /// <summary>
+    /// PROP-007 "save complete starting images and traces for every failure": a cross-product run that fails its oracle
+    /// (here a deliberately injected violation after the faulted workload) leaves a replay directory with the seeds, every
+    /// node's durable starting image, the fault schedule, the generated workload and steps, the cluster trace, the history
+    /// and the failure itself.
+    /// </summary>
+    [Fact, Catalog("PROP-007", "S", "INV-20")]
+    public Task PROP_007_FaultAndWorkloadSeedCrossProduct_FailureArtifactsSaved()
+    {
+        const ulong workloadSeed = 799;
+        const ulong faultSeed = 7999;
+        return RunPropertyAsync("PROP-007", Combine(workloadSeed, faultSeed), async trace =>
+        {
+            string directory = CrossProductFailureDirectory(workloadSeed, faultSeed);
+            if (Directory.Exists(directory))
+                Directory.Delete(directory, recursive: true);
+
+            Exception? failure = await Record.ExceptionAsync(() => RunCrossProductAsync(workloadSeed, faultSeed, trace, injectViolation: true));
+            Assert.NotNull(failure);
+            if (failure is NotImplementedException)
+                throw failure; // the harness is not implemented yet: not a pass
+            Assert.Contains(InjectedCrossProductViolation, failure.ToString(), StringComparison.Ordinal);
+            Assert.Contains(directory, failure.ToString(), StringComparison.Ordinal);
+
+            Assert.True(Directory.Exists(directory), $"no replay directory {directory}");
+            string summary = File.ReadAllText(Path.Combine(directory, "starting-image.txt"));
+            Assert.Contains($"workloadSeed={workloadSeed.ToString(CultureInfo.InvariantCulture)}", summary, StringComparison.Ordinal);
+            Assert.Contains($"faultSeed={faultSeed.ToString(CultureInfo.InvariantCulture)}", summary, StringComparison.Ordinal);
+            Assert.Contains("clusterSeed=", summary, StringComparison.Ordinal);
+            Assert.Equal(CrossProductKeys.Length, summary.Split('\n').Count(l => l.StartsWith("initial ", StringComparison.Ordinal)));
+            foreach (string node in new[] { "n0", "n1", "n2" })
+            {
+                string image = Path.Combine(directory, "starting-image", node);
+                Assert.True(Directory.Exists(image) && Directory.EnumerateFiles(image, "*", SearchOption.AllDirectories).Any(),
+                    $"the starting image of {node} was not saved under {image}");
+            }
+
+            Assert.Equal(GenerateFaultSchedule(faultSeed, 3).Select(e => e.ToString()), File.ReadAllLines(Path.Combine(directory, "fault-schedule.txt")));
+            Assert.Equal(GenerateWorkload(workloadSeed, 3, 16).Sum(ops => ops.Count), File.ReadAllLines(Path.Combine(directory, "workload.txt")).Length);
+            Assert.NotEmpty(File.ReadAllLines(Path.Combine(directory, "generated-steps.txt")));
+            Assert.NotEmpty(File.ReadAllLines(Path.Combine(directory, "cluster-trace.txt")));
+            string[] history = File.ReadAllLines(Path.Combine(directory, "history.txt"));
+            Assert.True(history.Length >= CrossProductKeys.Length * 2, $"history.txt holds only {history.Length} operations");
+            Assert.Contains(InjectedCrossProductViolation, File.ReadAllText(Path.Combine(directory, "failure.txt")), StringComparison.Ordinal);
+            Assert.Contains(faultSeed.ToString(CultureInfo.InvariantCulture), File.ReadAllText(Path.Combine(directory, "README.txt")), StringComparison.Ordinal);
+        });
+    }
+
+    private static string CrossProductFailureDirectory(ulong workloadSeed, ulong faultSeed) =>
+        Path.Combine(new TestClusterOptions().ResolveDataRoot(), "prop-007-failures",
+            $"w{workloadSeed.ToString(CultureInfo.InvariantCulture)}-f{faultSeed.ToString(CultureInfo.InvariantCulture)}");
+
+    private static Task<CrossProductResult> RunCrossProductAsync(ulong workloadSeed, ulong faultSeed, PropertyTrace trace, bool injectViolation = false)
     {
         // Node/network/storage/scheduler randomness all derive from the cluster seed, which depends on the fault seed only,
         // so the same environment seed is combined with every workload seed.
@@ -1699,6 +1801,8 @@ public sealed class PropSimulationTests
 
                 CheckResult check = LinearizabilityChecker.Check(history.Operations, new RegisterModel());
                 Log($"PROP-007 w{workloadSeed}/f{faultSeed}: {history.Count} ops, {unknown.Count} resolved unknowns; {check}");
+                if (injectViolation)
+                    throw new InvalidOperationException(InjectedCrossProductViolation);
                 check.AssertValid();
                 await cluster.WaitForReplicationAsync(Vol, Ct);
                 await cluster.Inspect.AssertNoSplitBrainAsync();
@@ -1833,8 +1937,7 @@ public sealed class PropSimulationTests
     private static string SaveCrossProductFailure(TestCluster cluster, ulong workloadSeed, ulong faultSeed, IReadOnlyList<ChaosEvent> schedule,
         IReadOnlyList<WorkloadOp>[] workload, StartingImage? start, PropertyTrace trace, Exception failure)
     {
-        string directory = Path.Combine(new TestClusterOptions().ResolveDataRoot(), "prop-007-failures",
-            $"w{workloadSeed.ToString(CultureInfo.InvariantCulture)}-f{faultSeed.ToString(CultureInfo.InvariantCulture)}");
+        string directory = CrossProductFailureDirectory(workloadSeed, faultSeed);
         Directory.CreateDirectory(directory);
         start?.Save(directory);
         File.WriteAllLines(Path.Combine(directory, "fault-schedule.txt"), schedule.Select(e => e.ToString()));
@@ -1905,6 +2008,33 @@ public sealed class PropSimulationTests
 
             // Every delivery strategy yields the same bytes at every equivalent publication boundary.
             Assert.Single(observed.Values.Select(v => string.Join("|", v)).Distinct(StringComparer.Ordinal));
+        });
+
+    /// <summary>
+    /// PROP-008 transport-fragmentation dimension: the in-memory simulated transport delivers whole messages, so the same
+    /// byte program is also delivered over the real QUIC transport (envelope frames of at most 60 KiB, fragmented and
+    /// reassembled per correlation id; chunk-sized object uploads and 128 KiB writes span several frames), with whole and
+    /// fragmented write calls. Single writer, sequential calls: the boundaries are timing-independent.
+    /// </summary>
+    [Theory, MemberData(nameof(BatchingSeeds)), Catalog("PROP-008", "S", "INV-02", "INV-07", "INV-14")]
+    public Task PROP_008_MetamorphicBatchingInvariant_RealTransportFragmentation(ulong seed) =>
+        RunPropertyAsync("PROP-008", seed, async trace =>
+        {
+            (List<List<ByteUpdate>> segments, List<string> expected, List<bool> changes) = GenerateByteProgram(seed, trace);
+            BatchingVariant[] variants =
+            [
+                new("quic-whole-writes", o => o with { Mode = ClusterMode.Realtime, Transport = TransportKind.Quic }, 64 * 1024, DfsWriteMode.OnFlush, int.MaxValue, false, null),
+                new("quic-fragmented-writes", o => o with { Mode = ClusterMode.Realtime, Transport = TransportKind.Quic }, 4096, DfsWriteMode.OnFlush, 997, false, null),
+            ];
+            foreach (BatchingVariant variant in variants)
+            {
+                trace.Step("variant " + variant.Name);
+                IReadOnlyList<string> boundaries = await ClusterTest.RunAsync(variant.Configure(Sim(seed)),
+                    cluster => RunBatchingVariantAsync(cluster, variant, seed, segments, changes));
+                Assert.Equal(expected.Count, boundaries.Count);
+                for (int i = 0; i < expected.Count; i++)
+                    Assert.True(expected[i] == boundaries[i], $"variant {variant.Name}: publication boundary {i} is {boundaries[i]}, reference model {expected[i]}");
+            }
         });
 
     private static (List<List<ByteUpdate>> Segments, List<string> Expected, List<bool> Changes) GenerateByteProgram(ulong seed, PropertyTrace trace)
@@ -2377,7 +2507,9 @@ public sealed class PropSimulationTests
                     case DupKind.MismatchedReuse:
                     {
                         string before = (await CaptureAsync(volume)).Digest();
-                        ProgOp changed = op with { DataId = op.DataId + 7_777 };
+                        // Different content AND length: a different DataId alone leaves a zero-length payload identical
+                        // (boundary-biased lengths are often 0), which is a legal retry, not an incompatible reuse.
+                        ProgOp changed = op with { DataId = op.DataId + 7_777, Length = op.Length + 1 };
                         Exception ex = await ExpectFailureAsync(() => ProgramRunner.ExecuteAsync(volume, changed, seed, id),
                             $"step {i}: reusing {id} with a different payload", DfsErrorCode.OperationIdMismatch);
                         Assert.IsType<DfsOperationIdMismatchException>(ex);
@@ -2861,6 +2993,10 @@ public sealed class PropSimulationTests
             await cluster.WaitForReplicationAsync(Vol, Ct);
             GroupInspection lagGroup = await lagging.Inspect.GetGroupAsync(Vol) ?? throw new Xunit.Sdk.XunitException($"{lagging.Name} hosts no group {Vol}");
             Assert.True(lagGroup.SnapshotIndex > 0, $"{lagging.Name} caught up without installing a checkpoint although its history was compacted");
+            // Local compaction after a full log replay would also give SnapshotIndex > 0; the leader's log no longer holds
+            // the lagging replica's missing entries, so it must have received and installed a checkpoint (F16 site reached).
+            Assert.True(cluster.Faults.Coverage.WasReached(FaultSites.RaftSnapshotInstall, lagging.Name),
+                $"{lagging.Name} never reached {FaultSites.RaftSnapshotInstall}: it did not install a leader checkpoint after compaction");
             VolumeStateInspection lagState = await cluster.Inspect.GetVolumeStateAsync(Vol, lagging.Name);
             Assert.Contains(lagState.Snapshots, s => s.Name == "early");
             Assert.Equal(session.RetiredWatermark, lagState.Sessions.Single(s => s.Id == session.Id).RetiredWatermark);
@@ -3144,6 +3280,13 @@ public sealed class PropSimulationTests
         HistoryRecorder unknownView = Snapshot("snapshot:S/k", v1);
         Done(unknownView, unknownView.Invoke("r", "read", "k", "cache:x"), v1);
         Invalid(ViewChecker.Check(unknownView.Operations), "a read with an unknown view kind");
+
+        // A pin covers the key it was established for; another key's historical value cannot borrow it.
+        HistoryRecorder otherKey = Snapshot("snapshot:S/k", v1);
+        Done(otherKey, otherKey.Invoke("w", "write", "j", v1));
+        Done(otherKey, otherKey.Invoke("w", "write", "j", v2));
+        Done(otherKey, otherKey.Invoke("r", "read", "j", "snapshot:S/k"), v1);
+        Invalid(ViewChecker.Check(otherKey.Operations), "a read of key j through the snapshot view of key k");
     }
 
     public static TheoryData<ulong, bool> LivePinnedSeeds => new() { { 1601, false }, { 1602, true } };

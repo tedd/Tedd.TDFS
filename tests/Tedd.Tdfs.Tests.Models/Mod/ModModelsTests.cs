@@ -199,8 +199,10 @@ public sealed class ModModelsTests
                     $"{context}: node {n} applied log differs from node 0 after convergence ({log.Count} vs {reference.Count} entries)");
             }
 
-            var distinct = new HashSet<string>(reference.Select(Convert.ToHexString), StringComparer.Ordinal);
-            Assert.True(distinct.Count == reference.Count, $"{context}: a proposal was applied more than once");
+            // Every proposal is nonempty and unique; empty payloads (leader no-op entries, if exposed) are not proposals.
+            string[] proposals = reference.Where(e => e.Length > 0).Select(Convert.ToHexString).ToArray();
+            Assert.True(proposals.Distinct(StringComparer.Ordinal).Count() == proposals.Length, $"{context}: a proposal was applied more than once");
+            Assert.True(proposals.Length <= proposed + 1, $"{context}: {proposals.Length} applied proposals but only {proposed + 1} were made");
         }
         catch (Exception ex) when (ex is not NotImplementedException)
         {
@@ -333,9 +335,14 @@ public sealed class ModModelsTests
         ModHelpers.AssertRefinementMapWellFormed(spec);
         SpecRun run = ModHelpers.AssertCorrectVariantHolds(spec, minimumStates: 100);
         Assert.Contains("CommitWithSnapshot", run.ActionKinds);
+        Assert.Contains("WriteZ", run.ActionKinds);
         IReadOnlyList<SpecRun> broken = ModHelpers.AssertNegativeControlsDetected(spec);
-        foreach (SpecRun b in broken)
-            Assert.Contains("cuts through a transaction", b.Result.Violation!, StringComparison.Ordinal);
+        foreach (string cut in new[] { SnapshotBoundarySpec.IndependentFileCopy, SnapshotBoundarySpec.TwoEntryTransactionCommit })
+            Assert.Contains("cuts through a transaction", broken.Single(b => b.Variant == cut).Result.Violation!, StringComparison.Ordinal);
+        // A capture racing the apply of the latest decision misses a decision ordered before the snapshot.
+        SpecRun racing = broken.Single(b => b.Variant == SnapshotBoundarySpec.CaptureRacesApply);
+        Assert.Contains("does not match its log position", racing.Result.Violation!, StringComparison.Ordinal);
+        Assert.Contains(racing.Result.CounterexampleTrace!, a => a.StartsWith("Snapshot(", StringComparison.Ordinal));
     }
 
     [Fact, Catalog("MOD-007", "M", "INV-10")]
