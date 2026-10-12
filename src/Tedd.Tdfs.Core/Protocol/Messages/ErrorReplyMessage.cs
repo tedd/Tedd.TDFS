@@ -21,6 +21,9 @@ public sealed record ErrorReplyMessage(
     /// <summary>The error message (null is stored as empty).</summary>
     public string Message { get; init; } = Message ?? string.Empty;
 
+    /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
+    public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
+
     /// <inheritdoc />
     public MessageType Type => MessageType.ErrorReply;
 
@@ -36,7 +39,7 @@ public sealed record ErrorReplyMessage(
         writer.WriteBool(Retryable);
         writer.WriteOptionalString(LeaderHint);
         writer.WriteOptionalOperationId(TransactionId?.Operation);
-        writer.WriteNoExtensions();
+        writer.WriteExtensionBlock(Extensions);
     }
 
     /// <inheritdoc />
@@ -50,14 +53,17 @@ public sealed record ErrorReplyMessage(
         bool retryable = reader.ReadBool();
         string? leaderHint = reader.ReadOptionalString();
         DfsOperationId? tx = reader.ReadOptionalOperationId();
-        reader.ReadExtensions();
+        IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
         return new ErrorReplyMessage(
             (DfsErrorCode)(int)code,
             message,
             op,
             retryable,
             leaderHint,
-            tx.HasValue ? new DfsTransactionId(tx.Value) : null);
+            tx.HasValue ? new DfsTransactionId(tx.Value) : null)
+        {
+            Extensions = extensions,
+        };
     }
 
     /// <summary>Creates an error reply describing <paramref name="exception"/> using the canonical mapping.</summary>

@@ -94,7 +94,7 @@ public ref struct WireWriter
     }
 
     /// <summary>Writes a varuint length followed by the bytes.</summary>
-    public void WriteBytes(ReadOnlySpan<byte> v)
+    public void WriteBytes(scoped ReadOnlySpan<byte> v)
     {
         WriteVarUInt((ulong)v.Length);
         WriteRaw(v);
@@ -119,10 +119,10 @@ public ref struct WireWriter
     /// Writes pre-encoded bytes as a string field (varuint length + bytes) without validation. Intended for raw
     /// protocol tests that must send malformed UTF-8; normal code uses <see cref="WriteString"/>.
     /// </summary>
-    public void WriteUtf8(ReadOnlySpan<byte> utf8) => WriteBytes(utf8);
+    public void WriteUtf8(scoped ReadOnlySpan<byte> utf8) => WriteBytes(utf8);
 
     /// <summary>Writes bytes without a length prefix.</summary>
-    public void WriteRaw(ReadOnlySpan<byte> v)
+    public void WriteRaw(scoped ReadOnlySpan<byte> v)
     {
         while (!v.IsEmpty)
         {
@@ -188,9 +188,12 @@ public ref struct WireWriter
     /// <summary>Writes a <see cref="DateTimeOffset"/> as zigzag varint UTC ticks (the offset is not preserved).</summary>
     public void WriteDateTimeOffset(DateTimeOffset v) => WriteVarInt(v.UtcTicks);
 
+    /// <summary>Writes an enum value as a zigzag varint of its underlying integer value (counterpart of <see cref="WireReader.ReadEnum{TEnum}"/>).</summary>
+    public void WriteEnum<TEnum>(TEnum v) where TEnum : struct, Enum => WriteVarInt(WireEnum<TEnum>.ToInt64(v));
+
     /// <summary>Writes the terminal extension block: count, then (field id varuint, flags byte, value bytes) per entry.</summary>
     /// <exception cref="ArgumentException">Two extensions share a field id.</exception>
-    public void WriteExtensions(ReadOnlySpan<WireExtension> extensions)
+    public void WriteExtensions(scoped ReadOnlySpan<WireExtension> extensions)
     {
         for (int i = 1; i < extensions.Length; i++)
         {
