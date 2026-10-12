@@ -50,24 +50,36 @@ public sealed class NetSimulationTests
             (CommitToken token, Exception? error) = await CaptureValueAsync(() => m.InvokeAsync(volume, id, Ct));
             Assert.True(drop.Matched >= 1, "the request drop must have been reached");
 
-            if (error is not null)
-                Assert.True(IsUnavailability(error) || IsUnknownOutcome(error), $"{m}: a non-delivered request must fail explicitly, got {error}");
-
-            // Success is only reported for an executed request, and the operation took effect at most once.
-            await NetHelpers.AssertExactlyOnceAsync(m, volume, id, error is null ? token : null, error);
             if (error is null)
-                Assert.Equal(droppedCopies, drop.Matched);
-
-            // After the loss the same identity is still usable for a successful retry (when no definite abort was recorded).
-            if (error is not null && m.SupportsRetry)
             {
-                DfsOperationOutcome outcome = await m.QueryAsync(volume, id, false);
-                if (outcome.Status == DfsOutcomeStatus.Committed)
+                // Success is only reported for an executed request: every dropped copy was consumed before the delivered
+                // retry, and the operation took effect exactly once with the reported token.
+                Assert.Equal(droppedCopies, drop.Matched);
+                await NetHelpers.AssertExactlyOnceAsync(m, volume, id, token, null);
+            }
+            else
+            {
+                // The SDK transmitted the request and cannot know that it was lost in the network: it must not report a
+                // definite failure, only that the commit may have happened.
+                NetHelpers.AssertUnknownWithIdentity(m, error, id, "a transmitted request without any reply");
+                drop.Cancel();
+                DfsOperationOutcome seen = await m.QueryAsync(volume, id, false);
+                if (m.SupportsRetry && seen.Status == DfsOutcomeStatus.NotFound)
                 {
+                    // Never executed and not fenced: the caller's retry with the same identity executes exactly once.
                     CommitToken retried = await m.InvokeAsync(volume, id, Ct);
-                    if (m.ReturnsCommitToken)
-                        Assert.Equal(outcome.Token, retried);
-                    await m.AssertAppliedOnceAsync(volume);
+                    await NetHelpers.AssertExactlyOnceAsync(m, volume, id, retried, null);
+                }
+                else
+                {
+                    DfsOperationOutcome outcome = await NetHelpers.AssertExactlyOnceAsync(m, volume, id, null, error);
+                    if (m.SupportsRetry && outcome.Status == DfsOutcomeStatus.Committed)
+                    {
+                        CommitToken retried = await m.InvokeAsync(volume, id, Ct);
+                        if (m.ReturnsCommitToken)
+                            Assert.Equal(outcome.Token, retried);
+                        await m.AssertAppliedOnceAsync(volume);
+                    }
                 }
             }
 
@@ -106,43 +118,48 @@ public sealed class NetSimulationTests
 
             // The request is delivered and executed; its reply (and, depending on the mode, every retry's reply) is lost.
             MessageRule drop = cluster.Network.DropReplies(new MessageFilter(From: ClientNet("c0"), Type: m.RequestType), mode == "one-reply-lost" ? 1 : 10_000);
-            (CommitToken token, Exception? error) = await CaptureValueAsync(() => m.InvokeAsync(volume, id, Ct));
-            Assert.True(drop.Matched >= 1, "the reply drop must have been reached");
 
             if (mode == "one-reply-lost")
             {
+                (CommitToken token, Exception? error) = await CaptureValueAsync(() => m.InvokeAsync(volume, id, Ct));
+                Assert.True(drop.Matched >= 1, "the reply drop must have been reached");
+
+                // The SDK's retry with the same identity is answered from the outcome record (success), or the caller is
+                // told that the commit may have happened; never a definite failure.
                 if (error is not null)
-                    Assert.True(IsUnknownOutcome(error) || error is TimeoutException, $"{m}: a lost reply must be reported as uncertain, got {error}");
+                    NetHelpers.AssertUnknownWithIdentity(m, error, id, "a delivered request whose reply was lost");
                 drop.Cancel();
                 DfsOperationOutcome outcome = await NetHelpers.AssertExactlyOnceAsync(m, volume, id, error is null ? token : null, error);
-                Assert.Equal(DfsOutcomeStatus.Committed, outcome.Status);
+                if (error is not null)
+                    Assert.Equal(DfsOutcomeStatus.Committed, outcome.Status);   // it was executed; only the reply was lost
                 await client.DisposeAsync();
                 await RecoverAndConvergeAsync(cluster);
                 return;
             }
 
-            // Every reply was lost: the caller must learn that the commit may have happened, carrying the identity.
-            Assert.True(error is not null, $"{m}: no reply was ever delivered, so success cannot have been observed");
-            Assert.True(IsUnknownOutcome(error!), $"{m}: expected DfsCommitOutcomeUnknownException, got {error}");
-            if (error is DfsCommitOutcomeUnknownException unknown)
-            {
-                if (m.Operation == DfsOperationKind.TxCommit)
-                    Assert.Equal(new DfsTransactionId(id), unknown.TransactionId);
-                else
-                    Assert.Equal(id, unknown.OperationId);
-            }
-
             DfsVolume resolver = volume;
             if (mode == "client-crash-after-send")
             {
-                // The process that sent the request dies; a new process resolves and retries with the persisted identity.
+                // The process that sent the request dies while the request is in flight (test plan §9.2: drop every
+                // response to the caller and crash its process); a new process resolves and retries with the persisted
+                // identity. The delivered request executes although its sender is gone.
+                Task<(CommitToken Value, Exception? Error)> abandoned = CaptureValueAsync(() => m.InvokeAsync(volume, id, Ct));
+                await cluster.WaitUntilAsync(() => Task.FromResult(drop.Matched >= 1), ElectionBound, "the request must be delivered", Ct);
                 cluster.KillClient(client);
                 drop.Cancel();
+                _ = abandoned;   // belongs to the dead process; its result is never observed
                 DfsClient other = await cluster.ConnectAsync(new TestClientOptions { Name = "c1", OperationTimeout = ElectionBound }, Ct);
                 resolver = other.GetVolume(Vol);
+                await cluster.WaitUntilAsync(async () => (await m.QueryAsync(resolver, id, false)).Status == DfsOutcomeStatus.Committed, ElectionBound,
+                    $"{m}: the delivered request must commit although its sender died", Ct);
             }
             else
             {
+                (CommitToken _, Exception? error) = await CaptureValueAsync(() => m.InvokeAsync(volume, id, Ct));
+                Assert.True(drop.Matched >= 1, "the reply drop must have been reached");
+
+                // Every reply was lost: the caller must learn that the commit may have happened, carrying the identity.
+                NetHelpers.AssertUnknownWithIdentity(m, error, id, "no reply was ever delivered");
                 drop.Cancel();
             }
 
@@ -219,7 +236,10 @@ public sealed class NetSimulationTests
                     AssertNoCommitClaimed(error, "requests to the leader never arrive");
                     break;
                 case "leader-to-client-replies-vanish":
-                    Assert.True(error is not null && (IsUnknownOutcome(error) || error is TimeoutException), $"the request executed but no reply can arrive: {error}");
+                    // No reply from the leader can arrive, so success cannot be observed. Whether the WriteAll itself was
+                    // ever transmitted depends on earlier steps (e.g. a staging registration whose reply also vanished), so
+                    // the outcome is checked against the authoritative resolution below.
+                    AssertNoCommitClaimed(error, "replies from the leader never arrive");
                     break;
                 default:
                     // Rerouted to the next placement target / committed with the other follower within the deadline.
@@ -229,23 +249,30 @@ public sealed class NetSimulationTests
 
             cluster.Network.Heal();
             await cluster.WaitForStableAsync(ElectionBound, Ct);
-            DfsOperationOutcome outcome = await volume.QueryOperationAsync(id, resolve: error is not null, Ct);
             if (error is null)
             {
-                Assert.Equal(DfsOutcomeStatus.Committed, outcome.Status);
-                Assert.Equal(outcome.Token, token);
+                DfsOperationOutcome outcome = await volume.QueryOperationAsync(id, resolve: false, Ct);
+                Assert.True(outcome.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Expired, $"an acknowledged write resolved as {outcome.Status}");
+                if (outcome.Status == DfsOutcomeStatus.Committed)
+                    Assert.Equal(outcome.Token, token);
+                Assert.Equal(token.Sequence, (await volume.Files.GetInfoAsync("/h", Ct)).Revision);
                 await AssertContentAsync(volume, "/h", updated, "committed write");
                 await NetHelpers.AssertDurablyPlacedAsync(cluster, "/h", "rerouted upload");
             }
             else if (variant == "client-to-leader-requests-vanish")
             {
+                // Nothing the client sent to the leader arrived: the request can never have executed.
+                DfsOperationOutcome outcome = await volume.QueryOperationAsync(id, resolve: true, Ct);
                 Assert.Equal(DfsOutcomeStatus.Aborted, outcome.Status);
                 await AssertContentAsync(volume, "/h", old, "a request that never arrived has no effect");
             }
             else
             {
-                Assert.Equal(DfsOutcomeStatus.Committed, outcome.Status);
-                await AssertContentAsync(volume, "/h", updated, "the executed request took effect once");
+                // The request may have executed: the resolution is definite, consistent with the report, and exactly once.
+                await AssertResolvedConsistentlyAsync(volume, id, error,
+                    () => AssertContentAsync(volume, "/h", updated, "the executed request took effect once"),
+                    () => AssertContentAsync(volume, "/h", old, "an aborted request has no effect"),
+                    $"{variant} write");
             }
 
             // The client recovers promptly after the network does (no stuck connection in its pool).
@@ -262,20 +289,45 @@ public sealed class NetSimulationTests
 
     public static TheoryData<string, string, int> UploadBoundaries => new()
     {
+        // boundary, site, occurrence (for client.upload.chunk: the chunk's position in the upload order, -1 = last chunk)
         { "request-header", FaultSites.ClientRequestSend, 1 },
-        { "first-payload-chunk", FaultSites.ClientUploadChunk, 1 },
-        { "interior-payload-chunk", FaultSites.ClientUploadChunk, 2 },
-        { "last-payload-chunk", FaultSites.ClientUploadChunk, 4 },
+        { "payload-chunk-1-first", FaultSites.ClientUploadChunk, 0 },
+        { "payload-chunk-2", FaultSites.ClientUploadChunk, 1 },
+        { "payload-chunk-3-interior", FaultSites.ClientUploadChunk, 2 },
+        { "payload-chunk-4", FaultSites.ClientUploadChunk, 3 },
+        { "payload-chunk-5-last", FaultSites.ClientUploadChunk, -1 },
         { "server-payload-write", FaultSites.ObjectWrite, 1 },
         { "checksum-before-flush", FaultSites.ObjectBeforeFlush, 1 },
         { "finalization-after-flush", FaultSites.ObjectAfterFlushBeforeReceipt, 1 },
     };
 
+    /// <summary>
+    /// Resets the client's connections at one upload boundary of a five-chunk publication (four full 64 KiB logical update
+    /// units plus a 100-byte tail). Chunk boundaries are located from a fault-free reference run of the same deterministic
+    /// scenario: the hit number of the first upload of the selected chunk (so every chunk, including the short last one,
+    /// is covered regardless of how many targets each chunk is sent to).
+    /// </summary>
     [Theory, Catalog("NET-004", "S", "INV-01", "INV-02", "INV-03", "INV-06", "INV-08", "INV-17")]
     [MemberData(nameof(UploadBoundaries))]
     public async Task NET_004_ResetDuringObjectUpload(string boundary, string site, int occurrence)
     {
-        await ClusterTest.RunAsync(Det(TestClusterOptions.ThreeZones), async cluster =>
+        int hit = occurrence;
+        if (site == FaultSites.ClientUploadChunk)
+        {
+            IReadOnlyList<FaultContext> reference = await RunUploadResetScenarioAsync(boundary, site, occurrence: null);
+            int[] chunks = reference.Select(c => c.Occurrence).Distinct().ToArray();
+            Assert.True(chunks.Length >= 5, $"the publication must upload five chunks; the reference run uploaded {chunks.Length}");
+            int chunk = occurrence < 0 ? chunks[^1] : chunks[occurrence];
+            hit = 1 + reference.ToList().FindIndex(c => c.Occurrence == chunk);
+            Log($"NET-004 {boundary}: chunk index {chunk} is upload hit {hit} of {reference.Count}");
+        }
+
+        await RunUploadResetScenarioAsync(boundary, site, hit);
+    }
+
+    private static async Task<IReadOnlyList<FaultContext>> RunUploadResetScenarioAsync(string boundary, string site, int? occurrence)
+    {
+        return await ClusterTest.RunAsync(Det(TestClusterOptions.ThreeZones), async cluster =>
         {
             await using DfsClient client = await cluster.ConnectAsync(new TestClientOptions { Name = "c0", OperationTimeout = ElectionBound }, Ct);
             DfsVolume volume = client.GetVolume(Vol);
@@ -283,13 +335,16 @@ public sealed class NetSimulationTests
             await volume.Files.WriteAllBytesAsync("/up", old, Ct);
             byte[] data = TestData.Bytes(0x4002, (4 * 64 * 1024) + 100);
 
+            // A null occurrence is the reference run: an observer arm records every hit without changing behaviour.
             DfsOperationKind? operation = site == FaultSites.ClientUploadChunk ? null : DfsOperationKind.PutObject;
-            FaultArm arm = cluster.Faults.Arm(new FaultMatch(site, Operation: operation, Occurrence: occurrence),
-                FaultAction.Custom(_ =>
-                {
-                    cluster.Network.ResetConnections(ClientNet("c0"));
-                    return Task.CompletedTask;
-                }));
+            FaultArm arm = occurrence is null
+                ? cluster.Faults.Arm(new FaultMatch(site, Operation: operation, Count: 100_000), FaultAction.Delay(TimeSpan.Zero))
+                : cluster.Faults.Arm(new FaultMatch(site, Operation: operation, Occurrence: occurrence.Value),
+                    FaultAction.Custom(_ =>
+                    {
+                        cluster.Network.ResetConnections(ClientNet("c0"));
+                        return Task.CompletedTask;
+                    }));
             Exception? error = await CaptureAsync(async () =>
             {
                 await using DfsStream stream = await volume.Files.OpenAsync("/up", new DfsOpenOptions { Mode = FileMode.Open, Access = FileAccess.ReadWrite, Share = FileShare.Read }, Ct);
@@ -298,7 +353,13 @@ public sealed class NetSimulationTests
                 await stream.FlushAsync(Ct);
             });
             cluster.Faults.AssertReached(arm);
-            Log($"NET-004 {boundary}: {(error is null ? "flush succeeded" : error.GetType().Name)}");
+            IReadOnlyList<FaultContext> contexts = arm.Contexts.ToArray();
+            Log($"NET-004 {boundary}{(occurrence is null ? " (reference)" : "")}: {(error is null ? "flush succeeded" : error.GetType().Name)}");
+            if (occurrence is null)
+            {
+                Assert.True(error is null, $"the fault-free reference run must succeed: {error}");
+                return contexts;
+            }
 
             await using DfsClient observer = await cluster.ConnectAsync(new TestClientOptions { Name = "observer" }, Ct);
             DfsVolume observed = observer.GetVolume(Vol);
@@ -313,7 +374,8 @@ public sealed class NetSimulationTests
 
             if (now.AsSpan().SequenceEqual(data))
             {
-                // Every object of the published revision is complete and durably held per policy.
+                // Every object of the published revision is complete and durably held per policy: no receipt that the
+                // commit counted can belong to an incomplete object.
                 await NetHelpers.AssertDurablyPlacedAsync(cluster, "/up", boundary);
                 foreach (ExtentInfo extent in await NetHelpers.ExtentsAsync(cluster, "/up"))
                 {
@@ -338,6 +400,7 @@ public sealed class NetSimulationTests
             }
 
             await RecoverAndConvergeAsync(cluster);
+            return contexts;
         }, Ct);
     }
 
@@ -436,11 +499,12 @@ public sealed class NetSimulationTests
         foreach (int length in PrefixLengths(frame.Length, exhaustive: variant == "error-reply-small", seed: 0x0601))
             Assert.Throws<DfsProtocolException>(() => MessageCodec.Decode(frame.AsSpan(0, length)));
 
-        // Reassembling the pieces of every split reconstructs the frame exactly.
-        foreach (int split in PrefixLengths(frame.Length, exhaustive: variant == "error-reply-small", seed: 0x0602).Where(l => l > 0))
+        // The mirror image of a split: a frame followed by bytes of the next frame (coalesced delivery) is never parsed as
+        // the first message with the rest silently ignored; the frame boundary belongs to the transport envelope.
+        foreach (int extra in new[] { 1, 2, frame.Length / 2 })
         {
-            byte[] reassembled = Concat(frame.AsSpan(0, split).ToArray(), frame.AsSpan(split).ToArray());
-            Assert.Equal(message, MessageCodec.Decode(reassembled));
+            byte[] coalesced = Concat(frame, frame.AsSpan(0, Math.Max(1, extra)).ToArray());
+            Assert.Throws<DfsProtocolException>(() => MessageCodec.Decode(coalesced));
         }
     }
 
@@ -573,9 +637,12 @@ public sealed class NetSimulationTests
                 Exception? error = await pending;
                 hold.DropAll();   // retries captured meanwhile are discarded too, never released by Dispose
                 hold.Dispose();
-                Assert.True(error is not null, "the request was never delivered");
-                Assert.Equal(DfsOutcomeStatus.Aborted, (await volume.QueryOperationAsync(id, resolve: true, Ct)).Status);
 
+                // The SDK transmitted the request and never heard back: it cannot know the request was lost.
+                AssertUnknownOutcome(error, id, "a transmitted WriteAll that never arrived");
+
+                // The identity stays unresolved (not fenced) while truncated copies of its frame are delivered, so any
+                // truncated frame wrongly accepted as a complete request would create the file.
                 TestNode leader = await cluster.GetLeaderAsync(Vol, Ct);
                 byte[] frame = captured.Frame.ToArray();
                 foreach (int delivered in new[] { 0, 1, 2, 3, frame.Length / 2, frame.Length - 1 })
@@ -600,6 +667,9 @@ public sealed class NetSimulationTests
                     Assert.False(await volume.Files.ExistsAsync("/trunc", Ct), $"a truncated request ({delivered} of {frame.Length} bytes) must never create a file");
                 }
 
+                // No complete copy of the request was ever delivered: resolving the identity yields a definite abort.
+                Assert.Equal(DfsOutcomeStatus.Aborted, (await volume.QueryOperationAsync(id, resolve: true, Ct)).Status);
+                Assert.False(await volume.Files.ExistsAsync("/trunc", Ct));
                 await AssertContentAsync(volume, "/big", big, "the cluster keeps serving");
                 await RecoverAndConvergeAsync(cluster);
                 return;
@@ -616,7 +686,9 @@ public sealed class NetSimulationTests
             };
             MessageRule truncate = cluster.Network.TruncateNext(new MessageFilter(To: ClientNet("reader"), Type: type), keep);
 
-            if (variant == "stream-object-reply-truncated")
+            // ReadRange carries live-read metadata only for live stream reads (whole-file helpers pin a revision through
+            // their handle), so the metadata variant reads through a live stream like the stream variant.
+            if (variant is "stream-object-reply-truncated" or "metadata-reply-truncated")
             {
                 await using DfsStream stream = await readerVolume.Files.OpenAsync("/big", new DfsOpenOptions { Share = FileShare.ReadWrite }, Ct);
                 (byte[] all, Exception? streamError) = (Array.Empty<byte>(), null);
@@ -732,6 +804,12 @@ public sealed class NetSimulationTests
     // NET-009 DelayedOldReply
     // ------------------------------------------------------------------------------------------------------------
 
+    /// <summary>
+    /// Every reply of a first call is held until the caller's 1 s deadline has expired; a second call is then issued and,
+    /// while it is outstanding, the stale replies of the abandoned call are delivered first (in capture order), followed by
+    /// the new call's own reply. Correlation must route the stale replies nowhere: the outstanding call completes with its
+    /// own result, and later calls are unaffected.
+    /// </summary>
     [Theory, Catalog("NET-009", "S", "INV-01", "INV-02", "INV-03", "INV-06", "INV-08", "INV-17")]
     [InlineData("get-info")]
     [InlineData("read-range")]
@@ -749,55 +827,63 @@ public sealed class NetSimulationTests
             DfsFileInfo infoA = await setupVolume.Files.GetInfoAsync("/a", Ct);
             DfsFileInfo infoB = await setupVolume.Files.GetInfoAsync("/b", Ct);
 
-            // A short deadline so the delayed reply arrives after the caller retried or gave up.
+            // A short deadline so the first call is abandoned while its replies are still held.
             await using DfsClient client = await cluster.ConnectAsync(new TestClientOptions { Name = "c0", OperationTimeout = TimeSpan.FromSeconds(1) }, Ct);
             DfsVolume volume = client.GetVolume(Vol);
-            TimeSpan replyDelay = TimeSpan.FromMilliseconds(1500);
 
             switch (variant)
             {
                 case "get-info":
                 {
-                    MessageRule delay = cluster.Network.DelayNext(new MessageFilter(To: ClientNet("c0"), Type: MessageType.GetInfoResult), replyDelay);
+                    await volume.Files.GetInfoAsync("/b", Ct);   // warm the pooled connection to the leader
+                    MessageHold hold = cluster.Network.Hold(new MessageFilter(To: ClientNet("c0"), Type: MessageType.GetInfoResult));
                     (DfsFileInfo? first, Exception? firstError) = await CaptureValueAsync(() => volume.Files.GetInfoAsync("/a", Ct));
-                    if (firstError is null)
-                    {
-                        Assert.Equal("/a", first!.Path);
-                        Assert.Equal(infoA.InodeId, first.InodeId);
-                    }
+                    Assert.True(hold.Count >= 1, "the first call's reply must have been captured");
+                    Assert.True(firstError is not null, $"no reply reached the caller, yet it returned {first?.Path}");
+                    Assert.True(IsUnavailability(firstError!), $"an expired read must fail explicitly, got {firstError}");
 
-                    DfsFileInfo second = await volume.Files.GetInfoAsync("/b", Ct);
-                    Assert.Equal("/b", second.Path);
-                    Assert.Equal(infoB.InodeId, second.InodeId);
-                    Assert.Equal(200, second.Length);
-                    await cluster.DelayAsync(replyDelay * 2, Ct);
-                    DfsFileInfo third = await volume.Files.GetInfoAsync("/b", Ct);
-                    Assert.Equal(infoB.InodeId, third.InodeId);
-                    Assert.Equal(1, delay.Matched);
+                    int stale = hold.Count;
+                    Task<DfsFileInfo> second = volume.Files.GetInfoAsync("/b", Ct);
+                    await hold.WaitForAsync(stale + 1, ElectionBound);
+                    hold.ReleaseAll();   // stale /a replies arrive first, while the /b call is outstanding
+                    hold.Dispose();
+                    DfsFileInfo secondInfo = await second;
+                    Assert.Equal("/b", secondInfo.Path);
+                    Assert.Equal(infoB.InodeId, secondInfo.InodeId);
+                    Assert.Equal(200, secondInfo.Length);
+
+                    DfsFileInfo third = await volume.Files.GetInfoAsync("/a", Ct);
+                    Assert.Equal(infoA.InodeId, third.InodeId);
+                    Assert.Equal(100, third.Length);
                     break;
                 }
 
                 case "read-range":
                 {
                     await using DfsStream stream = await volume.Files.OpenAsync("/big", new DfsOpenOptions { Share = FileShare.ReadWrite }, Ct);
-                    MessageRule delay = cluster.Network.DelayNext(new MessageFilter(To: ClientNet("c0"), Type: MessageType.ReadRangeResult), replyDelay);
+                    MessageHold hold = cluster.Network.Hold(new MessageFilter(To: ClientNet("c0"), Type: MessageType.ReadRangeResult));
                     var firstBuffer = new byte[1000];
                     (int firstCount, Exception? firstError) = await CaptureValueAsync(() => stream.ReadAsync(firstBuffer, Ct).AsTask());
-                    if (firstError is null)
-                        AssertEx.BytesEqual(big.AsSpan(0, firstCount), firstBuffer.AsSpan(0, firstCount), "first read at offset 0");
-                    else
-                        Assert.Equal(0, stream.Position);
+                    Assert.True(hold.Count >= 1, "the first read's reply must have been captured");
+                    Assert.True(firstError is not null, $"no reply reached the caller, yet the read returned {firstCount} bytes");
+                    Assert.True(IsUnavailability(firstError!), $"an expired read must fail explicitly, got {firstError}");
+                    Assert.Equal(0, stream.Position);
 
+                    int stale = hold.Count;
                     stream.Seek(70_000, SeekOrigin.Begin);
                     var secondBuffer = new byte[1000];
-                    int secondCount = await stream.ReadAsync(secondBuffer, Ct);
+                    Task<int> second = stream.ReadAsync(secondBuffer, Ct).AsTask();
+                    await hold.WaitForAsync(stale + 1, ElectionBound);
+                    hold.ReleaseAll();   // the stale offset-0 replies arrive first, while the offset-70000 read is outstanding
+                    hold.Dispose();
+                    int secondCount = await second;
                     Assert.True(secondCount > 0);
-                    AssertEx.BytesEqual(big.AsSpan(70_000, secondCount), secondBuffer.AsSpan(0, secondCount), "a later read must not be completed by the delayed reply of an earlier one");
-                    await cluster.DelayAsync(replyDelay * 2, Ct);
+                    AssertEx.BytesEqual(big.AsSpan(70_000, secondCount), secondBuffer.AsSpan(0, secondCount), "a later read must not be completed by the stale reply of an earlier one");
+                    Assert.Equal(70_000 + secondCount, stream.Position);
+
                     stream.Seek(100, SeekOrigin.Begin);
                     int thirdCount = await stream.ReadAsync(secondBuffer, Ct);
-                    AssertEx.BytesEqual(big.AsSpan(100, thirdCount), secondBuffer.AsSpan(0, thirdCount), "read after the stale reply arrived");
-                    Assert.Equal(1, delay.Matched);
+                    AssertEx.BytesEqual(big.AsSpan(100, thirdCount), secondBuffer.AsSpan(0, thirdCount), "read after the stale replies arrived");
                     break;
                 }
 
@@ -807,24 +893,27 @@ public sealed class NetSimulationTests
                     DfsOperationId k2 = await volume.NewOperationIdAsync(Ct);
                     byte[] v1 = TestData.Bytes(0x9011, 3000);
                     byte[] v2 = TestData.Bytes(0x9012, 3000);
-                    MessageRule delay = cluster.Network.DelayNext(new MessageFilter(To: ClientNet("c0"), Type: MessageType.WriteAllResult), replyDelay);
-                    (CommitToken t1, Exception? e1) = await CaptureValueAsync(() => volume.Files.WriteAllBytesAsync("/w", v1, WithId(k1), Ct));
-                    CommitToken t2 = await volume.Files.WriteAllBytesAsync("/w", v2, WithId(k2), Ct);
-                    await cluster.DelayAsync(replyDelay * 2, Ct);
-                    Assert.Equal(1, delay.Matched);
+                    MessageHold hold = cluster.Network.Hold(new MessageFilter(To: ClientNet("c0"), Type: MessageType.WriteAllResult));
+                    (CommitToken _, Exception? e1) = await CaptureValueAsync(() => volume.Files.WriteAllBytesAsync("/w", v1, WithId(k1), Ct));
+                    Assert.True(hold.Count >= 1, "the first write's reply must have been captured");
 
-                    DfsOperationOutcome o2 = await volume.QueryOperationAsync(k2, resolve: false, Ct);
-                    Assert.Equal(DfsOutcomeStatus.Committed, o2.Status);
-                    Assert.Equal(o2.Token, t2);
+                    // The first write was delivered and executed, but no reply reached the caller.
+                    AssertUnknownOutcome(e1, k1, "a WriteAll whose replies were all held past its deadline");
+
+                    int stale = hold.Count;
+                    Task<CommitToken> second = volume.Files.WriteAllBytesAsync("/w", v2, WithId(k2), Ct);
+                    await hold.WaitForAsync(stale + 1, ElectionBound);
+                    hold.ReleaseAll();   // the stale k1 results arrive first, while the k2 write is outstanding
+                    hold.Dispose();
+                    CommitToken t2 = await second;
+
+                    // t2 is the second write's own token: it names the revision that wrote v2 (an oracle independent of
+                    // outcome retention) and differs from the first write's still-unacknowledged committed outcome.
+                    Assert.Equal(t2.Sequence, (await volume.Files.GetInfoAsync("/w", Ct)).Revision);
                     DfsOperationOutcome o1 = await volume.QueryOperationAsync(k1, resolve: true, Ct);
-                    if (e1 is null)
-                    {
-                        Assert.Equal(o1.Token, t1);
-                        Assert.NotEqual(t1, t2);
-                    }
-
-                    if (o1.Status == DfsOutcomeStatus.Committed)
-                        Assert.True(o1.Token.CompareTo(o2.Token) < 0, "the first write committed before the second");
+                    Assert.Equal(DfsOutcomeStatus.Committed, o1.Status);
+                    Assert.NotEqual(o1.Token, t2);
+                    Assert.True(o1.Token.CompareTo(t2) < 0, "the first write committed before the second");
                     await AssertContentAsync(volume, "/w", v2, "the later write is the final state");
                     break;
                 }
@@ -869,8 +958,8 @@ public sealed class NetSimulationTests
                     Task<DfsFileInfo>[] calls = Enumerable.Range(0, n).Select(i => volume.Files.GetInfoAsync("/f" + i.ToString(CultureInfo.InvariantCulture), Ct)).ToArray();
                     await hold.WaitForAsync(n, ElectionBound);
                     hold.ReleaseAll(reverseOrder: true);
+                    hold.Dispose();   // stop capturing before awaiting, so any further round trip is not held forever
                     DfsFileInfo[] results = await Task.WhenAll(calls);
-                    hold.Dispose();
                     for (int i = 0; i < n; i++)
                     {
                         Assert.Equal("/f" + i.ToString(CultureInfo.InvariantCulture), results[i].Path);
@@ -896,14 +985,20 @@ public sealed class NetSimulationTests
                         .Select(i => volume.Files.WriteAllBytesAsync("/f" + i.ToString(CultureInfo.InvariantCulture), updated[i], WithId(ids[i]), Ct)).ToArray();
                     await hold.WaitForAsync(n, ElectionBound);
                     hold.ReleaseAll(reverseOrder: true);
-                    CommitToken[] tokens = await Task.WhenAll(calls);
                     hold.Dispose();
+                    CommitToken[] tokens = await Task.WhenAll(calls);
                     Assert.Equal(n, tokens.Distinct().Count());
                     for (int i = 0; i < n; i++)
                     {
+                        // Each caller received its own token: the one naming the revision of its own file (independent of
+                        // outcome retention), and the one its outcome record holds while retained.
+                        string path = "/f" + i.ToString(CultureInfo.InvariantCulture);
+                        Assert.Equal(tokens[i].Sequence, (await volume.Files.GetInfoAsync(path, Ct)).Revision);
                         DfsOperationOutcome outcome = await volume.QueryOperationAsync(ids[i], resolve: false, Ct);
-                        Assert.Equal(outcome.Token, tokens[i]);
-                        await AssertContentAsync(volume, "/f" + i.ToString(CultureInfo.InvariantCulture), updated[i], "each caller's own write");
+                        Assert.True(outcome.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Expired, $"{ids[i]}: {outcome.Status}");
+                        if (outcome.Status == DfsOutcomeStatus.Committed)
+                            Assert.Equal(outcome.Token, tokens[i]);
+                        await AssertContentAsync(volume, path, updated[i], "each caller's own write");
                     }
 
                     break;
@@ -925,8 +1020,8 @@ public sealed class NetSimulationTests
                     Task<int>[] reads = Enumerable.Range(0, n).Select(i => streams[i].ReadAsync(buffers[i], Ct).AsTask()).ToArray();
                     await hold.WaitForAsync(n, ElectionBound);
                     hold.ReleaseAll(reverseOrder: true);
-                    int[] counts = await Task.WhenAll(reads);
                     hold.Dispose();
+                    int[] counts = await Task.WhenAll(reads);
                     for (int i = 0; i < n; i++)
                     {
                         Assert.True(counts[i] > 0);
@@ -950,12 +1045,16 @@ public sealed class NetSimulationTests
                     Task<DfsDirectoryInfo> mkdir = volume.Directories.CreateDirectoryAsync("/newdir", Ct);
                     await hold.WaitForAsync(5, ElectionBound);
                     hold.ReleaseAll(reverseOrder: true);
+                    hold.Dispose();   // a call needing a further round trip (e.g. an identity reservation) is not held forever
                     await Task.WhenAll(info, exists, missing, write, mkdir);
-                    hold.Dispose();
+                    Assert.Equal("/f0", info.Result.Path);
                     Assert.Equal(infos[0].InodeId, info.Result.InodeId);
                     Assert.True(exists.Result);
                     Assert.False(missing.Result);
-                    Assert.Equal((await volume.QueryOperationAsync(writeId, resolve: false, Ct)).Token, write.Result);
+                    Assert.Equal(write.Result.Sequence, (await volume.Files.GetInfoAsync("/f2", Ct)).Revision);
+                    DfsOperationOutcome writeOutcome = await volume.QueryOperationAsync(writeId, resolve: false, Ct);
+                    if (writeOutcome.Status == DfsOutcomeStatus.Committed)
+                        Assert.Equal(writeOutcome.Token, write.Result);
                     Assert.Equal("/newdir", mkdir.Result.Path);
                     await AssertContentAsync(volume, "/f2", written, "mixed write");
                     break;
@@ -994,6 +1093,12 @@ public sealed class NetSimulationTests
             TestNode cutFollower = followers[0];
             TestNode healthyFollower = followers[1];
 
+            // Identities and values are prepared before the cut (a cut can make reserving identities impossible).
+            bool large = variant == "storage-receipts-cut";
+            var planned = new List<(DfsOperationId Id, byte[] Value)>();
+            for (int i = 1; i <= 6; i++)
+                planned.Add((await writerVolume.NewOperationIdAsync(Ct), TestData.Bytes(0xB000 + (ulong)i, large ? 70_000 : 300)));
+
             switch (variant)
             {
                 case "leader-to-one-follower-cut":
@@ -1018,33 +1123,34 @@ public sealed class NetSimulationTests
                     break;
             }
 
-            bool large = variant == "storage-receipts-cut";
             var writes = new List<(long HistoryId, DfsOperationId OperationId, byte[] Value, CommitToken? Token)>();
 
             async Task WriterAsync()
             {
-                for (int i = 1; i <= 6; i++)
+                for (int i = 0; i < planned.Count; i++)
                 {
-                    byte[] value = TestData.Bytes(0xB000 + (ulong)i, large ? 70_000 : 300);
-                    DfsOperationId id = await writerVolume.NewOperationIdAsync(Ct);
+                    (DfsOperationId id, byte[] value) = planned[i];
                     long historyId = cluster.History.Invoke("writer", "write", "/reg", value, id);
-                    CommitToken? token = null;
-                    try
+                    (CommitToken written, Exception? error) = await CaptureValueAsync(() => writerVolume.Files.WriteAllBytesAsync("/reg", value, WithId(id), Ct));
+                    CommitToken? token = error is null ? written : null;
+                    if (error is null)
                     {
-                        token = await writerVolume.Files.WriteAllBytesAsync("/reg", value, WithId(id), Ct);
-                        cluster.History.Complete(historyId, OpOutcome.Ok, token);
+                        cluster.History.Complete(historyId, OpOutcome.Ok, written);
+
+                        // Assertions run outside the operation's try/catch, so a violation fails the test rather than being
+                        // recorded as a failed write.
                         if (variant is "leader-to-one-follower-cut" or "one-follower-to-leader-cut")
                         {
                             // The acknowledgement must come from a completed exchange: the healthy follower holds the entry.
-                            Assert.True((await GroupOnAsync(healthyFollower)).LastIndex >= token.Value.Sequence,
+                            Assert.True((await GroupOnAsync(healthyFollower)).LastIndex >= written.Sequence,
                                 $"write {i} was acknowledged without the follower whose exchange could complete");
                             if (variant == "leader-to-one-follower-cut")
-                                Assert.True((await GroupOnAsync(cutFollower)).LastIndex < token.Value.Sequence, "the cut follower cannot have received the entry");
+                                Assert.True((await GroupOnAsync(cutFollower)).LastIndex < written.Sequence, "the cut follower cannot have received the entry");
                         }
                     }
-                    catch (Exception ex)
+                    else
                     {
-                        cluster.History.Complete(historyId, HistoryRecorder.Classify(ex), ex);
+                        cluster.History.Complete(historyId, HistoryRecorder.Classify(error), error);
                     }
 
                     writes.Add((historyId, id, value, token));
@@ -1083,6 +1189,16 @@ public sealed class NetSimulationTests
 
             if (variant == "storage-receipts-cut")
                 await NetHelpers.AssertDurablyPlacedAsync(cluster, "/reg", "receipts are counted only from completed exchanges");
+
+            if (variant is "leader-outbound-cut" or "leader-inbound-cut")
+            {
+                // A leader that can only send (or only receive) completes no protocol exchange with any follower: one-way
+                // reachability must not keep it acting as leader.
+                await cluster.WaitUntilAsync(async () => await LeaderAmongAsync([leader]) is null, ElectionBound,
+                    $"[{variant}] the old leader must stop leading once its exchanges cannot complete", Ct);
+                TestNode newLeader = await WaitForLeaderAmongAsync(cluster, followers, $"[{variant}] the followers must elect a leader");
+                Assert.NotEqual(leader.Name, newLeader.Name);
+            }
 
             cluster.Network.Heal();
             await cluster.WaitForStableAsync(ElectionBound, Ct);
@@ -1195,16 +1311,30 @@ public sealed class NetSimulationTests
             await appender;
             await cluster.WaitForStableAsync(ElectionBound, Ct);
 
-            // Resolve every uncertain append authoritatively before checking the history.
+            // Resolve every uncertain append authoritatively before checking the history. Acknowledged appends carry their
+            // token in the history (their outcome records may already be retired by the acknowledgement watermark);
+            // unacknowledged ones are resolved; a definite failure must resolve as aborted.
             var committed = new List<(CommitToken Token, byte[] Chunk)>();
             foreach ((long historyId, DfsOperationId id, byte[] chunk) in attempts)
             {
                 HistoryOp op = cluster.History.Get(historyId);
-                DfsOperationOutcome outcome = await volume.QueryOperationAsync(id, resolve: op.Outcome == OpOutcome.Unknown, Ct);
+                if (op.Outcome == OpOutcome.Ok)
+                {
+                    CommitToken acknowledged = Assert.IsType<CommitToken>(op.Output);
+                    DfsOperationOutcome retained = await volume.QueryOperationAsync(id, resolve: false, Ct);
+                    Assert.True(retained.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Expired, $"acknowledged append {id} resolved as {retained.Status}");
+                    if (retained.Status == DfsOutcomeStatus.Committed)
+                        Assert.Equal(acknowledged, retained.Token);
+                    committed.Add((acknowledged, chunk));
+                    continue;
+                }
+
+                DfsOperationOutcome outcome = await volume.QueryOperationAsync(id, resolve: true, Ct);
+                Assert.True(outcome.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Aborted, $"append {id} must resolve definitely, got {outcome.Status}");
                 if (op.Outcome == OpOutcome.Unknown)
                     cluster.History.Resolve(historyId, outcome.Status == DfsOutcomeStatus.Committed ? OpOutcome.Ok : OpOutcome.Failed, outcome.Token);
-                if (op.Outcome == OpOutcome.Ok)
-                    Assert.Equal(DfsOutcomeStatus.Committed, outcome.Status);
+                else
+                    Assert.True(outcome.Status == DfsOutcomeStatus.Aborted, $"append {id} was reported as a definite failure ({op.Output}) but committed");
                 if (outcome.Status == DfsOutcomeStatus.Committed)
                     committed.Add((outcome.Token, chunk));
             }
@@ -1216,12 +1346,13 @@ public sealed class NetSimulationTests
             byte[] expected = Concat([.. committed.OrderBy(c => c.Token.Sequence).Select(c => c.Chunk)]);
             AssertEx.BytesEqual(expected, final, "every committed append appears exactly once, in commit order");
 
-            // An idle client with nothing pending sends no further requests besides keep-alives.
+            // An idle client with nothing pending has no retry queue left: no mutation, upload or outcome query is sent any
+            // more (keep-alives and routing refreshes are not retries).
             cluster.Network.Log.Reset();
             await cluster.DelayAsync(TimeSpan.FromSeconds(3), Ct);
-            long all = cluster.Network.Log.CountMessages(new MessageFilter(From: ClientNet("c0"), Direction: LinkDirection.Request));
-            long keepAlives = cluster.Network.Log.CountMessages(new MessageFilter(From: ClientNet("c0"), Type: MessageType.KeepAlive));
-            Assert.Equal(0, all - keepAlives);
+            MessageType[] retryable = [MessageType.Append, MessageType.WriteAll, MessageType.PutObject, MessageType.CreateStaging, MessageType.CommitFile, MessageType.QueryOperation];
+            foreach (MessageType type in retryable)
+                Assert.Equal(0, cluster.Network.Log.CountMessages(new MessageFilter(From: ClientNet("c0"), Type: type)));
             await RecoverAndConvergeAsync(cluster);
         }, Ct);
     }
@@ -1491,8 +1622,11 @@ public sealed class NetSimulationTests
                 hold.Dispose();
                 t1 = error is null ? value : null;
                 e1 = error;
+
+                // The request was delivered and executed; a reply lost with its connection leaves the caller uncertain
+                // (unless a retry over a new connection fetched the stored outcome).
                 if (error is not null)
-                    Assert.True(IsUnknownOutcome(error) || error is TimeoutException, $"a reply lost with its connection leaves the outcome uncertain: {error}");
+                    AssertUnknownOutcome(error, k1, "a WriteAll whose reply was lost with its connection");
             }
             else
             {
@@ -1509,15 +1643,31 @@ public sealed class NetSimulationTests
             long start = cluster.Time.GetTimestamp();
             CommitToken t2 = await volume.Files.WriteAllBytesAsync("/p", v2, WithId(k2), Ct);
             Assert.True(cluster.Time.GetElapsedTime(start) <= deadline + TimeSpan.FromSeconds(1), "recovery from a dead pooled connection must respect the deadline");
+
+            // t2 is the new request's own result (it names the revision that wrote v2), never the stale outcome of k1.
+            Assert.Equal(t2.Sequence, (await volume.Files.GetInfoAsync("/p", Ct)).Revision);
             DfsOperationOutcome o2 = await volume.QueryOperationAsync(k2, resolve: false, Ct);
-            Assert.Equal(o2.Token, t2);
+            if (o2.Status == DfsOutcomeStatus.Committed)
+                Assert.Equal(o2.Token, t2);
             DfsOperationOutcome o1 = await volume.QueryOperationAsync(k1, resolve: true, Ct);
-            Assert.Equal(DfsOutcomeStatus.Committed, o1.Status);
             if (t1 is { } token1)
-                Assert.Equal(o1.Token, token1);
-            Assert.True(o1.Token.CompareTo(t2) < 0, "the earlier request committed first");
-            Assert.NotEqual(o1.Token, t2);
-            _ = e1;
+            {
+                // Acknowledged: its outcome record may already be retired by the client's acknowledgement watermark.
+                Assert.True(o1.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Expired, $"acknowledged k1 resolved as {o1.Status}");
+                if (o1.Status == DfsOutcomeStatus.Committed)
+                    Assert.Equal(o1.Token, token1);
+                Assert.True(token1.CompareTo(t2) < 0, "the earlier request committed first");
+                Assert.NotEqual(token1, t2);
+            }
+            else
+            {
+                // Never acknowledged: the executed request stays resolvable as committed.
+                Assert.NotNull(e1);
+                Assert.Equal(DfsOutcomeStatus.Committed, o1.Status);
+                Assert.True(o1.Token.CompareTo(t2) < 0, "the earlier request committed first");
+                Assert.NotEqual(o1.Token, t2);
+            }
+
             await AssertContentAsync(volume, "/p", v2, "the latest write");
             await RecoverAndConvergeAsync(cluster);
         }, Ct);
@@ -1584,11 +1734,13 @@ public sealed class NetSimulationTests
             await cluster.WaitForStableAsync(ElectionBound, Ct);
 
             DfsOperationOutcome outcome = await volume.QueryOperationAsync(id, resolve: true, Ct);
-            Assert.True(outcome.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Aborted);
+            bool committed = outcome.Status == DfsOutcomeStatus.Committed;
             switch (error)
             {
                 case null:
-                    Assert.Equal(DfsOutcomeStatus.Committed, outcome.Status);
+                    // Acknowledged: committed (its record may already be retired by the acknowledgement watermark).
+                    Assert.True(outcome.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Expired, $"{point}: success was reported but the outcome is {outcome.Status}");
+                    committed = true;
                     break;
                 case OperationCanceledException:
                     // Cancellation may only be reported when the SDK can establish that nothing was published.
@@ -1599,14 +1751,15 @@ public sealed class NetSimulationTests
                     Assert.True(IsUnknownOutcome(error), $"{point}: expected success, a truthful cancellation or an unknown outcome, got {error}");
                     if (error is DfsCommitOutcomeUnknownException unknown)
                         Assert.Equal(id, unknown.OperationId);
-                    cluster.History.Resolve(historyId, outcome.Status == DfsOutcomeStatus.Committed ? OpOutcome.Ok : OpOutcome.Failed, outcome.Token);
+                    Assert.True(outcome.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Aborted, $"{point}: an unknown outcome must resolve definitely, got {outcome.Status}");
+                    cluster.History.Resolve(historyId, committed ? OpOutcome.Ok : OpOutcome.Failed, outcome.Token);
                     break;
             }
 
             if (stage is FaultStage.F00 or FaultStage.F01)
                 Assert.IsAssignableFrom<OperationCanceledException>(error);
 
-            await AssertContentAsync(volume, "/c", outcome.Status == DfsOutcomeStatus.Committed ? Concat(prefix, suffix) : prefix, $"{point}: content matches the authoritative outcome");
+            await AssertContentAsync(volume, "/c", committed ? Concat(prefix, suffix) : prefix, $"{point}: content matches the authoritative outcome");
             await cluster.History.RecordAsync<byte[]>("c0", "read", "/c", null, () => volume.Files.ReadAllBytesAsync("/c", Ct));
             LinearizabilityChecker.Check(cluster.History.Operations.Where(op => op.Key == "/c").ToList(), new AppendLogModel()).AssertValid();
             await RecoverAndConvergeAsync(cluster);
@@ -1644,7 +1797,7 @@ public sealed class NetSimulationTests
             DfsOperationId executed = await staleVolume.NewOperationIdAsync(Ct);
             MessageRule lostReply = cluster.Network.DropReplies(new MessageFilter(From: ClientNet("stale"), Type: MessageType.Append), 10_000);
             Exception? executedError = await CaptureAsync(() => staleVolume.Files.AppendAllBytesAsync("/log", logSuffix, WithId(executed), Ct));
-            Assert.True(executedError is not null && (IsUnknownOutcome(executedError) || executedError is TimeoutException));
+            AssertUnknownOutcome(executedError, executed, "an executed append whose every reply was lost");
             lostReply.Cancel();
 
             // The client disappears long enough for its leases, session and retained outcomes to expire
@@ -1655,18 +1808,20 @@ public sealed class NetSimulationTests
 
             // Meanwhile another writer takes over once the stale reservation expired (server-authoritative expiry).
             byte[] v1 = TestData.Bytes(0x1805, 4500);
+            ulong takeoverGeneration = 0;
             await cluster.WaitUntilAsync(async () =>
             {
                 Exception? openError = await CaptureAsync(async () =>
                 {
                     await using DfsStream takeover = await otherVolume.Files.OpenAsync("/f", new DfsOpenOptions { Mode = FileMode.Open, Access = FileAccess.ReadWrite, Share = FileShare.Read }, Ct);
-                    Assert.True(takeover.WriterGeneration > staleGeneration, "the new writer must hold a newer fencing generation");
+                    takeoverGeneration = takeover.WriterGeneration;
                     await takeover.WriteAsync(v1, Ct);
                     await takeover.SetLengthAsync(v1.Length, Ct);
                     await takeover.FlushAsync(Ct);
                 });
                 return openError is null;
             }, Lease * 5, "the stale reservation must expire so another writer can take over", Ct);
+            Assert.True(takeoverGeneration > staleGeneration, $"the new writer must hold a newer fencing generation ({takeoverGeneration} vs {staleGeneration})");
             await cluster.DelayAsync(TimeSpan.FromSeconds(45), Ct);
             VolumeStateInspection state = await cluster.Inspect.GetVolumeStateAsync(Vol);
             Assert.DoesNotContain(state.Handles, h => h.IsWriter && h.Generation == staleGeneration && !h.Expired);
@@ -1730,9 +1885,14 @@ public sealed class NetSimulationTests
                         cluster.Network.Isolate(ClientNet("c0"));
                         return Task.CompletedTask;
                     }));
-                await stream.WriteAsync(data, Ct);
-                await stream.SetLengthAsync(data.Length, Ct);
-                flushError = await CaptureAsync(() => stream.FlushAsync(Ct));
+                // Chunks are uploaded while writing (the buffer is smaller than the data), so the cut can already fail
+                // the write; the failure of any step of the publication is what is checked.
+                flushError = await CaptureAsync(async () =>
+                {
+                    await stream.WriteAsync(data, Ct);
+                    await stream.SetLengthAsync(data.Length, Ct);
+                    await stream.FlushAsync(Ct);
+                });
                 cluster.Faults.AssertReached(arm);
                 Assert.True(flushError is not null, "a publication whose receipts are incomplete cannot succeed while the client is cut off");
                 Assert.True(IsUnavailability(flushError!) || IsUnknownOutcome(flushError!) || flushError is IOException, $"explicit failure expected: {flushError}");
@@ -1814,7 +1974,12 @@ public sealed class NetSimulationTests
         foreach (MatrixCase matrixCase in applicable)
             results.Add(await NetFaultMatrix.RunCaseAsync(matrixCase, driver));
 
-        var notes = new List<string>();
+        var notes = new List<string>
+        {
+            $"bounds: {operation} x {FaultSites.All.Count} registered sites x {Enum.GetValues<MatrixFault>().Length} faults; one fault per case at the first matching occurrence; " +
+            "deterministic three-zone cluster (three voters, target 3 / ack 2 copies in 2 zones); one client; fresh cluster per case; " +
+            "later occurrences of multi-chunk boundaries are covered by NET-004/NET-019 and CON-013",
+        };
         notes.AddRange(slice.Where(c => !c.Applicable).Select(c => $"excluded {c.Id}: {c.ExclusionReason}"));
         notes.AddRange(results.Where(r => !r.Passed).Select(r => $"FAILED {r.Case.Id}: {r.Failure}"));
         var report = new CampaignReport(
@@ -1831,7 +1996,17 @@ public sealed class NetSimulationTests
         foreach (string note in notes.Where(n => n.StartsWith("FAILED", StringComparison.Ordinal)))
             Log("  " + note);
 
+        // Every generated case is accounted for exactly once: executed (with a result) or excluded (with a reason).
+        string[] generatedIds = slice.Select(c => c.Id).ToArray();
+        string[] resultIds = results.Select(r => r.Case.Id).ToArray();
+        string[] excludedIds = slice.Where(c => !c.Applicable).Select(c => c.Id).ToArray();
+        Assert.Equal(generatedIds.Length, generatedIds.Distinct(StringComparer.Ordinal).Count());
+        Assert.Empty(resultIds.Intersect(excludedIds, StringComparer.Ordinal));
+        Assert.Equal(generatedIds.Order(StringComparer.Ordinal), resultIds.Concat(excludedIds).Order(StringComparer.Ordinal));
+        Assert.All(slice.Where(c => !c.Applicable), c => Assert.False(string.IsNullOrWhiteSpace(c.ExclusionReason), $"{c.Id} is excluded without a reason"));
         Assert.Equal(report.Generated, report.Applicable + report.Excluded);
+        Assert.Equal(report.Applicable, report.Passed + report.Failed);
+        Assert.Equal(1 + report.Excluded + report.Failed, report.Notes.Count);
         Assert.True(report.Applicable > 0, $"{operation} has a driver but no applicable case");
         Assert.True(report.Reached == report.Applicable,
             $"unreached fault points (never counted as exercised): {string.Join(", ", results.Where(r => !r.Reached).Select(r => r.Case.Id))}");
@@ -1860,6 +2035,14 @@ public sealed class NetSimulationTests
         Assert.Equal(all.Count, applicable + excluded);
         Assert.All(all.Where(c => !c.Applicable), c => Assert.False(string.IsNullOrWhiteSpace(c.ExclusionReason), $"{c.Id} is excluded without a reason"));
         Assert.DoesNotContain(all, c => c.ExclusionReason is not null && c.ExclusionReason.StartsWith("no driver registered", StringComparison.Ordinal));
+
+        // The per-operation campaign slices (one NET_020 theory row per driven operation) and the wholly excluded operations
+        // partition the matrix, so the slice reports together account for every generated case.
+        int drivenCases = NetFaultMatrix.Drivers.Keys.Sum(op => all.Count(c => c.Operation == op));
+        int wholeExcludedCases = NetFaultMatrix.OperationExclusions.Keys.Sum(op => all.Count(c => c.Operation == op));
+        Assert.Equal(all.Count, drivenCases + wholeExcludedCases);
+        Assert.All(all.Where(c => NetFaultMatrix.OperationExclusions.ContainsKey(c.Operation)), c => Assert.False(c.Applicable));
+        Assert.Equal(NetFaultMatrix.Drivers.Count, CampaignOperations().Count);
 
         // Every operation kind is either driven or excluded as a whole with a reason, never both.
         foreach (DfsOperationKind operation in Enum.GetValues<DfsOperationKind>())

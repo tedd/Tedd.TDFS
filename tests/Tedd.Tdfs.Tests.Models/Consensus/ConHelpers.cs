@@ -9,7 +9,10 @@ namespace Tedd.Tdfs.Tests.Models.Con;
 /// <summary>
 /// Bounds of one bounded-exhaustive election model (CON-001). Every budget is consumed by an environment action, so the
 /// reachable state space is finite and the exploration can complete: elections (<see cref="Timeouts"/>), leader
-/// heartbeat rounds, client proposals, message drops, message duplications and node crashes.
+/// heartbeat rounds, client proposals, message drops, message duplications, node crashes and single-server membership
+/// changes (<see cref="ConfChanges"/>: promote a learner or remove a voter, proposed by whichever node currently leads,
+/// so elections interleave with configuration transitions). Restarts are not budgeted separately: a node can only
+/// restart after a budgeted crash.
 /// </summary>
 internal sealed record RaftModelBounds(
     int Voters,
@@ -20,7 +23,9 @@ internal sealed record RaftModelBounds(
     int Proposals,
     int Drops,
     int Duplicates,
-    int Crashes)
+    int Crashes,
+    int Learners = 0,
+    int ConfChanges = 0)
 {
     /// <summary>Raft timing used by every model node: tiny tick counts keep macro actions short.</summary>
     public const int ElectionTicksMin = 3;
@@ -33,7 +38,7 @@ internal sealed record RaftModelBounds(
 
     public override string ToString() =>
         string.Create(CultureInfo.InvariantCulture,
-            $"voters={Voters} preVote={PreVote} checkQuorum={CheckQuorum} timeouts<={Timeouts} heartbeats<={Heartbeats} proposals<={Proposals} drops<={Drops} duplicates<={Duplicates} crashes<={Crashes}");
+            $"voters={Voters} learners={Learners} preVote={PreVote} checkQuorum={CheckQuorum} timeouts<={Timeouts} heartbeats<={Heartbeats} proposals<={Proposals} drops<={Drops} duplicates<={Duplicates} crashes<={Crashes} confChanges<={ConfChanges}");
 }
 
 /// <summary>
@@ -82,13 +87,14 @@ internal sealed class RaftModelCluster
     private int _drops;
     private int _duplicates;
     private int _crashes;
+    private int _confChanges;
     private string? _violation;
 
     public RaftModelCluster(RaftModelBounds bounds, ulong seed)
     {
         _bounds = bounds;
         _seed = seed;
-        int n = bounds.Voters;
+        int n = bounds.Voters + bounds.Learners;
         _ids = new NodeId[n];
         for (int i = 0; i < n; i++)
         {
@@ -99,7 +105,10 @@ internal sealed class RaftModelCluster
             _indexOf[_ids[i]] = i;
         }
 
-        _conf = new RaftConfState(_ids, []);
+        // The bootstrap configuration (the "snapshot at index 0"). A correct host persists configuration only through the
+        // log and snapshot metadata (IRaftStorage), so a restarted core receives this bootstrap configuration plus its
+        // persisted log, from which the configuration in effect (changes are effective on append) is re-derived.
+        _conf = new RaftConfState(_ids.Take(bounds.Voters).ToArray(), _ids.Skip(bounds.Voters).ToArray());
         _nodes = new RaftNode?[n];
         _logs = new InMemoryRaftLog[n];
         _hard = new RaftHardState[n];
@@ -121,6 +130,9 @@ internal sealed class RaftModelCluster
 
     /// <summary>First invariant violation observed, or null.</summary>
     public string? Violation => _violation;
+
+    /// <summary>Number of membership changes a leader accepted along the schedule (vacuity check of configuration rows).</summary>
+    public int AcceptedConfChanges { get; private set; }
 
     /// <summary>Replays <paramref name="schedule"/> from the initial state.</summary>
     public static RaftModelCluster Replay(RaftModelBounds bounds, ulong seed, IEnumerable<string> schedule)
@@ -189,12 +201,21 @@ internal sealed class RaftModelCluster
 
             string name = "n" + i.ToString(CultureInfo.InvariantCulture);
             bool leader = node.Role == RaftRole.Leader;
-            if (!leader && _timeouts < _bounds.Timeouts)
+            if (!leader && node.Role != RaftRole.Learner && _timeouts < _bounds.Timeouts)
                 actions.Add("timeout " + name);
             if (leader && _heartbeats < _bounds.Heartbeats)
                 actions.Add("heartbeat " + name);
             if (leader && _proposals < _bounds.Proposals)
                 actions.Add("propose " + name);
+            if (leader && _confChanges < _bounds.ConfChanges)
+            {
+                RaftConfState conf = node.ConfState;
+                foreach (NodeId learner in conf.Learners.OrderBy(id => _indexOf[id]))
+                    actions.Add("promote " + name + " " + Name(learner));
+                foreach (NodeId voter in conf.Voters.Where(id => id != _ids[i]).OrderBy(id => _indexOf[id]))
+                    actions.Add("remove " + name + " " + Name(voter));
+            }
+
             if (_crashes < _bounds.Crashes)
                 actions.Add("crash " + name);
         }
@@ -287,6 +308,24 @@ internal sealed class RaftModelCluster
                 return;
             }
 
+            case "promote":
+            case "remove":
+            {
+                // "<verb> <leader> <target>": the leader proposes one single-server membership change.
+                string[] parts = arg.Split(' ');
+                int i = ParseNode(parts[0]);
+                int target = ParseNode(parts[1]);
+                RaftNode node = _nodes[i] ?? throw new InvalidOperationException($"n{i} is crashed.");
+                _confChanges++;
+                var change = new RaftConfChange(verb == "promote" ? RaftConfChangeKind.PromoteLearner : RaftConfChangeKind.RemoveNode, _ids[target]);
+                bool accepted = node.TryProposeConfChange(change, out _);
+                if (accepted)
+                    AcceptedConfChanges++;
+                _inputs[i].Add(verb + " " + parts[1] + (accepted ? "" : " (rejected)"));
+                Drain(i);
+                return;
+            }
+
             case "crash":
             {
                 int i = ParseNode(arg);
@@ -334,7 +373,7 @@ internal sealed class RaftModelCluster
         foreach (string key in inflight)
             sb.Append(key).Append('\u001f');
         sb.Append(']');
-        sb.Append(CultureInfo.InvariantCulture, $"budget[{_timeouts},{_heartbeats},{_proposals},{_drops},{_duplicates},{_crashes}]");
+        sb.Append(CultureInfo.InvariantCulture, $"budget[{_timeouts},{_heartbeats},{_proposals},{_drops},{_duplicates},{_crashes},{_confChanges}]");
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString())));
     }
 

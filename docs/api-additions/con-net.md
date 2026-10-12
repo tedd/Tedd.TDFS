@@ -95,3 +95,17 @@ spelled out so the implementation and the harness agree:
 * `MessageLog` counts delivered messages per filter; `MessageHold.Captured` keeps frames for `ReplayAsync`.
 * `TestCluster.Network.Partition(...)` groups may list client network names (`client:<name>`); a client is only able to
   reach nodes in its own group.
+* Client stages F00/F01 carry the API-level operation kind (e.g. `Exists` for `ExistsAsync`); wire and server stages carry
+  the kind of the message actually sent (`ExistsAsync` sends `GetInfo`, so `Exists` has no wire/server stages and the
+  NET-020 matrix excludes them with that reason).
+* `client.upload.chunk`: `FaultContext.Occurrence` is the chunk index. NET-004 locates the first/interior/last chunk from a
+  fault-free reference run of the same deterministic scenario, so it does not depend on how many targets a chunk is sent to.
+* An acknowledged operation's outcome record may be retired by the client's acknowledgement watermark or the retention
+  period (ARCHITECTURE §5.2); tests accept `Expired` for acknowledged identities and use revision/commit-token equality
+  as the retention-independent oracle. Identities whose outcome never reached the client must stay resolvable.
+* `QueryOperationAsync(id, resolve: true)` for an identity without an outcome proposes `FenceOperation`; the fault context
+  of that proposal carries `QueryOperation` (NET-020 drives the Propose stages of `QueryOperation` this way).
+* A node reported `Drained` holds no replicas of the volume any more (copies are re-created elsewhere and verified, then
+  deleted from the drained node through the `replica.delete` boundary); NET-020's `MembershipChange` driver waits for it.
+* A client that disposes does not close its volume session; staging sessions it opened are closed at the latest when the
+  session expires (`SessionTimeout`), which NET-020's leak check waits for after disposing the case client.

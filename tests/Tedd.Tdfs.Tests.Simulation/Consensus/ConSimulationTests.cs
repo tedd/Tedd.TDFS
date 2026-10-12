@@ -52,9 +52,9 @@ public sealed class ConSimulationTests
             DfsVolume majorityVolume = majority.GetVolume(Vol);
             DfsOperationId majorityOp = await majorityVolume.NewOperationIdAsync(Ct);
 
-            var commitBefore = new Dictionary<string, ulong>(StringComparer.Ordinal);
-            foreach (TestNode node in cluster.Nodes)
-                commitBefore[node.Name] = (await GroupOnAsync(node)).CommitIndex;
+            // Every entry proposed after the partition has an index above this bound; in-flight messages may still spread
+            // knowledge of earlier commits, so "nothing new committed" is CommitIndex <= lastBefore, not equality.
+            ulong lastBefore = await MaxLastIndexAsync(cluster.Nodes);
 
             if (shape == "no-majority-1-1-1")
                 cluster.Network.Partition([isolated.Name, ClientNet("minority")], [rest[0].Name, ClientNet("majority")], [rest[1].Name]);
@@ -65,7 +65,7 @@ public sealed class ConSimulationTests
             byte[] minorityBytes = TestData.Bytes(0x0202, 3000);
             Exception? minorityError = await CaptureAsync(() => minorityVolume.Files.WriteAllBytesAsync("/minority", minorityBytes, WithId(minorityOp), Ct));
             AssertNoCommitClaimed(minorityError, $"[{shape}] a lone voter ({isolated.Name})");
-            Assert.Equal(commitBefore[isolated.Name], (await GroupOnAsync(isolated)).CommitIndex);
+            Assert.True((await GroupOnAsync(isolated)).CommitIndex <= lastBefore, $"[{shape}] the lone voter {isolated.Name} committed an entry proposed after the partition");
             Assert.Null(await FileOnReplicaAsync(cluster, isolated.Name, "/minority"));
 
             byte[] majorityBytes = TestData.Bytes(0x0203, 3000);
@@ -74,7 +74,7 @@ public sealed class ConSimulationTests
                 Exception? error = await CaptureAsync(() => majorityVolume.Files.WriteAllBytesAsync("/majority", majorityBytes, WithId(majorityOp), Ct));
                 AssertNoCommitClaimed(error, "1+1+1: no group of one voter may commit");
                 foreach (TestNode node in cluster.Nodes)
-                    Assert.Equal(commitBefore[node.Name], (await GroupOnAsync(node)).CommitIndex);
+                    Assert.True((await GroupOnAsync(node)).CommitIndex <= lastBefore, $"1+1+1: {node.Name} committed an entry proposed after the partition");
             }
             else
             {
@@ -101,10 +101,24 @@ public sealed class ConSimulationTests
             cluster.Network.Heal();
             await cluster.WaitForStableAsync(ElectionBound, Ct);
 
-            // The minority request can never become committed later: resolving it yields a definite abort.
-            DfsOperationOutcome minorityOutcome = await majorityVolume.QueryOperationAsync(minorityOp, resolve: true, Ct);
-            Assert.Equal(DfsOutcomeStatus.Aborted, minorityOutcome.Status);
-            Assert.False(await majorityVolume.Files.ExistsAsync("/minority", Ct));
+            if (shape == "no-majority-1-1-1")
+            {
+                // The old leader may have appended the minority write locally. After healing it may win the election (its
+                // log is the most up to date) and then commit that entry legitimately, or lose and have it overwritten.
+                // Either way the resolution must be definite and match the namespace and what the client was told.
+                await AssertResolvedConsistentlyAsync(majorityVolume, minorityOp, minorityError,
+                    () => AssertContentAsync(majorityVolume, "/minority", minorityBytes, "a minority write committed after healing"),
+                    () => AssertAbsentAsync(majorityVolume, "/minority", "an aborted minority write"),
+                    "1+1+1 minority write");
+            }
+            else
+            {
+                // The majority committed in a higher term at the overlapping index, so whatever the isolated voter
+                // appended is overwritten: resolving the minority request yields a definite abort.
+                DfsOperationOutcome minorityOutcome = await majorityVolume.QueryOperationAsync(minorityOp, resolve: true, Ct);
+                Assert.Equal(DfsOutcomeStatus.Aborted, minorityOutcome.Status);
+                await AssertAbsentAsync(majorityVolume, "/minority", "an aborted minority write");
+            }
 
             if (shape == "no-majority-1-1-1")
             {
@@ -161,10 +175,11 @@ public sealed class ConSimulationTests
             DfsVolume majorityVolume = majority.GetVolume(Vol);
             DfsOperationId majorityOp = await majorityVolume.NewOperationIdAsync(Ct);
             DfsOperationId twoOfFiveOp = await majorityVolume.NewOperationIdAsync(Ct);
+            byte[] twoOfFiveBytes = TestData.Bytes(0x0304, 100);
+            Exception? twoOfFiveError = null;
 
-            var commitBefore = new Dictionary<string, ulong>(StringComparer.Ordinal);
-            foreach (TestNode node in cluster.Nodes)
-                commitBefore[node.Name] = (await GroupOnAsync(node)).CommitIndex;
+            // Entries proposed after the partition have indexes above this bound (see CON-002).
+            ulong lastBefore = await MaxLastIndexAsync(cluster.Nodes);
 
             var groups = new List<string[]>();
             groups.Add([.. Names(minorityNodes), ClientNet("minority")]);
@@ -174,12 +189,13 @@ public sealed class ConSimulationTests
             cluster.Network.Partition([.. groups]);
 
             // Two disconnected survivors never advertise a successful authoritative change.
+            byte[] minorityBytes = TestData.Bytes(0x0302, 2000);
             Exception? minorityError = await CaptureAsync(() =>
-                minorityVolume.Files.WriteAllBytesAsync("/minority", TestData.Bytes(0x0302, 2000), WithId(minorityOp), Ct));
+                minorityVolume.Files.WriteAllBytesAsync("/minority", minorityBytes, WithId(minorityOp), Ct));
             AssertNoCommitClaimed(minorityError, $"[{shape}] two of five voters");
             foreach (TestNode node in minorityNodes)
             {
-                Assert.Equal(commitBefore[node.Name], (await GroupOnAsync(node)).CommitIndex);
+                Assert.True((await GroupOnAsync(node)).CommitIndex <= lastBefore, $"[{shape}] minority voter {node.Name} committed an entry proposed after the partition");
                 Assert.Null(await FileOnReplicaAsync(cluster, node.Name, "/minority"));
             }
 
@@ -202,7 +218,11 @@ public sealed class ConSimulationTests
 
                 Assert.True(holders >= 3, $"a commit with five voters requires three durable copies of the entry; found {holders}");
                 foreach (TestNode node in minorityNodes)
-                    Assert.True((await GroupOnAsync(node)).LastIndex < committed.Sequence || (await GroupOnAsync(node)).CommitIndex < committed.Sequence);
+                {
+                    GroupInspection group = await GroupOnAsync(node);
+                    Assert.True(group.CommitIndex < committed.Sequence, $"partitioned minority voter {node.Name} cannot know of the majority's commit {committed.Sequence} (commit {group.CommitIndex})");
+                    Assert.Null(await FileOnReplicaAsync(cluster, node.Name, "/majority"));
+                }
 
                 if (shape == "3+2-then-majority-loses-one")
                 {
@@ -211,14 +231,12 @@ public sealed class ConSimulationTests
                     TestNode victim = majorityNodes.First(n => n.Name != currentLeader.Name);
                     await victim.CrashAsync(CrashMode.LoseUnflushed);
                     TestNode[] survivors = majorityNodes.Where(n => n.Name != victim.Name).ToArray();
-                    var survivorCommit = new Dictionary<string, ulong>(StringComparer.Ordinal);
-                    foreach (TestNode node in survivors)
-                        survivorCommit[node.Name] = (await GroupOnAsync(node)).CommitIndex;
+                    ulong survivorLastBefore = await MaxLastIndexAsync(survivors);
                     var shortClient = await cluster.ConnectAsync(new TestClientOptions { Name = "survivor", SeedNodes = Names(survivors), OperationTimeout = ShortOperationTimeout }, Ct);
-                    Exception? lostError = await CaptureAsync(() => shortClient.GetVolume(Vol).Files.WriteAllBytesAsync("/two-of-five", TestData.Bytes(0x0304, 100), WithId(twoOfFiveOp), Ct));
-                    AssertNoCommitClaimed(lostError, "two surviving voters of five");
+                    twoOfFiveError = await CaptureAsync(() => shortClient.GetVolume(Vol).Files.WriteAllBytesAsync("/two-of-five", twoOfFiveBytes, WithId(twoOfFiveOp), Ct));
+                    AssertNoCommitClaimed(twoOfFiveError, "two surviving voters of five");
                     foreach (TestNode node in survivors)
-                        Assert.Equal(survivorCommit[node.Name], (await GroupOnAsync(node)).CommitIndex);
+                        Assert.True((await GroupOnAsync(node)).CommitIndex <= survivorLastBefore, $"survivor {node.Name} committed an entry proposed with two of five voters");
                     await shortClient.DisposeAsync();
                     await victim.RestartAsync();
                 }
@@ -228,19 +246,38 @@ public sealed class ConSimulationTests
                 Exception? error = await CaptureAsync(() => majorityVolume.Files.WriteAllBytesAsync("/majority", majorityBytes, WithId(majorityOp), Ct));
                 AssertNoCommitClaimed(error, "2+2+1: no side holds three voters");
                 foreach (TestNode node in cluster.Nodes)
-                    Assert.Equal(commitBefore[node.Name], (await GroupOnAsync(node)).CommitIndex);
+                    Assert.True((await GroupOnAsync(node)).CommitIndex <= lastBefore, $"2+2+1: {node.Name} committed an entry proposed after the partition");
             }
 
             await cluster.Inspect.AssertNoSplitBrainAsync();
 
             await RecoverAndConvergeAsync(cluster);
-            DfsOperationOutcome minorityOutcome = await majorityVolume.QueryOperationAsync(minorityOp, resolve: true, Ct);
-            Assert.Equal(DfsOutcomeStatus.Aborted, minorityOutcome.Status);
-            Assert.False(await majorityVolume.Files.ExistsAsync("/minority", Ct));
+            if (shape == "2+2+1")
+            {
+                // The old leader and its partner both hold the minority write: after healing either one of them wins the
+                // election and commits it, or a voter without it wins and overwrites it. The outcome is resolved, not guessed.
+                await AssertResolvedConsistentlyAsync(majorityVolume, minorityOp, minorityError,
+                    () => AssertContentAsync(majorityVolume, "/minority", minorityBytes, "a minority write committed after healing"),
+                    () => AssertAbsentAsync(majorityVolume, "/minority", "an aborted minority write"),
+                    "2+2+1 minority write");
+            }
+            else
+            {
+                // A majority committed in a higher term at the overlapping indexes (or the request never reached a
+                // leader): the minority request is definitely aborted.
+                DfsOperationOutcome minorityOutcome = await majorityVolume.QueryOperationAsync(minorityOp, resolve: true, Ct);
+                Assert.Equal(DfsOutcomeStatus.Aborted, minorityOutcome.Status);
+                await AssertAbsentAsync(majorityVolume, "/minority", "an aborted minority write");
+            }
+
             if (shape == "3+2-then-majority-loses-one")
             {
-                Assert.Equal(DfsOutcomeStatus.Aborted, (await majorityVolume.QueryOperationAsync(twoOfFiveOp, resolve: true, Ct)).Status);
-                Assert.False(await majorityVolume.Files.ExistsAsync("/two-of-five", Ct));
+                // The two survivors may both hold the write; whether a later leader commits it depends on who wins after
+                // the victim and the minority return. Resolution must be definite and consistent.
+                await AssertResolvedConsistentlyAsync(majorityVolume, twoOfFiveOp, twoOfFiveError,
+                    () => AssertContentAsync(majorityVolume, "/two-of-five", twoOfFiveBytes, "a two-of-five write committed after recovery"),
+                    () => AssertAbsentAsync(majorityVolume, "/two-of-five", "an aborted two-of-five write"),
+                    "two-of-five write");
             }
 
             if (!majorityCanCommit)
@@ -259,6 +296,8 @@ public sealed class ConSimulationTests
 
     [Theory, Catalog("CON-004", "S", "INV-01", "INV-03", "INV-04", "INV-05", "INV-11", "INV-18")]
     [InlineData("vote-flush-fails", CrashMode.LoseUnflushed, 1UL)]
+    [InlineData("vote-flush-delayed-then-crash", CrashMode.LoseUnflushed, 1UL)]
+    [InlineData("vote-flush-delayed-then-crash", CrashMode.TearLastWrite, 2UL)]
     [InlineData("crash-during-election", CrashMode.LoseUnflushed, 1UL)]
     [InlineData("crash-during-election", CrashMode.LoseUnflushed, 2UL)]
     [InlineData("crash-during-election", CrashMode.LoseUnflushed, 3UL)]
@@ -274,60 +313,78 @@ public sealed class ConSimulationTests
             await volume.Files.WriteAllBytesAsync("/initial", initial, Ct);
             await cluster.WaitForReplicationAsync(Vol, Ct);
 
-            if (variant == "vote-flush-fails")
+            if (variant is "vote-flush-fails" or "vote-flush-delayed-then-crash")
             {
-                // A vote (or an own candidacy) that cannot be made durable must never be sent. With the leader isolated,
-                // the other two voters can only elect a leader if the voter whose disk refuses every flush grants a vote.
+                // A vote (or an own candidacy) that is not yet durable must never be sent. With the leader isolated, the
+                // other two voters can only elect a leader if the voter whose persistence fails (or is still in progress)
+                // grants a vote. In the delayed variant every I/O of that voter takes 3 s (a vote needs at least a write
+                // and a flush, so it cannot be durable before 6 s); probing for 2 s therefore observes exactly the window
+                // in which the vote exists only in memory, and the crash afterwards discards it.
+                bool delayed = variant == "vote-flush-delayed-then-crash";
                 TestNode leader = await cluster.GetLeaderAsync(Vol, Ct);
                 TestNode[] followers = Others(cluster, leader);
                 TestNode healthy = followers[0];
                 TestNode broken = followers[1];
-                ulong healthyCommit = (await GroupOnAsync(healthy)).CommitIndex;
-                broken.Disk.Faults.FailNextFlushes = 1_000_000;
+                ulong lastBefore = await MaxLastIndexAsync(cluster.Nodes);
+                if (delayed)
+                    broken.Disk.Faults.IoDelay = TimeSpan.FromSeconds(3);
+                else
+                    broken.Disk.Faults.FailNextFlushes = 1_000_000;
                 cluster.Network.Isolate(leader.Name);
 
-                for (int probe = 0; probe < 15; probe++)
+                int probes = delayed ? 10 : 15;
+                for (int probe = 0; probe < probes; probe++)
                 {
                     await cluster.DelayAsync(TimeSpan.FromMilliseconds(200), Ct);
                     TestNode? elected = await LeaderAmongAsync(followers);
                     Assert.True(elected is null,
-                        $"probe {probe}: {elected?.Name} became leader although {broken.Name} could not persist any vote or term");
-                    Assert.Equal(healthyCommit, (await GroupOnAsync(healthy)).CommitIndex);
+                        $"[{variant}] probe {probe}: {elected?.Name} became leader although {broken.Name} could not yet have persisted any vote or term");
+                    Assert.True((await GroupOnAsync(healthy)).CommitIndex <= lastBefore, $"probe {probe}: {healthy.Name} committed a new entry without a leader");
                     await cluster.Inspect.AssertNoSplitBrainAsync();
                 }
 
-                // Restore the disk; recover the broken node from its durable image (it may have failed-stop already).
+                // Restore the disk; recover the broken node from its durable image (it may have failed-stop already). In
+                // the delayed variant the crash discards the vote that was never made durable: after the restart the node
+                // must not behave as if it had voted (no second leader of a term it voted in).
                 broken.Disk.Faults.FailNextFlushes = 0;
+                broken.Disk.Faults.IoDelay = null;
                 if (broken.State == TestNodeState.Running)
                     await broken.CrashAsync(crashMode);
                 await broken.RestartAsync();
                 await WaitForLeaderAmongAsync(cluster, followers, "once votes can be persisted again an election must succeed");
+                await cluster.Inspect.AssertNoSplitBrainAsync();
                 await volume.Files.WriteAllBytesAsync("/after", TestData.Bytes(0x0402, 100), Ct);
                 await RecoverAndConvergeAsync(cluster);
                 await AssertContentAsync(volume, "/initial", initial, "committed data must survive");
                 return;
             }
 
-            // Crash a voter at a seeded point inside an election (the leader is isolated so the survivors must elect),
-            // restart it from its durable image only, and check that no term ever has two leaders.
+            // The leader crashes, so the two followers must elect; one of them crashes at a seeded point inside that
+            // election, and both return from their durable images in a seeded order. The returning old leader is a third
+            // voter that has not voted in the new term: if a vote had been sent before it was durable, the restarted
+            // voter could campaign in the term it already voted in and win with the old leader's vote, giving that term
+            // two leaders. No term may ever have two leaders.
             var random = new SeededRandom(seed);
             var markers = new List<(string Path, byte[] Bytes)>();
             for (int round = 0; round < 4; round++)
             {
                 TestNode leader = await cluster.GetLeaderAsync(Vol, Ct);
                 TestNode[] followers = Others(cluster, leader);
-                cluster.Network.Isolate(leader.Name);
+                await leader.CrashAsync(crashMode);
                 await cluster.DelayAsync(TimeSpan.FromMilliseconds(random.Next(400)), Ct);
                 TestNode victim = followers[random.Next(followers.Length)];
                 await victim.CrashAsync(crashMode);
                 await cluster.Inspect.AssertNoSplitBrainAsync();
                 await cluster.DelayAsync(TimeSpan.FromMilliseconds(random.Next(300)), Ct);
-                await victim.RestartAsync();
+                TestNode first = random.Next(2) == 0 ? victim : leader;
+                TestNode second = ReferenceEquals(first, victim) ? leader : victim;
+                await first.RestartAsync();
                 await cluster.Inspect.AssertNoSplitBrainAsync();
-                await WaitForLeaderAmongAsync(cluster, followers, $"round {round}: the restarted voter and its peer must elect a leader");
+                await cluster.DelayAsync(TimeSpan.FromMilliseconds(random.Next(200)), Ct);
+                await second.RestartAsync();
                 await cluster.Inspect.AssertNoSplitBrainAsync();
-                cluster.Network.Heal();
                 await cluster.WaitForStableAsync(ElectionBound, Ct);
+                await cluster.Inspect.AssertNoSplitBrainAsync();
 
                 byte[] marker = TestData.Bytes(0x0410 + (ulong)round, 500);
                 string path = "/round" + round.ToString(CultureInfo.InvariantCulture);
@@ -450,17 +507,17 @@ public sealed class ConSimulationTests
                 cluster.Faults.Arm(new FaultMatch(FaultSites.RpcReplySend, Operation: DfsOperationKind.CreateDirectory, Count: 1000), FaultAction.DropReply()),
             ];
             Exception? e1 = await CaptureAsync(() => lostVolume.Files.AppendAllBytesAsync("/log2", suffix2, WithId(kAppend), Ct));
-            Exception? e2 = await CaptureAsync(() => lostVolume.Files.WriteAllBytesAsync("/w", wBytes, WithId(kWrite), Ct));
-            Exception? e3 = await CaptureAsync(() => lostVolume.Directories.CreateDirectoryAsync("/dd", WithId(kDir), Ct));
+            Exception? e2 = await CaptureAsync(() => lostVolume.Directories.CreateDirectoryAsync("/dd", WithId(kDir), Ct));
+            Exception? e3 = await CaptureAsync(() => lostVolume.Files.WriteAllBytesAsync("/w", wBytes, WithId(kWrite), Ct));
             foreach (FaultArm arm in dropReplies)
                 cluster.Faults.AssertReached(arm);
-            foreach (Exception? e in new[] { e1, e2, e3 })
-            {
-                Assert.True(e is not null, "no reply ever reached the client, so it cannot report success");
-                Assert.True(IsUnknownOutcome(e!) || e is TimeoutException, $"a lost reply must surface as an unknown outcome, got {e}");
-            }
+            AssertUnknownOutcome(e1, kAppend, "Append whose every reply was lost");
+            AssertUnknownOutcome(e2, kDir, "CreateDirectory whose every reply was lost");
+            AssertUnknownOutcome(e3, kWrite, "WriteAll whose every reply was lost");
 
-            cluster.KillClient(lost);
+            // The client that issued them stays alive but idle (it never received a reply, so it never acknowledged these
+            // identities). Killing it would let its session expire (10 s with Fast timings) during the slowest leader
+            // change below, which would legitimately turn the retries into OperationExpired.
             foreach (FaultArm arm in dropReplies)
                 arm.Disarm();
 
@@ -567,8 +624,11 @@ public sealed class ConSimulationTests
             await AssertEx.ThrowsDfsAsync<DfsOperationIdMismatchException>(
                 () => volume.Files.AppendAllBytesAsync("/log2", TestData.Bytes(0x0509, 300), WithId(kAppend), Ct), DfsErrorCode.OperationIdMismatch);
             await AssertContentAsync(volume, "/log2", Concat(prefix2, suffix2), "rejected reuse must not apply");
+            await AssertContentAsync(volume, "/w", wBytes, "WriteAll whose reply was lost, applied once");
+            Assert.True(await volume.Directories.ExistsAsync("/dd", Ct), "CreateDirectory whose reply was lost");
 
             await RecoverAndConvergeAsync(cluster);
+            await lost.DisposeAsync();
 
             CheckResult linearizable = LinearizabilityChecker.Check(
                 cluster.History.Operations.Where(op => op.Key == "/reg").ToList(), new RegisterModel(v0));
@@ -601,23 +661,29 @@ public sealed class ConSimulationTests
             await setupVolume.Directories.CreateDirectoryAsync("/dst", Ct);
             await setupVolume.Files.WriteAllBytesAsync("/src/f", srcBytes, Ct);
             await setupVolume.Files.WriteAllBytesAsync("/marker", TestData.Bytes(0x0604, 10), Ct);
-            await cluster.WaitForReplicationAsync(Vol, Ct);
             ulong xRevision = (await setupVolume.Files.GetInfoAsync("/x", Ct)).Revision;
+            ulong logRevision = (await setupVolume.Files.GetInfoAsync("/log", Ct)).Revision;
 
             TestNode leader = await cluster.GetLeaderAsync(Vol, Ct);
             TestNode[] followers = Others(cluster, leader);
-            int inodesBefore = (await cluster.Inspect.GetVolumeStateAsync(Vol, leader.Name)).InodeCount;
 
-            // The writer can only reach the leader, and the leader can no longer send to its followers: the leader
-            // appends the entry to its own journal but can never replicate or commit it.
+            // The writer's session (and, should the SDK keep one per session, its staging session) is established while
+            // replication still works: once replication is cut, nothing else can commit, so the faulted request must be
+            // the only proposal it needs. All faulted payloads stay at or below the 4 KiB inline threshold, so no object
+            // upload, receipt or staging registration has to commit before the entry is proposed.
             DfsClient writer = await cluster.ConnectAsync(new TestClientOptions { Name = "writer", SeedNodes = [leader.Name], OperationTimeout = ShortOperationTimeout }, Ct);
             DfsVolume writerVolume = writer.GetVolume(Vol);
+            await writerVolume.Files.WriteAllBytesAsync("/writer-warm", TestData.Bytes(0x0608, 6000), Ct);
+            await writerVolume.Files.AppendAllBytesAsync("/writer-warm", TestData.Bytes(0x0609, 100), Ct);
             DfsOperationId k = await writerVolume.NewOperationIdAsync(Ct);
+            await cluster.WaitForReplicationAsync(Vol, Ct);
+            int inodesBefore = (await cluster.Inspect.GetVolumeStateAsync(Vol, leader.Name)).InodeCount;
+
+            // The leader can no longer send to its followers: it appends the entry to its own journal but can never
+            // replicate or commit it. Once the entry is appended the writer is also confined to the leader, so no SDK
+            // retry can reach a new leader.
             foreach (TestNode follower in followers)
-            {
                 cluster.Network.Cut(leader.Name, follower.Name);
-                cluster.Network.CutBoth(ClientNet("writer"), follower.Name);
-            }
 
             DfsOperationKind kind;
             Func<Task> invoke;
@@ -625,7 +691,7 @@ public sealed class ConSimulationTests
             {
                 case "write-all":
                     kind = DfsOperationKind.WriteAll;
-                    invoke = () => writerVolume.Files.WriteAllBytesAsync("/x", TestData.Bytes(0x0605, 8000), WithId(k), Ct);
+                    invoke = () => writerVolume.Files.WriteAllBytesAsync("/x", TestData.Bytes(0x0605, 3500), WithId(k), Ct);
                     break;
                 case "append":
                     kind = DfsOperationKind.Append;
@@ -647,11 +713,13 @@ public sealed class ConSimulationTests
             Task pending = invoke();
             await appended.WaitTriggeredAsync(ElectionBound);
             cluster.Faults.AssertReached(appended);
+            foreach (TestNode follower in followers)
+                cluster.Network.CutBoth(ClientNet("writer"), follower.Name);
 
             // Crash the leader while the suffix exists only in its local journal.
             await leader.CrashAsync(crashMode);
             Exception? error = await CaptureAsync(() => pending);
-            AssertNoCommitClaimed(error, $"[{operation}] a locally appended, unreplicated entry");
+            AssertUnknownOutcome(error, k, $"[{operation}] a locally appended, unreplicated entry whose leader crashed");
             await writer.DisposeAsync();
             cluster.Network.Heal();
 
@@ -683,8 +751,10 @@ public sealed class ConSimulationTests
 
             await AssertSuffixAbsentAsync("authoritative state before the old leader returns");
 
-            // Restart the old leader from its durable image containing the uncommitted suffix and watch it recover:
-            // its applied state must never present the suffix as committed.
+            // Restart the old leader from its durable image containing the uncommitted suffix and watch it recover: while
+            // replaying it may legitimately show an older committed prefix (its applied index lags), but its applied state
+            // must never present the suffix as committed. Every file below was written exactly once before the suffix, so
+            // each is either absent (older prefix) or exactly its single committed revision.
             await leader.RestartAsync();
             for (int probe = 0; probe < 25; probe++)
             {
@@ -701,15 +771,15 @@ public sealed class ConSimulationTests
                         continue;
                     }
 
-                    Assert.Equal(inodesBefore, state.InodeCount);
+                    Assert.True(state.InodeCount <= inodesBefore,
+                        $"probe {probe}: the recovering replica shows {state.InodeCount} inodes, more than the {inodesBefore} that were ever committed");
                     FileInspection? x = state.GetFile("/x");
-                    Assert.True(x is not null && x.Length == v1.Length && x.Revision == xRevision, $"probe {probe}: /x on the recovering replica must stay at the committed revision");
+                    Assert.True(x is null || (x.Revision == xRevision && x.Length == v1.Length),
+                        $"probe {probe}: /x on the recovering replica shows revision {x?.Revision} length {x?.Length}; the only committed revision is {xRevision} ({v1.Length} bytes)");
                     FileInspection? log = state.GetFile("/log");
-                    Assert.True(log is not null && log.Length == logPrefix.Length, $"probe {probe}: /log must not show the uncommitted append");
-                    Assert.NotNull(state.GetFile("/src/f"));
+                    Assert.True(log is null || (log.Revision == logRevision && log.Length == logPrefix.Length),
+                        $"probe {probe}: /log on the recovering replica shows revision {log?.Revision} length {log?.Length}; the uncommitted append must not appear");
                     Assert.Null(state.GetFile("/dst/f"));
-                    GroupInspection? recovering = await leader.Inspect.GetGroupAsync(Vol);
-                    Assert.True(recovering is null || recovering.Role != RaftRole.Leader, $"probe {probe}: the replica with a stale suffix must not lead");
                 }
 
                 await AssertSuffixAbsentAsync($"probe {probe} through the authoritative leader");
@@ -754,8 +824,13 @@ public sealed class ConSimulationTests
             }, Ct);
             DfsVolume writerVolume = writer.GetVolume(Vol);
             DfsOperationId k = await writerVolume.NewOperationIdAsync(Ct);
-            GroupInspection leaderBefore = await GroupOnAsync(leader);
+            await cluster.WaitForReplicationAsync(Vol, Ct);
 
+            // The WriteAll entry is appended after this index; once the holds are in place nothing appended later can
+            // reach a quorum, so the leader's commit index stays at or below it. The new value stays within the 4 KiB
+            // inline threshold: the WriteAll entry is then the only proposal the write needs (no object upload, receipt
+            // validation or staging registration has to commit first while the quorum decision is withheld).
+            ulong lastAtHold = (await GroupOnAsync(leader)).LastIndex;
             FaultArm appended = cluster.Faults.Arm(
                 new FaultMatch(FaultSites.RaftAfterLocalAppend, Node: leader.Name, Volume: Vol, Operation: DfsOperationKind.WriteAll),
                 FaultAction.Delay(TimeSpan.Zero));
@@ -772,23 +847,27 @@ public sealed class ConSimulationTests
                 holds.Add(cluster.Network.Hold(new MessageFilter(To: leader.Name, Type: MessageType.RaftBatch)));
             }
 
+            byte[] v2 = TestData.Bytes(0x0702, 3500);
+            Task<CommitToken> pending = writerVolume.Files.WriteAllBytesAsync("/x", v2, WithId(k), Ct);
+            await appended.WaitTriggeredAsync(ElectionBound);
+            cluster.Faults.AssertReached(appended);
             if (crash)
             {
+                // Confine the writer to the leader, so that after the crash no SDK retry can reach a new leader.
                 foreach (TestNode follower in followers)
                     cluster.Network.CutBoth(ClientNet("writer"), follower.Name);
             }
 
-            byte[] v2 = TestData.Bytes(0x0702, 6000);
-            Task<CommitToken> pending = writerVolume.Files.WriteAllBytesAsync("/x", v2, WithId(k), Ct);
-            await appended.WaitTriggeredAsync(ElectionBound);
-            cluster.Faults.AssertReached(appended);
-
-            // Shorter than the minimum election timeout (30 ticks x 5 ms): leadership is kept while the quorum decision is missing.
-            await cluster.DelayAsync(TimeSpan.FromMilliseconds(100), Ct);
+            // Well below the minimum election timeout (30 ticks x 5 ms = 150 ms), counted from the moment the holds were
+            // installed: with CheckQuorum the leader keeps its role for at least one election timeout without quorum
+            // responses, so the observation is of a leader that has appended locally but has no quorum decision.
+            await cluster.DelayAsync(TimeSpan.FromMilliseconds(50), Ct);
             Assert.False(pending.IsCompletedSuccessfully, "the client received success although only the leader's local append existed");
+            if (!crash)
+                Assert.False(pending.IsCompleted, $"the write must still be waiting for its quorum decision, but it completed: {pending.Exception?.InnerException}");
             GroupInspection held = await GroupOnAsync(leader);
             Assert.True(held.LastIndex > held.CommitIndex, $"the entry must be appended but uncommitted on the leader (last {held.LastIndex}, commit {held.CommitIndex})");
-            Assert.Equal(leaderBefore.CommitIndex, held.CommitIndex);
+            Assert.True(held.CommitIndex <= lastAtHold, $"the leader committed beyond {lastAtHold} (commit {held.CommitIndex}) without a quorum decision");
             if (five)
             {
                 int copies = 1;
@@ -820,21 +899,32 @@ public sealed class ConSimulationTests
             }
             else
             {
+                // Both followers received and persisted the entry (only their acknowledgements are held).
+                foreach (TestNode follower in followers)
+                {
+                    await cluster.WaitUntilAsync(async () => (await GroupOnAsync(follower)).LastIndex >= held.LastIndex, ElectionBound,
+                        $"{follower.Name} must persist the replicated entry {held.LastIndex}", Ct);
+                }
+
                 await leader.CrashAsync(CrashMode.LoseUnflushed);
                 foreach (MessageHold hold in holds)
                     hold.Dispose();
                 Exception? error = await CaptureAsync(() => pending);
-                AssertNoCommitClaimed(error, "the leader crashed before learning of any quorum");
+
+                // The leader never learned of a quorum, but the entry is on a majority: the commit may (and here will)
+                // happen, so the client must be told "unknown", never success and never a definite failure.
+                AssertUnknownOutcome(error, k, "the leader crashed before learning of any quorum");
                 await writer.DisposeAsync();
                 cluster.Network.Heal();
                 await WaitForLeaderAmongAsync(cluster, followers, "the surviving majority must elect a leader");
                 await using DfsClient observer = await cluster.ConnectAsync(new TestClientOptions { Name = "observer", SeedNodes = Names(followers) }, Ct);
                 DfsVolume observerVolume = observer.GetVolume(Vol);
 
-                // The followers may legitimately commit the entry they persisted; the outcome is resolved, not guessed.
+                // Every voter that can win the election holds the entry, so the new leader commits it with its first
+                // entry of the new term: the resolution is Committed and the content is the new revision.
                 DfsOperationOutcome outcome = await observerVolume.QueryOperationAsync(k, resolve: true, Ct);
-                Assert.True(outcome.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Aborted, $"resolution must be definite, got {outcome.Status}");
-                await AssertContentAsync(observerVolume, "/x", outcome.Status == DfsOutcomeStatus.Committed ? v2 : v1, $"content must match the resolved outcome {outcome.Status}");
+                Assert.Equal(DfsOutcomeStatus.Committed, outcome.Status);
+                await AssertContentAsync(observerVolume, "/x", v2, "the entry persisted by the majority is committed by the next leader");
             }
 
             foreach (MessageHold hold in holds)
@@ -858,6 +948,7 @@ public sealed class ConSimulationTests
             DfsClient setup = await cluster.ConnectAsync(new TestClientOptions { Name = "setup" }, Ct);
             byte[] v1 = TestData.Bytes(0x0801, 2500);
             await setup.GetVolume(Vol).Files.WriteAllBytesAsync("/x", v1, Ct);
+            await setup.GetVolume(Vol).Directories.CreateDirectoryAsync("/dir", Ct);
             await setup.GetVolume(Vol).Files.WriteAllBytesAsync("/dir/a", TestData.Bytes(0x0802, 10), Ct);
             await setup.DisposeAsync();
             await cluster.WaitForReplicationAsync(Vol, Ct);
@@ -869,11 +960,16 @@ public sealed class ConSimulationTests
             DfsVolume staleVolume = stale.GetVolume(Vol);
             DfsVolume freshVolume = fresh.GetVolume(Vol);
             await staleVolume.Files.GetInfoAsync("/x", Ct);   // warm routing/connection to the (soon stale) leader
-            ulong leaderCommit = (await GroupOnAsync(leader)).CommitIndex;
+
+            // A live read handle opened while the leader was still authoritative: every later read call on it must select
+            // a linearizable revision (FSD §6.2), so it may not be answered from the stale leader's state either.
+            DfsStream liveHandle = await staleVolume.Files.OpenAsync("/x", new DfsOpenOptions { Share = FileShare.ReadWrite }, Ct);
+            Assert.Equal(DfsReadView.Live, liveHandle.ReadView);
+            ulong lastBefore = await MaxLastIndexAsync(cluster.Nodes);
 
             cluster.Network.Partition([leader.Name, ClientNet("stale")], [.. Names(followers), ClientNet("fresh")]);
 
-            byte[] latest = v1;
+            byte[]? latest = v1;
             if (variant == "concurrent-history")
             {
                 byte[][] values = Enumerable.Range(1, 5).Select(i => TestData.Bytes(0x0810 + (ulong)i, 200)).ToArray();
@@ -902,7 +998,11 @@ public sealed class ConSimulationTests
                 await Task.WhenAll(FreshWriterAsync(), ReaderAsync("stale-reader", staleVolume, 6), ReaderAsync("fresh-reader", freshVolume, 6));
                 Assert.All(cluster.History.Operations.Where(op => op.Process == "stale-reader"),
                     op => Assert.True(op.Outcome != OpOutcome.Ok, $"the stale leader answered live read #{op.Id}"));
-                latest = values[^1];
+
+                // The final value is known only when the last fresh write was acknowledged; otherwise the linearizability
+                // check below (which includes the read after healing) is the oracle.
+                HistoryOp lastWrite = cluster.History.Operations.Last(op => op.Process == "fresh-writer");
+                latest = lastWrite.Outcome == OpOutcome.Ok ? values[^1] : null;
             }
             else if (variant == "read-after-majority-commit")
             {
@@ -927,8 +1027,14 @@ public sealed class ConSimulationTests
                 await using DfsStream stream = await staleVolume.Files.OpenAsync("/x", new DfsOpenOptions { Share = FileShare.ReadWrite }, Ct);
                 var buffer = new byte[256];
                 return await stream.ReadAsync(buffer, Ct);
-            }, "stream Read (Live)");
-            Assert.Equal(leaderCommit, (await GroupOnAsync(leader)).CommitIndex);
+            }, "open + stream Read (Live)");
+            long positionBefore = liveHandle.Position;
+            (int handleCount, Exception? handleError) = await CaptureValueAsync(async () => await liveHandle.ReadAsync(new byte[256], Ct));
+            Assert.True(handleError is not null, $"a live handle opened before the partition read {handleCount} bytes through a leader cut off from its quorum");
+            Assert.True(IsUnavailability(handleError!) || handleError is DfsLeaseLostException or DfsPinExpiredException,
+                $"live handle read: expected an explicit unavailability (or, once its lease lapsed, lease/pin loss), got {handleError!.GetType().FullName}: {handleError.Message}");
+            Assert.Equal(positionBefore, liveHandle.Position);
+            Assert.True((await GroupOnAsync(leader)).CommitIndex <= lastBefore, "the isolated leader committed an entry proposed after the partition");
             await cluster.Inspect.AssertNoSplitBrainAsync();
 
             cluster.Network.Heal();
@@ -936,13 +1042,16 @@ public sealed class ConSimulationTests
 
             // Once reconnected, the same client reads the latest committed value.
             byte[] afterHeal = await staleVolume.Files.ReadAllBytesAsync("/x", Ct);
-            AssertEx.BytesEqual(latest, afterHeal, "after healing the client must observe the latest commit");
+            if (latest is not null)
+                AssertEx.BytesEqual(latest, afterHeal, "after healing the client must observe the latest commit");
             if (variant == "concurrent-history")
             {
                 await cluster.History.RecordAsync<byte[]>("stale-reader", "read", "/x", null, () => staleVolume.Files.ReadAllBytesAsync("/x", Ct));
                 LinearizabilityChecker.Check(cluster.History.Operations.Where(op => op.Key == "/x").ToList(), new RegisterModel(v1)).AssertValid();
             }
 
+            // The handle's lease may have lapsed during the partition; closing it is best effort.
+            await CaptureAsync(async () => await liveHandle.DisposeAsync());
             await RecoverAndConvergeAsync(cluster);
         }, Ct);
     }
@@ -1101,11 +1210,15 @@ public sealed class ConSimulationTests
 
             Task reordering = reorder ? ReorderAsync() : Task.CompletedTask;
             var appended = new List<byte[]> { prefix };
+            var appendIds = new List<(DfsOperationId Id, CommitToken Token)>();
             for (int i = 0; i < 30; i++)
             {
                 byte[] chunk = TestData.Bytes(0x1020 + (ulong)i, 100);
-                await cluster.History.RecordAsync("w", "append", "/log", chunk, () => volume.Files.AppendAllBytesAsync("/log", chunk, Ct));
+                DfsOperationId id = await volume.NewOperationIdAsync(Ct);
+                CommitToken token = await cluster.History.RecordAsync("w", "append", "/log", chunk,
+                    () => volume.Files.AppendAllBytesAsync("/log", chunk, WithId(id), Ct));
                 appended.Add(chunk);
+                appendIds.Add((id, token));
             }
 
             for (int i = 0; i < 5; i++)
@@ -1124,6 +1237,18 @@ public sealed class ConSimulationTests
             // Each logical mutation took effect exactly once, in order.
             byte[] expectedLog = Concat([.. appended]);
             await AssertContentAsync(volume, "/log", expectedLog, "each append applied exactly once");
+
+            // Request outcomes were recorded once: every append has its own commit index (strictly increasing tokens), and
+            // a retained outcome record still reports that same token (an acknowledged outcome may already be retired).
+            for (int i = 1; i < appendIds.Count; i++)
+                Assert.True(appendIds[i - 1].Token.CompareTo(appendIds[i].Token) < 0, $"append {i} must commit after append {i - 1}");
+            foreach ((DfsOperationId id, CommitToken token) in appendIds)
+            {
+                DfsOperationOutcome outcome = await volume.QueryOperationAsync(id, resolve: false, Ct);
+                Assert.True(outcome.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Expired, $"{id}: unexpected outcome {outcome.Status}");
+                if (outcome.Status == DfsOutcomeStatus.Committed)
+                    Assert.Equal(token, outcome.Token);
+            }
             for (int i = 0; i < 5; i++)
             {
                 Assert.False(await volume.Files.ExistsAsync("/m/src" + i, Ct));
@@ -1160,25 +1285,46 @@ public sealed class ConSimulationTests
         sim.RunUntil(() => sim.LeaderIndex is not null, 5_000);
         Assert.NotNull(sim.LeaderIndex);
         var proposed = new List<byte[]>();
+        var leaderships = new HashSet<(int Leader, ulong Term)>();
         for (int i = 0; i < 40; i++)
         {
             byte[] command = Encoding.ASCII.GetBytes(string.Create(CultureInfo.InvariantCulture, $"cmd-{seed}-{i}"));
             sim.RunUntil(() => sim.LeaderIndex is not null, 5_000);
-            if (sim.Propose(sim.LeaderIndex!.Value, command))
+            int leader = sim.LeaderIndex!.Value;
+            leaderships.Add((leader, sim.Nodes[leader].Term));
+            if (sim.Propose(leader, command))
                 proposed.Add(command);
             sim.RunTicks(3);
             Assert.Null(sim.CheckSafety());
         }
 
+        // Liveness after the duplication stops: a final command is applied everywhere.
         sim.DuplicateProbability(0);
-        sim.RunUntil(() => Enumerable.Range(0, 3).All(n => proposed.All(p => sim.AppliedLog(n).Any(a => a.AsSpan().SequenceEqual(p)))), 10_000);
+        sim.RunUntil(() => sim.LeaderIndex is not null, 5_000);
+        int finalLeader = sim.LeaderIndex!.Value;
+        leaderships.Add((finalLeader, sim.Nodes[finalLeader].Term));
+        byte[] final = Encoding.ASCII.GetBytes(string.Create(CultureInfo.InvariantCulture, $"final-{seed}"));
+        Assert.True(sim.Propose(finalLeader, final), "the leader must accept a proposal");
+        sim.RunUntil(() => Enumerable.Range(0, 3).All(n => sim.AppliedLog(n).Any(a => a.AsSpan().SequenceEqual(final))), 10_000);
+
         for (int n = 0; n < 3; n++)
         {
             IReadOnlyList<byte[]> applied = sim.AppliedLog(n);
+            Assert.Equal(1, applied.Count(a => a.AsSpan().SequenceEqual(final)));
+
+            // Duplicated/reordered replication never applies an entry twice.
             Assert.Equal(applied.Count, applied.Select(Convert.ToHexString).Distinct(StringComparer.Ordinal).Count());
             foreach (byte[] command in proposed)
-                Assert.Equal(1, applied.Count(a => a.AsSpan().SequenceEqual(command)));
+                Assert.True(applied.Count(a => a.AsSpan().SequenceEqual(command)) <= 1, $"n{n} applied {Encoding.ASCII.GetString(command)} twice");
             Assert.Equal(sim.AppliedLog(0).Select(Convert.ToHexString), applied.Select(Convert.ToHexString));
+
+            // A proposal accepted by a leader that loses leadership before replicating it may legitimately be lost; with
+            // one stable leadership throughout, every accepted proposal is committed exactly once.
+            if (leaderships.Count == 1)
+            {
+                foreach (byte[] command in proposed)
+                    Assert.Equal(1, applied.Count(a => a.AsSpan().SequenceEqual(command)));
+            }
         }
 
         Assert.Null(sim.CheckSafety());
@@ -1199,6 +1345,7 @@ public sealed class ConSimulationTests
             DfsClient setup = await cluster.ConnectAsync(new TestClientOptions { Name = "setup" }, Ct);
             DfsVolume setupVolume = setup.GetVolume(Vol);
             var committed = new Dictionary<string, (byte[] Bytes, ulong Revision)>(StringComparer.Ordinal);
+            await setupVolume.Directories.CreateDirectoryAsync("/pre", Ct);
             foreach (string name in new[] { "a", "b", "c" })
             {
                 byte[] bytes = TestData.Bytes(0x1100 + (ulong)name[0], 900);
@@ -1218,7 +1365,12 @@ public sealed class ConSimulationTests
             var staleIds = new List<DfsOperationId>();
             for (int i = 0; i < divergent; i++)
                 staleIds.Add(await staleVolume.NewOperationIdAsync(Ct));
+            await cluster.WaitForReplicationAsync(Vol, Ct);
             GroupInspection leaderBefore = await GroupOnAsync(leader);
+
+            // Entries proposed after the partition have indexes above this bound (in-flight messages may still spread
+            // knowledge of earlier commits, see CON-002).
+            ulong lastBefore = await MaxLastIndexAsync(cluster.Nodes);
 
             FaultArm localAppends = cluster.Faults.Arm(
                 new FaultMatch(FaultSites.RaftAfterLocalAppend, Node: leader.Name, Volume: Vol, Operation: DfsOperationKind.WriteAll, Count: divergent),
@@ -1236,18 +1388,21 @@ public sealed class ConSimulationTests
             // The majority elects a new leader and commits different entries at overlapping indexes.
             await WaitForLeaderAmongAsync(cluster, followers, "the majority must elect a new leader");
             var freshFiles = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+            ulong lastFreshCommit = 0;
             for (int j = 0; j < fresh; j++)
             {
                 byte[] bytes = TestData.Bytes(0x1120 + (ulong)j, 700);
-                await freshVolume.Files.WriteAllBytesAsync("/fresh" + j, bytes, Ct);
+                CommitToken token = await freshVolume.Files.WriteAllBytesAsync("/fresh" + j, bytes, Ct);
                 freshFiles["/fresh" + j] = bytes;
+                lastFreshCommit = Math.Max(lastFreshCommit, token.Sequence);
             }
 
             foreach (Exception? error in await Task.WhenAll(staleOps))
                 AssertNoCommitClaimed(error, "an entry appended only by an isolated leader");
             GroupInspection staleGroup = await GroupOnAsync(leader);
             Assert.True(staleGroup.LastIndex >= leaderBefore.LastIndex + (ulong)divergent, "the old leader must hold the divergent suffix");
-            Assert.Equal(leaderBefore.CommitIndex, staleGroup.CommitIndex);
+            Assert.True(staleGroup.CommitIndex <= lastBefore,
+                $"the isolated leader committed beyond {lastBefore} (commit {staleGroup.CommitIndex}): its divergent entries have no quorum");
 
             cluster.Network.Heal();
 
@@ -1268,8 +1423,9 @@ public sealed class ConSimulationTests
 
             await cluster.WaitForReplicationAsync(Vol, Ct);
             await cluster.Inspect.AssertReplicasConvergedAsync(Vol);
-            GroupInspection authoritative = await cluster.Inspect.GetVolumeGroupAsync(Vol);
-            Assert.Equal(authoritative.AppliedIndex, (await GroupOnAsync(leader)).AppliedIndex);
+            GroupInspection reconciled = await GroupOnAsync(leader);
+            Assert.True(reconciled.AppliedIndex >= lastFreshCommit,
+                $"the reconciled replica must apply the majority's commits (applied {reconciled.AppliedIndex}, last majority commit {lastFreshCommit})");
 
             foreach (TestNode node in cluster.Nodes)
             {
@@ -1388,7 +1544,7 @@ public sealed class ConSimulationTests
             Exception? lostError = await CaptureAsync(() => volume.Files.AppendAllBytesAsync("/dedup-log", dedupSuffix, WithId(lostReply), Ct));
             cluster.Faults.AssertReached(dropReply);
             dropReply.Disarm();
-            Assert.True(lostError is not null && (IsUnknownOutcome(lostError) || lostError is TimeoutException), $"a lost reply must surface as unknown, got {lostError}");
+            AssertUnknownOutcome(lostError, lostReply, "an executed append whose every reply was lost");
             DfsOperationOutcome lostOutcomeBefore = await volume.QueryOperationAsync(lostReply, resolve: false, Ct);
             Assert.Equal(DfsOutcomeStatus.Committed, lostOutcomeBefore.Status);
 
@@ -1588,19 +1744,32 @@ public sealed class ConSimulationTests
             if (recoverySite)
             {
                 // Recovery boundaries run when the replica restarts from its local checkpoint/journal after the install.
-                await cluster.WaitForReplicationAsync(Vol, Ct);
-                await lagging.CrashAsync(CrashMode.LoseUnflushed);
-                await lagging.RestartAsync();
+                // The armed crash may stop the replica during the install or interrupt this very restart.
+                await cluster.WaitUntilAsync(async () =>
+                {
+                    if (lagging.State != TestNodeState.Running)
+                        return true;
+                    (GroupInspection? group, _) = await CaptureValueAsync(() => lagging.Inspect.GetGroupAsync(Vol));
+                    return group is not null && group.AppliedIndex >= created[^1].Sequence;
+                }, ElectionBound * 3, "the lagging replica must catch up (or be stopped by the injected crash)", Ct);
+                if (lagging.State == TestNodeState.Running)
+                    await lagging.CrashAsync(CrashMode.LoseUnflushed);
+                Exception? restartError = await CaptureAsync(() => lagging.RestartAsync());
+                Assert.True(restartError is null || (crashAtOccurrence is not null && lagging.State != TestNodeState.Running),
+                    $"the restart failed although no crash was injected into it: {restartError}");
             }
 
             if (crashAtOccurrence is not null)
             {
                 await arm.WaitTriggeredAsync(ElectionBound * 2);
                 cluster.Faults.AssertReached(arm);
-                await cluster.WaitUntilAsync(() => Task.FromResult(lagging.State == TestNodeState.Crashed), ElectionBound,
-                    "the injected crash must stop the replica", Ct);
                 arm.Disarm();
-                await lagging.RestartAsync();
+
+                // The injected crash stopped the replica (possibly already restarted above when it hit during the
+                // install); bring it back from its durable image.
+                await cluster.DelayAsync(TimeSpan.FromMilliseconds(50), Ct);
+                if (lagging.State != TestNodeState.Running)
+                    await lagging.RestartAsync();
             }
 
             // Whatever the replica recovers to is one complete committed prefix, never a mix of old and new files.
@@ -1776,19 +1945,15 @@ public sealed class ConSimulationTests
             int committedOutcomes = 0;
             foreach ((DfsOperationId id, string path, byte[] bytes, Exception? error) in new[] { (ka, "/side-a", aBytes, errors[0]), (kb, "/side-b", bBytes, errors[1]) })
             {
-                DfsOperationOutcome outcome = await checkVolume.QueryOperationAsync(id, resolve: true, Ct);
-                if (error is null)
-                    Assert.Equal(DfsOutcomeStatus.Committed, outcome.Status);
+                // A side's write that was appended without a valid quorum may still be committed after healing (its leader
+                // may win again); the resolution must be definite and agree with what the client was told and with the
+                // namespace.
+                DfsOperationOutcome outcome = await AssertResolvedConsistentlyAsync(checkVolume, id, error,
+                    () => AssertContentAsync(checkVolume, path, bytes, $"[{shape}, step {blockAtStep}] committed side write {path}"),
+                    () => AssertAbsentAsync(checkVolume, path, $"[{shape}, step {blockAtStep}] aborted side write"),
+                    $"[{shape}, step {blockAtStep}] {path}");
                 if (outcome.Status == DfsOutcomeStatus.Committed)
-                {
                     committedOutcomes++;
-                    await AssertContentAsync(checkVolume, path, bytes, "committed side write");
-                }
-                else
-                {
-                    Assert.Equal(DfsOutcomeStatus.Aborted, outcome.Status);
-                    Assert.False(await checkVolume.Files.ExistsAsync(path, Ct));
-                }
             }
 
             Assert.True(committedOutcomes <= 1, $"[{shape}] both partition sides' writes ended up committed");
@@ -1809,6 +1974,7 @@ public sealed class ConSimulationTests
             await using DfsClient client = await cluster.ConnectAsync(new TestClientOptions { Name = "c0", OperationTimeout = ElectionBound }, Ct);
             DfsVolume volume = client.GetVolume(Vol);
             var files = new List<(string Path, byte[] Bytes)>();
+            await volume.Directories.CreateDirectoryAsync("/bulk", Ct);
             for (int i = 0; i < 250; i++)
             {
                 byte[] bytes = TestData.Bytes(0x1500 + (ulong)i, 48);
@@ -2086,6 +2252,23 @@ public sealed class ConSimulationTests
                 Assert.DoesNotContain("vol2", volumes);
             if (!unknown.Contains("AddNode"))
                 Assert.DoesNotContain(await cluster.Admin.ListNodesAsync(Ct), n => n.Name == "n9");
+            if (!unknown.Contains("DefinePolicy"))
+                Assert.False((await data.GetInfoAsync(Ct)).NamedPolicies.ContainsKey("two"), "a policy definition that failed explicitly was applied later");
+            if (!unknown.Contains("SetFeature"))
+                Assert.DoesNotContain("con-017-feature", (await cluster.Admin.GetClusterStatusAsync(Ct)).ActiveFeatures);
+            if (!unknown.Contains("CreatePrincipal"))
+            {
+                Exception? login = await CaptureAsync(async () =>
+                {
+                    await using DfsClient late = await cluster.ConnectAsync(new TestClientOptions
+                    {
+                        Name = "late",
+                        Credentials = new DfsCredentials("late-user", "late-secret-123"),
+                        SeedNodes = keep,
+                    }, Ct);
+                });
+                Assert.True(login is DfsAuthenticationException, $"a principal whose creation failed explicitly must not exist later; login gave {login?.GetType().Name ?? "success"}");
+            }
 
             await cluster.Admin.CreateVolumeAsync(new DfsVolumeSpec { Name = "vol3" }, Ct);
             Assert.Contains("vol3", await cluster.Admin.ListVolumesAsync(Ct));
@@ -2170,9 +2353,14 @@ public sealed class ConSimulationTests
             await cluster.WaitForReplicationAsync(healthyName, Ct);
             await cluster.Inspect.AssertReplicasConvergedAsync(lostName);
             await cluster.Inspect.AssertReplicasConvergedAsync(healthyName);
-            Assert.Equal(DfsOutcomeStatus.Aborted, (await client.GetVolume(lostName).QueryOperationAsync(lostOp, resolve: true, Ct)).Status);
+
+            // A surviving voter of the lost volume may have been its leader and appended the write locally; after the
+            // victims return it may legitimately commit it. The resolution must be definite and match the client's report.
+            await AssertResolvedConsistentlyAsync(client.GetVolume(lostName), lostOp, writeError,
+                () => AssertContentAsync(client.GetVolume(lostName), "/l2", TestData.Bytes(0x1805, 100), "a write committed after the voters returned"),
+                () => AssertAbsentAsync(client.GetVolume(lostName), "/l2", "an aborted write"),
+                $"{lostName} write without its voters' majority");
             await AssertContentAsync(client.GetVolume(lostName), "/l", lostBefore, "the unavailable volume's data survives");
-            Assert.False(await client.GetVolume(lostName).Files.ExistsAsync("/l2", Ct));
             await AssertContentAsync(healthy, "/h2", healthyAfter, "healthy volume after recovery");
         }, Ct);
     }
@@ -2250,7 +2438,7 @@ public sealed class ConSimulationTests
                 Assert.Equal(0, cluster.Network.Log.CountMessages(new MessageFilter(Type: type)));
             FaultContext[] recoveryHits = cluster.Faults.Coverage.Hits.Skip(hitsBefore).ToArray();
             Assert.DoesNotContain(recoveryHits, h => h.Site == FaultSites.RpcRequestAccepted && NamespaceOperations.Contains(h.Operation));
-            Assert.DoesNotContain(recoveryHits, h => h.Site == FaultSites.ClientOperationStart);
+            Assert.DoesNotContain(recoveryHits, h => h.Site == FaultSites.ClientOperationStart && NamespaceOperations.Contains(h.Operation));
             Assert.Contains(recoveryHits, h => h.Site == FaultSites.RecoveryJournalReplay || h.Site == FaultSites.RecoveryCheckpointInstall);
 
             // The cluster identity was recovered from local trust data, and the data is intact.
@@ -2348,7 +2536,7 @@ public sealed class ConSimulationTests
             Exception? lostError = await CaptureAsync(() => volume.Files.WriteAllBytesAsync("/lost-reply", lostBytes, WithId(lostReply), Ct));
             cluster.Faults.AssertReached(drop);
             drop.Disarm();
-            Assert.True(lostError is not null && (IsUnknownOutcome(lostError) || lostError is TimeoutException));
+            AssertUnknownOutcome(lostError, lostReply, "an executed WriteAll whose every reply was lost");
             DfsOperationOutcome lostOutcome = await volume.QueryOperationAsync(lostReply, resolve: false, Ct);
             Assert.Equal(DfsOutcomeStatus.Committed, lostOutcome.Status);
             expected["/lost-reply"] = lostBytes;
@@ -2414,18 +2602,12 @@ public sealed class ConSimulationTests
             await using (DfsSnapshotView view = await freshVolume.Snapshots.OpenAsync("s1", Ct))
                 await AssertBytesAsync(snapshotBig, view.Files.ReadAllBytesAsync("/big", Ct), "snapshot after cold restart");
 
-            DfsOperationOutcome inflightOutcome = await freshVolume.QueryOperationAsync(inflightOp, resolve: true, Ct);
-            if (inflightError is null)
-                Assert.Equal(DfsOutcomeStatus.Committed, inflightOutcome.Status);
-            if (inflightOutcome.Status == DfsOutcomeStatus.Committed)
-            {
-                await AssertContentAsync(freshVolume, "/inflight", inflightBytes, "committed in-flight write");
-            }
-            else
-            {
-                Assert.Equal(DfsOutcomeStatus.Aborted, inflightOutcome.Status);
-                Assert.False(await freshVolume.Files.ExistsAsync("/inflight", Ct));
-            }
+            // Wholly committed or wholly absent, consistent with what the writer was told (a definite failure may only be
+            // reported for a write that can never commit).
+            await AssertResolvedConsistentlyAsync(freshVolume, inflightOp, inflightError,
+                () => AssertContentAsync(freshVolume, "/inflight", inflightBytes, "committed in-flight write"),
+                () => AssertAbsentAsync(freshVolume, "/inflight", "an aborted in-flight write"),
+                $"in-flight write across the cold restart in order {order}");
 
             await cluster.WaitForReplicationAsync(Vol, Ct);
             await cluster.Inspect.AssertReplicasConvergedAsync(Vol);

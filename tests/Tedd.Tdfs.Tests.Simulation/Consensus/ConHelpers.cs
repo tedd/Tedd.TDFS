@@ -87,6 +87,60 @@ internal static class ConHelpers
             $"{because}: expected an explicit unavailability or unknown-outcome error, got {error!.GetType().FullName}: {error.Message}");
     }
 
+    /// <summary>
+    /// Asserts the FSD §13 surface for a request that was delivered (so a commit may have happened): an explicit
+    /// unknown-outcome error carrying the operation identity, never success and never a definite failure.
+    /// </summary>
+    public static void AssertUnknownOutcome(Exception? error, DfsOperationId id, string because)
+    {
+        Assert.True(error is not null, $"{because}: success was reported although no commit decision reached the client");
+        Assert.True(IsUnknownOutcome(error!),
+            $"{because}: the request was delivered, so the commit may have happened and must be reported as unknown; got {error!.GetType().FullName}: {error.Message}");
+        if (error is DfsCommitOutcomeUnknownException unknown)
+            Assert.Equal(id, unknown.OperationId);
+    }
+
+    /// <summary>
+    /// Resolves <paramref name="id"/> authoritatively and checks that the resolution is definite and consistent with what
+    /// the caller was told (<paramref name="error"/>) and with the namespace: a reported success must be committed, a
+    /// definite (non-unknown) failure must be an abort (FSD §13: an operation that may have committed is reported as
+    /// unknown), a commit must be visible exactly once and an abort must have no effect.
+    /// </summary>
+    public static async Task<DfsOperationOutcome> AssertResolvedConsistentlyAsync(DfsVolume resolver, DfsOperationId id, Exception? error,
+        Func<Task> assertApplied, Func<Task> assertNotApplied, string because)
+    {
+        DfsOperationOutcome outcome = await resolver.QueryOperationAsync(id, resolve: true, Ct);
+        Assert.True(outcome.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Aborted, $"{because}: resolution must be definite, got {outcome.Status}");
+        if (error is null)
+            Assert.True(outcome.Status == DfsOutcomeStatus.Committed, $"{because}: success was reported but the operation resolved as {outcome.Status}");
+        else if (!IsUnknownOutcome(error))
+            Assert.True(outcome.Status == DfsOutcomeStatus.Aborted,
+                $"{because}: a definite failure ({error.GetType().Name}) was reported for an operation that committed; it had to be reported as unknown");
+        if (outcome.Status == DfsOutcomeStatus.Committed)
+            await assertApplied();
+        else
+            await assertNotApplied();
+        return outcome;
+    }
+
+    /// <summary>
+    /// The highest log index any of <paramref name="nodes"/> holds right now. Entries proposed after this moment have
+    /// higher indexes, so "no new metadata was committed" is <c>CommitIndex &lt;= this bound</c> (robust against
+    /// in-flight messages that only spread knowledge of entries committed earlier).
+    /// </summary>
+    public static async Task<ulong> MaxLastIndexAsync(IEnumerable<TestNode> nodes, string group = Vol)
+    {
+        ulong max = 0;
+        foreach (TestNode node in nodes)
+        {
+            if (node.State != TestNodeState.Running)
+                continue;
+            max = Math.Max(max, (await GroupOnAsync(node, group)).LastIndex);
+        }
+
+        return max;
+    }
+
     /// <summary>The nodes of the cluster other than <paramref name="excluded"/>.</summary>
     public static TestNode[] Others(TestCluster cluster, params TestNode[] excluded) =>
         cluster.Nodes.Where(n => excluded.All(e => !string.Equals(e.Name, n.Name, StringComparison.Ordinal))).ToArray();
@@ -180,6 +234,10 @@ internal static class ConHelpers
 
         return result;
     }
+
+    /// <summary>Asserts that a file is absent (never a false "present").</summary>
+    public static async Task AssertAbsentAsync(DfsVolume volume, string path, string because) =>
+        Assert.False(await volume.Files.ExistsAsync(path, Ct), $"{because}: {path} must not exist");
 
     /// <summary>The leader's applied view of a file on a specific replica (null when absent).</summary>
     public static async Task<FileInspection?> FileOnReplicaAsync(TestCluster cluster, string node, string path, string volume = Vol) =>

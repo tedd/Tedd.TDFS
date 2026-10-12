@@ -163,8 +163,19 @@ internal static class NetFaultMatrix
         return FaultExclusion(site, fault);
     }
 
+    /// <summary>
+    /// Operation kinds that exist only at the API level and travel inside another operation's message
+    /// (<c>MessageTypes.OperationOf</c> maps no message type to them), so their wire and server stages carry the other kind.
+    /// </summary>
+    private static readonly IReadOnlyDictionary<DfsOperationKind, string> CarriedBy = new Dictionary<DfsOperationKind, string>
+    {
+        [DfsOperationKind.Exists] = "GetInfo",
+    };
+
     private static string SiteExclusion(DfsOperationKind operation, string site) => FaultSites.StageOf(site) switch
     {
+        FaultStage.F03 or FaultStage.F04 or FaultStage.F13 or FaultStage.F14 when CarriedBy.TryGetValue(operation, out string? carrier) =>
+            $"{operation} has no message of its own (it travels as a {carrier} request, see MessageTypes.OperationOf); its wire and server stages are the {carrier} cases",
         FaultStage.F00 or FaultStage.F01 => $"{operation} is not started by a public SDK call (internal protocol or background work), so client op.start/validated stages do not exist for it",
         FaultStage.F02 => $"{operation} runs over an established pooled connection; connection establishment is the Connect operation's stage (stale pooled reuse is NET-016)",
         FaultStage.F03 when site == FaultSites.ClientUploadChunk => $"{operation} uploads no object payload chunks (payload chunks are PutObject requests)",
@@ -219,57 +230,67 @@ internal static class NetFaultMatrix
     /// <summary>Runs one applicable case in a fresh deterministic cluster and records reached/completed/failure.</summary>
     public static async Task<MatrixCaseResult> RunCaseAsync(MatrixCase matrixCase, OperationDriver driver)
     {
-        bool reached = false;
+        FaultArm? arm = null;
         bool completed = false;
         string? failure = null;
         try
         {
             await ClusterTest.RunAsync(driver.Options(), async cluster =>
             {
-                await using DfsClient client = await cluster.ConnectAsync(new TestClientOptions { Name = "c0", OperationTimeout = TimeSpan.FromSeconds(8) }, Ct);
-                var context = new MatrixContext { Cluster = cluster, Client = client, Volume = client.GetVolume(Vol), Case = matrixCase };
-                await driver.SetupAsync(context);
-
-                FaultArm arm = cluster.Faults.Arm(new FaultMatch(matrixCase.Site, Operation: OperationFilter(matrixCase.Operation, matrixCase.Site)),
-                    ActionFor(matrixCase.Fault));
-                using var caller = CancellationTokenSource.CreateLinkedTokenSource(Ct);
-                Task<Exception?> invocation = CaptureAsync(() => driver.InvokeAsync(context, caller.Token));
-
-                // Liveness: the operation terminates (or reaches the pause) within a bound.
-                await cluster.WaitUntilAsync(() => Task.FromResult(invocation.IsCompleted || (matrixCase.Fault == MatrixFault.Pause && arm.Triggered)),
-                    TimeSpan.FromSeconds(60), $"{matrixCase.Id}: the operation must terminate", Ct);
-                if (matrixCase.Fault == MatrixFault.Pause)
+                DfsClient client = await cluster.ConnectAsync(new TestClientOptions { Name = "c0", OperationTimeout = TimeSpan.FromSeconds(8) }, Ct);
+                try
                 {
-                    await cluster.DelayAsync(TimeSpan.FromSeconds(1), Ct);
-                    arm.Release();
+                    var context = new MatrixContext { Cluster = cluster, Client = client, Volume = client.GetVolume(Vol), Case = matrixCase };
+                    await driver.SetupAsync(context);
+
+                    arm = cluster.Faults.Arm(new FaultMatch(matrixCase.Site, Operation: OperationFilter(matrixCase.Operation, matrixCase.Site)),
+                        ActionFor(matrixCase.Fault));
+                    using var caller = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+                    Task<Exception?> invocation = CaptureAsync(() => driver.InvokeAsync(context, caller.Token));
+
+                    // Liveness: the operation terminates (or reaches the pause) within a bound.
+                    await cluster.WaitUntilAsync(() => Task.FromResult(invocation.IsCompleted || (matrixCase.Fault == MatrixFault.Pause && arm.Triggered)),
+                        TimeSpan.FromSeconds(60), $"{matrixCase.Id}: the operation must terminate", Ct);
+                    if (matrixCase.Fault == MatrixFault.Pause)
+                    {
+                        await cluster.DelayAsync(TimeSpan.FromSeconds(1), Ct);
+                        arm.Release();
+                    }
+
+                    await cluster.WaitUntilAsync(() => Task.FromResult(invocation.IsCompleted), TimeSpan.FromSeconds(60),
+                        $"{matrixCase.Id}: the operation must terminate after the fault is released", Ct);
+                    Exception? error = await invocation;
+                    cluster.Faults.DisarmAll();
+
+                    // Recovery invariants: restart crashed nodes, heal, stable, converged, no split brain.
+                    await RecoverAndConvergeAsync(cluster);
+                    if (arm.Triggered)
+                        Assert.True(cluster.Faults.Coverage.WasReached(matrixCase.Site), $"{matrixCase.Id}: the coverage registry must record the hit");
+
+                    // Outcome invariants common to every operation.
+                    if (error is not null)
+                    {
+                        NetHelpers.AssertTypedFailure(error, matrixCase.Id);
+                        if (error is OperationCanceledException)
+                            Assert.True(matrixCase.Fault == MatrixFault.CancelCaller, $"{matrixCase.Id}: cancellation reported although the caller never cancelled");
+                    }
+
+                    if (arm.Triggered && matrixCase.Fault == MatrixFault.CancelCaller && matrixCase.Stage is FaultStage.F00 or FaultStage.F01)
+                        Assert.True(error is OperationCanceledException, $"{matrixCase.Id}: cancellation before transmission must surface as OperationCanceledException, got {error?.GetType().Name ?? "success"}");
+
+                    // Operation-specific data, namespace and outcome invariants, then reservations and pins: writer
+                    // reservations and transactions are released (or expire) while the client is connected; once the
+                    // client is gone, its session expires and every staging session it opened is closed.
+                    await driver.VerifyAsync(context, error);
+                    await AssertNoLeakedReservationsAsync(cluster, includeStaging: false);
+                    await client.DisposeAsync();
+                    await AssertNoLeakedReservationsAsync(cluster, includeStaging: true);
+                    completed = true;
                 }
-
-                await cluster.WaitUntilAsync(() => Task.FromResult(invocation.IsCompleted), TimeSpan.FromSeconds(60),
-                    $"{matrixCase.Id}: the operation must terminate after the fault is released", Ct);
-                Exception? error = await invocation;
-                reached = arm.Triggered;
-                cluster.Faults.DisarmAll();
-
-                // Recovery invariants: restart crashed nodes, heal, stable, converged, no split brain.
-                await RecoverAndConvergeAsync(cluster);
-                if (reached)
-                    Assert.True(cluster.Faults.Coverage.WasReached(matrixCase.Site), $"{matrixCase.Id}: the coverage registry must record the hit");
-
-                // Outcome invariants common to every operation.
-                if (error is not null)
+                finally
                 {
-                    NetHelpers.AssertTypedFailure(error, matrixCase.Id);
-                    if (error is OperationCanceledException)
-                        Assert.True(matrixCase.Fault == MatrixFault.CancelCaller, $"{matrixCase.Id}: cancellation reported although the caller never cancelled");
+                    await CaptureAsync(async () => await client.DisposeAsync());
                 }
-
-                if (reached && matrixCase.Fault == MatrixFault.CancelCaller && matrixCase.Stage is FaultStage.F00 or FaultStage.F01)
-                    Assert.True(error is OperationCanceledException, $"{matrixCase.Id}: cancellation before transmission must surface as OperationCanceledException, got {error?.GetType().Name ?? "success"}");
-
-                // Operation-specific data, namespace and outcome invariants, then pins/reservations.
-                await driver.VerifyAsync(context, error);
-                await AssertNoLeakedReservationsAsync(cluster);
-                completed = true;
             }, Ct);
         }
         catch (Exception ex) when (!Ct.IsCancellationRequested)
@@ -277,9 +298,24 @@ internal static class NetFaultMatrix
             failure = ex.GetType().Name + ": " + FirstLine(ex.Message);
         }
 
+        // A case whose fault point was reached but which then failed counts as reached (and failed), not as unreached.
+        bool reached = arm?.Triggered ?? false;
         if (!reached && failure is null)
             failure = "fault point not reached";
         return new MatrixCaseResult(matrixCase, reached, completed, failure);
+    }
+
+    /// <summary>
+    /// Restarts a node; when an armed fault crashes it during that very restart (recovery boundaries F16), the node is
+    /// restarted once more (the fault fires once), so the driver continues with a running node.
+    /// </summary>
+    private static async Task RestartToleratingInjectedCrashAsync(TestNode node)
+    {
+        Exception? error = await CaptureAsync(() => node.RestartAsync());
+        if (error is null && node.State != TestNodeState.Crashed)
+            return;
+        Assert.True(node.State == TestNodeState.Crashed, $"{node.Name}: restart failed without an injected crash: {error}");
+        await node.RestartAsync();
     }
 
     private static string FirstLine(string text)
@@ -288,13 +324,20 @@ internal static class NetFaultMatrix
         return newline < 0 ? text : text[..newline];
     }
 
-    /// <summary>Writer reservations, open staging sessions and transactions are released (or expire) after a case.</summary>
-    public static Task AssertNoLeakedReservationsAsync(TestCluster cluster) =>
+    /// <summary>
+    /// Writer reservations and transactions are released (or expire) after a case; with <paramref name="includeStaging"/>
+    /// also every staging session (closed at the latest when the owning client's session expires, ARCHITECTURE §7).
+    /// </summary>
+    public static Task AssertNoLeakedReservationsAsync(TestCluster cluster, bool includeStaging) =>
         cluster.WaitUntilAsync(async () =>
         {
             VolumeStateInspection state = await cluster.Inspect.GetVolumeStateAsync(Vol);
-            return state.Handles.All(h => !h.IsWriter || h.Expired) && state.Staging.All(s => !s.Open) && state.ActiveTransactions == 0;
-        }, Lease * 4, "writer reservations, staging sessions and transactions must be released or expire after the case", Ct);
+            return state.Handles.All(h => !h.IsWriter || h.Expired) && state.ActiveTransactions == 0
+                && (!includeStaging || state.Staging.All(s => !s.Open));
+        }, includeStaging ? NodeTimings.Fast.SessionTimeout + (Lease * 4) : Lease * 4,
+            includeStaging
+                ? "staging sessions must be closed once their clients' sessions have expired"
+                : "writer reservations and transactions must be released or expire after the case", Ct);
 
     // ------------------------------------------------------------------------------------------------------------
     // Drivers
@@ -448,7 +491,8 @@ internal static class NetFaultMatrix
                     AssertEx.BytesEqual(bytes, context.Get<byte[]>("read"), "read through a renewed handle");
                 else
                     Assert.True(error is DfsLeaseLostException or DfsPinExpiredException || IsUnavailability(error) || error is IOException, $"handle failure must be typed: {error}");
-                await context.Get<DfsStream>("handle").DisposeAsync();
+                // Closing a read handle whose lease may have lapsed during the fault is best effort.
+                await CaptureAsync(async () => await context.Get<DfsStream>("handle").DisposeAsync());
                 await AssertContentAsync(context.Volume, "/ka", bytes, "file untouched");
             });
     }
@@ -517,7 +561,7 @@ internal static class NetFaultMatrix
                     AssertEx.BytesEqual(updated, content, "dispose published the pending changes");
                 else
                     Assert.True(content.AsSpan().SequenceEqual(old) || content.AsSpan().SequenceEqual(updated), "publication is all-or-nothing");
-                await AssertNoLeakedReservationsAsync(context.Cluster);
+                await AssertNoLeakedReservationsAsync(context.Cluster, includeStaging: false);
                 await using DfsStream again = await context.Volume.Files.OpenWriteAsync("/ch", Ct);
                 Assert.True(again.CanWrite, "the reservation must be released so a new writer can open");
             });
@@ -545,7 +589,8 @@ internal static class NetFaultMatrix
             {
                 if (error is null)
                     AssertEx.BytesEqual(bytes, context.Get<byte[]>("read"), "verified bytes of the selected revision");
-                await context.Get<DfsStream>("handle").DisposeAsync();
+                // Closing a read handle whose lease may have lapsed during the fault is best effort.
+                await CaptureAsync(async () => await context.Get<DfsStream>("handle").DisposeAsync());
                 await AssertContentAsync(context.Volume, "/rd", bytes, "file intact");
             });
     }
@@ -560,6 +605,7 @@ internal static class NetFaultMatrix
             DefaultOptions,
             async context =>
             {
+                await context.Volume.Directories.CreateDirectoryAsync("/en", Ct);
                 foreach (string name in expected)
                     await context.Volume.Files.WriteAllBytesAsync("/en/" + name, TestData.Bytes(0x6050, 10), Ct);
             },
@@ -574,6 +620,8 @@ internal static class NetFaultMatrix
             {
                 if (error is null)
                     Assert.Equal(expected, context.Get<List<string>>("names").Order(StringComparer.Ordinal).ToArray());
+                else
+                    Assert.False(error is DirectoryNotFoundException, "a fault must never surface as false absence");
                 return Task.CompletedTask;
             });
     }
@@ -611,8 +659,8 @@ internal static class NetFaultMatrix
 
     private static OperationDriver ExistsDriver() => new(
         DfsOperationKind.Exists,
-        "existence check of a present file",
-        Sites(ClientStart, ClientWire, ServerWire),
+        "existence check of a present file (API-level stages; the request itself is a GetInfo)",
+        Sites(ClientStart),
         DefaultOptions,
         context => context.Volume.Files.WriteAllBytesAsync("/ex", TestData.Bytes(0x6071, 10), Ct),
         async (context, ct) => context.State["exists"] = await context.Volume.Files.ExistsAsync("/ex", ct),
@@ -722,31 +770,47 @@ internal static class NetFaultMatrix
     private static OperationDriver QueryOperationDriver()
     {
         byte[] bytes = TestData.Bytes(0x60C1, 5000);
+        byte[] neverBytes = TestData.Bytes(0x60C2, 300);
         return new OperationDriver(
             DfsOperationKind.QueryOperation,
-            "resolve an operation whose reply was lost",
+            "resolve (fence) an identity that was never used, then resolve an operation whose reply was lost",
             Sites(ClientStart, ClientWire, ServerWire, Propose),
             DefaultOptions,
             async context =>
             {
+                // The never-used identity has no outcome, so resolving it must propose a fence (the Propose stages); the
+                // lost-reply identity has a committed outcome that must be reported as such.
+                context.State["never"] = await context.Volume.NewOperationIdAsync(Ct);
                 context.OperationId = await context.Volume.NewOperationIdAsync(Ct);
                 FaultArm drop = context.Cluster.Faults.Arm(new FaultMatch(FaultSites.RpcReplySend, Operation: DfsOperationKind.WriteAll, Count: 1000), FaultAction.DropReply());
                 await CaptureAsync(() => context.Volume.Files.WriteAllBytesAsync("/qo", bytes, WithId(context.OperationId), Ct));
                 context.Cluster.Faults.AssertReached(drop);
                 drop.Disarm();
             },
-            async (context, ct) => context.State["outcome"] = await context.Volume.QueryOperationAsync(context.OperationId, resolve: true, ct),
+            async (context, ct) =>
+            {
+                context.State["fenced"] = await context.Volume.QueryOperationAsync(context.Get<DfsOperationId>("never"), resolve: true, ct);
+                context.State["outcome"] = await context.Volume.QueryOperationAsync(context.OperationId, resolve: true, ct);
+            },
             async (context, error) =>
             {
+                DfsOperationId never = context.Get<DfsOperationId>("never");
+                DfsOperationOutcome fenced = await context.Volume.QueryOperationAsync(never, resolve: true, Ct);
+                Assert.Equal(DfsOutcomeStatus.Aborted, fenced.Status);
                 DfsOperationOutcome final = await context.Volume.QueryOperationAsync(context.OperationId, resolve: true, Ct);
                 Assert.Equal(DfsOutcomeStatus.Committed, final.Status);
                 if (error is null)
                 {
+                    Assert.Equal(DfsOutcomeStatus.Aborted, context.Get<DfsOperationOutcome>("fenced").Status);
                     DfsOperationOutcome first = context.Get<DfsOperationOutcome>("outcome");
                     Assert.Equal(DfsOutcomeStatus.Committed, first.Status);
                     Assert.Equal(final.Token, first.Token);
                 }
 
+                // A fenced identity can never execute later (a delayed or retried copy is rejected, not applied).
+                Exception? late = await CaptureAsync(() => context.Volume.Files.WriteAllBytesAsync("/qo-never", neverBytes, WithId(never), Ct));
+                Assert.True(late is not null, "a write with a fenced identity must not succeed");
+                Assert.False(await context.Volume.Files.ExistsAsync("/qo-never", Ct), "a fenced identity must never take effect");
                 await AssertContentAsync(context.Volume, "/qo", bytes, "the executed write");
             });
     }
@@ -866,7 +930,7 @@ internal static class NetFaultMatrix
         {
             TestNode follower = Others(context.Cluster, await context.Cluster.GetLeaderAsync(Vol, ct))[0];
             await follower.StopAsync();
-            await follower.RestartAsync();
+            await RestartToleratingInjectedCrashAsync(follower);
             await context.Volume.Files.WriteAllBytesAsync("/ra-after", TestData.Bytes(0x6120, 300), ct);
             await context.Cluster.WaitForReplicationAsync(Vol, ct);
         },
@@ -893,9 +957,14 @@ internal static class NetFaultMatrix
         {
             TestNode follower = context.Get<TestNode>("follower");
             context.Cluster.Network.Heal();
+
+            // An injected crash may stop the follower during the install; it is then brought back like any crashed node.
+            await context.Cluster.WaitForReplicationAsync(Vol, ct);
+            if (follower.State is TestNodeState.Crashed or TestNodeState.Stopped)
+                await RestartToleratingInjectedCrashAsync(follower);
             await context.Cluster.WaitForReplicationAsync(Vol, ct);
             await follower.CrashAsync(CrashMode.LoseUnflushed);
-            await follower.RestartAsync();
+            await RestartToleratingInjectedCrashAsync(follower);
             await context.Cluster.WaitForReplicationAsync(Vol, ct);
         },
         async (context, _) =>
@@ -927,9 +996,19 @@ internal static class NetFaultMatrix
             context => context.Volume.Files.WriteAllBytesAsync("/mc", bytes, Ct),
             async (context, ct) =>
             {
+                // Draining ends when the node has lost its voter role and its replicas have been moved off it (new copies
+                // verified first, then the old ones deleted: the replica-deletion boundary).
                 await context.Cluster.Admin.DrainNodeAsync("n2", ct);
-                await context.Cluster.WaitUntilAsync(async () => !(await context.Cluster.Inspect.GetVolumeGroupAsync(Vol)).Voters.Contains("n2"),
-                    TimeSpan.FromSeconds(60), "the drained voter must be replaced", ct);
+                await context.Cluster.WaitUntilAsync(async () =>
+                {
+                    if ((await context.Cluster.Inspect.GetVolumeGroupAsync(Vol)).Voters.Contains("n2"))
+                        return false;
+                    DfsNodeInfo? info = (await context.Cluster.Admin.ListNodesAsync(ct)).FirstOrDefault(n => n.Name == "n2");
+                    if (info is null || info.Status != DfsNodeStatus.Drained)
+                        return false;
+                    TestNode drained = context.Cluster.Node("n2");
+                    return drained.State != TestNodeState.Running || (await drained.Inspect.ListObjectsAsync(Vol)).Count == 0;
+                }, TimeSpan.FromSeconds(60), "the drained voter must be replaced and its replicas moved off", ct);
             },
             async (context, _) =>
             {

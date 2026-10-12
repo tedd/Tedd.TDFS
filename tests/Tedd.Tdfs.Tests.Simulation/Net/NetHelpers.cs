@@ -283,10 +283,19 @@ internal static class NetHelpers
                     },
                     InvokeAsync = async (v, id, ct) =>
                     {
-                        await using DfsTransaction tx = await v.Transactions.BeginAsync(new DfsTransactionOptions { OperationId = id }, ct);
-                        await tx.Files.WriteAllBytesAsync("/t1", a1, ct);
-                        await tx.Files.WriteAllBytesAsync("/t2", b1, ct);
-                        return await tx.CommitAsync(ct);
+                        DfsTransaction tx = await v.Transactions.BeginAsync(new DfsTransactionOptions { OperationId = id }, ct);
+                        try
+                        {
+                            await tx.Files.WriteAllBytesAsync("/t1", a1, ct);
+                            await tx.Files.WriteAllBytesAsync("/t2", b1, ct);
+                            return await tx.CommitAsync(ct);
+                        }
+                        finally
+                        {
+                            // Disposal after an uncertain commit only requests an abort; a failure there must not mask the
+                            // commit's own outcome report, which is what the caller is held to.
+                            await CaptureAsync(async () => await tx.DisposeAsync());
+                        }
                     },
                     QueryAsync = (v, id, resolve) => v.Transactions.QueryOutcomeAsync(new DfsTransactionId(id), resolve, Ct),
                     AssertAppliedOnceAsync = async v =>
@@ -339,16 +348,22 @@ internal static class NetHelpers
     /// <summary>
     /// Checks one attempt of <paramref name="mutation"/> with identity <paramref name="id"/>: a reported success must be
     /// a committed outcome with the same token and exactly one effect; a failure is resolved authoritatively and the state
-    /// must match the resolution (committed → exactly once, aborted → untouched). Returns the final outcome.
+    /// must match the resolution (committed → exactly once, aborted → untouched). A definite failure (anything but an
+    /// explicit unknown outcome, including a cancellation) is a claim that the operation did not take effect, so it must
+    /// resolve as aborted (FSD §13: once publication is potentially committed, unknown takes precedence). Returns the final
+    /// outcome.
     /// </summary>
     public static async Task<DfsOperationOutcome> AssertExactlyOnceAsync(MutationCase mutation, DfsVolume volume, DfsOperationId id,
         CommitToken? returned, Exception? error)
     {
         if (error is null)
         {
+            // An acknowledged outcome may already be retired (the client's acknowledgement watermark or the retention
+            // period, ARCHITECTURE §5.2): Expired is then the truthful answer; it must never be Aborted or NotFound.
             DfsOperationOutcome outcome = await mutation.QueryAsync(volume, id, false);
-            Assert.True(outcome.Status == DfsOutcomeStatus.Committed, $"{mutation}: success was reported but the outcome is {outcome.Status}");
-            if (mutation.ReturnsCommitToken && returned is { } token)
+            Assert.True(outcome.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Expired,
+                $"{mutation}: success was reported but the outcome is {outcome.Status}");
+            if (outcome.Status == DfsOutcomeStatus.Committed && mutation.ReturnsCommitToken && returned is { } token)
                 Assert.Equal(outcome.Token, token);
             await mutation.AssertAppliedOnceAsync(volume);
             return outcome;
@@ -357,11 +372,31 @@ internal static class NetHelpers
         DfsOperationOutcome resolved = await mutation.QueryAsync(volume, id, true);
         Assert.True(resolved.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Aborted,
             $"{mutation}: resolution must be definite, got {resolved.Status}");
+        if (!IsUnknownOutcome(error))
+            Assert.True(resolved.Status == DfsOutcomeStatus.Aborted,
+                $"{mutation}: a definite failure ({error.GetType().Name}: {error.Message}) was reported for an operation that committed; it had to be reported as unknown");
         if (resolved.Status == DfsOutcomeStatus.Committed)
             await mutation.AssertAppliedOnceAsync(volume);
         else
             await mutation.AssertNotAppliedAsync(volume);
         return resolved;
+    }
+
+    /// <summary>
+    /// Asserts the FSD §13 surface of a mutation whose request was transmitted without a decision reaching the caller: an
+    /// explicit unknown outcome carrying the identity (the transaction identity for a transaction commit).
+    /// </summary>
+    public static void AssertUnknownWithIdentity(MutationCase mutation, Exception? error, DfsOperationId id, string because)
+    {
+        Assert.True(error is not null, $"{mutation}: {because}: success was reported although no decision reached the client");
+        Assert.True(IsUnknownOutcome(error!), $"{mutation}: {because}: expected DfsCommitOutcomeUnknownException, got {error!.GetType().FullName}: {error.Message}");
+        if (error is DfsCommitOutcomeUnknownException unknown)
+        {
+            if (mutation.Operation == DfsOperationKind.TxCommit)
+                Assert.Equal(new DfsTransactionId(id), unknown.TransactionId);
+            else
+                Assert.Equal(id, unknown.OperationId);
+        }
     }
 
     /// <summary>Asserts an error is a typed, explicit failure (never a raw/untyped exception).</summary>

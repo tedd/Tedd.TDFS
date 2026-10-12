@@ -13,29 +13,33 @@ public sealed class ConModelsTests
 {
     /// <summary>
     /// The bounded configurations explored exhaustively for CON-001. Each row is a published finite domain
-    /// (test plan §1: "exhaustive" means exhaustive over the stated bounds): number of voters, PreVote/CheckQuorum, and
-    /// budgets for elections, heartbeat rounds, proposals, drops, duplications and crashes. All interleavings of message
-    /// deliveries within those budgets are explored.
+    /// (test plan §1: "exhaustive" means exhaustive over the stated bounds): number of voters and learners,
+    /// PreVote/CheckQuorum, and budgets for elections, heartbeat rounds, proposals, drops, duplications, crashes and
+    /// single-server membership changes. All interleavings of message deliveries within those budgets are explored, so
+    /// the configuration rows cover elections racing an uncommitted configuration change ("no term/configuration has
+    /// conflicting authoritative leaders").
     /// </summary>
-    public static TheoryData<string, int, bool, bool, int, int, int, int, int, int> ElectionModels => new()
+    public static TheoryData<string, int, bool, bool, int, int, int, int, int, int, int, int> ElectionModels => new()
     {
-        // name, voters, preVote, checkQuorum, timeouts, heartbeats, proposals, drops, duplicates, crashes
-        { "3v-concurrent-candidates", 3, false, false, 2, 0, 0, 0, 0, 0 },
-        { "3v-prevote-concurrent-candidates", 3, true, false, 2, 0, 0, 0, 0, 0 },
-        { "3v-three-elections", 3, false, false, 3, 0, 0, 0, 0, 0 },
-        { "3v-election-with-proposal-and-loss", 3, false, false, 2, 1, 1, 1, 0, 0 },
-        { "3v-duplicate-vote-messages", 3, false, false, 2, 0, 0, 0, 2, 0 },
-        { "3v-crash-restart-voter", 3, false, false, 2, 0, 0, 0, 1, 1 },
-        { "3v-prevote-checkquorum-lease", 3, true, true, 3, 1, 0, 0, 0, 0 },
-        { "5v-split-vote", 5, false, false, 2, 0, 0, 0, 0, 0 },
+        // name, voters, preVote, checkQuorum, timeouts, heartbeats, proposals, drops, duplicates, crashes, learners, confChanges
+        { "3v-concurrent-candidates", 3, false, false, 2, 0, 0, 0, 0, 0, 0, 0 },
+        { "3v-prevote-concurrent-candidates", 3, true, false, 2, 0, 0, 0, 0, 0, 0, 0 },
+        { "3v-three-elections", 3, false, false, 3, 0, 0, 0, 0, 0, 0, 0 },
+        { "3v-election-with-proposal-and-loss", 3, false, false, 2, 1, 1, 1, 0, 0, 0, 0 },
+        { "3v-duplicate-vote-messages", 3, false, false, 2, 0, 0, 0, 2, 0, 0, 0 },
+        { "3v-crash-restart-voter", 3, false, false, 2, 0, 0, 0, 1, 1, 0, 0 },
+        { "3v-prevote-checkquorum-lease", 3, true, true, 3, 1, 0, 0, 0, 0, 0, 0 },
+        { "5v-split-vote", 5, false, false, 2, 0, 0, 0, 0, 0, 0, 0 },
+        { "3v1l-promote-learner-racing-elections", 3, false, false, 2, 0, 0, 0, 0, 0, 1, 1 },
+        { "3v-remove-voter-racing-elections", 3, true, false, 2, 0, 0, 0, 0, 0, 0, 1 },
     };
 
     [Theory, Catalog("CON-001", "M", "INV-01", "INV-03", "INV-04", "INV-05", "INV-11", "INV-18")]
     [MemberData(nameof(ElectionModels))]
     public void CON_001_ElectionSafety(string model, int voters, bool preVote, bool checkQuorum, int timeouts, int heartbeats, int proposals,
-        int drops, int duplicates, int crashes)
+        int drops, int duplicates, int crashes, int learners, int confChanges)
     {
-        var bounds = new RaftModelBounds(voters, preVote, checkQuorum, timeouts, heartbeats, proposals, drops, duplicates, crashes);
+        var bounds = new RaftModelBounds(voters, preVote, checkQuorum, timeouts, heartbeats, proposals, drops, duplicates, crashes, learners, confChanges);
         ulong seed = SeededRandom.DeriveSeed(0xC0_0001, model);
 
         RaftModelState initial = RaftModelCluster.Initial(bounds, seed);
@@ -65,6 +69,10 @@ public sealed class ConModelsTests
 
         // The explored domain must actually contain elections: a schedule exists in which a leader is elected.
         Assert.True(ContainsElection(bounds, seed), $"Model {model}: no explored schedule elected a leader; the bounds are vacuous.");
+
+        // Configuration rows must actually reach a configuration change: an elected leader accepts the proposal.
+        if (confChanges > 0)
+            Assert.True(ContainsConfigurationChange(bounds, seed), $"Model {model}: no explored schedule proposed a configuration change; the bounds are vacuous.");
     }
 
     public static TheoryData<int, ulong> RandomizedSeeds()
@@ -204,6 +212,34 @@ public sealed class ConModelsTests
         }
 
         return cluster.Violation is null && cluster.AnyLeader;
+    }
+
+    private static bool ContainsConfigurationChange(RaftModelBounds bounds, ulong seed)
+    {
+        // Elect n0 as in ContainsElection, then let it propose the first enabled membership change and deliver everything.
+        var cluster = new RaftModelCluster(bounds, seed);
+        cluster.Apply("timeout n0");
+        for (int guard = 0; guard < 200 && !cluster.AnyLeader; guard++)
+        {
+            string? deliver = cluster.EnabledActions().FirstOrDefault(a => a.StartsWith("deliver ", StringComparison.Ordinal));
+            if (deliver is null)
+                break;
+            cluster.Apply(deliver);
+        }
+
+        string? change = cluster.EnabledActions().FirstOrDefault(a => a.StartsWith("promote ", StringComparison.Ordinal) || a.StartsWith("remove ", StringComparison.Ordinal));
+        if (change is null)
+            return false;
+        cluster.Apply(change);
+        for (int guard = 0; guard < 200; guard++)
+        {
+            string? deliver = cluster.EnabledActions().FirstOrDefault(a => a.StartsWith("deliver ", StringComparison.Ordinal));
+            if (deliver is null)
+                break;
+            cluster.Apply(deliver);
+        }
+
+        return cluster.AcceptedConfChanges > 0 && cluster.Violation is null && cluster.CheckInvariants() is null;
     }
 
     private static void Report(string model, RaftModelBounds bounds, ModelCheckResult result)
