@@ -15,8 +15,13 @@ public sealed partial class TestNetwork
     /// in-flight work was cancelled at shutdown does not leak transport connections. Works for both
     /// <see cref="TransportKind.InMemory"/> and <see cref="TransportKind.Quic"/> transports (the harness wraps every
     /// transport factory it hands to nodes and clients, so it can track open/closed events per local name).
+    /// <para>Each connection is counted once, from the end that opened it (the harness wraps both ends).</para>
     /// </remarks>
     /// <param name="name">Network name of a node, backup node or client.</param>
     /// <returns>The number of open connections (0 when the name is unknown).</returns>
-    public int CountOpenConnections(string name) => throw Stub.NotYet("TestNetwork.CountOpenConnections");
+    public int CountOpenConnections(string name)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        return Fabric.CountOpenConnections(name);
+    }
 }

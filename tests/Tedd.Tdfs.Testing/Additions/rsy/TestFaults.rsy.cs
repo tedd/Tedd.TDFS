@@ -12,6 +12,9 @@ public sealed partial class TestFaults
     /// <see cref="Coverage"/>. Added for the RSY suite (RSY-012, RSY-013: interrupting checkpoint catch-up at named
     /// sub-stages, see <see cref="ResyncStageDetails"/>; docs/api-additions/rsy.md).
     /// </summary>
-    public FaultArm Arm(FaultMatch match, Func<FaultContext, bool> predicate, FaultAction action) =>
-        throw Stub.NotYet("TestFaults.Arm(match, predicate, action)");
+    public FaultArm Arm(FaultMatch match, Func<FaultContext, bool> predicate, FaultAction action)
+    {
+        ArgumentNullException.ThrowIfNull(predicate);
+        return ArmCore(match, predicate, action);
+    }
 }

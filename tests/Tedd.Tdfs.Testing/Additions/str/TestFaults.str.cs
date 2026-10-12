@@ -31,12 +31,24 @@ public sealed partial class TestFaults
     /// node-to-node replication, repair or backup transfer traffic. Every reply that was actually shortened increments
     /// <see cref="ReadResultLimitRule.Applied"/>; replies whose payload already fits are not counted.
     /// </para>
+    /// <para>
+    /// Implementation: the harness interposes on the replies a matching node sends to a client connection (an
+    /// authenticated principal, never a node or backup peer) and rewrites <c>ReadRangeResult</c> inline bytes and
+    /// <c>GetObjectResult</c> data to the prefix, recomputing the per-unit checksums of the returned range.
+    /// </para>
     /// </remarks>
     /// <param name="maxBytesPerResult">Largest payload per read result; must be at least 1.</param>
     /// <param name="node">Restrict to results served by this node; null = every live node.</param>
     /// <param name="volume">Restrict to reads of this volume; null = every volume.</param>
     /// <returns>The active rule.</returns>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxBytesPerResult"/> is less than 1.</exception>
-    public ReadResultLimitRule LimitReadResultBytes(int maxBytesPerResult, string? node = null, string? volume = null) =>
-        throw Stub.NotYet("TestFaults.LimitReadResultBytes");
+    public ReadResultLimitRule LimitReadResultBytes(int maxBytesPerResult, string? node = null, string? volume = null)
+    {
+        var rule = new ReadResultLimitRule(maxBytesPerResult, node, volume);
+        Action<ReadResultLimitRule> registrar = ReadLimitRegistrar
+            ?? throw new InvalidOperationException("The cluster's network interposition layer is not attached.");
+        registrar(rule);
+        Trace($"read results limited to {maxBytesPerResult} byte(s){(node is null ? string.Empty : " on " + node)}{(volume is null ? string.Empty : " for volume " + volume)}");
+        return rule;
+    }
 }

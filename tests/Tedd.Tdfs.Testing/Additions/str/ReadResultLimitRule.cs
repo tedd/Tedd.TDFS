@@ -5,6 +5,9 @@ namespace Tedd.Tdfs.Testing;
 /// </summary>
 public sealed class ReadResultLimitRule
 {
+    private int _applied;
+    private int _cancelled;
+
     internal ReadResultLimitRule(int maxBytesPerResult, string? node, string? volume)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(maxBytesPerResult, 1);
@@ -23,11 +26,19 @@ public sealed class ReadResultLimitRule
     public string? Volume { get; }
 
     /// <summary>Number of read results that were actually shortened by this rule so far (thread-safe snapshot).</summary>
-    public int Applied => throw Stub.NotYet("ReadResultLimitRule.Applied");
+    public int Applied => Volatile.Read(ref _applied);
 
     /// <summary>True until <see cref="Cancel"/> is called or the cluster is disposed.</summary>
-    public bool IsActive => throw Stub.NotYet("ReadResultLimitRule.IsActive");
+    public bool IsActive => Volatile.Read(ref _cancelled) == 0;
 
     /// <summary>Deactivates the rule; replies produced afterwards are no longer shortened. Idempotent.</summary>
-    public void Cancel() => throw Stub.NotYet("ReadResultLimitRule.Cancel");
+    public void Cancel() => Interlocked.Exchange(ref _cancelled, 1);
+
+    /// <summary>True when the rule applies to a result served by <paramref name="node"/> for <paramref name="volume"/>.</summary>
+    internal bool AppliesTo(string node, string? volume) =>
+        IsActive
+        && (Node is null || string.Equals(Node, node, StringComparison.Ordinal))
+        && (Volume is null || string.Equals(Volume, volume, StringComparison.Ordinal));
+
+    internal void CountApplied() => Interlocked.Increment(ref _applied);
 }

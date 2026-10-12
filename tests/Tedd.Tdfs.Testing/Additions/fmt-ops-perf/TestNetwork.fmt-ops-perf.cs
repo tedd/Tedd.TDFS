@@ -12,6 +12,9 @@ public sealed partial class TestNetwork
     /// Duplicates created by <see cref="DuplicateNext"/> appear once per delivered copy with the same correlation id. The
     /// returned list is a snapshot; later traffic does not change it.
     /// </remarks>
-    public IReadOnlyList<MessageAttempt> GetMessageAttempts(MessageFilter filter) =>
-        throw Stub.NotYet("TestNetwork.GetMessageAttempts");
+    public IReadOnlyList<MessageAttempt> GetMessageAttempts(MessageFilter filter)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+        return Fabric.Policy.GetAttempts(filter);
+    }
 }

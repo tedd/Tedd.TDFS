@@ -355,14 +355,23 @@ Files/              DfsFileClient (+ partials per helper family), Directories/, 
 ## 3. Harness (`tests/Tedd.Tdfs.Testing`)
 
 ```
-Cluster/       TestCluster (+ partials: .Lifecycle.cs, .Clients.cs, .Waits.cs), ClusterTest, ClusterBuilder (bootstrap,
-               per-node environments), TestClusterOptions
-Nodes/         TestNode, TestBackupNode, TestDisk (SimulatedMedium or FaultingFileSystemMedium), node environments
-Network/       TestNetwork -> HarnessLinkPolicy (implements ILinkPolicy; partitions, cuts, black holes, rules, holds, log)
+Cluster/       TestCluster (+ partials: .Lifecycle.cs = bootstrap/static+seed-join, nodes, per-node NodeEnvironment,
+               recovery/foreign clusters, disposal; .Clients.cs = SDK/raw/admin clients, principals; .Waits.cs = leaders,
+               stability, replication, repair, digest, leadership transfer; .Invariants.cs = leadership history/split
+               brain, assumption violations, uncontrolled dependencies), ClusterTest (realtime runs; deterministic runs on a
+               driver thread in four SimScheduler phases), HarnessAdmin (raw admin channel to the control leader),
+               HarnessStartOptions (internal start settings), TestClusterOptions
+Nodes/         TestNode, TestBackupNode, TestDisk (SimulatedMedium or FaultingFileSystemMedium), FencedMedium (per-incarnation
+               view fenced at crash/stop)
+Network/       TestNetwork -> NetworkFabric (sim/in-memory/QUIC transports wrapped by HarnessTransport: holds, reply drops,
+               truncation, tampering, silent death, read limits, replay, attempt/connection accounting) and HarnessLinkPolicy
+               (implements ILinkPolicy; partitions, cuts, black holes, mesh, latency, rules, message log)
 Faults/        TestFaults -> HarnessFaultInjector (implements IFaultInjector; arms, coverage registry)
 Simulation/    SimScheduler, SimNodeLoop, SimTimeProvider, SimNetwork (deterministic mode)
-Inspection/    ClusterInspector
+Inspection/    ClusterInspector (harness ground truth from node inspectors)
 Protocol/      RawProtocolClient
+Internal/      ClusterRuntime (realtime vs deterministic execution context), out-of-process launcher (HostProcess runs
+               src/Tedd.Tdfs.Host), PortAllocator, HarnessNodeLog
 Raft/          RaftSimulation
 History/, Models/, Catalog/, Data/   (implemented)
 Additions/     suite-requested additions (partials), one folder per suite group

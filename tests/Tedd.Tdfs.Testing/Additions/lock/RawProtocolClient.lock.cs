@@ -1,3 +1,6 @@
+using Tedd.Tdfs.Protocol;
+using Tedd.Tdfs.Protocol.Messages;
+
 namespace Tedd.Tdfs.Testing;
 
 // Additions for the LOCK suite (docs/api-additions/lock.md) and, for OpenHandleAsync, the SDK/PATH suites
@@ -46,8 +49,20 @@ public sealed partial class RawProtocolClient
     /// <param name="share">Share mode, sent verbatim.</param>
     /// <param name="autoRenew">True to have the raw client's session keep-alive renew the granted handle automatically.</param>
     /// <returns>The verdict, the granted handle id and its writer generation.</returns>
-    public Task<RawOpenHandleResult> OpenHandleAsync(string volume, string path, FileMode mode, FileAccess access, FileShare share, bool autoRenew = false) =>
-        throw Stub.NotYet("RawProtocolClient.OpenHandleAsync");
+    public async Task<RawOpenHandleResult> OpenHandleAsync(string volume, string path, FileMode mode, FileAccess access, FileShare share, bool autoRenew = false)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(volume);
+        ArgumentNullException.ThrowIfNull(path);
+        (DfsErrorCode code, IWireMessage? reply) = await SendVolumeRequestAsync(volume, mutating: true, header => Encode(new OpenHandleMessage(header, path,
+            mode, access, share, FileOptions.None, VersionPinned: false, WriteThrough: false, StoragePolicy: null)));
+        if (reply is not OpenHandleResultMessage opened)
+            return new RawOpenHandleResult(code == DfsErrorCode.None ? DfsErrorCode.ProtocolError : code, null, 0);
+        (_, RawSession? session) = await GetSessionAsync(volume);
+        session?.RememberGeneration(opened.Handle, opened.WriterGeneration);
+        if (autoRenew)
+            session?.AutoRenew(opened.Handle);
+        return new RawOpenHandleResult(DfsErrorCode.None, opened.Handle, opened.WriterGeneration);
+    }
 
     /// <summary>
     /// Sends one <c>KeepAlive</c> for this raw client's session on <paramref name="volume"/> listing exactly
@@ -58,13 +73,48 @@ public sealed partial class RawProtocolClient
     /// otherwise the first per-handle or request-level error code (for example <see cref="DfsErrorCode.InvalidHandle"/>,
     /// <see cref="DfsErrorCode.LeaseLost"/>, <see cref="DfsErrorCode.AccessDenied"/> or the handshake refusal code).
     /// </returns>
-    public Task<DfsErrorCode> KeepAliveAsync(string volume, IReadOnlyList<HandleId> handles) =>
-        throw Stub.NotYet("RawProtocolClient.KeepAliveAsync");
+    public async Task<DfsErrorCode> KeepAliveAsync(string volume, IReadOnlyList<HandleId> handles)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(volume);
+        ArgumentNullException.ThrowIfNull(handles);
+        HandleId[] listed = [.. handles];
+        (DfsErrorCode code, IWireMessage? reply) = await SendVolumeRequestAsync(volume, mutating: false,
+            header => Encode(new KeepAliveMessage(header, listed, [], [])));
+        return KeepAliveOutcome(code, reply, listed);
+    }
 
     /// <summary>
     /// Sends <c>CloseHandle</c> for <paramref name="handle"/> in this raw client's session on <paramref name="volume"/>.
     /// Returns the reply's error code (<see cref="DfsErrorCode.None"/> when the server closed the handle).
     /// </summary>
-    public Task<DfsErrorCode> CloseHandleAsync(string volume, HandleId handle) =>
-        throw Stub.NotYet("RawProtocolClient.CloseHandleAsync");
+    public async Task<DfsErrorCode> CloseHandleAsync(string volume, HandleId handle)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(volume);
+        (_, RawSession? session) = await GetSessionAsync(volume);
+        ulong generation = session?.GenerationOf(handle) ?? 0;
+        (DfsErrorCode code, _) = await SendVolumeRequestAsync(volume, mutating: true, header => Encode(new CloseHandleMessage(header, handle, generation)));
+        if (code == DfsErrorCode.None)
+            session?.Forget(handle);
+        return code;
+    }
+
+    /// <summary>
+    /// The verdict of a <c>KeepAlive</c> listing <paramref name="listed"/>: the request's error, else
+    /// <see cref="DfsErrorCode.LeaseLost"/> when the session expired or a listed handle was reported expired, else
+    /// <see cref="DfsErrorCode.None"/>.
+    /// </summary>
+    private static DfsErrorCode KeepAliveOutcome(DfsErrorCode code, IWireMessage? reply, IReadOnlyCollection<HandleId> listed)
+    {
+        if (reply is not KeepAliveResultMessage result)
+            return code == DfsErrorCode.None ? DfsErrorCode.ProtocolError : code;
+        if (result.SessionExpired)
+            return DfsErrorCode.LeaseLost;
+        foreach (HandleId expired in result.ExpiredHandles)
+        {
+            if (listed.Contains(expired))
+                return DfsErrorCode.LeaseLost;
+        }
+
+        return DfsErrorCode.None;
+    }
 }

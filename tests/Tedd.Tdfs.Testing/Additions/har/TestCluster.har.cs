@@ -15,8 +15,7 @@ public sealed partial class TestCluster
     /// with <see cref="UncontrolledDependencyException"/>. A cluster start that reaches a stable state through the
     /// harness's own facilities records nothing. In <see cref="ClusterMode.Realtime"/> mode the list is always empty.
     /// </summary>
-    public IReadOnlyList<UncontrolledDependency> UncontrolledDependencies =>
-        throw Stub.NotYet("TestCluster.UncontrolledDependencies");
+    public IReadOnlyList<UncontrolledDependency> UncontrolledDependencies => GetUncontrolledDependencies();
 
     /// <summary>
     /// Every environment-assumption violation recorded so far in this run, in detection order (HAR-018). The harness
@@ -27,6 +26,5 @@ public sealed partial class TestCluster
     /// <see cref="ClusterTest.RunAsync(TestClusterOptions, Func{TestCluster, Task}, CancellationToken)"/> throws
     /// <see cref="AssumptionViolatedException"/>.
     /// </summary>
-    public IReadOnlyList<AssumptionViolation> AssumptionViolations =>
-        throw Stub.NotYet("TestCluster.AssumptionViolations");
+    public IReadOnlyList<AssumptionViolation> AssumptionViolations => GetAssumptionViolations();
 }

@@ -19,6 +19,9 @@ public sealed partial class TestCluster
     /// <param name="options">Harness client options (null = defaults, client "c0", admin credentials).</param>
     /// <param name="configure">Transforms the public options (use a <c>with</c> expression).</param>
     /// <param name="ct">Cancels connecting.</param>
-    public Task<DfsClient> ConnectAsync(TestClientOptions? options, Func<DfsClientOptions, DfsClientOptions> configure, CancellationToken ct = default) =>
-        throw Stub.NotYet("TestCluster.ConnectAsync(configure)");
+    public Task<DfsClient> ConnectAsync(TestClientOptions? options, Func<DfsClientOptions, DfsClientOptions> configure, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(configure);
+        return ConnectCoreAsync(options ?? new TestClientOptions(), configure, harness: false, ct);
+    }
 }

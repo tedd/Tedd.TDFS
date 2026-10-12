@@ -50,7 +50,7 @@ public sealed partial class TestCluster
     /// <returns>The started, stable recovery cluster.</returns>
     /// <exception cref="ArgumentException">Name collision or incompatible mode/transport/storage.</exception>
     public Task<TestCluster> StartRecoveryClusterAsync(TestClusterOptions options, CancellationToken ct = default) =>
-        throw Stub.NotYet("TestCluster.StartRecoveryClusterAsync");
+        StartRecoveryClusterCoreAsync(options, ct);
 
     /// <summary>
     /// Adds a live node whose <see cref="NodeOptions"/> are transformed by <paramref name="configure"/> before the node
@@ -68,5 +68,5 @@ public sealed partial class TestCluster
     /// (duplicate name, invalid spec).
     /// </remarks>
     public Task<TestNode> AddNodeAsync(TestNodeSpec spec, Func<NodeOptions, NodeOptions> configure, bool join = true, CancellationToken ct = default) =>
-        throw Stub.NotYet("TestCluster.AddNodeAsync(configure)");
+        AddConfiguredNodeAsync(spec, configure, join, ct);
 }

@@ -44,7 +44,7 @@ public sealed partial class TestCluster
     /// leader/term.
     /// </exception>
     public Task<TestNode> TransferLeadershipAsync(string group, string targetNode, TimeSpan? timeout = null, bool waitUntilServing = true, CancellationToken ct = default) =>
-        throw Stub.NotYet("TestCluster.TransferLeadershipAsync");
+        TransferLeadershipCoreAsync(group, targetNode, timeout, waitUntilServing, ct);
 
     /// <summary>
     /// Starts a single-node cluster with a different cluster identity on an endpoint of this cluster's network, to test that
@@ -67,5 +67,5 @@ public sealed partial class TestCluster
     /// <see cref="InvalidOperationException"/> when a running node of this cluster still listens on the endpoint.
     /// </remarks>
     public Task<NodeHost> StartForeignClusterNodeAsync(string listenEndpoint, CancellationToken ct = default) =>
-        throw Stub.NotYet("TestCluster.StartForeignClusterNodeAsync");
+        StartForeignClusterNodeCoreAsync(listenEndpoint, ct);
 }

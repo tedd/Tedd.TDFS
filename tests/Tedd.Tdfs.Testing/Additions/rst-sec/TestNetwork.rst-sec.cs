@@ -15,7 +15,11 @@ public sealed partial class TestNetwork
     /// recovery environment and may keep reconnecting to a destroyed node. Used to prove that a recovery procedure made
     /// no undeclared call to a source service (test plan §9.8).
     /// </summary>
-    public long CountAttemptsTo(string name) => throw Stub.NotYet("TestNetwork.CountAttemptsTo");
+    public long CountAttemptsTo(string name)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        return Fabric.AttemptsTo(name);
+    }
 
     /// <summary>
     /// Tampers with the next <paramref name="count"/> transmissions of messages matching <paramref name="filter"/>
@@ -31,7 +35,24 @@ public sealed partial class TestNetwork
     /// receiver that accepts the tampered bytes as a valid message is a defect. <see cref="MessageRule.Matched"/> counts
     /// tampered transmissions (proof the tamper point was reached). Retransmissions by the transport itself are not
     /// tampered unless <paramref name="count"/> covers them.
+    /// <para>Implementation status: the in-memory and simulated transports carry frames without any integrity protection,
+    /// so the harness alters the transmitted frame itself (the receiver's own validation is what is exercised; a receiver
+    /// that accepts an altered frame as a different valid message is reported by the test). QUIC tampering needs a datagram
+    /// interposer between MsQuic sockets, which this harness does not provide: the call throws
+    /// <see cref="NotSupportedException"/> for <see cref="TransportKind.Quic"/> rather than fabricating evidence.</para>
     /// </remarks>
-    public MessageRule TamperNext(MessageFilter filter, TransportTamper mode, int count = 1) =>
-        throw Stub.NotYet("TestNetwork.TamperNext");
+    public MessageRule TamperNext(MessageFilter filter, TransportTamper mode, int count = 1)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+        if (!Enum.IsDefined(mode))
+            throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown tamper mode.");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(count);
+        if (Fabric.Kind == TransportKind.Quic)
+        {
+            throw new NotSupportedException(
+                "Tampering below QUIC packet protection requires a UDP datagram interposer between the MsQuic sockets, which the harness does not provide.");
+        }
+
+        return AddRule(new MessageRule(filter, count, MessageRuleKind.Tamper, tamper: mode));
+    }
 }

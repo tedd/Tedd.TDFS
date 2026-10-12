@@ -7,6 +7,8 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Tedd.Tdfs.Client\Tedd.Tdfs.Client.csproj" />
     <ProjectReference Include="..\..\src\Tedd.Tdfs.Server\Tedd.Tdfs.Server.csproj" />
+    <!-- Host configuration types and the executable launched by out-of-process clusters. -->
+    <ProjectReference Include="..\..\src\Tedd.Tdfs.Host\Tedd.Tdfs.Host.csproj" />
   </ItemGroup>
   <ItemGroup>
     <!-- Assert + ITraitAttribute/TestContext; versions match xunit.v3 4.0.1's dependency graph. -->
