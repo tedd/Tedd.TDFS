@@ -12,7 +12,8 @@ namespace Tedd.Tdfs.Tests.Simulation.Rsy;
 /// 14.1 RCV-01..RCV-08). Every scenario runs in deterministic simulation with <see cref="NodeTimings.Fast"/> timings
 /// (lease 2 s, session 10 s, outcome retention 30 s, Raft snapshot threshold 200 entries, chunk 64 KiB). Checkpoint
 /// catch-up is forced by committing more than the snapshot threshold while the returning node ("C") is offline and
-/// waiting until every online source compacted beyond C's last log index.
+/// waiting until every online source's log starts after C's next index. Log-path scenarios raise the snapshot threshold
+/// (<see cref="RsyHelpers.WithPath"/>) so background entries during long outages cannot compact C's missing range.
 /// </summary>
 public sealed class RsySimulationTests
 {
@@ -37,7 +38,7 @@ public sealed class RsySimulationTests
     [MemberData(nameof(ShortGapCases))]
     [Catalog("RSY-001", "S", "INV-01", "INV-07", "INV-18")]
     public Task RSY_001_ShortGapIncrementalCatchup(int nodeCount, OfflineMode mode) =>
-        RunAsync(Sim(nodeCount), async cluster =>
+        RunAsync(Sim(nodeCount).WithPath(CatchupPath.Log), async cluster =>
         {
             var (client, vol) = await ConnectAsync(cluster, "w");
             await using var clientScope = client;
@@ -51,7 +52,7 @@ public sealed class RsySimulationTests
             RsyOutage outage = await BeginOutageAsync(cluster, mode);
             TestNode c = outage.Roles.Returning;
 
-            // Gap workload: a handful of entries, far below the 200-entry snapshot threshold.
+            // Gap workload: a handful of entries, far below the snapshot threshold (raised for log-path scenarios).
             var model = new ReferenceFileModel(base0);
             byte[] patch = TestData.Bytes(1003, 10);
             await OverwriteAsync(files, "/g/base", Chunk - 5, patch);   // straddles the first extent boundary
@@ -224,11 +225,12 @@ public sealed class RsySimulationTests
             FaultArm interrupt = cluster.Faults.Arm(
                 new FaultMatch(FaultSites.RaftSnapshotInstall, Node: c.Name, Volume: Volume),
                 FaultAction.CrashNode(CrashMode.LoseUnflushed));
-            await ReturnAsync(cluster, c, mode);
+            Task firstReturn = ReturnAsync(cluster, c, mode);   // the crash may hit before the restart call returns
             await interrupt.WaitTriggeredAsync(CatchupTimeout);
             cluster.Faults.AssertReached(interrupt);
             await cluster.WaitUntilAsync(() => Task.FromResult(c.State == TestNodeState.Crashed), TimeSpan.FromSeconds(10),
                 "the interrupted checkpoint installation crashes the returning node", Ct);
+            await AwaitInterruptedRestartAsync(firstReturn, c);
 
             foreach (TestNode n in RunningExcept(cluster, c))
                 cluster.Network.CutBoth("client:r", n.Name);
@@ -247,9 +249,10 @@ public sealed class RsySimulationTests
                         AssertEx.BytesEqual(x2, got, "a live read through the catching-up replica must return the authoritative /x (inode J)");
                         okReads++;
                     }
-                    catch (Exception ex) when (IsAvailabilityFailure(ex))
+                    catch (Exception ex) when (IsRefusal(ex))
                     {
-                        // Unavailable while catching up: legal. FileNotFound or old bytes would be a stale read.
+                        // Refused while catching up (the reader's session may also lapse while it is cut off): legal.
+                        // FileNotFound or old bytes would be a stale read and fail the test.
                     }
 
                     await cluster.DelayAsync(TimeSpan.FromMilliseconds(50), Ct);
@@ -267,8 +270,7 @@ public sealed class RsySimulationTests
             RaftGroupStats cStats = await StatsAsync(c);
             Assert.True(cStats.SnapshotIndex > outage.ReturningLastIndex, "C installed a checkpoint covering its compacted gap");
             await AssertMatchesLeaderAsync(cluster, c, ["/x", "/x-renamed", "/keep/a", "/keep/b", "/keep/c", "/keep/d", "/w", "/log", "/r2"]);
-            VolumeStateInspection cState = await StateAsync(c);
-            VolumeStateInspection leaderState = await LeaderStateAsync(cluster);
+            (VolumeStateInspection leaderState, VolumeStateInspection cState) = await StatesAtSameIndexAsync(cluster, c);
             Assert.Equal(inodeJ, cState.GetFile("/x")!.Inode);
             Assert.Null(cState.GetFile("/x-renamed"));
             Assert.Null(cState.GetFile("/keep/c"));
@@ -318,12 +320,25 @@ public sealed class RsySimulationTests
             await ServeFromAsync(cluster, c);
             await AssertServiceAsync(after);
 
-            // Live objects stay protected after GC rounds.
+            // J's objects were written while C was offline (copies on A/B). With A stopped, repair must give B and C verified
+            // copies (two hosts, two zones), and GC rounds must never take a live object below that.
+            IReadOnlyList<ObjectId> objectsOfJ = await ObjectsOfAsync(cluster, "/x");
+            await cluster.WaitUntilAsync(async () =>
+            {
+                foreach (ObjectId o in objectsOfJ)
+                {
+                    (int copies, int zones) = await cluster.Inspect.CountDurableDomainsAsync(o);
+                    if (copies < 2 || zones < 2)
+                        return false;
+                }
+
+                return true;
+            }, RepairTimeout, "repair restores two verified copies of J's objects on B and C", Ct);
             await cluster.DelayAsync(Timings.GcInterval * 8, Ct);
-            foreach (ObjectId o in await ObjectsOfAsync(cluster, "/x"))
+            foreach (ObjectId o in objectsOfJ)
             {
                 (int copies, int zones) = await cluster.Inspect.CountDurableDomainsAsync(o);
-                Assert.True(copies >= 2 && zones >= 2, $"object {o} of /x must keep ack-level durability (has {copies} copies in {zones} zones)");
+                Assert.True(copies >= 2 && zones >= 2, $"GC removed a live copy: object {o} of /x has {copies} copies in {zones} zones");
             }
 
             async Task AssertServiceAsync(DfsVolume v)
@@ -379,7 +394,7 @@ public sealed class RsySimulationTests
     [MemberData(nameof(StaleReadCases))]
     [Catalog("RSY-003", "S", "INV-07", "INV-18")]
     public Task RSY_003_OfflineReplicaNeverServesNewLiveReadsEarly(OfflineMode mode, StaleWindow window, bool readerOnlyReachesReturningNode) =>
-        RunAsync(Sim(3), async cluster =>
+        RunAsync(Sim(3).WithPath(CatchupPath.Log), async cluster =>   // log catch-up: the apply block sees every missing entry
         {
             RsyRoles roles = await PickRolesAsync(cluster);
             TestNode c = roles.Returning;
@@ -422,16 +437,27 @@ public sealed class RsySimulationTests
                 new FaultMatch(FaultSites.RaftAfterCommitBeforeApply, Node: c.Name, Volume: Volume, Count: int.MaxValue),
                 FaultAction.Block());
 
-            // Without a restart the block must be in place before the network heals; after a restart it is armed once the
-            // node is up so local recovery is not blocked.
+            // Without a restart the block must be in place before the network heals. After a restart it is armed once the
+            // node is up (so local journal replay is not blocked), and replication to C is gated until then: otherwise C
+            // could receive and apply the missing entries between the restart and the arming, and never be stale.
             if (window == StaleWindow.BlockApply && mode == OfflineMode.Isolate)
                 blockApply = ArmBlockApply();
+            MessageHold? gateAppends = null, gateChunks = null;
+            if (window == StaleWindow.BlockApply && blockApply is null)
+            {
+                gateAppends = cluster.Network.Hold(new MessageFilter(To: c.Name, Type: MessageType.RaftBatch));
+                gateChunks = cluster.Network.Hold(new MessageFilter(To: c.Name, Type: MessageType.RaftSnapshotChunk));
+            }
 
             if (window != StaleWindow.MinorityPartition)
             {
                 await ReturnAsync(cluster, c, mode);
                 if (window == StaleWindow.BlockApply && blockApply is null)
+                {
                     blockApply = ArmBlockApply();
+                    gateAppends!.Dispose();   // releases the gated messages: C now appends but cannot apply
+                    gateChunks!.Dispose();
+                }
                 if (readerOnlyReachesReturningNode)
                 {
                     foreach (TestNode n in RunningExcept(cluster, c))
@@ -459,7 +485,7 @@ public sealed class RsySimulationTests
                     await history.RecordAsync("r", "read", "/x", null, () => r.Files.ReadAllBytesAsync("/x", Ct));
                     okReadsWhileStale++;
                 }
-                catch (Exception ex) when (IsAvailabilityFailure(ex))
+                catch (Exception ex) when (IsRefusal(ex))
                 {
                     // Refusing is legal while the replica lacks an authoritative boundary.
                 }
@@ -502,7 +528,7 @@ public sealed class RsySimulationTests
                     byte[] got = await history.RecordAsync("r", "read", "/x", null, () => r.Files.ReadAllBytesAsync("/x", Ct));
                     return got.AsSpan().SequenceEqual(latest);
                 }
-                catch (Exception ex) when (IsAvailabilityFailure(ex))
+                catch (Exception ex) when (IsRefusal(ex))
                 {
                     return false;
                 }
@@ -533,7 +559,7 @@ public sealed class RsySimulationTests
     [MemberData(nameof(PathModeCases))]
     [Catalog("RSY-004", "S", "INV-01", "INV-07", "INV-18")]
     public Task RSY_004_CatchupIncludesOverwrites(CatchupPath path, OfflineMode mode) =>
-        RunAsync(Sim(3), async cluster =>
+        RunAsync(Sim(3).WithPath(path), async cluster =>
         {
             var (client, vol) = await ConnectAsync(cluster, "w");
             await using var clientScope = client;
@@ -609,7 +635,7 @@ public sealed class RsySimulationTests
     [MemberData(nameof(DeletionCases))]
     [Catalog("RSY-005", "S", "INV-07", "INV-09", "INV-18")]
     public Task RSY_005_CatchupIncludesDeletion(CatchupPath path, DeletionKind kind) =>
-        RunAsync(Sim(3), async cluster =>
+        RunAsync(Sim(3).WithPath(path), async cluster =>
         {
             var (client, vol) = await ConnectAsync(cluster, "w");
             await using var clientScope = client;
@@ -626,6 +652,7 @@ public sealed class RsySimulationTests
                 deletedObjects.UnionWith(await ObjectsOfAsync(cluster, "/d/sub/y"));
             Assert.NotEmpty(deletedObjects);
 
+            await cluster.WaitForRepairAsync(Volume, RepairTimeout, Ct);   // the third copy is not part of the ack
             await cluster.WaitForReplicationAsync(Volume, Ct);
             RsyRoles roles = await PickRolesAsync(cluster);
             TestNode c = roles.Returning;
@@ -659,7 +686,12 @@ public sealed class RsySimulationTests
             await ServeFromAsync(cluster, c);
             await AssertDeletedAsync();
 
-            // The old contents are unreachable with closed staging: eventually reclaimed everywhere, including on C...
+            // The writing client goes away so its staging sessions are closed (by disposal or session expiry); the old
+            // contents are then unreachable with closed staging: eventually reclaimed everywhere, including on C...
+            await client.DisposeAsync();
+            var (readerClient, reader) = await ConnectAsync(cluster, "v");
+            await using var readerScope = readerClient;
+            (vol, files) = (reader, reader.Files);
             await cluster.WaitUntilAsync(async () =>
             {
                 foreach (ObjectId o in deletedObjects)
@@ -724,13 +756,15 @@ public sealed class RsySimulationTests
     [InlineData(L0 - 1, L0 + Chunk, CatchupPath.Log)]
     [Catalog("RSY-006", "S", "INV-01", "INV-07", "INV-18")]
     public Task RSY_006_CatchupIncludesTruncation(int shrinkTo, int extendTo, CatchupPath path) =>
-        RunAsync(Sim(3), async cluster =>
+        RunAsync(Sim(3).WithPath(path), async cluster =>
         {
             var (client, vol) = await ConnectAsync(cluster, "w");
             await using var clientScope = client;
             DfsFileClient files = vol.Files;
             byte[] original = TestData.Bytes(6000 + (ulong)shrinkTo, L0);
             await files.WriteAllBytesAsync("/t", original, Ct);
+            var originalObjects = new HashSet<ObjectId>(await ObjectsOfAsync(cluster, "/t"));
+            Assert.NotEmpty(originalObjects);
 
             RsyOutage outage = await BeginOutageAsync(cluster, OfflineMode.Crash);
             TestNode c = outage.Roles.Returning;
@@ -745,8 +779,11 @@ public sealed class RsySimulationTests
             FileInspection cFile = (await StateAsync(c)).GetFile("/t")!;
             Assert.Equal(extendTo, cFile.Length);
             Assert.Equal(extended.Sequence, cFile.Revision);
-            Assert.All(cFile.Extents, e => Assert.True(e.Offset + e.Length <= shrinkTo,
-                $"extent [{e.Offset}, {e.Offset + e.Length}) maps data into the discarded range [{shrinkTo}, {extendTo})"));
+            // Prefix extents may keep (clipped) references to the original objects, but nothing that reaches into the
+            // discarded range may map an original object: those bytes are the discarded tail. (An implementation may leave
+            // the gap sparse or write fresh zero-filled objects; the bytes are checked below.)
+            Assert.All(cFile.Extents, e => Assert.True(e.Offset + e.Length <= shrinkTo || !originalObjects.Contains(e.Object),
+                $"extent [{e.Offset}, {e.Offset + e.Length}) maps original object {e.Object} into the discarded range [{shrinkTo}, {extendTo})"));
 
             await ServeFromAsync(cluster, c);
             await AssertBytesAsync(files, "/t", expected, "prefix kept, gap reads as zeroes, the discarded tail never returns");
@@ -795,7 +832,7 @@ public sealed class RsySimulationTests
     [InlineData(CatchupPath.Checkpoint)]
     [Catalog("RSY-007", "S", "INV-07", "INV-18")]
     public Task RSY_007_CatchupIncludesRenameAndNameReuse(CatchupPath path) =>
-        RunAsync(Sim(3), async cluster =>
+        RunAsync(Sim(3).WithPath(path), async cluster =>
         {
             var (client, vol) = await ConnectAsync(cluster, "w");
             await using var clientScope = client;
@@ -875,7 +912,7 @@ public sealed class RsySimulationTests
     [InlineData(CatchupPath.Checkpoint)]
     [Catalog("RSY-008", "S", "INV-01", "INV-02", "INV-07", "INV-18")]
     public Task RSY_008_CatchupIncludesTransactionBoundary(CatchupPath path) =>
-        RunAsync(Sim(3), async cluster =>
+        RunAsync(Sim(3).WithPath(path), async cluster =>
         {
             var (client, vol) = await ConnectAsync(cluster, "w");
             await using var clientScope = client;
@@ -932,39 +969,42 @@ public sealed class RsySimulationTests
             if (path == CatchupPath.Checkpoint)
                 await ForceCompactionAsync(cluster, vol, sources, outage.ReturningLastIndex, "/fill", 8100);
             else
-                await AssertMissingRangeRetainedAsync(sources, outage.ReturningLastIndex);
+                await AssertMissingRangeRetainedAsync(sources, outage.ReturningAppliedIndex);
 
             await ReturnAsync(cluster, c, outage.Mode);
             bool stop = false;
-            int postSeen = 0;
+            int observations = 0;
+            async Task<bool?> ObserveOnceAsync()
+            {
+                VolumeStateInspection? st = null;
+                if (c.State == TestNodeState.Running)
+                {
+                    try
+                    {
+                        st = await c.Inspect.GetVolumeStateAsync(Volume);
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        // the node left Running between the check and the call
+                    }
+                }
+
+                if (st is null)
+                    return null;
+                observations++;
+                bool isPre = txPaths.All(p => SameFile(pre[p], st.GetFile(p)));
+                bool isPost = txPaths.All(p => SameFile(post[p], st.GetFile(p)));
+                Assert.True(isPre || isPost,
+                    $"{c.Name} exposed a half-applied transaction at applied index {st.AppliedIndex}: " +
+                    string.Join(", ", txPaths.Select(p => $"{p}={(st.GetFile(p) is { } f ? $"{f.Inode}@{f.Revision}" : "absent")}")));
+                return isPost;
+            }
+
             async Task ObserveAsync()
             {
                 while (!stop)
                 {
-                    VolumeStateInspection? st = null;
-                    if (c.State == TestNodeState.Running)
-                    {
-                        try
-                        {
-                            st = await c.Inspect.GetVolumeStateAsync(Volume);
-                        }
-                        catch (InvalidOperationException)
-                        {
-                            // the node left Running between the check and the call
-                        }
-                    }
-
-                    if (st is not null)
-                    {
-                        bool isPre = txPaths.All(p => SameFile(pre[p], st.GetFile(p)));
-                        bool isPost = txPaths.All(p => SameFile(post[p], st.GetFile(p)));
-                        Assert.True(isPre || isPost,
-                            $"{c.Name} exposed a half-applied transaction at applied index {st.AppliedIndex}: " +
-                            string.Join(", ", txPaths.Select(p => $"{p}={(st.GetFile(p) is { } f ? $"{f.Inode}@{f.Revision}" : "absent")}")));
-                        if (isPost)
-                            postSeen++;
-                    }
-
+                    await ObserveOnceAsync();
                     await cluster.DelayAsync(TimeSpan.FromMilliseconds(5), Ct);
                 }
             }
@@ -973,8 +1013,9 @@ public sealed class RsySimulationTests
             await WaitCaughtUpAsync(cluster, c);
             stop = true;
             await observer;
+            Assert.True(await ObserveOnceAsync() == true, "the caught-up replica holds the complete post-transaction state");
+            Assert.True(observations > 1, "the replica's applied state was observed during the catch-up");
             await AssertCatchupPathAsync(cluster, c, path, null);
-            Assert.True(postSeen > 0, "the returning replica ends in the post-transaction state");
             await AssertMatchesLeaderAsync(cluster, c, txPaths);
 
             await ServeFromAsync(cluster, c);
@@ -1004,7 +1045,7 @@ public sealed class RsySimulationTests
     [InlineData(CatchupPath.Checkpoint)]
     [Catalog("RSY-009", "S", "INV-07", "INV-09", "INV-18")]
     public Task RSY_009_CatchupIncludesSnapshotsAndPins(CatchupPath path) =>
-        RunAsync(Sim(3), async cluster =>
+        RunAsync(Sim(3).WithPath(path), async cluster =>
         {
             var (client, vol) = await ConnectAsync(cluster, "w");
             await using var clientScope = client;
@@ -1026,8 +1067,10 @@ public sealed class RsySimulationTests
             await vol.Snapshots.CreateAsync("s1", null, Ct);
             await files.WriteAllBytesAsync("/s/f", v2, Ct);
             protectedObjects.UnionWith(await ObjectsOfAsync(cluster, "/s/f"));
-            DateTimeOffset expires = cluster.Time.GetUtcNow() + TimeSpan.FromHours(1);
-            await vol.Snapshots.CreateAsync("s2", new DfsSnapshotOptions { Retention = new DfsRetention(expires, false) }, Ct);
+            // Whole seconds, so the round-trip comparison does not depend on the wire/at-rest timestamp precision.
+            DateTimeOffset now = cluster.Time.GetUtcNow();
+            var expires = new DateTimeOffset(now.UtcTicks - now.UtcTicks % TimeSpan.TicksPerSecond, TimeSpan.Zero) + TimeSpan.FromHours(1);
+            DfsSnapshotInfo s2 = await vol.Snapshots.CreateAsync("s2", new DfsSnapshotOptions { Retention = new DfsRetention(expires, false) }, Ct);
             await vol.Snapshots.DeleteAsync("s0", Ct);
             CommitToken t3 = await files.WriteAllBytesAsync("/s/f", v3, new DfsMutationOptions { CommitSnapshotName = "s3" }, Ct);
             protectedObjects.UnionWith(await ObjectsOfAsync(cluster, "/s/f"));
@@ -1040,12 +1083,11 @@ public sealed class RsySimulationTests
 
             await EndOutageAsync(cluster, outage, path, vol, "/fill", 9100);
             await AssertMatchesLeaderAsync(cluster, c, ["/s/f"]);
-            VolumeStateInspection cs = await StateAsync(c);
-            VolumeStateInspection ls = await LeaderStateAsync(cluster);
+            (VolumeStateInspection ls, VolumeStateInspection cs) = await StatesAtSameIndexAsync(cluster, c);
             Assert.Equal(ls.Snapshots.OrderBy(s => s.Name, StringComparer.Ordinal).ToArray(), cs.Snapshots.OrderBy(s => s.Name, StringComparer.Ordinal).ToArray());
             Assert.Equal(new[] { "s1", "s2", "s3" }, cs.Snapshots.Select(s => s.Name).Order(StringComparer.Ordinal).ToArray());
             Assert.Equal(ls.Pins.OrderBy(p => p.Id).ToArray(), cs.Pins.OrderBy(p => p.Id).ToArray());
-            Assert.Contains(cs.Pins, p => p.Snapshot == "s2");
+            Assert.Contains(cs.Pins, p => p.Snapshot == "s2" || p.Snapshot == s2.Id.Value.ToString());   // the reader pin survived catch-up
             IReadOnlySet<ObjectId> cReach = cs.ReachableObjects();
             Assert.Equal(ls.ReachableObjects().Order().ToArray(), cReach.Order().ToArray());
             Assert.All(protectedObjects, o => Assert.Contains(o, cReach));
@@ -1095,7 +1137,7 @@ public sealed class RsySimulationTests
     [MemberData(nameof(RetirementCases))]
     [Catalog("RSY-010", "S", "INV-06", "INV-18")]
     public Task RSY_010_CatchupPreservesRequestRetirement(CatchupPath path, RetirementKind kind) =>
-        RunAsync(Sim(3), async cluster =>
+        RunAsync(Sim(3).WithPath(path), async cluster =>
         {
             var (appClient, app) = await ConnectAsync(cluster, "app");
             await using var appScope = appClient;
@@ -1145,7 +1187,7 @@ public sealed class RsySimulationTests
 
             await EndOutageAsync(cluster, outage, path, app, "/fill", 10_200);
             await AssertMatchesLeaderAsync(cluster, c, ["/r/log", "/r/w"]);
-            VolumeStateInspection cs = await StateAsync(c), ls = await LeaderStateAsync(cluster);
+            (VolumeStateInspection ls, VolumeStateInspection cs) = await StatesAtSameIndexAsync(cluster, c);
             SessionInspection? cSession = cs.Sessions.SingleOrDefault(s => s.Id == id1.Session);
             Assert.Equal(ls.Sessions.SingleOrDefault(s => s.Id == id1.Session), cSession);
             if (cSession is not null)
@@ -1184,7 +1226,7 @@ public sealed class RsySimulationTests
     [InlineData(CatchupPath.Checkpoint)]
     [Catalog("RSY-011", "S", "INV-05", "INV-18")]
     public Task RSY_011_CatchupPreservesFenceGenerations(CatchupPath path) =>
-        RunAsync(Sim(3), async cluster =>
+        RunAsync(Sim(3).WithPath(path), async cluster =>
         {
             var (appClient, app) = await ConnectAsync(cluster, "app");
             await using var appScope = appClient;
@@ -1228,14 +1270,11 @@ public sealed class RsySimulationTests
             Assert.True(cFile.WriterGeneration >= g3, $"{c.Name} must not reset the fencing generation ({cFile.WriterGeneration} < {g3})");
 
             await ServeFromAsync(cluster, c);
-            long rejectedBefore = (await c.GetCountersAsync()).RejectedStaleWrites;
             w1Clock.Unfreeze();
             Exception fenced = await Assert.ThrowsAnyAsync<Exception>(() => stale.FlushAsync(Ct));
             Assert.True(fenced is DfsLeaseLostException or DfsOperationExpiredException,
                 $"the obsolete generation {g1} must be rejected by the returning leader, got {fenced.GetType().Name}: {fenced.Message}");
             Assert.True(stale.IsFaulted);
-            if (fenced is DfsLeaseLostException)
-                Assert.True((await c.GetCountersAsync()).RejectedStaleWrites > rejectedBefore, "the returning leader counted the rejected stale publication");
             await AssertBytesAsync(app.Files, "/f", f2, "the newest generation's contents remain authoritative");
             Assert.Equal(cFile.Revision, (await StateAsync(c)).GetFile("/f")!.Revision);
 
@@ -1337,7 +1376,8 @@ public sealed class RsySimulationTests
             FaultArm arm = cluster.Faults.Arm(new FaultMatch(FaultSites.RaftSnapshotInstall, Node: c.Name, Volume: Volume),
                 ctx => ctx.Detail == detail, action);
 
-            await c.RestartAsync();
+            // The interruption may hit before the restart call returns, so the restart is awaited only afterwards.
+            Task restart = c.RestartAsync();
             await arm.WaitTriggeredAsync(CatchupTimeout);
             cluster.Faults.AssertReached(arm);
             Assert.All(arm.Contexts, ctx => Assert.Equal(detail, ctx.Detail));
@@ -1346,11 +1386,14 @@ public sealed class RsySimulationTests
             {
                 await cluster.WaitUntilAsync(() => Task.FromResult(c.State == TestNodeState.Crashed), TimeSpan.FromSeconds(10),
                     $"the crash at stage '{detail}' takes the returning node down", Ct);
+                await AwaitInterruptedRestartAsync(restart, c);
                 cluster.Network.Isolate(c.Name);   // inspect what recovered from durable progress before it can make more
-                await c.RestartAsync();
+                restart = c.RestartAsync();
             }
 
-            // While cut off (both variants), only a complete image can be active.
+            // While cut off (both variants), only a complete image can be active. A node recovers locally while partitioned.
+            await cluster.WaitUntilAsync(() => Task.FromResult(c.State == TestNodeState.Running), TimeSpan.FromSeconds(10),
+                $"{c.Name} runs (cut off) after the interruption at '{detail}'", Ct);
             for (int i = 0; i < 10; i++)
             {
                 await AssertWholeImageAsync();
@@ -1358,6 +1401,7 @@ public sealed class RsySimulationTests
             }
 
             cluster.Network.Heal();
+            await restart;
             await WaitCaughtUpAsync(cluster, c);
             stopWriting = true;
             await suffixWriter;
@@ -1400,7 +1444,8 @@ public sealed class RsySimulationTests
     /// The catch-up source (the leader) fails part-way through a checkpoint transfer or suffix replay — by crashing, or by
     /// being partitioned with its in-flight messages delivered only after the new source finished. The returning replica
     /// completes against the new leader's valid boundary, never activates a mixture of the two histories, and rejects the
-    /// old source's late messages.
+    /// old source's late messages. Five voters: while C's catch-up is held at the fault point the remaining three elect the
+    /// new source without needing C's vote (with three voters the election would depend on the blocked node).
     /// </summary>
     [Theory]
     [InlineData(SourceFailure.CrashDuringReceive)]
@@ -1408,7 +1453,7 @@ public sealed class RsySimulationTests
     [InlineData(SourceFailure.CrashDuringSuffix)]
     [Catalog("RSY-013", "S", "INV-01", "INV-07", "INV-18")]
     public Task RSY_013_SecondLeaderFailureDuringResync(SourceFailure failure) =>
-        RunAsync(Sim(3), async cluster =>
+        RunAsync(Sim(5), async cluster =>
         {
             var (client, vol) = await ConnectAsync(cluster, "w");
             await using var clientScope = client;
@@ -1453,7 +1498,7 @@ public sealed class RsySimulationTests
             string detail = failure == SourceFailure.CrashDuringSuffix ? ResyncStageDetails.Suffix : ResyncStageDetails.Receive;
             FaultArm block = cluster.Faults.Arm(new FaultMatch(FaultSites.RaftSnapshotInstall, Node: c.Name, Volume: Volume),
                 ctx => ctx.Detail == detail, FaultAction.Block());
-            await c.RestartAsync();
+            Task restart = c.RestartAsync();   // awaited after the block is released (it may be reached during the restart)
             await block.WaitTriggeredAsync(CatchupTimeout);
             cluster.Faults.AssertReached(block);
 
@@ -1483,6 +1528,7 @@ public sealed class RsySimulationTests
             TestNode newLeader = await cluster.GetLeaderAsync(Volume, Ct);
             Assert.NotEqual(c.Name, newLeader.Name);
             block.Release();
+            await restart;
 
             // The returning node never activates a mixture while it switches sources.
             bool stopObserving = false;
@@ -1592,7 +1638,7 @@ public sealed class RsySimulationTests
                     {
                         await history.RecordAsync("r", "read", "/hot", null, () => r.Files.ReadAllBytesAsync("/hot", Ct));
                     }
-                    catch (Exception ex) when (IsAvailabilityFailure(ex))
+                    catch (Exception ex) when (IsRefusal(ex))
                     {
                         // tolerated; never stale
                     }
@@ -1617,6 +1663,9 @@ public sealed class RsySimulationTests
             await reader;
             await WaitCaughtUpAsync(cluster, c);
             await AssertCatchupPathAsync(cluster, c, CatchupPath.Checkpoint, null);
+            Assert.True(cluster.Faults.Coverage.Hits.Any(h => h.Site == FaultSites.RaftSnapshotInstall && h.Node == c.Name
+                    && h.Volume == Volume && h.Detail == ResyncStageDetails.Suffix),
+                "the concurrent writes produced a post-checkpoint suffix that the returning node replayed (checkpoint-plus-suffix)");
             await AssertMatchesLeaderAsync(cluster, c, ["/hot", "/log", "/big"]);
             Assert.True(version > 0);
             Assert.All(history.Operations.Where(o => o.Kind == "write"), o => Assert.Equal(OpOutcome.Ok, o.Outcome));
@@ -1673,7 +1722,9 @@ public sealed class RsySimulationTests
         CapturedMessage original = hold.Captured[0];
         hold.DropAll();
         hold.Dispose();
-        byte[] bad = truncate ? original.Frame[..(original.Frame.Length / 2)].ToArray() : Flip(original.Frame, original.Frame.Length - 2);
+        // A bit flip in the middle of the frame lands in the checkpoint payload (the bulk of a chunk), not in the trailing
+        // framing/extension fields, so the frame still decodes and only checksum verification can catch it.
+        byte[] bad = truncate ? original.Frame[..(original.Frame.Length / 2)].ToArray() : Flip(original.Frame, original.Frame.Length / 2);
         DfsErrorCode reply = await cluster.Network.ReplayAsync(original with { Frame = bad });
 
         // Until a verified checkpoint arrives the replica keeps its complete old image.
@@ -1706,8 +1757,6 @@ public sealed class RsySimulationTests
         await using var clientScope = client;
         RsyRoles roles = await PickRolesAsync(cluster);
         TestNode target = roles.Returning;
-        long failuresBefore = (await target.GetCountersAsync()).ChecksumFailures;
-
         MessageHold hold = cluster.Network.Hold(new MessageFilter(To: target.Name, Type: MessageType.PutObject));
         byte[] data = TestData.Bytes(15_200, 2 * Chunk);
         Task<CommitToken> write = vol.Files.WriteAllBytesAsync("/p", data, Ct);
@@ -1715,17 +1764,16 @@ public sealed class RsySimulationTests
         CapturedMessage original = hold.Captured[0];
         hold.DropAll();
         hold.Dispose();
-        DfsErrorCode reply = await cluster.Network.ReplayAsync(original with { Frame = Flip(original.Frame, original.Frame.Length - 64) });
+        // The 64 KiB chunk payload is the bulk of the frame: a mid-frame flip corrupts payload bytes, not the capability.
+        DfsErrorCode reply = await cluster.Network.ReplayAsync(original with { Frame = Flip(original.Frame, original.Frame.Length / 2) });
         Assert.True(reply is DfsErrorCode.Integrity or DfsErrorCode.ProtocolError,
             $"a storage node must reject a payload that does not match its declared checksum (got {reply})");
 
-        CommitToken token = await write;   // the uploader retries with intact bytes
+        CommitToken token = await write;   // ack 2-of-3 from intact uploads; the target is repaired from verified copies
         Assert.False(token.IsNone);
         IReadOnlyList<ObjectId> objects = await ObjectsOfAsync(cluster, "/p");
         await cluster.WaitUntilAsync(() => VerifiedOnAsync(cluster, target.Name, objects), RepairTimeout,
             $"{target.Name} ends up with verified copies of every object", Ct);
-        Assert.True((await target.GetCountersAsync()).ChecksumFailures > failuresBefore || reply == DfsErrorCode.ProtocolError,
-            "the rejected payload is visible as a checksum failure");
         foreach (TestNode n in RunningExcept(cluster, target))
             await DeleteCopiesAsync(n, objects);
         await AssertBytesAsync(vol.Files, "/p", data, "the only remaining copies (on the target) are verified bytes");
@@ -1741,16 +1789,32 @@ public sealed class RsySimulationTests
         IReadOnlyList<ObjectId> objects = await ObjectsOfAsync(cluster, "/r");
         RsyRoles roles = await PickRolesAsync(cluster);
         (TestNode badSource, TestNode goodSource, TestNode target) = (roles.Leader, roles.Other, roles.Returning);
-        long failuresBefore = (await cluster.Inspect.GetTotalCountersAsync()).ChecksumFailures;
+        long failuresBefore = (await badSource.GetCountersAsync()).ChecksumFailures + (await target.GetCountersAsync()).ChecksumFailures;
 
         foreach (ObjectId o in objects)
             await badSource.Disk.CorruptObjectAsync(o, 100);
         await DeleteCopiesAsync(target, objects);
 
+        // Phase 1: the only reachable holder is corrupt (the verified holder is down). Repair must not store its bytes on
+        // the target, reads fail explicitly, and the deficit is reported.
+        await goodSource.StopAsync();
+        await cluster.DelayAsync(Timings.InventoryInterval * 16, Ct);
+        foreach (ObjectId o in objects)
+            Assert.False(await target.Inspect.HasObjectAsync(o), $"{target.Name} stored object {o} copied from the corrupt source");
+        Exception noSource = await Assert.ThrowsAnyAsync<Exception>(() => vol.Files.ReadAllBytesAsync("/r", Ct));
+        Assert.True(noSource is DfsIntegrityException || IsAvailabilityFailure(noSource),
+            $"with only a corrupt copy reachable the read must fail explicitly, got {noSource.GetType().Name}: {noSource.Message}");
+        DfsReplicaHealth health = await cluster.Admin.GetReplicaHealthAsync(Volume, Ct);
+        Assert.True(health.UnderReplicatedObjects + health.MissingObjects >= objects.Count,
+            $"the missing/corrupt copies are reported, not counted as healthy (under-replicated {health.UnderReplicatedObjects}, missing {health.MissingObjects})");
+
+        // Phase 2: the verified source returns; repair rebuilds both the lost and the corrupt copies from it only.
+        await goodSource.RestartAsync();
         await cluster.WaitUntilAsync(async () =>
             await VerifiedOnAsync(cluster, target.Name, objects) && await VerifiedOnAsync(cluster, badSource.Name, objects),
             RepairTimeout, "repair rebuilds the lost and the corrupt copies from the verified source only", Ct);
-        Assert.True((await cluster.Inspect.GetTotalCountersAsync()).ChecksumFailures > failuresBefore, "the corrupt source copy was detected");
+        long failuresAfter = (await badSource.GetCountersAsync()).ChecksumFailures + (await target.GetCountersAsync()).ChecksumFailures;
+        Assert.True(failuresAfter > failuresBefore, "the corrupt source copy was detected (scrub or verification of a pulled copy)");
         await AssertBytesAsync(vol.Files, "/r", data);
         await DeleteCopiesAsync(goodSource, objects);
         await DeleteCopiesAsync(badSource, objects);
@@ -1788,16 +1852,12 @@ public sealed class RsySimulationTests
             TestNode silent = roles.Leader;
             TestNode second = roles.Returning;
 
-            await DeleteCopiesAsync(silent, objects);
+            // The offline holder goes first; the two deletions then happen back to back so repair (32 KiB/s, two seconds per
+            // 64 KiB object) cannot re-create a copy before the "single survivor" precondition is checked.
             if (loss == CopyLoss.OfflineAndSilentDeletion)
-            {
                 await second.StopAsync();
-                await DeleteCopiesAsync(second, objects);   // its stored copies are gone when it is offline
-            }
-            else
-            {
-                await DeleteCopiesAsync(second, objects);
-            }
+            await DeleteCopiesAsync(second, objects);   // offline: its stored copies are gone when it returns
+            await DeleteCopiesAsync(silent, objects);
 
             foreach (ObjectId o in objects)
                 Assert.Equal(new[] { survivor.Name }, (await cluster.Inspect.GetObjectHoldersAsync(o)).ToArray());
@@ -2002,15 +2062,22 @@ public sealed class RsySimulationTests
             {
                 if (kind == NoSourceKind.SoleHolderOffline)
                 {
-                    Assert.True(ex is DfsUnavailableException or TimeoutException,
+                    // Intact bytes on an unreachable host are an availability condition, not an integrity loss.
+                    Assert.True(IsAvailabilityFailure(ex) && ex is not DfsCommitOutcomeUnknownException,
                         $"an offline sole holder must surface as unavailability, got {ex.GetType().Name}: {ex.Message}");
                 }
-                else
+                else if (ex is DfsIntegrityException integrity)
                 {
-                    DfsIntegrityException integrity = Assert.IsAssignableFrom<DfsIntegrityException>(ex);
                     Assert.Equal(DfsErrorCode.Integrity, integrity.ErrorCode);
                     Assert.True(integrity.ObjectId is null || affected.Contains(integrity.ObjectId.Value),
                         $"the integrity failure names an affected object (got {integrity.ObjectId})");
+                }
+                else
+                {
+                    // RCV-06 allows explicit unavailability as well (e.g. once scrubbing quarantined every corrupt copy, or for
+                    // an object no node holds any more); anything else — or success — is wrong.
+                    Assert.True(ex is DfsUnavailableException || ex is DfsException { ErrorCode: DfsErrorCode.Unavailable or DfsErrorCode.NodeUnavailable },
+                        $"no healthy source must surface as an integrity or unavailability error, got {ex.GetType().Name}: {ex.Message}");
                 }
             }
         });
@@ -2029,7 +2096,7 @@ public sealed class RsySimulationTests
     [InlineData(CatchupPath.Checkpoint)]
     [Catalog("RSY-018", "S", "INV-07", "INV-09", "INV-11", "INV-18")]
     public Task RSY_018_StaleObjectsAreNotAuthoritative(CatchupPath path) =>
-        RunAsync(Sim(3), async cluster =>
+        RunAsync(Sim(3).WithPath(path), async cluster =>
         {
             var (client, vol) = await ConnectAsync(cluster, "w");
             await using var clientScope = client;
@@ -2069,6 +2136,12 @@ public sealed class RsySimulationTests
                 Assert.All(obsolete, o => Assert.DoesNotContain(o, st.ReachableObjects()));
             }
 
+            // The writing client goes away so its staging sessions are closed (disposal or session expiry); unreachable
+            // objects with closed staging are then reclaimable.
+            await client.DisposeAsync();
+            var (readerClient, reader) = await ConnectAsync(cluster, "v");
+            await using var readerScope = readerClient;
+            files = reader.Files;
             await cluster.WaitUntilAsync(async () =>
             {
                 foreach (ObjectId o in obsolete)
@@ -2161,12 +2234,20 @@ public sealed class RsySimulationTests
                     continue;
                 }
 
-                // Safety at every sample: no copy discarded below the recoverable two-copies-in-two-zones level.
+                // Safety at every sample: no copy discarded below the recoverable two-copies-in-two-zones level. Ground truth
+                // counts running nodes only, so a sample during which the armed crash took a node down is discarded (its
+                // durable copies are intact and return with it).
+                var sample = new List<(ObjectId Object, int Copies, int Zones)>();
                 foreach (ObjectId o in objects)
                 {
                     (int copies, int zones) = await cluster.Inspect.CountDurableDomainsAsync(o);
-                    Assert.True(copies >= 2 && zones >= 2, $"object {o} dropped to {copies} copies in {zones} zones during the policy transition");
+                    sample.Add((o, copies, zones));
                 }
+
+                if (cluster.Nodes.Any(n => n.State != TestNodeState.Running))
+                    continue;
+                foreach ((ObjectId o, int copies, int zones) in sample)
+                    Assert.True(copies >= 2 && zones >= 2, $"object {o} dropped to {copies} copies in {zones} zones during the policy transition");
 
                 DfsPolicyMigrationStatus status;
                 try
@@ -2185,9 +2266,17 @@ public sealed class RsySimulationTests
                 if (status.Effective)
                 {
                     Assert.Equal(target, status.Target);
+                    var effectiveSample = new List<(ObjectId Object, int Copies, int Zones)>();
                     foreach (ObjectId o in objects)
                     {
                         (int copies, int zones) = await cluster.Inspect.CountDurableDomainsAsync(o);
+                        effectiveSample.Add((o, copies, zones));
+                    }
+
+                    if (cluster.Nodes.Any(n => n.State != TestNodeState.Running))
+                        continue;
+                    foreach ((ObjectId o, int copies, int zones) in effectiveSample)
+                    {
                         Assert.True(copies >= target.TargetCopies && zones >= target.TargetDistinctZones,
                             $"policy declared effective while object {o} has {copies} copies in {zones} zones");
                     }
@@ -2254,13 +2343,27 @@ public sealed class RsySimulationTests
                 GroupInspection volume = await cluster.Inspect.GetVolumeGroupAsync(Volume);
                 bool gone = !control.Voters.Contains(stale.Name) && !control.Learners.Contains(stale.Name)
                     && !volume.Voters.Contains(stale.Name) && !volume.Learners.Contains(stale.Name);
-                return gone && (replacement is null || volume.Voters.Contains(replacement.Name));
-            }, CatchupTimeout, $"{stale.Name} is removed from every group (and the replacement admitted)", Ct);
+                bool admitted = replacement is null
+                    || control.Voters.Contains(replacement.Name) || control.Learners.Contains(replacement.Name);
+                return gone && admitted;
+            }, CatchupTimeout, $"{stale.Name} is removed from every group (and the replacement admitted as a member)", Ct);
 
             byte[] after = TestData.Bytes(20_001, 2 * Chunk);
             await vol.Files.WriteAllBytesAsync("/after", after, Ct);
+
+            // Baseline once membership changes and any leader balancing have settled: two samples a second apart agree.
             GroupInspection volBefore = await cluster.Inspect.GetVolumeGroupAsync(Volume);
             GroupInspection controlBefore = await cluster.Inspect.GetControlGroupAsync();
+            for (int settle = 0; ; settle++)
+            {
+                await cluster.DelayAsync(TimeSpan.FromSeconds(1), Ct);
+                GroupInspection v = await cluster.Inspect.GetVolumeGroupAsync(Volume);
+                GroupInspection k = await cluster.Inspect.GetControlGroupAsync();
+                if (v.Term == volBefore.Term && v.Leader == volBefore.Leader && k.Term == controlBefore.Term && k.Leader == controlBefore.Leader)
+                    break;
+                Assert.True(settle < 10, "terms/leaders did not settle after the membership change (before the stale node returned)");
+                (volBefore, controlBefore) = (v, k);
+            }
 
             // The stale identity reappears with its old data.
             try
@@ -2305,8 +2408,15 @@ public sealed class RsySimulationTests
                 foreach (ObjectId o in await ObjectsOfAsync(cluster, "/strict-ok"))
                     Assert.DoesNotContain(stale.Name, await cluster.Inspect.GetObjectHoldersAsync(o));
 
-                // ...and with one real member down, the stale node cannot stand in as the third copy/zone.
-                TestNode down = cluster.Nodes.First(n => n.Name != stale.Name && n.Name != replacement.Name && n.Name != volAfter.Leader);
+                // ...and with one real member down, the stale node cannot stand in as the third copy/zone. The member taken
+                // down keeps both quorums (whether or not the replacement was also made a volume voter), so the write fails on
+                // placement, not on quorum.
+                GroupInspection vg = await cluster.Inspect.GetVolumeGroupAsync(Volume);
+                GroupInspection cg = await cluster.Inspect.GetControlGroupAsync();
+                bool KeepsQuorum(GroupInspection g, string name) =>
+                    g.Voters.Count(v => v != name && v != stale.Name && cluster.Node(v).State == TestNodeState.Running) * 2 > g.Voters.Count;
+                TestNode down = cluster.Nodes.First(n => n.Name != stale.Name && n.State == TestNodeState.Running
+                    && n.Name != vg.Leader && n.Name != cg.Leader && KeepsQuorum(vg, n.Name) && KeepsQuorum(cg, n.Name));
                 await down.StopAsync();
             }
 
@@ -2431,7 +2541,7 @@ public sealed class RsySimulationTests
     [InlineData(DiskFullPhase.DataRepair)]
     [Catalog("RSY-022", "S", "INV-01", "INV-11", "INV-18")]
     public Task RSY_022_ResyncDiskFull(DiskFullPhase phase) =>
-        RunAsync(Sim(3), async cluster =>
+        RunAsync(Sim(3).WithPath(phase == DiskFullPhase.DataRepair ? CatchupPath.Log : CatchupPath.Checkpoint), async cluster =>
         {
             var (client, vol) = await ConnectAsync(cluster, "w");
             await using var clientScope = client;
@@ -2459,10 +2569,12 @@ public sealed class RsySimulationTests
                 await ForceCompactionAsync(cluster, vol, RunningExcept(cluster, c), outage.ReturningLastIndex, "/fill", 22_100);
             }
             else
-                await AssertMissingRangeRetainedAsync(RunningExcept(cluster, c), outage.ReturningLastIndex);
+                await AssertMissingRangeRetainedAsync(RunningExcept(cluster, c), outage.ReturningAppliedIndex);
 
-            // No room for the checkpoint, respectively for any data object (the reserve stays for metadata).
-            c.Disk.Faults.CapacityOverride = c.Disk.UsedBytes + (phase == DiskFullPhase.CheckpointInstall ? 16L << 10 : 2L << 20);
+            // No room for the checkpoint (16 KiB), respectively for any 64 KiB data object (48 KiB: repair may legitimately
+            // use the reserved repair space, so only the physical capacity can rule a copy out) while the few KiB of log
+            // entries still fit.
+            c.Disk.Faults.CapacityOverride = c.Disk.UsedBytes + (phase == DiskFullPhase.CheckpointInstall ? 16L << 10 : 48L << 10);
             await c.RestartAsync();
 
             if (phase == DiskFullPhase.CheckpointInstall)
@@ -2476,6 +2588,11 @@ public sealed class RsySimulationTests
                 await cluster.DelayAsync(TimeSpan.FromSeconds(2), Ct);
                 GroupInspection stuck = await GroupAsync(c);
                 Assert.True(stuck.AppliedIndex <= outage.ReturningLastIndex, "an uninstallable checkpoint is never reported as caught up");
+                foreach (ObjectId o in newObjects)
+                    Assert.DoesNotContain(c.Name, await cluster.Inspect.GetObjectHoldersAsync(o));
+                DfsReplicaHealth health = await cluster.Admin.GetReplicaHealthAsync(Volume, Ct);
+                Assert.True(health.UnderReplicatedObjects >= newObjects.Count,
+                    $"the full node's missing copies must be reported (under-replicated {health.UnderReplicatedObjects} < {newObjects.Count})");
             }
             else
             {
@@ -2716,9 +2833,21 @@ public sealed class RsySimulationTests
                 await cluster.DelayAsync(Timings.InventoryInterval * 2, Ct);
             }
 
-            // Faults stop: wait for convergence.
+            // Faults stop: scrub every node so latent corruption from the sequence is found, then wait for convergence (product
+            // view and harness ground truth).
             await cluster.WaitForStableAsync(CatchupTimeout, Ct);
+            await cluster.Admin.StartScrubAsync(null, Ct);
             await cluster.WaitForRepairAsync(Volume, RepairTimeout, Ct);
+            await cluster.WaitUntilAsync(async () =>
+            {
+                foreach (ObjectId o in objects)
+                {
+                    if (await cluster.Inspect.CountDurableDomainsAsync(o) != (3, 3))
+                        return false;
+                }
+
+                return true;
+            }, RepairTimeout, "every object regains three verified copies in three zones once faults stop", Ct);
             await cluster.WaitUntilAsync(async () =>
             {
                 DfsReplicaHealth h = await cluster.Admin.GetReplicaHealthAsync(Volume, Ct);
@@ -2744,8 +2873,9 @@ public sealed class RsySimulationTests
             {
                 NodeCounters after = await n.GetCountersAsync();
                 NodeCounters before = countersBefore[n.Name];
+                // A copy/delete cycle of a healthy replica needs a new store (puts/repair bytes) to stay invisible in the holder
+                // sets checked above; quarantine cleanup of already-replaced corrupt records is not ping-pong.
                 Assert.True(after.RepairBytes == before.RepairBytes, $"{n.Name} kept repairing healthy replicas ({after.RepairBytes - before.RepairBytes} bytes)");
-                Assert.True(after.GcDeletedObjects == before.GcDeletedObjects, $"{n.Name} kept deleting replicas ({after.GcDeletedObjects - before.GcDeletedObjects})");
                 Assert.True(after.ObjectPuts == before.ObjectPuts, $"{n.Name} kept storing copies ({after.ObjectPuts - before.ObjectPuts})");
             }
 
@@ -2780,8 +2910,12 @@ public sealed class RsySimulationTests
 
             if (divergence == SilentDivergence.MissedReplication)
             {
+                // Every way a copy can reach the target is cut until the divergence is established: client uploads and pushed
+                // replication to it, and repair pulls (GetObject) from it — otherwise anti-entropy could already have fixed the
+                // gap before the precondition below is checked.
                 MessageRule dropPuts = cluster.Network.DropNext(new MessageFilter(To: target.Name, Type: MessageType.PutObject), 100_000);
                 MessageRule dropReplicas = cluster.Network.DropNext(new MessageFilter(To: target.Name, Type: MessageType.ReplicateObject), 100_000);
+                MessageRule dropPulls = cluster.Network.DropNext(new MessageFilter(From: target.Name, Type: MessageType.GetObject), 100_000);
                 CommitToken token = await vol.Files.WriteAllBytesAsync("/m", data, Ct);
                 Assert.False(token.IsNone, "ack 2-of-3 succeeds without the third copy");
                 objects = await ObjectsOfAsync(cluster, "/m");
@@ -2794,6 +2928,7 @@ public sealed class RsySimulationTests
 
                 dropPuts.Cancel();
                 dropReplicas.Cancel();
+                dropPulls.Cancel();
                 Assert.True(dropPuts.Matched + dropReplicas.Matched > 0);
             }
             else

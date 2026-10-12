@@ -84,6 +84,20 @@ internal static class RsyHelpers
         };
     }
 
+    /// <summary>Raft snapshot threshold used by log-path scenarios: high enough that no source can compact on its own.</summary>
+    public const int LogPathSnapshotThreshold = 10_000;
+
+    /// <summary>
+    /// Adjusts the options for the catch-up path a scenario exercises. Log-path scenarios raise the Raft snapshot threshold
+    /// (to the production value) so that background entries (keep-alives, session/handle expiry, GC bookkeeping) during
+    /// long outages can never compact the returning node's missing range; checkpoint-path scenarios keep the Fast threshold
+    /// (200) so <see cref="ForceCompactionAsync"/> can compact it quickly.
+    /// </summary>
+    public static TestClusterOptions WithPath(this TestClusterOptions options, CatchupPath path) =>
+        path == CatchupPath.Log
+            ? options with { Timings = options.Timings with { RaftSnapshotThreshold = LogPathSnapshotThreshold } }
+            : options;
+
     /// <summary>Runs a scenario with the test cancellation token.</summary>
     public static Task RunAsync(TestClusterOptions options, Func<TestCluster, Task> scenario) =>
         ClusterTest.RunAsync(options, scenario, Ct);
@@ -196,7 +210,7 @@ internal static class RsyHelpers
         if (path == CatchupPath.Checkpoint)
             await ForceCompactionAsync(cluster, volume, sources, outage.ReturningLastIndex, fillDirectory, seed);
         else
-            await AssertMissingRangeRetainedAsync(sources, outage.ReturningLastIndex);
+            await AssertMissingRangeRetainedAsync(sources, outage.ReturningAppliedIndex);
 
         await ReturnAsync(cluster, returning, outage.Mode);
         await WaitCaughtUpAsync(cluster, returning);
@@ -205,9 +219,10 @@ internal static class RsyHelpers
 
     /// <summary>
     /// Commits more than <see cref="NodeTimings.RaftSnapshotThreshold"/> (200 with Fast timings) small inline writes while
-    /// the returning node is down, and keeps writing until every source has compacted its log strictly beyond
-    /// <paramref name="pastIndex"/> (so index <c>pastIndex + 1</c> is only available inside a checkpoint). Fails when
-    /// compaction does not happen within ten times the threshold. Returns the number of files written.
+    /// the returning node is down, and keeps writing until every source's log starts strictly after index
+    /// <c>pastIndex + 1</c> (<see cref="RaftGroupStats.LogFirstIndex"/>): the entry following the returning node's last
+    /// entry, and the term of its last entry, are then only available inside a checkpoint, so log-only catch-up is
+    /// impossible. Fails when compaction does not happen within ten times the threshold. Returns the number of files written.
     /// </summary>
     public static async Task<int> ForceCompactionAsync(TestCluster cluster, DfsVolume volume, IReadOnlyList<TestNode> sources,
         ulong pastIndex, string directory, ulong seed)
@@ -222,8 +237,8 @@ internal static class RsyHelpers
             bool compacted = true;
             foreach (TestNode source in sources)
             {
-                GroupInspection g = await GroupAsync(source);
-                if (g.SnapshotIndex <= pastIndex)
+                RaftGroupStats s = await StatsAsync(source);
+                if (s.LogFirstIndex <= pastIndex + 1)
                 {
                     compacted = false;
                     break;
@@ -233,7 +248,7 @@ internal static class RsyHelpers
             if (compacted && written > threshold)
                 return written;
             Assert.True(written < maxWrites,
-                $"Sources [{string.Join(", ", sources.Select(s => s.Name))}] did not compact their logs beyond index {pastIndex} after {written} " +
+                $"Sources [{string.Join(", ", sources.Select(s => s.Name))}] still hold log entries at or below index {pastIndex + 1} after {written} " +
                 $"committed writes (RaftSnapshotThreshold = {threshold}); log compaction must be bounded by the threshold.");
 
             var batch = new Task<CommitToken>[batchSize];
@@ -249,14 +264,18 @@ internal static class RsyHelpers
         }
     }
 
-    /// <summary>Precondition of log-path tests: no source compacted the returning node's missing range.</summary>
-    public static async Task AssertMissingRangeRetainedAsync(IEnumerable<TestNode> sources, ulong returningLastIndex)
+    /// <summary>
+    /// Precondition of log-path tests: every source still holds the first entry the returning node lacks
+    /// (<c>LogFirstIndex &lt;= returningAppliedIndex + 1</c>), so incremental replay is possible. Log-path scenarios use
+    /// <see cref="WithPath"/> so background entries cannot break this.
+    /// </summary>
+    public static async Task AssertMissingRangeRetainedAsync(IEnumerable<TestNode> sources, ulong returningAppliedIndex)
     {
         foreach (TestNode source in sources)
         {
-            GroupInspection g = await GroupAsync(source);
-            Assert.True(g.SnapshotIndex <= returningLastIndex,
-                $"Precondition: {source.Name} compacted its log to {g.SnapshotIndex}, beyond the returning node's last index {returningLastIndex}; " +
+            RaftGroupStats s = await StatsAsync(source);
+            Assert.True(s.LogFirstIndex <= returningAppliedIndex + 1,
+                $"Precondition: {source.Name}'s log starts at {s.LogFirstIndex}, after the returning node's first missing index {returningAppliedIndex + 1}; " +
                 "the incremental (log) catch-up path cannot be exercised by this scenario.");
         }
     }
@@ -347,11 +366,49 @@ internal static class RsyHelpers
     {
         await cluster.WaitForReplicationAsync(Volume, Ct);
         await cluster.Inspect.AssertReplicasConvergedAsync(Volume);
-        VolumeStateInspection leader = await LeaderStateAsync(cluster);
-        VolumeStateInspection mine = await StateAsync(node);
+        (VolumeStateInspection leader, VolumeStateInspection mine) = await StatesAtSameIndexAsync(cluster, node);
         Assert.Equal(leader.InodeCount, mine.InodeCount);
         foreach (string path in paths)
             AssertSameFile(leader.GetFile(path), mine.GetFile(path), $"{node.Name} after catch-up");
+    }
+
+    /// <summary>
+    /// The leader's and <paramref name="node"/>'s applied volume states at the same applied index, so record-by-record
+    /// comparisons (sessions, pins, snapshots, reachable objects) are not disturbed by background entries such as
+    /// keep-alives applied between the two inspections. Retries (bounded) until both report the same index.
+    /// </summary>
+    public static async Task<(VolumeStateInspection Leader, VolumeStateInspection Node)> StatesAtSameIndexAsync(TestCluster cluster, TestNode node)
+    {
+        ulong leaderIndex = 0, nodeIndex = 0;
+        for (int attempt = 0; attempt < 50; attempt++)
+        {
+            await cluster.WaitForReplicationAsync(Volume, Ct);
+            VolumeStateInspection leader = await StateAsync(await cluster.GetLeaderAsync(Volume, Ct));
+            VolumeStateInspection mine = await StateAsync(node);
+            if (leader.AppliedIndex == mine.AppliedIndex)
+                return (leader, mine);
+            (leaderIndex, nodeIndex) = (leader.AppliedIndex, mine.AppliedIndex);
+            await cluster.DelayAsync(TimeSpan.FromMilliseconds(20), Ct);
+        }
+
+        Assert.Fail($"{node.Name} and the leader never reported the same applied index (last: {nodeIndex} vs {leaderIndex}).");
+        throw new InvalidOperationException("unreachable");
+    }
+
+    /// <summary>
+    /// Awaits a restart that a fault armed on the restarting node may interrupt: a restart task that fails because the
+    /// node crashed at the armed point is the intended interruption, not a test failure.
+    /// </summary>
+    public static async Task AwaitInterruptedRestartAsync(Task restart, TestNode node)
+    {
+        try
+        {
+            await restart;
+        }
+        catch (Exception) when (node.State == TestNodeState.Crashed)
+        {
+            // the armed crash hit while the restart was still in progress
+        }
     }
 
     /// <summary>Makes <paramref name="node"/> the volume leader so the following client calls are served by it.</summary>
@@ -445,6 +502,16 @@ internal static class RsyHelpers
             or DfsErrorCode.Unavailable or DfsErrorCode.Timeout or DfsErrorCode.OutcomeUnknown } => true,
         _ => false,
     };
+
+    /// <summary>
+    /// True for every legal refusal of a live read by a client that is cut off from authority (availability failures, plus
+    /// the session/handle/pin consequences of being cut off longer than the 2 s lease or the 10 s session timeout). A stale
+    /// value, a false absence (<see cref="FileNotFoundException"/>) or invented bytes are never refusals.
+    /// </summary>
+    public static bool IsRefusal(Exception ex) =>
+        IsAvailabilityFailure(ex)
+        || ex is DfsPinExpiredException or DfsLeaseLostException or DfsOperationExpiredException
+        || ex is DfsException { ErrorCode: DfsErrorCode.InvalidHandle or DfsErrorCode.StaleIncarnation };
 
     /// <summary>3 copies in 3 zones, all required before acknowledgement.</summary>
     public static DfsStoragePolicy Strict3 => new()

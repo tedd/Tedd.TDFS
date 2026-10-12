@@ -12,6 +12,12 @@ namespace Tedd.Tdfs.Server;
 /// </param>
 /// <param name="AppliedIndex">Index of the last entry whose effect is part of this replica's state machine.</param>
 /// <param name="SnapshotIndex">Index covered by this replica's newest durable checkpoint (local compaction or installed).</param>
+/// <param name="LogFirstIndex">
+/// Index of the first entry still held in this replica's log (so it can still be sent to a lagging follower without a
+/// checkpoint): <c>SnapshotIndex + 1</c> when the log is compacted exactly at the checkpoint, lower when the implementation
+/// keeps a trailing window of already-checkpointed entries; <c>LastIndex + 1</c> when the log is empty. Entries below it
+/// exist only inside a checkpoint.
+/// </param>
 /// <param name="EntriesAppended">Log entries durably appended to this replica's log (local journal replay excluded).</param>
 /// <param name="EntriesApplied">
 /// Committed log entries handed to the state machine individually (local journal replay at startup included). Entries
@@ -37,6 +43,7 @@ public sealed record RaftGroupStats(
     ulong StartIndex,
     ulong AppliedIndex,
     ulong SnapshotIndex,
+    ulong LogFirstIndex,
     long EntriesAppended,
     long EntriesApplied,
     long EntriesCoveredByInstall,
