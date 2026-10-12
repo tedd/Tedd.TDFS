@@ -64,9 +64,10 @@ internal static class FileHelpers
     }
 
     /// <summary>
-    /// Reads the whole committed file through an explicit live handle that shares ReadWrite|Delete, so the observation
-    /// is compatible with any concurrent writer reservation (test plan section 5: visibility checks must not be sharing
-    /// conflicts). Returns the bytes and the inode the handle names.
+    /// Reads the whole committed file through an explicit <see cref="DfsReadView.VersionPinned"/> handle that shares
+    /// ReadWrite|Delete, so the observation is compatible with any concurrent writer reservation (test plan section 5)
+    /// and is ONE revision: a live handle may legally observe a newer revision on each read call (FSD §6.2), so a
+    /// multi-call live read is not an atomic observation. Returns the bytes and the inode the handle names.
     /// </summary>
     public static async Task<(byte[] Bytes, InodeId Inode)> ReadSharedAsync(DfsVolume volume, string path)
     {
@@ -75,8 +76,20 @@ internal static class FileHelpers
             Mode = FileMode.Open,
             Access = FileAccess.Read,
             Share = FileShare.ReadWrite | FileShare.Delete,
+            ReadView = DfsReadView.VersionPinned,
         }, Ct);
         return (await ReadToEndAsync(stream, Ct), stream.InodeId);
+    }
+
+    /// <summary>
+    /// The published extent map of a file as an ordered list of object ids (empty for inline files). Equality before and
+    /// after an operation proves that nothing was published, independently of revision/writer-generation bookkeeping.
+    /// </summary>
+    public static async Task<List<ObjectId>> ExtentObjectsAsync(TestCluster cluster, string path)
+    {
+        FileInspection? file = await cluster.Inspect.GetFileAsync(Vol, path);
+        Assert.NotNull(file);
+        return file.Extents.OrderBy(e => e.Offset).Select(e => e.Object).ToList();
     }
 
     /// <summary>Asserts the file's full contents (and optionally its inode identity and length metadata).</summary>

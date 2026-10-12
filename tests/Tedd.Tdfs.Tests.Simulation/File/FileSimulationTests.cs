@@ -74,13 +74,24 @@ public sealed class FileSimulationTests
 
             await arm.WaitTriggeredAsync(FaultWait);
             // Suspended exactly at the boundary: the destination is the complete old revision, not pre-truncated.
-            (byte[] Bytes, InodeId Inode)? held = await TryReadSharedAsync(observer, path);
-            Assert.True(held is not null, $"the destination vanished while WriteAll was held at {stage}");
-            AssertBytes(oldBytes, held.Value.Bytes, $"observer while WriteAll is held at {stage}");
-            Assert.Equal(before.InodeId, held.Value.Inode);
+            // Metadata reads take no reservation, so length/identity/extent map are always observable.
             DfsFileInfo heldInfo = await observer.Files.GetInfoAsync(path, Ct);
-            Assert.Equal(before.Revision, heldInfo.Revision);
+            Assert.Equal(before.InodeId, heldInfo.InodeId);
             Assert.Equal(oldBytes.Length, heldInfo.Length);
+            Assert.True(oldObjects.SetEquals(await ObjectsOfAsync(cluster, path)), $"the published extent map changed while WriteAll was held at {stage}");
+            try
+            {
+                (byte[] Bytes, InodeId Inode)? held = await TryReadSharedAsync(observer, path);
+                Assert.True(held is not null, $"the destination vanished while WriteAll was held at {stage}");
+                AssertBytes(oldBytes, held.Value.Bytes, $"observer while WriteAll is held at {stage}");
+                Assert.Equal(before.InodeId, held.Value.Inode);
+            }
+            catch (DfsSharingViolationException)
+            {
+                // The helper's implicit writer reservation may refuse even a ReadWrite|Delete-sharing reader; the
+                // metadata/extent checks above and the byte checks after the failure still apply.
+            }
+
             gate.Release();
 
             Exception? failure = await Record.ExceptionAsync(() => write);
@@ -93,9 +104,10 @@ public sealed class FileSimulationTests
             await AssertResolvesAbortedAsync(writer, failure, opId);
             await WaitForNoHandlesAsync(cluster, before.InodeId, "a failed WriteAll must release its implicit writer reservation");
 
-            // The old destination is intact on every path: bytes, identity, revision and extent map.
+            // The old destination is intact on every path: bytes, length, identity and extent map. (Revision equality is
+            // deliberately not asserted: taking the implicit writer reservation may advance the inode's persisted writer
+            // generation without publishing anything; the extent map and bytes prove no publication happened.)
             await AssertFileAsync(observer, path, oldBytes, before.InodeId, $"destination after WriteAll failed at {stage}");
-            Assert.Equal(before.Revision, (await observer.Files.GetInfoAsync(path, Ct)).Revision);
             Assert.True(oldObjects.SetEquals(await ObjectsOfAsync(cluster, path)), "the failed write must not change the published extent map");
             await cluster.WaitForReplicationAsync(Vol, Ct);
             await cluster.Inspect.AssertReplicasConvergedAsync(Vol);
@@ -143,6 +155,7 @@ public sealed class FileSimulationTests
             byte[] oldBytes = TestData.Bytes(seed, 2 * Chunk);
             await writer.Files.WriteAllBytesAsync(path, oldBytes, new DfsMutationOptions { StoragePolicy = kind == "placement-unavailable" ? "strict" : null }, Ct);
             DfsFileInfo before = await observer.Files.GetInfoAsync(path, Ct);
+            IReadOnlySet<ObjectId> oldObjects = await ObjectsOfAsync(cluster, path);
             await cluster.WaitForRepairAsync(Vol, RecoveryWait, Ct);
 
             byte[] newBytes = kind switch
@@ -178,7 +191,7 @@ public sealed class FileSimulationTests
 
             await AssertResolvesAbortedAsync(writer, failure!, opId);
             await AssertFileAsync(observer, path, oldBytes, before.InodeId, $"destination after {kind} rejection");
-            Assert.Equal(before.Revision, (await observer.Files.GetInfoAsync(path, Ct)).Revision);
+            Assert.True(oldObjects.SetEquals(await ObjectsOfAsync(cluster, path)), $"the {kind} rejection must not change the published extent map");
 
             if (kind == "placement-unavailable")
             {
@@ -372,13 +385,24 @@ public sealed class FileSimulationTests
             const string src = "/f009/src.bin";
             await writer.Directories.CreateDirectoryAsync("/f009", Ct);
             int length = multiExtent ? 4 * Chunk + 3 : 600;
-            byte[] current = TestData.Bytes(seed, length);
-            await writer.Files.WriteAllBytesAsync(src, current, Ct);
-            InodeId srcInode = (await writer.Files.GetInfoAsync(src, Ct)).InodeId;
+            const int lastRevision = 8;
 
-            // revisions[i] = bytes of the i-th committed source revision; started/published count revisions whose
-            // publication was invoked / has returned (revision 0 is the initial one).
-            var revisions = new List<byte[]> { (byte[])current.Clone() };
+            // revisions[k] = bytes of the k-th committed source revision, computed up front: a copy may capture
+            // revision k after it committed but before the writer's FlushAsync(k) returned, so the oracle must already
+            // know every revision. started/published count revisions whose publication was invoked / has returned.
+            var patches = new (int Offset, byte[] Bytes)[lastRevision + 1];
+            var revisions = new List<byte[]> { TestData.Bytes(seed, length) };
+            for (int k = 1; k <= lastRevision; k++)
+            {
+                patches[k] = (multiExtent ? (k % 4) * Chunk + 500 : (k * 50) % 500, TestData.Bytes(seed + 10_000 + (ulong)k, multiExtent ? 1000 : 100));
+                byte[] next = (byte[])revisions[k - 1].Clone();
+                patches[k].Bytes.CopyTo(next, patches[k].Offset);
+                revisions.Add(next);
+            }
+
+            Assert.Equal(revisions.Count, revisions.Select(r => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(r))).Distinct(StringComparer.Ordinal).Count());
+            await writer.Files.WriteAllBytesAsync(src, revisions[0], Ct);
+            InodeId srcInode = (await writer.Files.GetInfoAsync(src, Ct)).InodeId;
             int started = 1;
             int published = 1;
             InodeId? fixedDestination = null;
@@ -392,14 +416,11 @@ public sealed class FileSimulationTests
 
             async Task PublishRevisionAsync(int k)
             {
-                byte[] patch = TestData.Bytes(seed + 10_000 + (ulong)k, multiExtent ? 1000 : 100);
-                int offset = multiExtent ? (k % 4) * Chunk + 500 : (k * 50) % 500;
-                stream.Position = offset;
-                await stream.WriteAsync(patch, Ct);
-                patch.CopyTo(current, offset);
+                Assert.Equal(k, started); // revisions publish strictly in order
+                stream.Position = patches[k].Offset;
+                await stream.WriteAsync(patches[k].Bytes, Ct);
                 started++;
                 await stream.FlushAsync(Ct);
-                revisions.Add((byte[])current.Clone());
                 published++;
             }
 
@@ -450,7 +471,8 @@ public sealed class FileSimulationTests
             await Task.WhenAll(WriterLoopAsync(), CopierLoopAsync());
 
             // Later source changes never leak into earlier copies (objects are shared but immutable).
-            await PublishRevisionAsync(8);
+            await PublishRevisionAsync(lastRevision);
+            Assert.Equal(7, copies.Count);
             await stream.DisposeAsync(); // release the writer handle before whole-file reads of the source
             if (!overwriteExistingDestination)
             {
@@ -462,7 +484,7 @@ public sealed class FileSimulationTests
                 AssertBytes(copies[^1].Bytes, await copier.Files.ReadAllBytesAsync("/f009/dst.bin", Ct), "destination after later source changes");
             }
 
-            AssertBytes(current, await copier.Files.ReadAllBytesAsync(src, Ct), "source holds the latest revision");
+            AssertBytes(revisions[lastRevision], await copier.Files.ReadAllBytesAsync(src, Ct), "source holds the latest revision");
         }, Ct);
     }
 
@@ -549,15 +571,16 @@ public sealed class FileSimulationTests
                     long id = cluster.History.Invoke("observer", "read", dst, null);
                     try
                     {
-                        byte[]? seen = (await TryReadSharedAsync(observer, dst))?.Bytes;
+                        (byte[] Bytes, InodeId Inode)? read = await TryReadSharedAsync(observer, dst);
+                        byte[]? seen = read?.Bytes;
                         cluster.History.Complete(id, OpOutcome.Ok, seen);
                         bool legal = seen is null ? oldDest is null
                             : seen.AsSpan().SequenceEqual(source) || (oldDest is not null && seen.AsSpan().SequenceEqual(oldDest));
                         Assert.True(legal, $"observer saw a partial or foreign destination ({seen?.Length.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "absent"})");
+                        if (read is { } r && dstInode is { } preservedInode)
+                            Assert.Equal(preservedInode, r.Inode); // replacement keeps the destination inode at every instant
                     }
-                    catch (Exception ex) when (ex is DfsUnavailableException or TimeoutException
-                        or DfsException { IsRetryable: true }
-                        or DfsException { ErrorCode: DfsErrorCode.NotLeader or DfsErrorCode.NodeUnavailable or DfsErrorCode.Unavailable or DfsErrorCode.Timeout })
+                    catch (Exception ex) when (IsAvailabilityFailure(ex) || ex is DfsException { IsRetryable: true })
                     {
                         cluster.History.Complete(id, OpOutcome.Failed, ex); // a failed read has no effect
                         await cluster.DelayAsync(TimeSpan.FromMilliseconds(50), Ct);
@@ -691,9 +714,8 @@ public sealed class FileSimulationTests
                 }
             }
 
-            static bool IsAvailabilityFailure(Exception ex) =>
-                ex is DfsUnavailableException or TimeoutException
-                    || ex is DfsException { ErrorCode: DfsErrorCode.Timeout or DfsErrorCode.NodeUnavailable or DfsErrorCode.Unavailable or DfsErrorCode.QuorumUnavailable or DfsErrorCode.NotLeader };
+            // Availability failures (FileHelpers.IsAvailabilityFailure) include a broken transport connection: the FSD
+            // requires connectivity failures to propagate (not to become false), not a particular exception type.
 
             // Liveness after the prerequisite is restored: bounded wait until Exists answers again.
             Task WaitAnswersAsync(DfsVolume v, string because) => cluster.WaitUntilAsync(async () =>

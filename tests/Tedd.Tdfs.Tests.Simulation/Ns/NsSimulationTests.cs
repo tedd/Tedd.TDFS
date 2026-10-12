@@ -243,7 +243,7 @@ public sealed class NsSimulationTests
                     {
                         return await deleter.Directories.DeleteAsync("/big", true, Ct);
                     }
-                    catch (DfsSharingViolationException) when (attempt < 100)
+                    catch (DfsSharingViolationException) when (attempt < 1_000) // outlasts the bounded observers
                     {
                         // An observer's read helper may briefly hold a handle without Delete sharing; a refused
                         // recursive delete detaches nothing and is retryable.
@@ -836,6 +836,10 @@ public sealed class NsSimulationTests
                 deleterDone = true;
             }
 
+            // Inodes the reader observed. Membership in `created` is checked after the race: a CreateNew open can commit
+            // (and be observed) before the creator's continuation has recorded its inode.
+            var observedInodes = new List<InodeId>();
+
             async Task ReaderAsync()
             {
                 for (int i = 0; i < 400 && !(creatorDone && deleterDone); i++)
@@ -844,7 +848,7 @@ public sealed class NsSimulationTests
                     try
                     {
                         DfsFileInfo info = await reader.Files.GetInfoAsync(name, Ct);
-                        Assert.Contains(info.InodeId, created);
+                        observedInodes.Add(info.InodeId);
                         Assert.False(deletedBefore.Contains(info.InodeId), $"name resolved to inode {info.InodeId} whose deletion had already completed (resurrection)");
                     }
                     catch (FileNotFoundException)
@@ -858,7 +862,10 @@ public sealed class NsSimulationTests
                             Mode = FileMode.Open,
                             Access = FileAccess.Read,
                             Share = FileShare.ReadWrite | FileShare.Delete,
+                            ReadView = DfsReadView.VersionPinned, // one incarnation revision for the whole read
                         }, Ct);
+                        Assert.False(deletedBefore.Contains(s.InodeId), $"open resolved to inode {s.InodeId} whose deletion had already completed (resurrection)");
+                        observedInodes.Add(s.InodeId);
                         byte[] content = await ReadToEndAsync(s);
                         Assert.True(content.Length == 0 || content.AsSpan().SequenceEqual(Tag(s.InodeId)),
                             $"handle on inode {s.InodeId} returned bytes of another incarnation");
@@ -875,6 +882,7 @@ public sealed class NsSimulationTests
             Assert.True(created.Count >= 3, "the race must have produced several incarnations");
             Assert.True(deleted.Count >= 2, "the race must have deleted several incarnations");
             Assert.True(deleted.IsSubsetOf(created));
+            Assert.All(observedInodes, id => Assert.Contains(id, created)); // the name only ever named real incarnations
 
             // Final state names at most the newest surviving incarnation.
             try
@@ -960,9 +968,19 @@ public sealed class NsSimulationTests
                         byte[] expected = isX ? xBytes : yBytes;
                         AssertBytes(expected, await ReadToEndAsync(s), "a handle reads exactly the inode it names");
                         if (mayKeep && i % 5 == 0)
+                        {
                             kept.Add((s, expected)); // keep some handles across the rename
+                        }
                         else
+                        {
                             await s.DisposeAsync();
+                            if (!mayKeep)
+                            {
+                                // Leave reservation-free windows: a back-to-back stream of non-Delete-sharing handles
+                                // would otherwise starve the (legitimately refused, retryable) rename.
+                                await cluster.DelayAsync(TimeSpan.FromMilliseconds(3), Ct);
+                            }
+                        }
                     }
                 }
 
@@ -996,8 +1014,10 @@ public sealed class NsSimulationTests
                 ];
                 await cluster.DelayAsync(TimeSpan.FromMilliseconds(10), Ct);
                 long renameOp = cluster.History.Invoke("renamer", "write", key, xValue);
+                // Bounded retry that outlasts the blocking opener (at most 100 short-lived handles): a refusal while a
+                // non-Delete-sharing handle exists is correct and retryable.
                 Exception? renameFailure = null;
-                for (int attempt = 0; attempt < 50; attempt++)
+                for (int attempt = 0; attempt < 1_000; attempt++)
                 {
                     renameFailure = await Record.ExceptionAsync(() => admin.Files.MoveAsync(x, b, true, Ct));
                     if (renameFailure is not DfsSharingViolationException)

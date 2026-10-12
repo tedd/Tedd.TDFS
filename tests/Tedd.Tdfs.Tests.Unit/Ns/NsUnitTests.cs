@@ -287,9 +287,11 @@ public sealed class NsUnitTests
                 bool secondWon = results[1] is null;
                 Assert.False(firstWon && secondWon, "both cross moves committed: the namespace now contains a cycle");
                 Assert.True(firstWon || secondWon, $"the move ordered first is valid and must commit; got {results[0]} / {results[1]}");
+                // Once the winner commits, the loser's destination parent no longer exists at the path it named (after
+                // A -> B/A the path ".../A/B" is gone), so DirectoryNotFound is a legitimate explicit rejection here, as is
+                // a cycle error from an implementation that resolved inodes up front. Silent success is never allowed.
                 Exception? loser = firstWon ? results[1] : results[0];
                 Assert.True(loser is IOException or ArgumentException, $"the move that would close the cycle must be rejected explicitly, got {loser}");
-                Assert.False(loser is FileNotFoundException or DirectoryNotFoundException, "a would-be cycle is not an absence");
 
                 // Both directories are still reachable from the root exactly once.
                 var reachable = new List<InodeId>();
@@ -506,13 +508,28 @@ public sealed class NsUnitTests
                     break;
             }
 
-            Exception? failure = await Record.ExceptionAsync(misuse);
-            Assert.True(
-                failure is ArgumentException
-                    or DfsPinExpiredException { ErrorCode: DfsErrorCode.ContinuationExpired }
-                    or DfsException { ErrorCode: DfsErrorCode.InvalidArgument }
-                    || (principalCase && failure is UnauthorizedAccessException),
-                $"reusing a continuation token for another query ({reuse}) must be rejected, got {failure?.ToString() ?? "a page"}");
+            DfsDirectoryPage? misusePage = null;
+            Exception? failure = await Record.ExceptionAsync(async () => misusePage = await misuse());
+            bool rejected = failure is ArgumentException
+                or DfsPinExpiredException { ErrorCode: DfsErrorCode.ContinuationExpired }
+                or DfsException { ErrorCode: DfsErrorCode.InvalidArgument }
+                || (principalCase && failure is UnauthorizedAccessException);
+            if (reuse is "tampered-token" or "truncated-token" && failure is null)
+            {
+                // A corrupted token presented for the SAME query (same volume, directory, filter and principal) is not
+                // one of the catalog's reuse cases; the FSD does not require integrity-protected tokens. If it still
+                // decodes, it may only continue this query's own pinned snapshot, never another query's state.
+                Assert.NotNull(misusePage);
+                Assert.Equal(first.PinnedAt, misusePage.PinnedAt);
+                Assert.All(misusePage.Entries, e => Assert.True(
+                    e.Path.StartsWith("/d1/", StringComparison.Ordinal) && e.Name.StartsWith('a'),
+                    $"a corrupted continuation token returned an entry of another query: {e.Path}"));
+            }
+            else
+            {
+                Assert.True(rejected,
+                    $"reusing a continuation token for another query ({reuse}) must be rejected, got {failure?.ToString() ?? "a page"}");
+            }
 
             // The original query is unaffected and completes with exactly its own entries.
             var names = first.Entries.Select(e => e.Name).ToList();

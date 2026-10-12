@@ -62,8 +62,11 @@ internal static class FileHelpers
     }
 
     /// <summary>
-    /// Reads the whole committed file through an explicit live handle sharing ReadWrite|Delete (compatible with any
-    /// concurrent writer reservation, test plan section 5); null for genuine absence. Returns bytes and the inode read.
+    /// Reads the whole committed file through an explicit <see cref="DfsReadView.VersionPinned"/> handle sharing
+    /// ReadWrite|Delete (compatible with any concurrent writer reservation, test plan section 5); null for genuine
+    /// absence. Returns bytes and the inode read. The pinned view makes the multi-call read ONE revision: through a live
+    /// handle each read call may legally select a newer revision (FSD §6.2), so a concurrent publication could otherwise
+    /// produce a composite that is not evidence of a publication bug.
     /// </summary>
     public static async Task<(byte[] Bytes, InodeId Inode)?> TryReadSharedAsync(DfsVolume volume, string path)
     {
@@ -74,6 +77,7 @@ internal static class FileHelpers
                 Mode = FileMode.Open,
                 Access = FileAccess.Read,
                 Share = FileShare.ReadWrite | FileShare.Delete,
+                ReadView = DfsReadView.VersionPinned,
             }, Ct);
             return (await ReadToEndAsync(stream), stream.InodeId);
         }
@@ -82,6 +86,14 @@ internal static class FileHelpers
             return null;
         }
     }
+
+    /// <summary>
+    /// True for failures that only say "no authoritative answer right now": typed availability errors, deadlines, leader
+    /// changes and broken transport connections. Never true for absence, authorization or integrity failures.
+    /// </summary>
+    public static bool IsAvailabilityFailure(Exception ex) =>
+        ex is DfsUnavailableException or TimeoutException or Tedd.Tdfs.Transport.RpcConnectionException
+            || ex is DfsException { ErrorCode: DfsErrorCode.Timeout or DfsErrorCode.NodeUnavailable or DfsErrorCode.Unavailable or DfsErrorCode.QuorumUnavailable or DfsErrorCode.NotLeader };
 
     /// <summary>Reads a file, returning null for genuine absence.</summary>
     public static async Task<byte[]?> TryReadAsync(DfsVolume volume, string path)

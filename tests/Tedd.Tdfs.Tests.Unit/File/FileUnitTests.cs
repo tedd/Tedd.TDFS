@@ -57,17 +57,30 @@ public sealed class FileUnitTests
             {
                 var writeDone = new TaskCompletionSource();
 
+                // One read = one complete observation of a single revision: either the whole-file helper (which pins one
+                // revision, FSD §5.2) or an explicit VersionPinned handle that shares ReadWrite|Delete (compatible with
+                // any writer reservation, test plan §5). A live handle read in several calls is NOT one observation.
+                async Task<byte[]> ObserveAsync(DfsVolume reader, bool viaPinnedHandle)
+                {
+                    if (!viaPinnedHandle)
+                        return await reader.Files.ReadAllBytesAsync(path, Ct);
+                    (byte[] bytes, InodeId inode) = await ReadSharedAsync(reader, path);
+                    Assert.Equal(before.InodeId, inode); // the name never resolves to another inode
+                    return bytes;
+                }
+
                 async Task ReadLoopAsync(DfsVolume reader, string process)
                 {
                     int readsAfterWrite = 0;
                     for (int iteration = 0; iteration < 100_000 && readsAfterWrite < 3; iteration++)
                     {
                         bool invokedAfterWrite = writeDone.Task.IsCompleted;
+                        bool viaPinnedHandle = iteration % 2 == 1;
                         byte[] observed;
                         try
                         {
                             observed = await cluster.History.RecordAsync(process, "read", path, null,
-                                () => reader.Files.ReadAllBytesAsync(path, Ct));
+                                () => ObserveAsync(reader, viaPinnedHandle));
                         }
                         catch (FileNotFoundException ex)
                         {
@@ -76,8 +89,9 @@ public sealed class FileUnitTests
                         }
                         catch (DfsSharingViolationException)
                         {
-                            // A reservation conflict between the helpers is a retryable refusal (recorded as a failed
-                            // read with no effect), not evidence about publication; try again.
+                            // A reservation conflict with the writer is a retryable refusal (recorded as a failed read
+                            // with no effect), not evidence about publication; back off and try again.
+                            await Task.Delay(TimeSpan.FromMilliseconds(2), Ct);
                             continue;
                         }
 
@@ -90,6 +104,10 @@ public sealed class FileUnitTests
                             readsAfterWrite++;
                             Assert.True(isNew, $"{process}: a read invoked after WriteAllBytes returned must observe the new contents.");
                         }
+
+                        // Leave reservation-free windows so read helpers cannot starve the writer's implicit reservation.
+                        if (!viaPinnedHandle)
+                            await Task.Delay(TimeSpan.FromMilliseconds(1), Ct);
                     }
 
                     Assert.True(readsAfterWrite >= 3, $"{process} did not complete its post-write reads.");
@@ -108,7 +126,7 @@ public sealed class FileUnitTests
                             : await writer.Files.WriteAllBytesAsync(path, newBytes, Ct);
                         break;
                     }
-                    catch (DfsSharingViolationException) when (attempt < 200)
+                    catch (DfsSharingViolationException) when (attempt < 2_000)
                     {
                         // Retryable refusal while a reader's helper holds a reservation; a refused attempt has no effect.
                         await Task.Delay(TimeSpan.FromMilliseconds(5), Ct);
@@ -635,6 +653,8 @@ public sealed class FileUnitTests
             await v.Files.WriteAllBytesAsync(src, source, Ct);
             await v.Files.WriteAllBytesAsync("/f11/dir/child/keep.bin", TestData.Bytes(0x1102, 100), Ct);
             DfsFileInfo srcBefore = await v.Files.GetInfoAsync(src, Ct);
+            List<ObjectId> srcExtentsBefore = await ExtentObjectsAsync(cluster, src);
+            Assert.NotEmpty(srcExtentsBefore);
             DfsDirectoryInfo dirBefore = await v.Directories.GetInfoAsync("/f11/dir", Ct);
 
             (string from, string to) = kind switch
@@ -699,7 +719,15 @@ public sealed class FileUnitTests
 
             // The source is never truncated or replaced; directories and their children are untouched.
             await AssertFileAsync(v, src, source, srcBefore.InodeId, "source after rejected copy");
-            Assert.Equal(srcBefore.Revision, (await v.Files.GetInfoAsync(src, Ct)).Revision);
+            Assert.Equal(srcExtentsBefore, await ExtentObjectsAsync(cluster, src));
+            if (from != to && kind != "normalization-equivalent-path")
+            {
+                // When the source is not also the destination nothing may even touch its inode record. (A self-copy may
+                // legitimately take and release a destination writer reservation before rejecting, which can advance the
+                // persisted writer generation; bytes, length, identity and extent map above prove it was not replaced.)
+                Assert.Equal(srcBefore.Revision, (await v.Files.GetInfoAsync(src, Ct)).Revision);
+            }
+
             DfsDirectoryInfo dirAfter = await v.Directories.GetInfoAsync("/f11/dir", Ct);
             Assert.Equal(dirBefore.InodeId, dirAfter.InodeId);
             Assert.Equal(dirBefore.Revision, dirAfter.Revision);
@@ -1028,8 +1056,6 @@ public sealed class FileUnitTests
             foreach (string p in new[] { "/t/src.bin", "/t/m1.bin", "/t/del.bin", "/t/app.bin", "/t/text.txt" })
                 inodes[p] = (await v.Files.GetInfoAsync(p, Ct)).InodeId;
             DfsDirectoryInfo dirBefore = await v.Directories.GetInfoAsync("/t", Ct);
-            DfsFileInfo appBefore = await v.Files.GetInfoAsync("/t/app.bin", Ct);
-            DfsFileInfo textBefore = await v.Files.GetInfoAsync("/t/text.txt", Ct);
 
             async Task AssertObserverSeesInitialStateAsync(string step)
             {
@@ -1040,14 +1066,34 @@ public sealed class FileUnitTests
                 Assert.True(await observer.Files.ExistsAsync("/t/del.bin", Ct), $"after {step}: tx Delete leaked");
                 Assert.False(await observer.Files.ExistsAsync("/t/lines.txt", Ct), $"after {step}: tx WriteAllLines leaked");
                 Assert.False(await observer.Directories.ExistsAsync("/t/newdir", Ct), $"after {step}: tx CreateDirectory leaked");
-                // Metadata reads take no reservation, so they never conflict with the transaction's writer reservations.
-                DfsFileInfo app = await observer.Files.GetInfoAsync("/t/app.bin", Ct);
-                Assert.Equal(appBefore.Revision, app.Revision);
-                Assert.Equal(appBytes.Length, app.Length);
-                DfsFileInfo text = await observer.Files.GetInfoAsync("/t/text.txt", Ct);
-                Assert.Equal(textBefore.Revision, text.Revision);
-                Assert.Equal(textBefore.Length, text.Length);
+                // Files the transaction reserved still show their committed contents. (Revision equality is not used for
+                // reserved inodes: taking a writer reservation may advance the inode's persisted writer generation
+                // without publishing anything.)
+                await AssertCommittedContentAsync("/t/app.bin", appBytes, step);
+                await AssertCommittedContentAsync("/t/text.txt", Encoding.UTF8.GetBytes("original"), step);
+                await AssertCommittedContentAsync("/t/m1.bin", m1Bytes, step);
+                await AssertCommittedContentAsync("/t/del.bin", delBytes, step);
                 Assert.Equal(dirBefore.Revision, (await observer.Directories.GetInfoAsync("/t", Ct)).Revision);
+                Assert.Equal(dirBefore.EntryCount, (await observer.Directories.GetInfoAsync("/t", Ct)).EntryCount);
+            }
+
+            async Task AssertCommittedContentAsync(string p, byte[] expected, string step)
+            {
+                // Metadata reads take no reservation, so they never conflict with the transaction's writer reservations.
+                DfsFileInfo info = await observer.Files.GetInfoAsync(p, Ct);
+                Assert.Equal(inodes[p], info.InodeId);
+                Assert.Equal(expected.Length, info.Length);
+                try
+                {
+                    (byte[] bytes, InodeId inode) = await ReadSharedAsync(observer, p);
+                    AssertBytes(expected, bytes, $"after {step}: {p} must still hold its committed contents");
+                    Assert.Equal(inodes[p], inode);
+                }
+                catch (DfsSharingViolationException)
+                {
+                    // The transaction's writer reservation may refuse even a ReadWrite|Delete-sharing reader; length and
+                    // identity above plus the post-transaction content checks still apply.
+                }
             }
 
             DfsTransaction tx = await v.Transactions.BeginAsync(null, Ct);
@@ -1154,7 +1200,11 @@ public sealed class FileUnitTests
                 await AssertObserverSeesInitialStateAsync($"transaction {ending}");
                 await AssertFileAsync(observer, "/t/app.bin", appBytes, inodes["/t/app.bin"], $"append after transaction {ending}");
                 Assert.Equal("original", await observer.Files.ReadAllTextAsync("/t/text.txt", null, Ct));
-                await Assert.ThrowsAnyAsync<Exception>(() => tx.Files.WriteAllBytesAsync("/t/late.bin", newBytes, Ct));
+                // After abort/dispose the bound facade is unusable (FSD §8.2): an explicit rejection, never a silent
+                // standalone write and never an unrelated crash.
+                Exception? late = await Record.ExceptionAsync(() => tx.Files.WriteAllBytesAsync("/t/late.bin", newBytes, Ct));
+                Assert.True(late is InvalidOperationException or DfsException,
+                    $"a helper on an ended transaction must be rejected (InvalidOperation/ObjectDisposed or a transaction error), got {late?.ToString() ?? "success"}");
                 Assert.False(await observer.Files.ExistsAsync("/t/late.bin", Ct));
                 await WaitForNoOpenStagingAsync(cluster, "an ended transaction must close its staging session");
             }

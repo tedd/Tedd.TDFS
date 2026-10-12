@@ -24,12 +24,29 @@ The tests do depend on the following behaviour of existing members. Harness and 
 
 - `DfsFileInfo.Revision` and `DfsDirectoryInfo.Revision` are the Raft index of the entry that last modified the inode,
   so they equal `CommitToken.Sequence` of that mutation (ARCHITECTURE §2.2). Covered by NS-018.
+- The tests do NOT assume that taking a writer reservation without publishing leaves `Revision` unchanged (a writable
+  open advances the inode's persisted writer generation, which an implementation may count as a modification). Where a
+  failed or not-yet-committed helper may have held a reservation, "unchanged" is asserted through bytes, length, inode
+  identity and the published extent map (`FileInspection.Extents`) instead. Affected tests: FILE-002, FILE-011 (self-copy),
+  FILE-015.
 - Inode ids are allocated monotonically and never reused (ARCHITECTURE §2.2). Covered by NS-010 and NS-018.
 - Overwriting through `WriteAll*` or `Copy(overwrite: true)` keeps the destination inode. A move with overwrite replaces
-  the destination inode (FSD §5.4, NS-06). Covered by FILE-001, FILE-012 and NS-008.
+  the destination inode (FSD §5.4, NS-06). Covered by FILE-001, FILE-010, FILE-012 and NS-008.
 - Visibility observations made while a writer is active use explicit handles opened with
-  `FileShare.ReadWrite | FileShare.Delete`, as required by test plan §5. Where a read helper (`ReadAll*`) may legitimately
-  hold a reservation, the tests treat `DfsSharingViolationException` as a retryable refusal and not as a failure.
-  Affected tests: FILE-001, FILE-007 and NS-004.
+  `FileShare.ReadWrite | FileShare.Delete` and `DfsReadView.VersionPinned`, as required by test plan §5. The pinned view
+  matters: through a live handle every read call may select a newer revision (FSD §6.2), so a multi-call live read that
+  straddles a publication is a legal composite and not evidence of a bug. Where a helper's implicit reservation (or a
+  read helper's internal handle) may legitimately refuse such a reader, the tests treat `DfsSharingViolationException` as
+  a retryable refusal and fall back to metadata/extent checks. Affected tests: FILE-001, FILE-002, FILE-007, FILE-010,
+  FILE-015, NS-004, NS-010 and NS-011. Writers that are legitimately refused retry with bounded loops that outlast the
+  bounded readers, and readers leave reservation-free gaps, so a correct implementation cannot be starved.
+- "No authoritative answer" failures (FILE-010 observers, FILE-014) may surface as typed availability exceptions,
+  `TimeoutException`, or a transport `RpcConnectionException`; the FSD requires connectivity failures to propagate (never
+  as `false`/absence), not a specific type.
+- After the winning move of two concurrent cross moves commits, the loser's destination parent path no longer exists, so
+  `DirectoryNotFoundException` is an accepted explicit rejection in NS-007's concurrent variant.
+- Continuation tokens: reuse for another volume, directory, filter or principal must be rejected (NS-013). A corrupted
+  token for the same query is not required to be rejected (the FSD does not mandate integrity-protected tokens), but if
+  accepted it may only continue that query's own pinned snapshot.
 - The API has no per-directory default storage policies. NS-016 therefore models "directories with different defaults"
   as directories whose resident files use different named policies.
