@@ -36,3 +36,7 @@ Distributed filesystem with a .NET client SDK. Requirements: `docs/spec/distribu
   `DfsBackupCheckpoint`) live in Core (namespace `Tedd.Tdfs`).
 - `MessageCodec` registrations go in `src/Tedd.Tdfs.Core/Protocol/MessageCodec.Registrations.cs`; message records
   implement `IWireMessage<TSelf>`.
+- Tedd.Quicly 0.2.2: an `MsQuicTransportListener` that owns its registration can deadlock in `Dispose` (it closes the
+  registration before its listener handle). `QuiclyRpcTransport` therefore always passes its own `MsQuicRegistration`
+  and closes it on a background thread. Use `QuiclyTransportFactory.CreateDevelopmentCertificate()`/`ComputeSpkiPin` for
+  test certificates (non-exportable, non-persisted key: nothing is left in the user's key store).

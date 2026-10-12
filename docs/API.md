@@ -1020,7 +1020,29 @@ public sealed class QuiclyTransportFactory : IRpcTransportFactory
     public QuiclyTransportFactory(QuiclyTransportOptions options);
 }
 public sealed record QuiclyTransportOptions(X509Certificate2 Certificate, IReadOnlyList<byte[]> TrustedSpkiPins, ILinkPolicy? LinkPolicy = null, int MaxConnectionsPerAddress = 4096);
+
+// Additions (implementation phase): both built-in transports implement IRpcTransportControl.
+public interface IRpcTransportControl
+{
+    string LocalName { get; }
+    int OpenConnectionCount { get; }
+    void ResetConnections(string? remoteName = null);   // abortive; both ends see Closed(exception); listening continues
+}
+// InMemoryNetwork: + InMemoryNetwork(ILinkPolicy? policy, TimeProvider timeProvider); TimeProvider TimeProvider { get; };
+//                  IReadOnlyList<string> Endpoints { get; }; void ResetConnections(string name);   // every connection with `name` at either end
+// QuiclyTransportFactory: + QuiclyTransportOptions Options { get; }; static X509Certificate2 CreateDevelopmentCertificate();
+//                  static X509Certificate2 CreateDevelopmentCertificate(string subject, TimeSpan validity); static byte[] ComputeSpkiPin(X509Certificate2 certificate);
+// QuiclyTransportOptions (init): TimeProvider TimeProvider = System; TimeSpan ConnectTimeout = 10 s; Func<X509Certificate2, bool>? ValidateServerCertificate;
+//                  bool AllowUntrustedForDevelopment; int MaxMessageBytes = 256 MiB; long MaxReassemblyBytesPerConnection = 512 MiB;
+//                  int MaxInboundConnections = 4096; Action<string>? Diagnostic.   Certificate may be null for connect-only transports.
 ```
+Semantics (both transports): delivery is asynchronous (thread pool, never on the sender's stack); the receiving end consults
+`ILinkPolicy.Decide(from, to, direction, payload)` once per message with the **complete** payload; handlers are invoked in
+arrival order per connection (not awaited before the next message); a handler exception becomes an `ErrorCodec`
+`Internal` error reply and a request to a never-started transport an `Unavailable` one; replies after a timeout are
+discarded; closing fails pending calls with `RpcConnectionException`; `Closed` carries null only for a local
+`DisposeAsync`/transport dispose. QUIC: single-frame messages (≤ 60 KiB) keep send order on the ordered channel;
+fragmented ones use the unordered data channel and may be overtaken by later small messages.
 
 ---
 
