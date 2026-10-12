@@ -1,5 +1,7 @@
 # API additions — RSY suite (RSY-001..RSY-026)
 
+> **Integration note (integrate/tests).** `TestCluster.TransferLeadershipAsync` was merged with the CON/NET request into `Task<TestNode> TransferLeadershipAsync(string group, string targetNode, TimeSpan? timeout = null, bool waitUntilServing = true, CancellationToken ct = default)` in `Additions/con-net/TestCluster.con-net.cs`; the behaviour described below is the default `waitUntilServing: true` (the default timeout is now the larger of 10 s and 10 election timeouts). `Additions/rsy/TestCluster.rsy.cs` was removed. See docs/API.md §I for the consolidated list.
+
 Additions made while writing the RSY tests (`tests/Tedd.Tdfs.Tests.Simulation/Rsy/`). All are stubs that throw
 `NotImplementedException` until implemented; no existing signature was changed.
 

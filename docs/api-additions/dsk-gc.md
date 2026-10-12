@@ -1,5 +1,7 @@
 # API additions requested by the DSK and GC suites
 
+> **Integration note (integrate/tests).** `TestNode.CompactStorageAsync` also replaces the CHA suite's `CompactObjectStoreAsync` and gained an optional `CancellationToken ct = default` (it only cancels waiting). The merged definition additionally specifies that every segment with a dead record, including the sealed active segment, is compacted. See docs/API.md §I for the consolidated list.
+
 Branch `tests/dsk-gc`. Every addition is a stub (`NotImplementedException`) in a separate partial-class file; no
 existing signature was changed.
 

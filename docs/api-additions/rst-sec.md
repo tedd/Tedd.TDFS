@@ -1,5 +1,7 @@
 # API / harness additions requested by the RST and SEC suites
 
+> **Integration note (integrate/tests).** `TestCluster.StartRecoveryClusterAsync` also serves CHA-006/010/016 (identical CHA request merged here; docs merged). See docs/API.md §I for the consolidated list.
+
 Branch `tests/rst-sec`. All additions are new files; no existing signature was changed. Harness members are stubs
 (`NotImplementedException` via `Stub.NotYet`) whose XML docs define the required behaviour. Pure test-logic helpers that
 only use the public SDK are implemented.

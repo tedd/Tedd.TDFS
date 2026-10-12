@@ -1108,7 +1108,7 @@ public sealed class ConSimulationTests
 
             // Make a lagging-apply replica the serving leader.
             if (transfer)
-                await cluster.TransferLeadershipAsync(Vol, followers[0].Name, Ct);
+                await cluster.TransferLeadershipAsync(Vol, followers[0].Name, waitUntilServing: false, ct: Ct);
             else
                 await leader.CrashAsync(CrashMode.LoseUnflushed);
 
@@ -1569,7 +1569,7 @@ public sealed class ConSimulationTests
             Assert.NotEmpty(laggingState.Pins);
 
             // Make the snapshot-installed replica the authority and exercise every safety state through it.
-            await cluster.TransferLeadershipAsync(Vol, lagging.Name, Ct);
+            await cluster.TransferLeadershipAsync(Vol, lagging.Name, waitUntilServing: false, ct: Ct);
             Assert.Equal(lagging.Name, (await cluster.GetLeaderAsync(Vol, Ct)).Name);
 
             // Version pin: the pinned reader still reads the version it pinned.
@@ -1802,7 +1802,7 @@ public sealed class ConSimulationTests
             Assert.Equal(baseline.InodeCount + created.Count, final.InodeCount);
 
             // The recovered replica can serve as the authority with complete contents.
-            await cluster.TransferLeadershipAsync(Vol, lagging.Name, Ct);
+            await cluster.TransferLeadershipAsync(Vol, lagging.Name, waitUntilServing: false, ct: Ct);
             foreach (int index in new[] { 0, 1, created.Count / 2, created.Count - 2, created.Count - 1 })
                 await AssertContentAsync(volume, created[index].Path, created[index].Bytes, $"file {index} through the recovered replica");
             await cluster.Inspect.AssertNoSplitBrainAsync();
@@ -2047,7 +2047,7 @@ public sealed class ConSimulationTests
             await cluster.WaitForReplicationAsync(Vol, Ct);
             await cluster.Inspect.AssertReplicasConvergedAsync(Vol);
             Assert.False(await volume.Files.ExistsAsync("/premature", Ct));
-            await cluster.TransferLeadershipAsync(Vol, joiner.Name, Ct);
+            await cluster.TransferLeadershipAsync(Vol, joiner.Name, waitUntilServing: false, ct: Ct);
             foreach (int index in new[] { 0, 1, 124, 248, 249 })
                 await AssertContentAsync(volume, files[index].Path, files[index].Bytes, "served by the admitted replacement");
             await cluster.Inspect.AssertNoSplitBrainAsync();

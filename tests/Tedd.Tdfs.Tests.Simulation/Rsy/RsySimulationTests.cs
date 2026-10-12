@@ -573,7 +573,7 @@ public sealed class RsySimulationTests
             byte[] v0 = TestData.Bytes(4000, 3 * Chunk + 100);
             CommitToken t0 = await files.WriteAllBytesAsync("/f", v0, Ct);
             DfsFileInfo staleInfo = await files.GetInfoAsync("/f", Ct);
-            await cluster.TransferLeadershipAsync(Volume, initial.Leader.Name, TimeSpan.FromSeconds(20), Ct);
+            await cluster.TransferLeadershipAsync(Volume, initial.Leader.Name, TimeSpan.FromSeconds(20), ct: Ct);
             RsyOutage outage = await BeginOutageAsync(cluster, mode, new RsyRoles(initial.Leader, initial.Other, c));
             Assert.True(outage.ReturningAppliedIndex >= staleInfo.Revision, "precondition: C holds the stale, latest-timestamped version");
 
@@ -3022,7 +3022,7 @@ public sealed class RsySimulationTests
                     TestNode currentLeader = await cluster.GetLeaderAsync(Volume, Ct);
                     TestNode newLeader = RunningExcept(cluster, c).First(n => n.Name != currentLeader.Name);
                     ulong oldTerm = (await GroupAsync(currentLeader)).Term;
-                    await cluster.TransferLeadershipAsync(Volume, newLeader.Name, TimeSpan.FromSeconds(20), Ct);
+                    await cluster.TransferLeadershipAsync(Volume, newLeader.Name, TimeSpan.FromSeconds(20), ct: Ct);
                     Assert.True((await GroupAsync(newLeader)).Term > oldTerm, "the leader change moved to a newer term");
                     await vol.Files.AppendAllBytesAsync("/x", TestData.Bytes(26_003, 10), Ct);
                     x2 = Concat(x2, TestData.Bytes(26_003, 10));

@@ -1,5 +1,7 @@
 # Harness/API additions requested by the CON and NET suites
 
+> **Integration note (integrate/tests).** `TestCluster.TransferLeadershipAsync` was merged with the RSY request into `Task<TestNode> TransferLeadershipAsync(string group, string targetNode, TimeSpan? timeout = null, bool waitUntilServing = true, CancellationToken ct = default)`; the behaviour described below is `waitUntilServing: false`, which the CON/NET tests now pass explicitly. See docs/API.md §I for the consolidated list.
+
 Branch `tests/con-net`. All additions are **stubs** (`Stub.NotYet`) in new partial-class files; no existing harness or SDK
 file or signature was changed. Each entry lists the exact signature, the required behaviour, and the tests that rely on it.
 

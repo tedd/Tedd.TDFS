@@ -1,5 +1,7 @@
 # API additions for suites FMT, OPS and PERF (FMT-001..FMT-012, OPS-001..OPS-016, PERF-001..PERF-016)
 
+> **Integration note (integrate/tests).** `SoftwareVersionProfile`, `TestNode.SoftwareVersion` and `TestNode.RestartAsSoftwareVersionAsync` also replace the CHA suite's `TestSoftwareVersion`/`RestartWithSoftwareAsync`; `SoftwareVersionProfile` gained `Next` (emulated newer build) and `NextFeature` (`"test.next-format"`) for CHA-011, and `Get("Next")`. See docs/API.md §I for the consolidated list.
+
 All additions are stubs (`NotImplementedException`) in separate files; no existing file or signature was changed. Exact
 required behaviour is in the XML docs of each member; this file summarises it.
 

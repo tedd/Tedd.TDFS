@@ -290,12 +290,16 @@ public sealed class SdkIntegrationTests
 
     /// <summary>
     /// Names that are reserved, rewritten, case-folded, normalized or otherwise special on at least one host OS
-    /// (Windows device names, NTFS stream syntax, trailing dots/spaces, HFS+/APFS normalization, case-insensitive
+    /// (Windows device names and forbidden characters, trailing dots/spaces, HFS+/APFS normalization, case-insensitive
     /// file systems). In the volume namespace each is an ordinary, case-sensitive, NFC-identified name.
     /// </summary>
+    /// <remarks>
+    /// Since Addendum A (ADS-01) ':' is not an ordinary name character: NTFS-style stream syntax (<c>name:stream</c>) is part
+    /// of the volume's own path contract, identical on every host, and is checked separately below.
+    /// </remarks>
     private static readonly string[] HostHostileNames =
     [
-        "CON", "con", "NUL", "aux.txt", "COM1", "LPT1.log", "PRN", "a:b", "file.txt:stream", "a*b?", "<>|\"", "trailing.", "trailing ",
+        "CON", "con", "NUL", "aux.txt", "COM1", "LPT1.log", "PRN", "a|b", "file.txt=stream", "a*b?", "<>|\"", "trailing.", "trailing ",
         " leading", "Readme", "README", "caf\u00E9", "cafe\u0301", "\u00C5ngstr\u00F6m", "\u212Bngstr\u00F6m", "tab\tname", "new\nline",
         new string('x', 255), "...", ".hidden", "~$lock", "desktop.ini", ".DS_Store", "Thumbs.db", "\u0130", "i", "back`tick", "semi;colon",
         "%TEMP%", "$HOME", "\U0001F600",
@@ -338,13 +342,34 @@ public sealed class SdkIntegrationTests
             SdkHelpers.Log($"SDK-015 on {platform} ({RuntimeInformation.OSDescription}, {RuntimeInformation.ProcessArchitecture}): transcript sha256 {Hash(actualTranscript)}; expected {Hash(expectedTranscript)}");
             Assert.Equal(expectedTranscript, actualTranscript);
 
-            // Host rules did not leak into the namespace: no stripping, folding, stream splitting or device mapping.
+            // Host rules did not leak into the namespace: no stripping, folding or device mapping.
             Assert.False(await volume.Files.ExistsAsync("/sdk015/names/trailing", Ct));
-            Assert.False(await volume.Files.ExistsAsync("/sdk015/names/file.txt", Ct));
             Assert.False(await volume.Files.ExistsAsync("/sdk015/names/readme", Ct));
             Assert.False(await volume.Files.ExistsAsync("/sdk015/names/leading", Ct));
             Assert.NotEqual((await volume.Files.GetInfoAsync("/sdk015/names/CON", Ct)).InodeId, (await volume.Files.GetInfoAsync("/sdk015/names/con", Ct)).InodeId);
             Assert.Equal((await volume.Files.GetInfoAsync("/sdk015/names/caf\u00E9", Ct)).InodeId, (await volume.Files.GetInfoAsync("/sdk015/names/cafe\u0301", Ct)).InodeId);
+
+            // Stream syntax follows the volume's rules (ADS-01), not the host's: "file.txt:stream" addresses a named stream
+            // of file.txt on every platform, enumeration lists only the file, and ':' in a non-final component is invalid.
+            byte[] fileBytes = TestData.Bytes(1597, 64);
+            byte[] streamBytes = TestData.Bytes(1598, 48);
+            await volume.Directories.CreateDirectoryAsync("/sdk015/streams", Ct);
+            await volume.Files.WriteAllBytesAsync("/sdk015/streams/file.txt", fileBytes, Ct);
+            await volume.Files.WriteAllBytesAsync("/sdk015/streams/file.txt:stream", streamBytes, Ct);
+            var streamDirectory = new List<string>();
+            await foreach (DfsEntryInfo entry in volume.Directories.EnumerateAsync("/sdk015/streams", null, Ct))
+                streamDirectory.Add(entry.Name);
+            Assert.Equal(new[] { "file.txt" }, streamDirectory);
+            byte[] fileRead = await volume.Files.ReadAllBytesAsync("/sdk015/streams/file.txt", Ct);
+            AssertEx.BytesEqual(fileBytes, fileRead, "default stream of file.txt");
+            byte[] streamRead = await volume.Files.ReadAllBytesAsync("/sdk015/streams/file.txt:stream:$DATA", Ct);
+            AssertEx.BytesEqual(streamBytes, streamRead, "named stream of file.txt");
+            DfsStreamInfo stream = Assert.Single(await volume.Files.ListStreamsAsync("/sdk015/streams/file.txt", Ct));
+            Assert.Equal("stream", stream.Name);
+            Assert.Equal(streamBytes.Length, stream.Length);
+            await Assert.ThrowsAnyAsync<ArgumentException>(() => volume.Files.WriteAllBytesAsync("/sdk015/a:b/c", fileBytes, Ct));
+            Assert.False(await volume.Directories.ExistsAsync("/sdk015/a", Ct));
+
             byte[] deepRead = await volume.Files.ReadAllBytesAsync(deepPath, Ct);
             AssertEx.BytesEqual(deepContent, deepRead, "a path far beyond host MAX_PATH limits");
             Assert.Equal(deepPath, (await volume.Files.GetInfoAsync(deepPath, Ct)).Path);

@@ -26,7 +26,7 @@ internal static class OpsHelpers
 /// <summary>Thread-safe <see cref="IDfsDiagnostics"/> sink that records every SDK diagnostic event in order.</summary>
 internal sealed class DiagnosticsRecorder : IDfsDiagnostics
 {
-    private readonly Lock _lock = new();
+    private readonly System.Threading.Lock _lock = new();
     private readonly List<DfsDiagnosticEvent> _events = [];
 
     /// <summary>Number of events recorded so far (use as a mark).</summary>

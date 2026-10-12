@@ -176,7 +176,7 @@ internal sealed class HistoryWorkload
     private readonly List<Task> _writers = [];
     private Task _reader = Task.CompletedTask;
     private readonly List<Exception> _unexpected = [];
-    private readonly Lock _lock = new();
+    private readonly System.Threading.Lock _lock = new();
     private readonly Dictionary<string, ulong> _seq = new(StringComparer.Ordinal);
     private volatile bool _stopping;
     private int _okWrites;

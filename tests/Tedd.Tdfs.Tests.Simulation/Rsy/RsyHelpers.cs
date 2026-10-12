@@ -414,7 +414,7 @@ internal static class RsyHelpers
     /// <summary>Makes <paramref name="node"/> the volume leader so the following client calls are served by it.</summary>
     public static async Task ServeFromAsync(TestCluster cluster, TestNode node)
     {
-        TestNode leader = await cluster.TransferLeadershipAsync(Volume, node.Name, TimeSpan.FromSeconds(20), Ct);
+        TestNode leader = await cluster.TransferLeadershipAsync(Volume, node.Name, TimeSpan.FromSeconds(20), ct: Ct);
         Assert.Equal(node.Name, leader.Name);
         Assert.Equal(node.Name, (await cluster.GetLeaderAsync(Volume, Ct)).Name);
     }

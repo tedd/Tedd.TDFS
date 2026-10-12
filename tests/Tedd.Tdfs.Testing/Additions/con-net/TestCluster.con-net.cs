@@ -2,28 +2,48 @@ using Tedd.Tdfs.Server;
 
 namespace Tedd.Tdfs.Testing;
 
-// Harness additions requested by the CON/NET suites (see docs/api-additions/con-net.md).
+// Harness additions requested by the CON/NET suites (see docs/api-additions/con-net.md). TransferLeadershipAsync is also
+// used by the RSY suite (docs/api-additions/rsy.md) and is defined only here.
 public sealed partial class TestCluster
 {
     /// <summary>
-    /// Transfers leadership of a Raft group to a chosen node and waits until that node is the group's leader.
+    /// Transfers leadership of a Raft group to a chosen node through the protocol's own leadership transfer and waits until
+    /// that node leads the group. Returns the target node.
     /// </summary>
     /// <param name="group">"control" or a volume name.</param>
     /// <param name="targetNode">Name of a running voter of the group ("n0".."n9").</param>
+    /// <param name="timeout">
+    /// Bound on the transfer in cluster time (virtual time in <see cref="ClusterMode.Deterministic"/> mode); null = the larger
+    /// of 10 s and 10 maximum election timeouts of the cluster's <see cref="NodeTimings"/>.
+    /// </param>
+    /// <param name="waitUntilServing">
+    /// True (default): additionally wait until every reachable voter reports the target as leader and the target has
+    /// applied its own no-op entry of the new term (so it can serve linearizable reads). False: complete as soon as the
+    /// target reports <c>RaftRole.Leader</c> in a term higher than the one observed before the call, without waiting for the
+    /// new leader to apply earlier committed entries (CON-009 relies on observing a leader whose apply lags its commit
+    /// index).
+    /// </param>
     /// <param name="ct">Cancellation.</param>
     /// <remarks>
-    /// Required behaviour: asks the current leader of <paramref name="group"/> to transfer leadership to
-    /// <paramref name="targetNode"/> through the production path (<c>RaftNode.TransferLeadership</c>, which sends
-    /// <c>TimeoutNow</c> once the target's log is caught up), never by editing persisted state. Completes as soon as the
-    /// target reports <c>RaftRole.Leader</c> for the group in a term higher than the one observed before the call; it does
-    /// not wait for the new leader to apply earlier committed entries (CON-009 relies on observing a leader whose apply
-    /// lags its commit index). Returns immediately when the target already leads. Throws <see cref="ArgumentException"/> when
-    /// the group is unknown or the target is not a voter of it, <see cref="InvalidOperationException"/> when the target is
-    /// not running, and <see cref="TimeoutException"/> (naming the group, the target and the observed leader/term) when
-    /// the transfer does not complete within 10 election timeouts of the cluster's <see cref="NodeTimings"/>. Uses virtual
-    /// time in <see cref="ClusterMode.Deterministic"/> mode. The transfer is recorded in <see cref="Trace"/>.
+    /// <para>Consolidated definition requested by the CON/NET suites (CON-009 <c>apply-delayed-new-leader-by-transfer</c>,
+    /// CON-012, CON-013, CON-015, NET-014 <c>node-moves-to-new-endpoint</c>; they pass
+    /// <paramref name="waitUntilServing"/> = false) and the RSY suite (RSY-004..RSY-011: verify that a returning node serves
+    /// the authoritative state itself; default <paramref name="waitUntilServing"/>). See docs/api-additions/con-net.md and
+    /// docs/api-additions/rsy.md.</para>
+    /// <para>Required behaviour: asks the current leader of <paramref name="group"/> to transfer leadership to
+    /// <paramref name="targetNode"/> through the production path (<c>RaftNode.TransferLeadership</c>: the current leader
+    /// sends <c>TimeoutNow</c> once the target's log is caught up and the target wins an election in a higher term). It never
+    /// forces a role change, edits persisted state or bypasses the vote/log-up-to-date checks. Returns immediately when the
+    /// target already leads the group (and, with <paramref name="waitUntilServing"/>, serves it). The transfer is recorded
+    /// in <see cref="Trace"/>.</para>
     /// </remarks>
-    public Task TransferLeadershipAsync(string group, string targetNode, CancellationToken ct = default) =>
+    /// <exception cref="ArgumentException">The group or the node name is unknown.</exception>
+    /// <exception cref="InvalidOperationException">The target is not running or is not a voter of the group.</exception>
+    /// <exception cref="TimeoutException">
+    /// The transfer did not complete within the timeout; the message names the group, the target and the observed
+    /// leader/term.
+    /// </exception>
+    public Task<TestNode> TransferLeadershipAsync(string group, string targetNode, TimeSpan? timeout = null, bool waitUntilServing = true, CancellationToken ct = default) =>
         throw Stub.NotYet("TestCluster.TransferLeadershipAsync");
 
     /// <summary>

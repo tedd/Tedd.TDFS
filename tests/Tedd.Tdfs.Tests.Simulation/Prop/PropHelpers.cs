@@ -994,7 +994,7 @@ internal sealed class StartingImage
                 string relative = path.Replace('\\', '/').TrimStart('/').Replace('/', Path.DirectorySeparatorChar);
                 string target = Path.Combine(root, node, relative);
                 System.IO.Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-                File.WriteAllBytes(target, bytes);
+                System.IO.File.WriteAllBytes(target, bytes);
             }
         }
 
@@ -1004,6 +1004,6 @@ internal sealed class StartingImage
         sb.AppendLine(CultureInfo.InvariantCulture, $"clusterSeed={ClusterSeed}");
         foreach ((string path, byte[] content) in InitialContents)
             sb.AppendLine(CultureInfo.InvariantCulture, $"initial {path} {PropHelpers.Boundary(content)}");
-        File.WriteAllText(Path.Combine(directory, "starting-image.txt"), sb.ToString());
+        System.IO.File.WriteAllText(Path.Combine(directory, "starting-image.txt"), sb.ToString());
     }
 }

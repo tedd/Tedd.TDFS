@@ -1,5 +1,7 @@
 # API additions requested by the SDK and PATH test suites
 
+> **Integration note (integrate/tests).** `RawProtocolClient.OpenHandleAsync` was merged with the LOCK request: it is defined once in `Additions/lock/RawProtocolClient.lock.cs` and returns `RawOpenHandleResult(Code, HandleId? Handle, WriterGeneration)`; the session keep-alive renewal described below is requested with the new `autoRenew: true` parameter, which PATH-014 passes. See docs/API.md §I for the consolidated list.
+
 Branch `tests/sdk-path`. All additions are harness members (`tests/Tedd.Tdfs.Testing`), added as stubs that throw
 `NotImplementedException` in new partial-class files under `tests/Tedd.Tdfs.Testing/Additions/sdk-path/`. No existing
 harness, SDK or server signature was changed.

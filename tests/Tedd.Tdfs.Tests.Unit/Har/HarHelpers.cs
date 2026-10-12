@@ -1169,7 +1169,7 @@ internal static class IlAudit
             if (string.Equals(type.Namespace, "System.Net.Sockets", StringComparison.Ordinal) || type == typeof(HttpClient)
                 || type == typeof(HttpMessageInvoker) || type == typeof(System.Net.Dns))
                 return UncontrolledDependencyKind.Socket;
-            if (type == typeof(File) || type == typeof(Directory) || type == typeof(FileInfo) || type == typeof(DirectoryInfo)
+            if (type == typeof(System.IO.File) || type == typeof(Directory) || type == typeof(FileInfo) || type == typeof(DirectoryInfo)
                 || type == typeof(RandomAccess) || type == typeof(FileSystemWatcher) || type == typeof(DriveInfo)
                 || (type == typeof(FileStream) && isConstructor)
                 || ((type == typeof(StreamReader) || type == typeof(StreamWriter)) && isConstructor && parameters.Length > 0 && parameters[0].ParameterType == typeof(string))
@@ -1247,7 +1247,7 @@ internal sealed class RogueSimulatedComponent
 
     public TcpClient OpensTcpClient() => new();
 
-    public byte[] ReadsDisk(string path) => File.ReadAllBytes(path);
+    public byte[] ReadsDisk(string path) => System.IO.File.ReadAllBytes(path);
 
     public FileStream OpensFileStream(string path) => new(path, FileMode.Open);
 

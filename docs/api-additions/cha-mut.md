@@ -1,5 +1,7 @@
 # API additions requested by the CHA and MUT suites
 
+> **Integration note (integrate/tests).** `TestCluster.StartRecoveryClusterAsync` is now defined once in `Additions/rst-sec/TestCluster.rst-sec.cs` (docs merged). `TestNode.CompactObjectStoreAsync` was merged into `TestNode.CompactStorageAsync(CancellationToken ct = default)` (`Additions/dsk-gc`; an interrupted pass **faults**, so CHA-009 tolerates the exception only for the node its armed crash took down). `TestSoftwareVersion`, `TestNode.SoftwareVersion` and `TestNode.RestartWithSoftwareAsync` were replaced by `SoftwareVersionProfile` (which gained `Next` and `NextFeature`), `TestNode.SoftwareVersion` and `TestNode.RestartAsSoftwareVersionAsync` (`Additions/fmt-ops-perf`). The original requests are kept below for reference. See docs/API.md §I for the consolidated list.
+
 Harness-only additions (stubs throwing `NotImplementedException` until implemented). No existing signature was changed.
 Files: `tests/Tedd.Tdfs.Testing/Additions/cha-mut/`.
 

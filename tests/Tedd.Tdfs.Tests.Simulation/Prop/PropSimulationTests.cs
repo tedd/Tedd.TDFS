@@ -1704,7 +1704,7 @@ public sealed class PropSimulationTests
             Assert.Contains(directory, failure.ToString(), StringComparison.Ordinal);
 
             Assert.True(Directory.Exists(directory), $"no replay directory {directory}");
-            string summary = File.ReadAllText(Path.Combine(directory, "starting-image.txt"));
+            string summary = System.IO.File.ReadAllText(Path.Combine(directory, "starting-image.txt"));
             Assert.Contains($"workloadSeed={workloadSeed.ToString(CultureInfo.InvariantCulture)}", summary, StringComparison.Ordinal);
             Assert.Contains($"faultSeed={faultSeed.ToString(CultureInfo.InvariantCulture)}", summary, StringComparison.Ordinal);
             Assert.Contains("clusterSeed=", summary, StringComparison.Ordinal);
@@ -1716,14 +1716,14 @@ public sealed class PropSimulationTests
                     $"the starting image of {node} was not saved under {image}");
             }
 
-            Assert.Equal(GenerateFaultSchedule(faultSeed, 3).Select(e => e.ToString()), File.ReadAllLines(Path.Combine(directory, "fault-schedule.txt")));
-            Assert.Equal(GenerateWorkload(workloadSeed, 3, 16).Sum(ops => ops.Count), File.ReadAllLines(Path.Combine(directory, "workload.txt")).Length);
-            Assert.NotEmpty(File.ReadAllLines(Path.Combine(directory, "generated-steps.txt")));
-            Assert.NotEmpty(File.ReadAllLines(Path.Combine(directory, "cluster-trace.txt")));
-            string[] history = File.ReadAllLines(Path.Combine(directory, "history.txt"));
+            Assert.Equal(GenerateFaultSchedule(faultSeed, 3).Select(e => e.ToString()), System.IO.File.ReadAllLines(Path.Combine(directory, "fault-schedule.txt")));
+            Assert.Equal(GenerateWorkload(workloadSeed, 3, 16).Sum(ops => ops.Count), System.IO.File.ReadAllLines(Path.Combine(directory, "workload.txt")).Length);
+            Assert.NotEmpty(System.IO.File.ReadAllLines(Path.Combine(directory, "generated-steps.txt")));
+            Assert.NotEmpty(System.IO.File.ReadAllLines(Path.Combine(directory, "cluster-trace.txt")));
+            string[] history = System.IO.File.ReadAllLines(Path.Combine(directory, "history.txt"));
             Assert.True(history.Length >= CrossProductKeys.Length * 2, $"history.txt holds only {history.Length} operations");
-            Assert.Contains(InjectedCrossProductViolation, File.ReadAllText(Path.Combine(directory, "failure.txt")), StringComparison.Ordinal);
-            Assert.Contains(faultSeed.ToString(CultureInfo.InvariantCulture), File.ReadAllText(Path.Combine(directory, "README.txt")), StringComparison.Ordinal);
+            Assert.Contains(InjectedCrossProductViolation, System.IO.File.ReadAllText(Path.Combine(directory, "failure.txt")), StringComparison.Ordinal);
+            Assert.Contains(faultSeed.ToString(CultureInfo.InvariantCulture), System.IO.File.ReadAllText(Path.Combine(directory, "README.txt")), StringComparison.Ordinal);
         });
     }
 
@@ -1940,13 +1940,13 @@ public sealed class PropSimulationTests
         string directory = CrossProductFailureDirectory(workloadSeed, faultSeed);
         Directory.CreateDirectory(directory);
         start?.Save(directory);
-        File.WriteAllLines(Path.Combine(directory, "fault-schedule.txt"), schedule.Select(e => e.ToString()));
-        File.WriteAllLines(Path.Combine(directory, "workload.txt"), workload.SelectMany((ops, p) => ops.Select((o, i) => $"w{p} #{i} {o}")));
-        File.WriteAllLines(Path.Combine(directory, "generated-steps.txt"), trace.Steps);
+        System.IO.File.WriteAllLines(Path.Combine(directory, "fault-schedule.txt"), schedule.Select(e => e.ToString()));
+        System.IO.File.WriteAllLines(Path.Combine(directory, "workload.txt"), workload.SelectMany((ops, p) => ops.Select((o, i) => $"w{p} #{i} {o}")));
+        System.IO.File.WriteAllLines(Path.Combine(directory, "generated-steps.txt"), trace.Steps);
         try
         {
-            File.WriteAllLines(Path.Combine(directory, "cluster-trace.txt"), cluster.Trace);
-            File.WriteAllLines(Path.Combine(directory, "history.txt"), cluster.History.Operations.Select(o =>
+            System.IO.File.WriteAllLines(Path.Combine(directory, "cluster-trace.txt"), cluster.Trace);
+            System.IO.File.WriteAllLines(Path.Combine(directory, "history.txt"), cluster.History.Operations.Select(o =>
                 $"#{o.Id} {o.Process} {o.Kind} {o.Key} invoke={o.InvokeTime} complete={o.CompleteTime} resolve={o.ResolveTime} {o.Outcome} op={o.OperationId}"));
         }
         catch (NotImplementedException)
@@ -1954,8 +1954,8 @@ public sealed class PropSimulationTests
             // Harness members not implemented yet: the seeds and generator inputs above are still saved.
         }
 
-        File.WriteAllText(Path.Combine(directory, "failure.txt"), failure.ToString());
-        File.WriteAllText(Path.Combine(directory, "README.txt"),
+        System.IO.File.WriteAllText(Path.Combine(directory, "failure.txt"), failure.ToString());
+        System.IO.File.WriteAllText(Path.Combine(directory, "README.txt"),
             $"PROP-007 replay: workload seed {workloadSeed}, fault seed {faultSeed}, cluster seed {(start?.ClusterSeed.ToString(CultureInfo.InvariantCulture) ?? "n/a")}.{Environment.NewLine}" +
             "Re-run PROP_007_FaultAndWorkloadSeedCrossProduct with these seeds; starting-image/ holds every node's durable files captured before the workload.");
         return directory;
@@ -3167,8 +3167,8 @@ public sealed class PropSimulationTests
             // Retain the minimised failure as a named regression schedule.
             Directory.CreateDirectory(RegressionCorpus.Directory);
             string file = Path.Combine(RegressionCorpus.Directory, found.Name + ".schedule");
-            await File.WriteAllTextAsync(file, found.Serialize(), Ct);
-            RegressionSchedule reloaded = RegressionSchedule.Parse(await File.ReadAllTextAsync(file, Ct));
+            await System.IO.File.WriteAllTextAsync(file, found.Serialize(), Ct);
+            RegressionSchedule reloaded = RegressionSchedule.Parse(await System.IO.File.ReadAllTextAsync(file, Ct));
             Assert.Equal(found.Name, reloaded.Name);
             Assert.Equal(found.Violation, reloaded.Violation);
             Assert.Equal(found.Ops, reloaded.Ops);

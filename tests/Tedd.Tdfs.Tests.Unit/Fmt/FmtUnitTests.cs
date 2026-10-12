@@ -345,7 +345,7 @@ public sealed class FmtUnitTests
     /// and retryability; it never degrades into Internal, not-found or cancellation.
     /// </summary>
     [Theory, Catalog("FMT-003", "U", "INV-01", "INV-06", "INV-08", "INV-10", "INV-18")]
-    [InlineData(48)]
+    [InlineData(52)]   // the first code after the highest defined one (Addendum A added 48..51, PoolNotFound..PrincipalNotFound)
     [InlineData(100)]
     [InlineData(1000)]
     [InlineData(int.MaxValue)]

@@ -262,6 +262,12 @@ public sealed class PathUnitTests
         ["ReversedPair"] = "/\uDE00\uD83D",
         ["HighHighLow"] = "/\uD83D\uD83D\uDE00",
         ["LoneSurrogateInDirectory"] = "/ok/\uD83D/ok",
+        // Addendum A (ADS-01): ':' is no longer an ordinary name character. It is the stream separator and may appear only
+        // in the final component ("/a/f:s"); in any other component it is invalid.
+        ["ColonInDirectory"] = "/a:b/c",
+        ["ColonInDeepDirectory"] = "/ok/x:y/z/f",
+        ["DefaultStreamSuffixInDirectory"] = "/a::$DATA/b",
+        ["StreamOnRootThenChild"] = "/:s/f",
     };
 
     private static readonly Dictionary<string, string> WellFormedSurrogateTable = new(StringComparer.Ordinal)
@@ -302,13 +308,23 @@ public sealed class PathUnitTests
         string input = ForbiddenCharacterPathTable[caseName];
         AssertInvalidPath(input);
         int offending = 0;
-        foreach (string component in input.Split('/'))
+        string[] components = input.Split('/');
+        for (int i = 0; i < components.Length; i++)
         {
+            string component = components[i];
             if (component.Contains('\0', StringComparison.Ordinal) || component.Contains('\\', StringComparison.Ordinal) || DfsUnicode.IndexOfUnpairedSurrogate(component) >= 0)
             {
                 offending++;
                 Assert.ThrowsAny<ArgumentException>(() => DfsPath.ValidateComponent(component));
                 Assert.ThrowsAny<ArgumentException>(() => DfsPath.Combine("/ok", component));
+            }
+            else if (i < components.Length - 1 && component.Contains(DfsPath.StreamSeparator, StringComparison.Ordinal))
+            {
+                // A ':' component may only end a path (stream syntax): it is never an entry name and never a parent.
+                offending++;
+                string child = components[i + 1];
+                Assert.ThrowsAny<ArgumentException>(() => DfsPath.ValidateComponent(component));
+                Assert.ThrowsAny<ArgumentException>(() => DfsPath.Normalize("/ok/" + component + "/" + child));
             }
         }
 
@@ -1762,9 +1778,10 @@ public sealed class PathUnitTests
             var volHandles = new List<HandleId>();
             async Task OpenRawAsync(string volume, List<HandleId> into)
             {
-                (DfsErrorCode code, HandleId handle) = await raw.OpenHandleAsync(volume, "/h.bin", FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                Assert.Equal(DfsErrorCode.None, code);
-                into.Add(handle);
+                RawOpenHandleResult opened = await raw.OpenHandleAsync(volume, "/h.bin", FileMode.Open, FileAccess.Read, FileShare.ReadWrite, autoRenew: true);
+                Assert.Equal(DfsErrorCode.None, opened.Code);
+                Assert.True(opened.Handle.HasValue, "a granted open must carry the server-issued handle id");
+                into.Add(opened.Handle.Value);
             }
 
             await OpenRawAsync("other", otherHandles);

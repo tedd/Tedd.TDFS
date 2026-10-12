@@ -1490,19 +1490,19 @@ public sealed class HarUnitTests
     public void HAR_010_OracleIsIndependent_MvccModelRejectsStaleOrMixedVersions()
     {
         Dictionary<string, string?> initial = State(("/x", "0"), ("/y", "0"));
-        TxRecord t1 = Tx("T1", 1, 2, OpOutcome.Ok, [], [("/x", "1"), ("/y", "1")]);
-        TxRecord t2 = Tx("T2", 3, 6, OpOutcome.Ok, [], [("/x", "2"), ("/y", "2")]);
+        TxRecord t1 = HarHelpers.Tx("T1", 1, 2, OpOutcome.Ok, [], [("/x", "1"), ("/y", "1")]);
+        TxRecord t2 = HarHelpers.Tx("T2", 3, 6, OpOutcome.Ok, [], [("/x", "2"), ("/y", "2")]);
 
         // A reader starting after T2 completed must see version 2.
-        SerializabilityChecker.CheckStrict([t1, t2, Tx("R", 7, 8, OpOutcome.Ok, [("/x", "2"), ("/y", "2")], [])], initial).AssertValid();
-        CheckResult stale = SerializabilityChecker.CheckStrict([t1, t2, Tx("R", 7, 8, OpOutcome.Ok, [("/x", "1"), ("/y", "1")], [])], initial);
+        SerializabilityChecker.CheckStrict([t1, t2, HarHelpers.Tx("R", 7, 8, OpOutcome.Ok, [("/x", "2"), ("/y", "2")], [])], initial).AssertValid();
+        CheckResult stale = SerializabilityChecker.CheckStrict([t1, t2, HarHelpers.Tx("R", 7, 8, OpOutcome.Ok, [("/x", "1"), ("/y", "1")], [])], initial);
         Assert.False(stale.IsValid);
         Assert.False(stale.IsInconclusive);
 
         // A reader overlapping T2 may see version 1 or 2 but never a mix of both.
-        SerializabilityChecker.CheckStrict([t1, t2, Tx("R", 4, 5, OpOutcome.Ok, [("/x", "1"), ("/y", "1")], [])], initial).AssertValid();
-        SerializabilityChecker.CheckStrict([t1, t2, Tx("R", 4, 5, OpOutcome.Ok, [("/x", "2"), ("/y", "2")], [])], initial).AssertValid();
-        CheckResult mixed = SerializabilityChecker.CheckStrict([t1, t2, Tx("R", 4, 5, OpOutcome.Ok, [("/x", "2"), ("/y", "1")], [])], initial);
+        SerializabilityChecker.CheckStrict([t1, t2, HarHelpers.Tx("R", 4, 5, OpOutcome.Ok, [("/x", "1"), ("/y", "1")], [])], initial).AssertValid();
+        SerializabilityChecker.CheckStrict([t1, t2, HarHelpers.Tx("R", 4, 5, OpOutcome.Ok, [("/x", "2"), ("/y", "2")], [])], initial).AssertValid();
+        CheckResult mixed = SerializabilityChecker.CheckStrict([t1, t2, HarHelpers.Tx("R", 4, 5, OpOutcome.Ok, [("/x", "2"), ("/y", "1")], [])], initial);
         Assert.False(mixed.IsValid);
         Assert.False(mixed.IsInconclusive);
     }
@@ -1593,10 +1593,10 @@ public sealed class HarUnitTests
             case "lost-update-transaction":
                 // Two read-modify-write increments both commit from the same read (0 -> 1 twice).
                 return (
-                    Ser([Tx("T1", 1, 4, ok, [("/x", "0")], [("/x", "1")]), Tx("T2", 2, 5, ok, [("/x", "0")], [("/x", "1")]),
-                        Tx("R", 6, 7, ok, [("/x", "1")], [])], xy),
-                    Ser([Tx("T1", 1, 4, ok, [("/x", "0")], [("/x", "1")]), Tx("T2", 2, 5, ok, [("/x", "1")], [("/x", "2")]),
-                        Tx("R", 6, 7, ok, [("/x", "2")], [])], xy));
+                    Ser([HarHelpers.Tx("T1", 1, 4, ok, [("/x", "0")], [("/x", "1")]), HarHelpers.Tx("T2", 2, 5, ok, [("/x", "0")], [("/x", "1")]),
+                        HarHelpers.Tx("R", 6, 7, ok, [("/x", "1")], [])], xy),
+                    Ser([HarHelpers.Tx("T1", 1, 4, ok, [("/x", "0")], [("/x", "1")]), HarHelpers.Tx("T2", 2, 5, ok, [("/x", "1")], [("/x", "2")]),
+                        HarHelpers.Tx("R", 6, 7, ok, [("/x", "2")], [])], xy));
             case "lost-update-append":
                 return (
                     Lin([Op(1, "c0", "append", "/log", e1, 1, 2, ok), Op(2, "c1", "append", "/log", e2, 3, 4, ok),
@@ -1615,20 +1615,20 @@ public sealed class HarUnitTests
                         Op(3, "c2", "read", "/f", null, 4, 5, ok, V("v1"))], register));
             case "stale-transaction-read":
                 return (
-                    Ser([Tx("T1", 1, 2, ok, [], [("/x", "1")]), Tx("T2", 3, 4, ok, [("/x", "0")], [])], xy),
-                    Ser([Tx("T1", 1, 3, ok, [], [("/x", "1")]), Tx("T2", 2, 4, ok, [("/x", "0")], [])], xy));
+                    Ser([HarHelpers.Tx("T1", 1, 2, ok, [], [("/x", "1")]), HarHelpers.Tx("T2", 3, 4, ok, [("/x", "0")], [])], xy),
+                    Ser([HarHelpers.Tx("T1", 1, 3, ok, [], [("/x", "1")]), HarHelpers.Tx("T2", 2, 4, ok, [("/x", "0")], [])], xy));
             case "fractured-transaction":
                 return (
-                    Ser([Tx("T1", 1, 2, ok, [], [("/x", "1"), ("/y", "1")]), Tx("T2", 3, 4, ok, [("/x", "1"), ("/y", "0")], [])], xy),
-                    Ser([Tx("T1", 1, 2, ok, [], [("/x", "1"), ("/y", "1")]), Tx("T2", 3, 4, ok, [("/x", "1"), ("/y", "1")], [])], xy));
+                    Ser([HarHelpers.Tx("T1", 1, 2, ok, [], [("/x", "1"), ("/y", "1")]), HarHelpers.Tx("T2", 3, 4, ok, [("/x", "1"), ("/y", "0")], [])], xy),
+                    Ser([HarHelpers.Tx("T1", 1, 2, ok, [], [("/x", "1"), ("/y", "1")]), HarHelpers.Tx("T2", 3, 4, ok, [("/x", "1"), ("/y", "1")], [])], xy));
             case "fractured-concurrent-transaction":
                 return (
-                    Ser([Tx("T1", 1, 4, ok, [], [("/x", "1"), ("/y", "1")]), Tx("T2", 2, 3, ok, [("/x", "1"), ("/y", "0")], [])], xy),
-                    Ser([Tx("T1", 1, 4, ok, [], [("/x", "1"), ("/y", "1")]), Tx("T2", 2, 3, ok, [("/x", "0"), ("/y", "0")], [])], xy));
+                    Ser([HarHelpers.Tx("T1", 1, 4, ok, [], [("/x", "1"), ("/y", "1")]), HarHelpers.Tx("T2", 2, 3, ok, [("/x", "1"), ("/y", "0")], [])], xy),
+                    Ser([HarHelpers.Tx("T1", 1, 4, ok, [], [("/x", "1"), ("/y", "1")]), HarHelpers.Tx("T2", 2, 3, ok, [("/x", "0"), ("/y", "0")], [])], xy));
             case "fractured-predicate-read":
                 return (
-                    Ser([Tx("T1", 1, 2, ok, [], [("/d/a", "1"), ("/d/b", "1")]), Tx("T2", 3, 4, ok, [], [], ("/d", ["a"]))], State()),
-                    Ser([Tx("T1", 1, 2, ok, [], [("/d/a", "1"), ("/d/b", "1")]), Tx("T2", 3, 4, ok, [], [], ("/d", ["a", "b"]))], State()));
+                    Ser([HarHelpers.Tx("T1", 1, 2, ok, [], [("/d/a", "1"), ("/d/b", "1")]), HarHelpers.Tx("T2", 3, 4, ok, [], [], ("/d", ["a"]))], State()),
+                    Ser([HarHelpers.Tx("T1", 1, 2, ok, [], [("/d/a", "1"), ("/d/b", "1")]), HarHelpers.Tx("T2", 3, 4, ok, [], [], ("/d", ["a", "b"]))], State()));
             case "duplicate-append":
                 return (
                     Lin([Op(1, "c0", "append", "/log", e1, 1, 2, ok), Op(2, "c1", "read", "/log", null, 3, 4, ok, e1.Concat(e1).ToArray())], log),
@@ -1642,15 +1642,15 @@ public sealed class HarUnitTests
                         Op(3, "c2", "read", "/log", null, 4, 5, ok, e1.Concat(e2).ToArray())], log));
             case "write-skew":
                 return (
-                    Ser([Tx("T1", 1, 4, ok, [("/a", "1"), ("/b", "1")], [("/a", "0")]), Tx("T2", 2, 5, ok, [("/a", "1"), ("/b", "1")], [("/b", "0")])], ab),
-                    Ser([Tx("T1", 1, 4, ok, [("/a", "1"), ("/b", "1")], [("/a", "0")]),
-                        Tx("T2", 2, 5, OpOutcome.Failed, [("/a", "1"), ("/b", "1")], [("/b", "0")])], ab));
+                    Ser([HarHelpers.Tx("T1", 1, 4, ok, [("/a", "1"), ("/b", "1")], [("/a", "0")]), HarHelpers.Tx("T2", 2, 5, ok, [("/a", "1"), ("/b", "1")], [("/b", "0")])], ab),
+                    Ser([HarHelpers.Tx("T1", 1, 4, ok, [("/a", "1"), ("/b", "1")], [("/a", "0")]),
+                        HarHelpers.Tx("T2", 2, 5, OpOutcome.Failed, [("/a", "1"), ("/b", "1")], [("/b", "0")])], ab));
             case "predicate-write-skew":
                 return (
-                    Ser([Tx("T1", 1, 4, ok, [], [("/oncall/alice", null)], ("/oncall", ["alice", "bob"])),
-                        Tx("T2", 2, 5, ok, [], [("/oncall/bob", null)], ("/oncall", ["alice", "bob"]))], oncall),
-                    Ser([Tx("T1", 1, 4, ok, [], [("/oncall/alice", null)], ("/oncall", ["alice", "bob"])),
-                        Tx("T2", 6, 7, ok, [], [("/oncall/bob", null)], ("/oncall", ["bob"]))], oncall));
+                    Ser([HarHelpers.Tx("T1", 1, 4, ok, [], [("/oncall/alice", null)], ("/oncall", ["alice", "bob"])),
+                        HarHelpers.Tx("T2", 2, 5, ok, [], [("/oncall/bob", null)], ("/oncall", ["alice", "bob"]))], oncall),
+                    Ser([HarHelpers.Tx("T1", 1, 4, ok, [], [("/oncall/alice", null)], ("/oncall", ["alice", "bob"])),
+                        HarHelpers.Tx("T2", 6, 7, ok, [], [("/oncall/bob", null)], ("/oncall", ["bob"]))], oncall));
             default:
                 throw new ArgumentOutOfRangeException(nameof(anomaly), anomaly, null);
         }
@@ -1734,10 +1734,10 @@ public sealed class HarUnitTests
             case "transactions-serialize-against-invocation-order":
                 return
                 [
-                    SerializabilityChecker.CheckStrict([Tx("T1", 1, 4, ok, [], [("/x", "1")]), Tx("T2", 2, 3, ok, [("/x", "0")], [("/y", "1")]),
-                        Tx("R", 5, 6, ok, [("/x", "1"), ("/y", "1")], [])], xy),
-                    SerializabilityChecker.CheckStrict([Tx("T1", 1, 4, ok, [], [("/x", "1")]), Tx("T2", 2, 3, ok, [("/x", "1")], [("/y", "1")]),
-                        Tx("R", 5, 6, ok, [("/x", "1"), ("/y", "1")], [])], xy),
+                    SerializabilityChecker.CheckStrict([HarHelpers.Tx("T1", 1, 4, ok, [], [("/x", "1")]), HarHelpers.Tx("T2", 2, 3, ok, [("/x", "0")], [("/y", "1")]),
+                        HarHelpers.Tx("R", 5, 6, ok, [("/x", "1"), ("/y", "1")], [])], xy),
+                    SerializabilityChecker.CheckStrict([HarHelpers.Tx("T1", 1, 4, ok, [], [("/x", "1")]), HarHelpers.Tx("T2", 2, 3, ok, [("/x", "1")], [("/y", "1")]),
+                        HarHelpers.Tx("R", 5, 6, ok, [("/x", "1"), ("/y", "1")], [])], xy),
                 ];
             case "unknown-write-may-or-may-not-apply":
                 return
@@ -1748,10 +1748,10 @@ public sealed class HarUnitTests
             case "overlapping-transactions-either-order":
                 return
                 [
-                    SerializabilityChecker.CheckStrict([Tx("T1", 1, 4, ok, [], [("/x", "1")]), Tx("T2", 2, 5, ok, [], [("/x", "2")]),
-                        Tx("R", 6, 7, ok, [("/x", "1")], [])], xy),
-                    SerializabilityChecker.CheckStrict([Tx("T1", 1, 4, ok, [], [("/x", "1")]), Tx("T2", 2, 5, ok, [], [("/x", "2")]),
-                        Tx("R", 6, 7, ok, [("/x", "2")], [])], xy),
+                    SerializabilityChecker.CheckStrict([HarHelpers.Tx("T1", 1, 4, ok, [], [("/x", "1")]), HarHelpers.Tx("T2", 2, 5, ok, [], [("/x", "2")]),
+                        HarHelpers.Tx("R", 6, 7, ok, [("/x", "1")], [])], xy),
+                    SerializabilityChecker.CheckStrict([HarHelpers.Tx("T1", 1, 4, ok, [], [("/x", "1")]), HarHelpers.Tx("T2", 2, 5, ok, [], [("/x", "2")]),
+                        HarHelpers.Tx("R", 6, 7, ok, [("/x", "2")], [])], xy),
                 ];
             default:
                 throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null);
@@ -2106,8 +2106,8 @@ public sealed class HarUnitTests
         string file = Path.Combine(directory, "minimal-trace.txt");
         try
         {
-            await File.WriteAllLinesAsync(file, result.Minimal, Ct);
-            string[] reloaded = await File.ReadAllLinesAsync(file, Ct);
+            await System.IO.File.WriteAllLinesAsync(file, result.Minimal, Ct);
+            string[] reloaded = await System.IO.File.ReadAllLinesAsync(file, Ct);
             Assert.Equal(result.Minimal, reloaded);
             Assert.Equal("INV-06", await RunDedupScheduleAsync(reloaded, seed, dedupDisabled: true));
             Assert.Equal("INV-06", await RunDedupScheduleAsync(reloaded, seed, dedupDisabled: true)); // deterministic replay
@@ -2423,8 +2423,8 @@ public sealed class HarUnitTests
         Assert.False(refuted.IsInconclusive);
 
         List<TxRecord> transactions = Enumerable.Range(0, 8)
-            .Select(i => Tx("T" + i, 1 + i, 20 + i, OpOutcome.Ok, [], [("/x", "v" + i)])).ToList();
-        transactions.Add(Tx("R", 40, 41, OpOutcome.Ok, [("/x", "v3")], []));
+            .Select(i => HarHelpers.Tx("T" + i, 1 + i, 20 + i, OpOutcome.Ok, [], [("/x", "v" + i)])).ToList();
+        transactions.Add(HarHelpers.Tx("R", 40, 41, OpOutcome.Ok, [("/x", "v3")], []));
         CheckResult cutTx = SerializabilityChecker.CheckStrict(transactions, State(("/x", null)), maxStates: 5);
         Assert.True(cutTx.IsInconclusive);
         Assert.False(cutTx.IsValid);

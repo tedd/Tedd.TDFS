@@ -1483,7 +1483,7 @@ public sealed class NetSimulationTests
                 await moving.RestartAsync(options => options with { ListenEndpoint = oldEndpoint + "-moved" });
                 Assert.NotEqual(oldEndpoint, moving.Endpoint);
                 await cluster.WaitForStableAsync(ElectionBound, Ct);
-                await cluster.TransferLeadershipAsync(Vol, moving.Name, Ct);
+                await cluster.TransferLeadershipAsync(Vol, moving.Name, waitUntilServing: false, ct: Ct);
                 byte[] after = TestData.Bytes(0xE003, 5000);
                 long start = cluster.Time.GetTimestamp();
                 await volume.Files.WriteAllBytesAsync("/e", after, Ct);
@@ -2009,7 +2009,8 @@ public sealed class NetSimulationTests
         Assert.Equal(1 + report.Excluded + report.Failed, report.Notes.Count);
         Assert.True(report.Applicable > 0, $"{operation} has a driver but no applicable case");
         Assert.True(report.Reached == report.Applicable,
-            $"unreached fault points (never counted as exercised): {string.Join(", ", results.Where(r => !r.Reached).Select(r => r.Case.Id))}");
+            $"unreached fault points (never counted as exercised): {string.Join(", ", results.Where(r => !r.Reached).Select(r => r.Case.Id))}" +
+            string.Concat(results.Where(r => !r.Reached && r.Failure is not null).Select(r => $"{Environment.NewLine}  {r.Case.Id} failed before reaching its fault point: {r.Failure}")));
         Assert.Equal(report.Applicable, report.Completed);
         Assert.True(report.Failed == 0, string.Join(Environment.NewLine, notes.Where(n => n.StartsWith("FAILED", StringComparison.Ordinal))));
         Assert.True(report.IsComplete);

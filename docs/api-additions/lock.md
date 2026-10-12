@@ -1,5 +1,7 @@
 # API additions — LOCK suite
 
+> **Integration note (integrate/tests).** `RawProtocolClient.OpenHandleAsync` also serves PATH-014 (SDK/PATH request merged here) and gained `bool autoRenew = false`; with the default the renewal rule below is unchanged. See docs/API.md §I for the consolidated list.
+
 Harness members added (as stubs throwing `NotImplementedException`) for the LOCK tests
 (`tests/Tedd.Tdfs.Tests.Unit/Lock`, `tests/Tedd.Tdfs.Tests.Simulation/Lock`). No existing signature was changed.
 Source: `tests/Tedd.Tdfs.Testing/Additions/lock/`.

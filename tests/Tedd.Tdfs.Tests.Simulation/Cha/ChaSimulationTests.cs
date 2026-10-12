@@ -1604,8 +1604,19 @@ public sealed class ChaSimulationTests
                 await cluster.WaitForRepairAsync(Vol, TimeSpan.FromSeconds(30), ct);
                 await WaitUntilReclaimedAsync(cluster, garbage, TimeSpan.FromSeconds(60), "GC deleted the unreferenced /g versions, leaving dead space to compact");
                 crash = cluster.Faults.Arm(new FaultMatch(crashSite), FaultAction.CrashNode(crashMode));
-                foreach (TestNode node in Running(cluster))
-                    await node.CompactObjectStoreAsync(ct);
+                foreach (TestNode node in Running(cluster).ToArray())
+                {
+                    try
+                    {
+                        await node.CompactStorageAsync(ct);
+                    }
+                    catch (Exception ex) when (node.State != TestNodeState.Running && ex is not Xunit.Sdk.XunitException)
+                    {
+                        // The armed crash hit this node mid-pass: an interrupted pass faults instead of reporting completion
+                        // (TestNode.CompactStorageAsync). The crash itself is asserted below.
+                        Log($"compaction on {node.Name} interrupted by the armed crash: {ex.GetType().Name}");
+                    }
+                }
             }
 
             Assert.NotNull(crash);
@@ -1643,7 +1654,7 @@ public sealed class ChaSimulationTests
 
             cluster.Faults.DisarmAll();
             foreach (TestNode node in Running(cluster))
-                await node.CompactObjectStoreAsync(ct);
+                await node.CompactStorageAsync(ct);
             await cluster.DelayAsync(TimeSpan.FromSeconds(3), ct);
             await cluster.WaitForRepairAsync(Vol, TimeSpan.FromSeconds(60), ct);
             await AssertPinnedHistoryIntactAsync("after further GC and compaction rounds", minimumCopies: 3);
@@ -1802,39 +1813,39 @@ public sealed class ChaSimulationTests
             TestNode upgraded = upgradeLeaderFirst ? leader : followers[1];
             ulong oldIncarnation = oldBuild.Incarnation;
             await oldBuild.StopAsync();
-            await upgraded.RestartWithSoftwareAsync(TestSoftwareVersion.Next);
-            Assert.Equal(TestSoftwareVersion.Next.Name, upgraded.SoftwareVersion.Name);
+            await upgraded.RestartAsSoftwareVersionAsync(SoftwareVersionProfile.Next);
+            Assert.Equal(SoftwareVersionProfile.Next.Name, upgraded.SoftwareVersion.Name);
             await cluster.WaitForStableAsync(TimeSpan.FromSeconds(60), ct);
 
             // Unsupported/InvalidArgument may surface as NotSupportedException/ArgumentException (API.md A.2), hence DfsErrors.ToCode.
-            Exception refused = await Assert.ThrowsAnyAsync<Exception>(() => cluster.Admin.SetFeatureAsync(TestSoftwareVersion.NextFeature, true, ct));
+            Exception refused = await Assert.ThrowsAnyAsync<Exception>(() => cluster.Admin.SetFeatureAsync(SoftwareVersionProfile.NextFeature, true, ct));
             DfsErrorCode refusedCode = DfsErrors.ToCode(refused);
             Assert.True(refusedCode is DfsErrorCode.Unsupported or DfsErrorCode.InvalidArgument,
                 $"activation before every member supports the feature must be rejected explicitly, got {refusedCode}: {refused}");
-            Assert.DoesNotContain(TestSoftwareVersion.NextFeature, (await cluster.Admin.GetClusterStatusAsync(ct)).ActiveFeatures);
+            Assert.DoesNotContain(SoftwareVersionProfile.NextFeature, (await cluster.Admin.GetClusterStatusAsync(ct)).ActiveFeatures);
 
             TestNode failing = await cluster.GetLeaderAsync(Vol, ct);
-            TestSoftwareVersion failingVersion = failing.SoftwareVersion;
+            SoftwareVersionProfile failingVersion = failing.SoftwareVersion;
             await failing.CrashAsync();
             TestNode successor = await cluster.GetLeaderAsync(Vol, ct);
             Assert.NotEqual(failing.Name, successor.Name);
 
             await oldBuild.RestartAsync();
             Assert.True(oldBuild.Incarnation > oldIncarnation, "a returning member re-establishes a new incarnation before being trusted");
-            Assert.Equal(TestSoftwareVersion.Current.Name, oldBuild.SoftwareVersion.Name);
-            await failing.RestartWithSoftwareAsync(failingVersion);
+            Assert.Equal(SoftwareVersionProfile.Current.Name, oldBuild.SoftwareVersion.Name);
+            await failing.RestartAsSoftwareVersionAsync(failingVersion);
             await cluster.WaitForReplicationAsync(Vol, ct);
             await cluster.Inspect.AssertReplicasConvergedAsync(Vol);
-            Assert.DoesNotContain(TestSoftwareVersion.NextFeature, (await cluster.Admin.GetClusterStatusAsync(ct)).ActiveFeatures);
+            Assert.DoesNotContain(SoftwareVersionProfile.NextFeature, (await cluster.Admin.GetClusterStatusAsync(ct)).ActiveFeatures);
 
-            foreach (TestNode node in cluster.Nodes.Where(n => n.SoftwareVersion.Name != TestSoftwareVersion.Next.Name).ToArray())
+            foreach (TestNode node in cluster.Nodes.Where(n => n.SoftwareVersion.Name != SoftwareVersionProfile.Next.Name).ToArray())
             {
-                await node.RestartWithSoftwareAsync(TestSoftwareVersion.Next);
+                await node.RestartAsSoftwareVersionAsync(SoftwareVersionProfile.Next);
                 await cluster.WaitForStableAsync(TimeSpan.FromSeconds(60), ct);
             }
 
-            await cluster.Admin.SetFeatureAsync(TestSoftwareVersion.NextFeature, true, ct);
-            Assert.Contains(TestSoftwareVersion.NextFeature, (await cluster.Admin.GetClusterStatusAsync(ct)).ActiveFeatures);
+            await cluster.Admin.SetFeatureAsync(SoftwareVersionProfile.NextFeature, true, ct);
+            Assert.Contains(SoftwareVersionProfile.NextFeature, (await cluster.Admin.GetClusterStatusAsync(ct)).ActiveFeatures);
 
             TestNode currentLeader = await cluster.GetLeaderAsync(Vol, ct);
             TestNode downgraded = cluster.Nodes.First(n => n.Name != currentLeader.Name);
@@ -1842,7 +1853,7 @@ public sealed class ChaSimulationTests
             bool refusedStart = false;
             try
             {
-                await downgraded.RestartWithSoftwareAsync(TestSoftwareVersion.Current);
+                await downgraded.RestartAsSoftwareVersionAsync(SoftwareVersionProfile.Current);
             }
             catch (DfsException ex)
             {
@@ -1864,7 +1875,7 @@ public sealed class ChaSimulationTests
                 }
             }
 
-            Assert.Contains(TestSoftwareVersion.NextFeature, (await cluster.Admin.GetClusterStatusAsync(ct)).ActiveFeatures);
+            Assert.Contains(SoftwareVersionProfile.NextFeature, (await cluster.Admin.GetClusterStatusAsync(ct)).ActiveFeatures);
             await stopLoad.CancelAsync();
             int completed = await load;
             Assert.True(completed >= 10, $"the register load completed only {completed} operations");
@@ -1874,7 +1885,7 @@ public sealed class ChaSimulationTests
 
             if (downgraded.State is TestNodeState.Running or TestNodeState.Paused)
                 await downgraded.StopAsync();   // a refused (crashed/stopped) start needs no stop before the restart
-            await downgraded.RestartWithSoftwareAsync(TestSoftwareVersion.Next);
+            await downgraded.RestartAsSoftwareVersionAsync(SoftwareVersionProfile.Next);
             await cluster.WaitForStableAsync(TimeSpan.FromSeconds(60), ct);
         }, ct);
     }

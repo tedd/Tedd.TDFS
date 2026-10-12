@@ -4,7 +4,9 @@ namespace Tedd.Tdfs.Testing;
 /// A software release that the harness can run a live node (<see cref="TestNode.RestartAsSoftwareVersionAsync"/>) or a
 /// backup node (<see cref="TestBackupNode.RestartAsSoftwareVersionAsync"/>) as. Used by the FMT suite to exercise disk
 /// images written by every supported release, rolling upgrades, downgrade refusal and feature activation
-/// (FMT-005..FMT-010; docs/api-additions/fmt-ops-perf.md).
+/// (FMT-005..FMT-010; docs/api-additions/fmt-ops-perf.md) and by the CHA suite for a rolling upgrade to the
+/// <see cref="Next"/> build during failover (CHA-011; docs/api-additions/cha-mut.md — this type replaces the
+/// <c>TestSoftwareVersion</c> that suite originally requested).
 /// </summary>
 /// <remarks>
 /// <para>
@@ -21,8 +23,13 @@ namespace Tedd.Tdfs.Testing;
 /// <see cref="DfsException"/> whose <see cref="DfsException.ErrorCode"/> is <see cref="DfsErrorCode.Unsupported"/>,
 /// before anything is written to the medium (the durable image is byte-for-byte unchanged).
 /// </para>
+/// <para>
+/// Identity: every built-in profile property returns one cached instance, and <see cref="TestNode.SoftwareVersion"/>
+/// returns the instance the node was (re)started with. Record equality compares the feature sets by reference, so tests
+/// compare <see cref="Name"/> where value semantics matter.
+/// </para>
 /// </remarks>
-/// <param name="Name">Release name: "Current", "Previous" or "BelowSupportedWindow" for the built-in profiles.</param>
+/// <param name="Name">Release name: "Current", "Previous", "BelowSupportedWindow" or "Next" for the built-in profiles.</param>
 /// <param name="ProtocolVersionMin">Lowest protocol version this release negotiates.</param>
 /// <param name="ProtocolVersionMax">Highest protocol version this release negotiates.</param>
 /// <param name="DiskFormatVersion">Disk-format version this release writes for new superblocks/journals/checkpoints/segments.</param>
@@ -85,16 +92,38 @@ public sealed record SoftwareVersionProfile(
     /// </summary>
     public static SoftwareVersionProfile BelowSupportedWindow => throw Stub.NotYet("SoftwareVersionProfile.BelowSupportedWindow");
 
+    /// <summary>
+    /// Test-only irreversible feature flag understood only by <see cref="Next"/> (CHA-011). Activating it
+    /// (<c>DfsAdminClient.SetFeatureAsync</c>) changes the replicated/on-disk format so that <see cref="Current"/> builds can
+    /// no longer interpret new state (it records a minimum-reader marker above <see cref="Current"/>'s
+    /// <see cref="MaxReadableDiskFormatVersion"/>); activation must therefore be refused (<see cref="DfsErrorCode.Unsupported"/>
+    /// or <see cref="DfsErrorCode.InvalidArgument"/>) until every member (voters, learners and data nodes) runs a build that
+    /// supports it, and it can never be deactivated.
+    /// </summary>
+    public const string NextFeature = "test.next-format";
+
+    /// <summary>
+    /// The next (newer) build, always emulated (<see cref="IsEmulated"/> = true): <see cref="ProtocolVersionMin"/> equal to
+    /// <see cref="Current"/>'s (backward-compatible window), <see cref="ProtocolVersionMax"/> one higher, the same
+    /// <see cref="DiskFormatVersion"/> as <see cref="Current"/> until <see cref="NextFeature"/> is activated,
+    /// <see cref="MaxReadableDiskFormatVersion"/> high enough to read the marker <see cref="NextFeature"/> records, and
+    /// <see cref="Current"/>'s features (and irreversible features) plus <see cref="NextFeature"/>. Mixed clusters of
+    /// <see cref="Current"/> and <see cref="Next"/> negotiate <see cref="Current"/>'s protocol until every member runs
+    /// <see cref="Next"/>. Not a member of <see cref="SupportedWindow"/> (it is newer than the build under test).
+    /// </summary>
+    public static SoftwareVersionProfile Next => throw Stub.NotYet("SoftwareVersionProfile.Next");
+
     /// <summary>Every supported release, oldest first; the last entry is <see cref="Current"/> and the first is <see cref="Previous"/>.</summary>
     public static IReadOnlyList<SoftwareVersionProfile> SupportedWindow => throw Stub.NotYet("SoftwareVersionProfile.SupportedWindow");
 
-    /// <summary>Resolves a built-in profile by name ("Current", "Previous" or "BelowSupportedWindow"), so theory data can stay serialisable.</summary>
+    /// <summary>Resolves a built-in profile by name ("Current", "Previous", "BelowSupportedWindow" or "Next"), so theory data can stay serialisable.</summary>
     /// <exception cref="ArgumentException">Unknown name.</exception>
     public static SoftwareVersionProfile Get(string name) => name switch
     {
         "Current" => Current,
         "Previous" => Previous,
         "BelowSupportedWindow" => BelowSupportedWindow,
+        "Next" => Next,
         _ => throw new ArgumentException($"Unknown software version profile '{name}'.", nameof(name)),
     };
 

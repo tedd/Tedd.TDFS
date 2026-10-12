@@ -1,23 +1,9 @@
 namespace Tedd.Tdfs.Testing;
 
-// Additions requested by the SDK/PATH test suites (docs/api-additions/sdk-path.md).
+// Additions requested by the SDK/PATH test suites (docs/api-additions/sdk-path.md). OpenHandleAsync, which PATH-014 also
+// uses, is defined once in Additions/lock/RawProtocolClient.lock.cs (it returns RawOpenHandleResult).
 public sealed partial class RawProtocolClient
 {
-    /// <summary>
-    /// Opens a file handle in <paramref name="volume"/> through this raw connection (its own authenticated session in
-    /// that volume), sending the path verbatim like <see cref="SendPathOperationAsync"/>. Returns the server's error
-    /// code (<see cref="DfsErrorCode.None"/> on success) and the server-issued handle id exactly as it appears on the
-    /// wire (<c>default</c> on failure). The handle is renewed by the raw client's session keep-alive until
-    /// <see cref="SendHandleOperationAsync"/> closes it or the connection is disposed.
-    /// </summary>
-    /// <remarks>
-    /// One raw client may hold handles in several volumes (one session per volume, same principal); the request is
-    /// routed to <paramref name="volume"/>'s current leader whichever node the client connected to. Used by PATH-014 to
-    /// obtain genuine handle ids of two volumes from one client and present each to the other volume.
-    /// </remarks>
-    public Task<(DfsErrorCode Code, HandleId Handle)> OpenHandleAsync(string volume, string rawPath, FileMode mode, FileAccess access, FileShare share) =>
-        throw Stub.NotYet("RawProtocolClient.OpenHandleAsync");
-
     /// <summary>
     /// Sends one handle-addressed request for <paramref name="handle"/> to the leader of <paramref name="volume"/>,
     /// bypassing every SDK check, and returns the reply's error code (<see cref="DfsErrorCode.None"/> on success).

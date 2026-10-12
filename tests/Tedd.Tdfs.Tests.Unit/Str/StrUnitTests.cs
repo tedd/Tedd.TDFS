@@ -62,6 +62,14 @@ public sealed class StrUnitTests
         return Task.CompletedTask;
     }
 
+    // Overload for synchronous reads whose byte count the caller does not need (argument-validation and overlap probes):
+    // the count is returned to this helper, so the read is not an "inexact read" (CA2022) in the test's own logic.
+    private static Task Sync<T>(Func<T> function)
+    {
+        _ = function();
+        return Task.CompletedTask;
+    }
+
     private static async Task<int> AsInt(Task task)
     {
         await task;

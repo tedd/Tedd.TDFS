@@ -67,7 +67,7 @@ public sealed class SimNetworkTests
             Assert.Equal(RpcAddress.Parse("mem://n1"), connection.Remote);
             TimeSpan start = s.Now;
             ReadOnlyMemory<byte> reply = await connection.CallAsync(Bytes("hello"), Second);
-            return (Str(reply), s.Now - start);
+            return (SimText.Str(reply), s.Now - start);
         });
 
         Assert.Equal("re:hello", result.Reply);
@@ -191,7 +191,7 @@ public sealed class SimNetworkTests
         {
             await ListenAsync(net, "n1", handler);
             IRpcConnection connection = await net.Create("c", "").ConnectAsync("mem://n1");
-            string text = Str(await connection.CallAsync(Bytes("twice"), Second));
+            string text = SimText.Str(await connection.CallAsync(Bytes("twice"), Second));
             await s.DelayAsync(Second);
             return text;
         });
@@ -207,13 +207,13 @@ public sealed class SimNetworkTests
     {
         var policy = new DelegateLinkPolicy
         {
-            OnDecide = (_, _, _, payload) => Str(payload) == "slow" ? LinkDecision.Delayed(10 * Ms) : LinkDecision.Deliver,
+            OnDecide = (_, _, _, payload) => SimText.Str(payload) == "slow" ? LinkDecision.Delayed(10 * Ms) : LinkDecision.Deliver,
         };
         (SimScheduler s, SimNetwork net) = Create(policy: policy, options: new SimNetworkOptions { MinLatency = Ms, MaxLatency = Ms });
         var arrivals = new List<(string, TimeSpan)>();
         var handler = new DelegateHandler((_, request, _, _) =>
         {
-            arrivals.Add((Str(request), s.Now));
+            arrivals.Add((SimText.Str(request), s.Now));
             return new ValueTask<ReadOnlyMemory<byte>?>((ReadOnlyMemory<byte>?)null);
         });
         await s.RunAsync(async () =>
@@ -379,7 +379,7 @@ public sealed class SimNetworkTests
             Assert.Equal("n1#2", restarted.Process.Id);
             await ListenAsync(net, "n1", DelegateHandler.Echo());
             IRpcConnection again = await net.Create("c", "").ConnectAsync("mem://n1");
-            Assert.Equal("re:hi", Str(await again.CallAsync(Bytes("hi"), Second)));
+            Assert.Equal("re:hi", SimText.Str(await again.CallAsync(Bytes("hi"), Second)));
         });
     }
 
@@ -507,7 +507,7 @@ public sealed class SimNetworkTests
             IRpcTransport client = await ListenAsync(net, "n2", DelegateHandler.Echo());
             IRpcConnection connection = await client.ConnectAsync("mem://n1");
             await connection.CallAsync(Bytes("hello"), Second);
-            return Str(await serverSide!.CallAsync(Bytes("callback"), Second));
+            return SimText.Str(await serverSide!.CallAsync(Bytes("callback"), Second));
         });
         Assert.Equal("re:callback", reply);
     }
@@ -588,7 +588,7 @@ public sealed class SimNetworkTests
 
         Assert.Equal(
             [(LinkDirection.Request, "c", "n1", "q", LinkDecisionKind.Deliver), (LinkDirection.Reply, "n1", "c", "re:q", LinkDecisionKind.Deliver), (LinkDirection.OneWay, "c", "n1", "gone", LinkDecisionKind.BlackHole)],
-            events.Select(e => (e.Direction, e.From, e.To, Str(e.Payload), e.Decision.Kind)));
+            events.Select(e => (e.Direction, e.From, e.To, SimText.Str(e.Payload), e.Decision.Kind)));
         Assert.Equal(1, net.MessagesDropped);
         Assert.Same(policy, net.Policy);
         net.Policy = null!;
