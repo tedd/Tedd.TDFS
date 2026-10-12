@@ -201,10 +201,14 @@ public sealed class SnpUnitTests
 
                 Exception? error = await CaptureAsync(() => act(stream, ct));
                 Assert.NotNull(error);
-                Assert.True(error is NotSupportedException or DfsReadOnlyException or InvalidOperationException,
+                // Write/SetLength/CopyTo on a non-writable Stream are NotSupportedException by the Stream contract (or the
+                // typed read-only error); only the commit extension may instead report a usage error on a read handle.
+                bool isCommit = mutation.StartsWith("Stream.Commit", StringComparison.Ordinal);
+                Assert.True(error is NotSupportedException or DfsReadOnlyException || (isCommit && error is InvalidOperationException),
                     $"'{mutation}' on a snapshot stream must be rejected as unsupported/read-only, got {error}");
                 if (error is DfsException dfs)
                     Assert.Equal(DfsErrorCode.ReadOnly, dfs.ErrorCode);
+                Assert.False(stream.IsFaulted, $"a rejected '{mutation}' must not fault the read-only snapshot stream");
 
                 // The stream still serves the exact snapshot revision from offset zero (no partial staged state).
                 stream.Position = 0;

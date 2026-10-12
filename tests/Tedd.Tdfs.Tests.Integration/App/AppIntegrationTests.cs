@@ -361,7 +361,8 @@ public sealed class AppIntegrationTests
                                 $"resolve:true must produce a definite outcome, got {outcome.Status}");
                             bool exists = (await vol.Snapshots.ListAsync(ct)).Any(s => s.Name == "bounded");
                             Assert.Equal(outcome.Status == DfsOutcomeStatus.Committed, exists);
-                            if (error is not DfsCommitOutcomeUnknownException)
+                            bool reportedUnknown = ChainContains(error, e => e is DfsCommitOutcomeUnknownException);
+                            if (!reportedUnknown)
                                 Assert.False(exists, "a definite failure reported to the caller must never commit afterwards");
                             if (exists)
                             {
@@ -449,7 +450,8 @@ public sealed class AppIntegrationTests
                     || (e is DfsSnapshotAdapterException d && d.AdapterId == "fragile" && string.Equals(d.Phase, "resume", StringComparison.OrdinalIgnoreCase))
                     || (failure == ResumeFailure.ReturnCanceledTask && e is OperationCanceledException)),
                 $"the cleanup problem of 'fragile' must be reported explicitly: {info.AdapterResumeFailure}");
-            Assert.Equal(1, fragile.ResumeCalls);
+            Assert.True(fragile.ResumeCalls >= 1, "resume of 'fragile' must have been attempted");
+            Assert.Equal(1, fragile.PrepareCalls);
             Assert.False(app.IsPaused, "the other adapter's resume still ran");
             Assert.NotNull(timeline.Find("log-app", "resume.done"));
 

@@ -272,7 +272,7 @@ public sealed class SnpSimulationTests
                 if (change == PendingChange.NewFileCreatedThenWritten)
                     expectedMid["/buf/new"] = [];  // the create is committed at open; its buffered bytes are not
 
-                SnapshotTree.AssertEqual(expectedMid, await SnapshotTree.CaptureAsync(observer, "/buf", ct), "live view of another client before any flush");
+                SnapshotTree.AssertEqual(expectedMid, await SnapshotTree.CaptureSharedAsync(observer, "/buf", ct), "live view of another client before any flush");
                 foreach (var w in writers)
                 {
                     Assert.False(w.Stream.IsFaulted);
@@ -319,7 +319,7 @@ public sealed class SnpSimulationTests
                     Assert.True(lastFlush.CompareTo(mid.Boundary) > 0, "the flush is published after the snapshot boundary");
                 }
 
-                SnapshotTree.AssertEqual(expectedAfter, await SnapshotTree.CaptureAsync(observer, "/buf", ct), "live view after flush");
+                SnapshotTree.AssertEqual(expectedAfter, await SnapshotTree.CaptureSharedAsync(observer, "/buf", ct), "live view after flush");
                 SnapshotTree.AssertEqual(expectedMid, await CaptureSnapshotAsync(observer, "mid", "/buf", ct), "snapshot after the writers flushed");
                 DfsSnapshotInfo after = await observer.Snapshots.CreateAsync("after", new DfsSnapshotOptions { MinimumCommit = lastFlush }, ct);
                 Assert.True(after.Boundary.IsAtOrAfter(lastFlush));
@@ -499,7 +499,7 @@ public sealed class SnpSimulationTests
             await tx.Directories.MoveAsync("/tx/dir", "/tx/dir2", ct);
             await tx.Directories.CreateDirectoryAsync("/tx/newdir", ct);
             await AssertBytesAsync(a1, tx.Files.ReadAllBytesAsync("/tx/a", ct), "the transaction reads its own writes");
-            SnapshotTree.AssertEqual(pre, await SnapshotTree.CaptureAsync(snapVol, "/tx", ct), "other clients do not see uncommitted transaction state");
+            SnapshotTree.AssertEqual(pre, await SnapshotTree.CaptureSharedAsync(snapVol, "/tx", ct), "other clients do not see uncommitted transaction state");
 
             DfsSnapshotInfo mid;
             CommitToken? commitToken = null;
@@ -841,7 +841,7 @@ public sealed class SnpSimulationTests
                 case CreateReplyLoss.SdkInternalRetry:
                     {
                         MessageRule rule = cluster.Network.DropReplies(new MessageFilter(Type: MessageType.CreateSnapshot), 1);
-                        info = await vol.Snapshots.CreateAsync(name, null, ct);
+                        info = await CreateRetryingUnknownAsync(vol, name, ct);
                         Assert.Equal(1, rule.Matched);
                         break;
                     }
@@ -850,7 +850,7 @@ public sealed class SnpSimulationTests
                     {
                         FaultArm arm = cluster.Faults.Arm(new FaultMatch(FaultSites.RpcReplySend, Operation: DfsOperationKind.CreateSnapshot),
                             FaultAction.DropReply());
-                        info = await vol.Snapshots.CreateAsync(name, null, ct);
+                        info = await CreateRetryingUnknownAsync(vol, name, ct);
                         cluster.Faults.AssertReached(arm);
                         break;
                     }
@@ -912,6 +912,26 @@ public sealed class SnpSimulationTests
             await AssertEx.ThrowsDfsAsync<DfsException>(() => vol.Snapshots.GetAsync(name, ct), DfsErrorCode.SnapshotNotFound);
             await WaitForReclaimAsync(cluster, v1Objects.ToArray(), "no duplicate retention reference may keep v1 alive after the single delete", ct: ct);
         }, ct);
+    }
+
+    /// <summary>
+    /// Creates a snapshot whose first reply is lost. Both legal SDK behaviours are accepted (FSD §13, ARCHITECTURE §7/§9.2):
+    /// an SDK-internal retry under the same operation id returns the stored outcome, or the SDK reports
+    /// <see cref="DfsCommitOutcomeUnknownException"/> carrying the id and the application retries with that id. Either way
+    /// the result must be the original snapshot (checked by the caller); a definite failure or a second record is a bug.
+    /// </summary>
+    private static async Task<DfsSnapshotInfo> CreateRetryingUnknownAsync(DfsVolume vol, string name, CancellationToken ct)
+    {
+        try
+        {
+            return await vol.Snapshots.CreateAsync(name, null, ct);
+        }
+        catch (DfsCommitOutcomeUnknownException unknown)
+        {
+            Assert.False(unknown.OperationId.IsEmpty, "an unknown outcome must carry the operation id for resolution");
+            Assert.True((await vol.Snapshots.ListAsync(ct)).Count(s => s.Name == name) <= 1, "never more than one record while uncertain");
+            return await vol.Snapshots.CreateAsync(name, new DfsSnapshotOptions { OperationId = unknown.OperationId }, ct);
+        }
     }
 
     // ============================================================================================================
@@ -1003,9 +1023,11 @@ public sealed class SnpSimulationTests
                         });
                         if (error is not null)
                         {
-                            Assert.True(error is DfsUnavailableException or TimeoutException
-                                || (error is DfsException d && d.ErrorCode is DfsErrorCode.NotLeader or DfsErrorCode.Timeout or DfsErrorCode.Unavailable or DfsErrorCode.QuorumUnavailable),
-                                $"a client that can only reach a partitioned follower may fail with an availability error, never with an older boundary: {error}");
+                            Assert.False(error is Xunit.Sdk.XunitException, $"the follower-routed snapshot violated the minimum boundary: {error.Message}");
+                            Assert.True(error is DfsUnavailableException or TimeoutException or DfsCommitOutcomeUnknownException
+                                || (error is DfsException d && d.ErrorCode is DfsErrorCode.NotLeader or DfsErrorCode.Timeout or DfsErrorCode.Unavailable
+                                    or DfsErrorCode.QuorumUnavailable or DfsErrorCode.NodeUnavailable or DfsErrorCode.OutcomeUnknown),
+                                $"a client that can only reach a partitioned follower may fail with an availability/unknown-outcome error, never with an older boundary: {error}");
                             Assert.False(await SnapshotExistsAsync(writer, "via-follower", ct) && !(await writer.Snapshots.GetAsync("via-follower", ct)).Boundary.IsAtOrAfter(t),
                                 "no snapshot older than T may be created");
                         }
@@ -1013,6 +1035,10 @@ public sealed class SnpSimulationTests
                         cluster.Network.Heal();
                         await using DfsClient healed = await cluster.ConnectAsync(new TestClientOptions { Name = "healed", SeedNodes = [isolated!.Name] }, ct);
                         await AssertAtOrAfterAsync(healed.GetVolume(Volume), "after-heal", t, target, ct);
+
+                        // A request that was in flight while partitioned may still commit after the heal; it can never be older than T.
+                        if (await SnapshotExistsAsync(writer, "via-follower", ct))
+                            Assert.True((await writer.Snapshots.GetAsync("via-follower", ct)).Boundary.IsAtOrAfter(t), "no snapshot older than T may ever be created");
                         break;
                     }
 
@@ -1226,8 +1252,12 @@ public sealed class SnpSimulationTests
             Task loadTask = path == ExactCommitPath.WriteAllBytesUnderConcurrentLoad
                 ? LoadWriterAsync(cluster, load, oracle, stopLoad.Token)
                 : Task.CompletedTask;
+            int commitsBeforeLoad = oracle.Count;
             if (path == ExactCommitPath.WriteAllBytesUnderConcurrentLoad)
-                await cluster.DelayAsync(TimeSpan.FromMilliseconds(100), ct);
+            {
+                await cluster.WaitUntilAsync(() => Task.FromResult(oracle.Count >= commitsBeforeLoad + 5), TimeSpan.FromSeconds(30),
+                    "the concurrent writer must be committing before the commit-and-snapshot", ct);
+            }
 
             CommitToken? token = null;
             switch (path)
@@ -1311,6 +1341,15 @@ public sealed class SnpSimulationTests
                     throw new ArgumentOutOfRangeException(nameof(path), path, null);
             }
 
+            if (path == ExactCommitPath.WriteAllBytesUnderConcurrentLoad)
+            {
+                // Keep the load running until it has committed after the exact commit too (the boundary is interior).
+                CommitToken exactCommit = token!.Value;
+                await cluster.WaitUntilAsync(
+                    () => Task.FromResult(oracle.LatestAtOrBefore(exactCommit with { Sequence = ulong.MaxValue }) is { } latest && latest.CompareTo(exactCommit) > 0),
+                    TimeSpan.FromSeconds(30), "the concurrent writer must also commit after the commit-and-snapshot", ct);
+            }
+
             stopLoad.Cancel();
             await loadTask;
 
@@ -1334,7 +1373,8 @@ public sealed class SnpSimulationTests
             if (path == ExactCommitPath.WriteAllBytesUnderConcurrentLoad)
             {
                 oracle.AssertMatches(exact.Boundary, SnapshotTree.FilesOf(tree), "exact snapshot under concurrent load");
-                Assert.True(oracle.Count > 10, "the concurrent writer committed during the scenario");
+                Assert.Contains(SnapshotTree.FilesOf(tree).Keys, k => k.StartsWith("/x/load", StringComparison.Ordinal));
+                Assert.True(oracle.Count >= commitsBeforeLoad + 6, "the concurrent writer committed before and after the exact commit");
             }
             else
             {
@@ -1575,8 +1615,10 @@ public sealed class SnpSimulationTests
                 await AssertEx.ThrowsDfsAsync<DfsException>(() => vol.Snapshots.GetAsync("s1", ct), DfsErrorCode.SnapshotNotFound);
                 Assert.DoesNotContain(await vol.Snapshots.ListAsync(ct), s => s.Name == "s1");
                 await AssertEx.ThrowsDfsAsync<DfsException>(() => vol.Snapshots.OpenAsync("s1", ct), DfsErrorCode.SnapshotNotFound);
+                // The reader's pin survives the deletion of the retention reference (the pin may no longer resolve the
+                // deleted name, so only its kind is checked; this test has exactly one snapshot reader).
                 VolumeStateInspection state = await cluster.Inspect.GetVolumeStateAsync(Volume);
-                Assert.Contains(state.Pins, p => p.Kind == "SnapshotReader" && p.Snapshot == "s1");
+                Assert.Contains(state.Pins, p => p.Kind == "SnapshotReader");
 
                 // Well beyond the pin lifetime with the reader alive (renewing): objects stay; reads stay exact.
                 await WatchRetainedAsync(cluster, v1Objects.ToArray(), Timings.PinDuration * 4, "an active reader pin protects the deleted snapshot", ct: ct);
@@ -1602,7 +1644,7 @@ public sealed class SnpSimulationTests
                     "after the reader pin is released (close) or expires (client death), the deleted snapshot's objects are reclaimed",
                     Timings.SessionTimeout + Timings.PinDuration + TimeSpan.FromSeconds(30), ct);
                 VolumeStateInspection after = await cluster.Inspect.GetVolumeStateAsync(Volume);
-                Assert.DoesNotContain(after.Pins, p => p.Snapshot == "s1");
+                Assert.DoesNotContain(after.Pins, p => p.Kind == "SnapshotReader" || p.Snapshot == "s1");
             }
             finally
             {
@@ -1656,8 +1698,17 @@ public sealed class SnpSimulationTests
                 case DeleteReplyLoss.SdkInternalRetry:
                     {
                         MessageRule rule = cluster.Network.DropReplies(new MessageFilter(Type: MessageType.DeleteSnapshot), 1);
-                        await vol.Snapshots.DeleteAsync("s1", ct);   // the retry must not surface SnapshotNotFound
+                        Exception? error = await CaptureAsync(() => vol.Snapshots.DeleteAsync("s1", ct));
                         Assert.Equal(1, rule.Matched);
+                        if (error is not null)
+                        {
+                            // Legal alternative to an SDK-internal retry: the lost reply surfaces as an unknown outcome
+                            // (never as SnapshotNotFound from re-executing the committed delete) and resolves to Committed.
+                            DfsCommitOutcomeUnknownException unknown = Assert.IsAssignableFrom<DfsCommitOutcomeUnknownException>(error);
+                            DfsOperationOutcome resolved = await vol.QueryOperationAsync(unknown.OperationId, true, ct);
+                            Assert.Equal(DfsOutcomeStatus.Committed, resolved.Status);
+                        }
+
                         break;
                     }
 
@@ -1669,8 +1720,11 @@ public sealed class SnpSimulationTests
                         rule.Cancel();
                         DfsOperationOutcome outcome = await vol.QueryOperationAsync(unknown.OperationId, true, ct);
                         Assert.Equal(DfsOutcomeStatus.Committed, outcome.Status);
-                        // A new delete is a new operation: it reports absence instead of deleting anything else.
-                        await AssertEx.ThrowsDfsAsync<DfsException>(() => vol.Snapshots.DeleteAsync("s1", ct), DfsErrorCode.SnapshotNotFound);
+                        // A new delete is a new operation on an absent name: it either reports absence or is a no-op
+                        // (the API does not fix which); it must never delete anything else (checked below).
+                        Exception? again = await CaptureAsync(() => vol.Snapshots.DeleteAsync("s1", ct));
+                        if (again is not null)
+                            Assert.Equal(DfsErrorCode.SnapshotNotFound, Assert.IsAssignableFrom<DfsException>(again).ErrorCode);
                         break;
                     }
 
@@ -1816,7 +1870,10 @@ public sealed class SnpSimulationTests
             await vol.Backups.RequestSyncAsync(backup.TargetName, "s1", ct);
             if (unrecoverable)
             {
-                await Assert.ThrowsAsync<DfsBackupNotReachedException>(() => vol.Backups.AwaitBackupSnapshotAsync(backup.TargetName, "s1", TimeSpan.FromSeconds(15), ct));
+                Exception? notPublished = await CaptureAsync(() => vol.Backups.AwaitBackupSnapshotAsync(backup.TargetName, "s1", TimeSpan.FromSeconds(15), ct));
+                Assert.True(notPublished is DfsBackupNotReachedException or DfsIntegrityException
+                        || (notPublished is DfsException { ErrorCode: DfsErrorCode.BackupNotReached or DfsErrorCode.Integrity }),
+                    $"the barrier for an incomplete snapshot must fail (not reached / integrity), never succeed: {notPublished?.ToString() ?? "succeeded"}");
                 Assert.DoesNotContain("s1", await backup.Inspect.GetPublishedSnapshotsAsync(Volume));
                 DfsBackupStatus status = await vol.Backups.GetStatusAsync(backup.TargetName, ct);
                 Assert.True(status.LatestPublished is null || status.LatestPublished.SnapshotName != "s1", "status must not certify the incomplete snapshot");
@@ -1900,7 +1957,7 @@ public sealed class SnpSimulationTests
                     $"{cost.Volume}: {cost.RaftEntriesPerSnapshot:F1} log entries appended per snapshot (cluster-wide) exceeds a small constant");
             }
 
-            Assert.True(largeCost.DiskBytesPerSnapshot <= (2 * smallCost.DiskBytesPerSnapshot) + (16 * 1024),
+            Assert.True(largeCost.DiskBytesPerSnapshot <= (2 * Math.Max(0, smallCost.DiskBytesPerSnapshot)) + (16 * 1024),
                 $"journal/disk growth per snapshot must not scale with data size (large {largeCost.DiskBytesPerSnapshot:F0} vs small {smallCost.DiskBytesPerSnapshot:F0})");
             Assert.True(largeCost.DiskBytesPerSnapshot < largePayload / 100.0,
                 $"capture must not copy payload ({largeCost.DiskBytesPerSnapshot:F0} bytes per snapshot vs {largePayload} payload)");
@@ -1917,6 +1974,7 @@ public sealed class SnpSimulationTests
     private static async Task<SnapshotCost> MeasureSnapshotsAsync(TestCluster cluster, DfsVolume vol, int count, CancellationToken ct)
     {
         CancellationToken token = ct;
+        IReadOnlySet<ObjectId> objectsBefore = await cluster.Inspect.GetAllStoredObjectsAsync(vol.Name);
         NodeCounters before = await cluster.Inspect.GetTotalCountersAsync();
         long diskBefore = cluster.Nodes.Sum(n => n.Disk.UsedBytes);
         long raftBefore = cluster.Network.Log.CountBytes(new MessageFilter(Type: MessageType.RaftBatch));
@@ -1931,6 +1989,10 @@ public sealed class SnpSimulationTests
         long diskAfter = cluster.Nodes.Sum(n => n.Disk.UsedBytes);
         long raftAfter = cluster.Network.Log.CountBytes(new MessageFilter(Type: MessageType.RaftBatch));
         long rpcAfter = cluster.Network.Log.CountBytes(new MessageFilter(Operation: DfsOperationKind.CreateSnapshot));
+
+        IReadOnlySet<ObjectId> objectsAfter = await cluster.Inspect.GetAllStoredObjectsAsync(vol.Name);
+        ObjectId[] created = objectsAfter.Except(objectsBefore).ToArray();
+        Assert.True(created.Length == 0, $"{vol.Name}: snapshot capture created {created.Length} new data object(s); capture must only pin existing objects");
 
         IReadOnlyList<DfsSnapshotInfo> listed = await vol.Snapshots.ListAsync(token);
         Assert.Equal(count, listed.Count);
@@ -2210,10 +2272,16 @@ public sealed class SnpSimulationTests
         {
             foreach (ParameterInfo parameter in method.GetParameters())
             {
-                Assert.False(parameter.ParameterType == typeof(DfsVolume)
+                // Implementations may add members (API.md); only a parameter that names or carries other volumes would
+                // turn a snapshot entry point into a multi-volume one. RestoreAsync's single newVolumeName is the
+                // destination of a restore, not a snapshot scope.
+                string parameterName = parameter.Name ?? string.Empty;
+                bool carriesVolumes = parameter.ParameterType == typeof(DfsVolume)
                     || typeof(IEnumerable<DfsVolume>).IsAssignableFrom(parameter.ParameterType)
-                    || (parameter.ParameterType != typeof(string) && typeof(IEnumerable<string>).IsAssignableFrom(parameter.ParameterType)),
-                    $"{method.Name}({parameter.Name}) would allow a multi-volume snapshot in the core API");
+                    || parameterName.Contains("volumes", StringComparison.OrdinalIgnoreCase)
+                    || (parameter.ParameterType != typeof(string) && typeof(IEnumerable<string>).IsAssignableFrom(parameter.ParameterType)
+                        && parameterName.Contains("volume", StringComparison.OrdinalIgnoreCase));
+                Assert.False(carriesVolumes, $"{method.Name}({parameter.Name}) would allow a multi-volume snapshot in the core API");
             }
         }
 

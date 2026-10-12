@@ -106,6 +106,7 @@ public static class SnapshotTree
     public static Task<SortedDictionary<string, byte[]?>> CaptureAsync(DfsFileClient files, DfsDirectoryClient directories, string root = "/", CancellationToken ct = default);
     public static Task<SortedDictionary<string, byte[]?>> CaptureAsync(DfsVolume volume, string root = "/", CancellationToken ct = default);
     public static Task<SortedDictionary<string, byte[]?>> CaptureAsync(DfsSnapshotView view, string root = "/", CancellationToken ct = default);
+    public static Task<SortedDictionary<string, byte[]?>> CaptureSharedAsync(DfsVolume volume, string root = "/", CancellationToken ct = default);
     public static SortedDictionary<string, byte[]> FilesOf(IReadOnlyDictionary<string, byte[]?> tree);
     public static SortedDictionary<string, byte[]?> Clone(IReadOnlyDictionary<string, byte[]?> tree);
     public static void AssertEqual(IReadOnlyDictionary<string, byte[]?> expected, IReadOnlyDictionary<string, byte[]?> actual, string because);
@@ -114,6 +115,10 @@ public static class SnapshotTree
 ```
 Complete namespace + byte image (directories map to `null`) captured by enumeration and full reads through the
 public SDK of a live volume, snapshot view or backup view. Used by most SNP tests, APP-010/011/012, SNP-004.
+`CaptureSharedAsync` reads every live file through an explicit read-only `VersionPinned` open granting
+`FileShare.ReadWrite | FileShare.Delete`, the compatible reader pairing required by test plan §5 while other clients
+hold writable handles or transaction reservations (used by SNP-002 and SNP-003 so a sharing conflict of the oracle
+reader can never masquerade as a visibility result).
 
 ### `CommitHistoryOracle`
 

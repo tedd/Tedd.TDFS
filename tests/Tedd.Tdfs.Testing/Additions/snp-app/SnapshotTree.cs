@@ -45,6 +45,28 @@ public static class SnapshotTree
         return CaptureAsync(view.Files, view.Directories, root, ct);
     }
 
+    /// <summary>
+    /// Captures a live volume below <paramref name="root"/> while other clients may hold writable handles or transaction
+    /// writer reservations: every file is read through an explicit read-only, version-pinned open that grants
+    /// <c>FileShare.ReadWrite | FileShare.Delete</c> (the compatible reader pairing of FSD §7 / test plan §5), so a
+    /// setup-level sharing conflict can never masquerade as a visibility result.
+    /// </summary>
+    public static async Task<SortedDictionary<string, byte[]?>> CaptureSharedAsync(DfsVolume volume, string root = "/", CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(volume);
+        string normalized = DfsPath.Normalize(root);
+        var tree = new SortedDictionary<string, byte[]?>(StringComparer.Ordinal);
+        if (!string.Equals(normalized, DfsPath.Root, StringComparison.Ordinal))
+        {
+            if (!await volume.Directories.ExistsAsync(normalized, ct))
+                return tree;
+            tree[normalized] = null;
+        }
+
+        await WalkSharedAsync(volume, normalized, tree, ct);
+        return tree;
+    }
+
     /// <summary>Only the file entries of a tree.</summary>
     public static SortedDictionary<string, byte[]> FilesOf(IReadOnlyDictionary<string, byte[]?> tree)
     {
@@ -147,5 +169,33 @@ public static class SnapshotTree
 
         foreach (string sub in subdirectories)
             await WalkAsync(files, directories, sub, tree, ct);
+    }
+
+    private static async Task WalkSharedAsync(DfsVolume volume, string directory, SortedDictionary<string, byte[]?> tree, CancellationToken ct)
+    {
+        var subdirectories = new List<string>();
+        await foreach (DfsEntryInfo entry in volume.Directories.EnumerateAsync(directory, null, ct))
+        {
+            if (entry.Kind == DfsEntryKind.Directory)
+            {
+                tree[entry.Path] = null;
+                subdirectories.Add(entry.Path);
+                continue;
+            }
+
+            await using DfsStream stream = await volume.Files.OpenAsync(entry.Path, new DfsOpenOptions
+            {
+                Mode = FileMode.Open,
+                Access = FileAccess.Read,
+                Share = FileShare.ReadWrite | FileShare.Delete,
+                ReadView = DfsReadView.VersionPinned,
+            }, ct);
+            using var buffer = new MemoryStream();
+            await stream.CopyToAsync(buffer, ct);
+            tree[entry.Path] = buffer.ToArray();
+        }
+
+        foreach (string sub in subdirectories)
+            await WalkSharedAsync(volume, sub, tree, ct);
     }
 }
