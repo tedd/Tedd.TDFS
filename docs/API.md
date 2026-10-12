@@ -1557,3 +1557,114 @@ public IReadOnlyList<string> AllPaths(); public int Count { get; } public long L
   (test plan §2.1: not-run is never a pass).
 * Assertions must check the specific required property (bytes, identity, outcome, counts) — never only "no exception".
   Fault-injection tests must assert the fault point was reached (`TestFaults.AssertReached(arm)`).
+
+---
+
+## H. Addendum A — permissions, pools, streams ([spec](spec/fsd-addendum-acl-pools-streams.md))
+
+### H.1 Core (namespace `Tedd.Tdfs`)
+
+```csharp
+[Flags] public enum DfsFileSystemRights   // NTFS values
+{
+    ReadData = 0x1, ListDirectory = 0x1, WriteData = 0x2, CreateFiles = 0x2, AppendData = 0x4, CreateDirectories = 0x4,
+    ReadExtendedAttributes = 0x8, WriteExtendedAttributes = 0x10, ExecuteFile = 0x20, Traverse = 0x20,
+    DeleteSubdirectoriesAndFiles = 0x40, ReadAttributes = 0x80, WriteAttributes = 0x100, Delete = 0x10000,
+    ReadPermissions = 0x20000, ChangePermissions = 0x40000, TakeOwnership = 0x80000, Synchronize = 0x100000,
+    Read = ReadData | ReadExtendedAttributes | ReadAttributes | ReadPermissions | Synchronize,           // 0x120089
+    Write = WriteData | AppendData | WriteExtendedAttributes | WriteAttributes | Synchronize,            // 0x100116
+    ReadAndExecute = Read | ExecuteFile,                                                                // 0x1200A9
+    Modify = ReadAndExecute | Write | Delete,                                                           // 0x1301BF
+    FullControl = 0x1F01FF
+}
+public enum DfsAccessControlType { Allow = 0, Deny = 1 }
+[Flags] public enum DfsInheritanceFlags { None = 0, ContainerInherit = 1, ObjectInherit = 2 }
+[Flags] public enum DfsPropagationFlags { None = 0, NoPropagateInherit = 1, InheritOnly = 2 }
+public enum DfsIdentityKind { User, Group, WellKnown }
+public readonly record struct DfsIdentity(DfsIdentityKind Kind, string Name)
+{
+    public static DfsIdentity Everyone { get; } public static DfsIdentity AuthenticatedUsers { get; }
+    public static DfsIdentity Administrators { get; } public static DfsIdentity CreatorOwner { get; }
+    public static DfsIdentity User(string name); public static DfsIdentity Group(string name);
+    public static DfsIdentity Parse(string s);  public static bool TryParse(string? s, out DfsIdentity id);
+    public override string ToString();          // "user:alice", "group:eng", "Everyone", "AuthenticatedUsers", "Administrators", "CreatorOwner"
+}
+public sealed record DfsAccessRule(DfsIdentity Identity, DfsFileSystemRights Rights, DfsAccessControlType Type = DfsAccessControlType.Allow,
+    DfsInheritanceFlags Inheritance = DfsInheritanceFlags.None, DfsPropagationFlags Propagation = DfsPropagationFlags.None)
+{
+    public bool IsInherited { get; init; }          // set only in returned descriptors
+    public string? InheritedFrom { get; init; }     // path of the ancestor the ACE was inherited from
+}
+public sealed record DfsSecurityDescriptor(DfsIdentity Owner, IReadOnlyList<DfsAccessRule> Rules, bool AreAccessRulesProtected = false)
+{
+    public static DfsSecurityDescriptor DefaultRoot(DfsIdentity owner);   // Everyone FullControl CI|OI
+    public void Validate();                                               // ArgumentException for invalid flags/identities
+}
+public static class DfsAccessEvaluator   // the single production implementation of ACL-03/ACL-04 (pure, deterministic)
+{
+    // chain: descriptor of the target first, then each ancestor's descriptor up to the root (nearest first).
+    public static IReadOnlyList<DfsAccessRule> EffectiveRules(IReadOnlyList<DfsSecurityDescriptor> chainNearestFirst, bool targetIsDirectory, DfsIdentity targetOwner);
+    public static DfsFileSystemRights GrantedRights(IReadOnlyList<DfsAccessRule> effectiveRules, DfsIdentity owner, IReadOnlySet<DfsIdentity> callerIdentities, bool callerIsAdministrator);
+    public static bool IsGranted(IReadOnlyList<DfsAccessRule> effectiveRules, DfsIdentity owner, IReadOnlySet<DfsIdentity> callerIdentities, bool callerIsAdministrator, DfsFileSystemRights requested);
+}
+public static class DfsStreamPath
+{
+    public const string DataType = "$DATA";
+    public const int MaxStreamsPerInode = 1024;
+    // Normalized paths may end in ":stream". Splits "/a/f:s" -> ("/a/f", "s"); "/a/f" -> ("/a/f", null).
+    public static (string FilePath, string? StreamName) Split(string normalizedPath);
+    public static string Combine(string normalizedFilePath, string? streamName);
+    public static bool HasStream(string normalizedPath);
+}
+// DfsPath.Normalize additionally implements ADS-01 (":$DATA" suffix normalisation, stream rules).
+// DfsErrorCode additions: PoolNotFound = 48, PoolInUse = 49, GroupNotFound = 50, PrincipalNotFound = 51.
+public sealed record DfsStreamInfo(string Name, long Length, ulong Revision);
+```
+
+### H.2 Client
+
+```csharp
+// DfsFileClient and DfsDirectoryClient (+ sync counterparts)
+public Task<DfsSecurityDescriptor> GetAccessControlAsync(string path, CancellationToken ct = default);           // includes inherited rules (IsInherited = true)
+public Task<CommitToken> SetAccessControlAsync(string path, DfsSecurityDescriptor descriptor, CancellationToken ct = default); // explicit rules only; inherited entries in the input are ignored
+public Task<CommitToken> SetOwnerAsync(string path, DfsIdentity owner, CancellationToken ct = default);
+public Task<DfsFileSystemRights> GetEffectiveRightsAsync(string path, DfsIdentity? identity = null, CancellationToken ct = default); // null = caller
+// DfsFileClient only
+public Task<IReadOnlyList<DfsStreamInfo>> ListStreamsAsync(string path, CancellationToken ct = default);
+// DfsFileInfo gains: bool IsStream, string? StreamName, int StreamCount (positional record parameters appended at the end with defaults)
+// DfsVolumeSpec gains: string StoragePool = "default"; DfsSecurityDescriptor? RootSecurity; bool EnforceTraverseChecking = false
+// DfsStoragePolicy gains: string? Pool = null (null = the volume's pool)
+// DfsVolumeInfo gains (appended, defaults): string StoragePool, bool EnforceTraverseChecking
+// DfsInodeAccess / SetAccessAsync remain as shortcuts: OwnerOnly -> protected {Owner FullControl, Administrators FullControl};
+//   ReadOnlyForOthers -> protected {Owner FullControl, Administrators FullControl, Everyone Read}; both false -> unprotected, no explicit rules.
+
+public sealed record DfsGroupInfo(string Name, IReadOnlyList<string> Members);
+public sealed record DfsPoolInfo(string Name, IReadOnlyList<string> Nodes, IReadOnlyList<string> Volumes, long CapacityBytes, long UsedBytes);
+public sealed record DfsPoolStatus(DfsPoolInfo Info, DfsReplicaHealth Replicas, IReadOnlyList<string> DrainingNodes);
+// DfsAdminClient additions
+public Task CreateGroupAsync(string group, CancellationToken ct = default);
+public Task DeleteGroupAsync(string group, CancellationToken ct = default);
+public Task AddGroupMemberAsync(string group, string principal, CancellationToken ct = default);
+public Task RemoveGroupMemberAsync(string group, string principal, CancellationToken ct = default);
+public Task<IReadOnlyList<DfsGroupInfo>> ListGroupsAsync(CancellationToken ct = default);
+public Task CreatePoolAsync(string pool, IReadOnlyList<string> nodeNames, CancellationToken ct = default);
+public Task SetPoolMembersAsync(string pool, IReadOnlyList<string> nodeNames, CancellationToken ct = default);
+public Task DeletePoolAsync(string pool, CancellationToken ct = default);
+public Task<IReadOnlyList<DfsPoolInfo>> ListPoolsAsync(CancellationToken ct = default);
+public Task<DfsPoolStatus> GetPoolStatusAsync(string pool, CancellationToken ct = default);
+```
+
+### H.3 Harness
+
+```csharp
+// TestNodeSpec gains: IReadOnlyList<string>? Pools = null (pools created at bootstrap; "default" always implied)
+// TestVolumeSpec gains: string StoragePool = "default"; DfsSecurityDescriptor? RootSecurity; bool EnforceTraverseChecking = false
+// TestCluster gains:
+public Task CreateGroupAsync(string group, params string[] members);
+public Task<TestPrincipal> CreateUserAsync(string name, DfsPermissions volumeGrants = DfsPermissions.Read | DfsPermissions.Write, params string[] groups); // grants on every test volume
+// ClusterInspector gains:
+public Task<IReadOnlyList<string>> GetPoolNodesAsync(string pool);
+public Task<IReadOnlySet<ObjectId>> GetStoredObjectsOnNodeAsync(string node, string? volume = null);
+// TestCatalog gains: public static IReadOnlyList<CatalogEntry> Addendum { get; }  // 78 rows parsed from the addendum (embedded resource)
+// FileInspection gains (appended): IReadOnlyList<StreamInspection> Streams; record StreamInspection(string Name, long Length, ulong Revision, IReadOnlyList<ExtentInspection> Extents)
+```

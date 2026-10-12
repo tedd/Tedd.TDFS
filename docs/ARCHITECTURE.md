@@ -589,3 +589,29 @@ implements partitions, asymmetric cuts, black holes, reply drops, duplication an
 | Snapshot (Raft) threshold | 10 000 entries | 200 entries |
 | Transfer pin budget | 24 h / 10 GiB | configurable per test |
 | Max materialize (ReadAll) | 256 MiB | 4 MiB |
+
+---
+
+## 17. Addendum A — permissions, pools, alternate data streams
+
+Requirements: [spec/fsd-addendum-acl-pools-streams.md](spec/fsd-addendum-acl-pools-streams.md). Signatures: API.md §H.
+
+* **Volumes are namespaces.** Nothing about cross-volume isolation changes; it is tested explicitly (suite POOL).
+* **Pools** live in the control state (`Pools: name -> sorted node-id set`); `default` is implicit (all live nodes not
+  excluded). Volume records and named policies carry a pool name. `Placement.SelectTargets/FallbackOrder` receive only
+  the pool's eligible nodes (the caller filters), so fallback can never leave the pool. Pool membership changes bump the
+  placement epoch; the repair coordinator treats out-of-pool holders like draining holders (copy-before-delete). The
+  membership manager chooses volume voters from pool nodes.
+* **Security descriptors** are part of `InodeRecord` (owner + explicit ACEs + protected flag). Effective ACEs are computed
+  dynamically by `DfsAccessEvaluator.EffectiveRules` from the ancestor chain resolved during path lookup (nearest
+  first). Groups and principals are in the control state; the deciding leader resolves the caller's identity set
+  (`user:x`, its groups, `Everyone`, `AuthenticatedUsers`, `Administrators` if cluster admin) and places it in the
+  command's `OperationHeader.Identities`; apply re-checks ACLs deterministically with that set (ACL-08). Volume grants
+  stay as the coarse gate. Handles keep the access granted at open. Snapshot inode records keep their descriptors.
+  An ACL change bumps the inode revision (transaction conflict detection, ACL-07).
+* **Streams**: `InodeRecord.Streams: ImmutableSortedDictionary<string, StreamRecord>` where `""` is the default stream;
+  `StreamRecord {Length, Inline | Extents, Revision, WriterGeneration}`. Handles, sharing, writer reservations and
+  fencing are keyed by `(InodeId, StreamName)`; delete/rename sharing checks consider handles of all streams of the
+  inode. Copy copies every stream's extent map (objects shared); delete drops all streams (their objects enter the
+  dereference log); GC/backup/snapshots traverse all streams. Protocol requests carry the full normalized path including
+  `:stream`; the server splits it with `DfsStreamPath.Split`.
