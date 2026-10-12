@@ -96,9 +96,10 @@ internal static class MeshHelpers
     };
 
     /// <summary>
-    /// Runs an operation the oracle says must succeed, retrying only typed availability failures (and unknown outcomes)
-    /// until <see cref="MeshScenarioOptions.MustWithin"/> elapses on the harness clock; any other failure, or still
-    /// failing at the deadline, fails the test with <paramref name="because"/>.
+    /// Runs an operation the oracle says must succeed, retrying only typed availability failures (and unknown outcomes or
+    /// ids expired during an earlier outage) until <see cref="MeshScenarioOptions.MustWithin"/> elapses on the harness
+    /// clock; any other failure, or still failing at the deadline, fails the test with <paramref name="because"/>.
+    /// Retried actions must be idempotent (same content, or a reserved operation id).
     /// </summary>
     public static async Task<T> MustAsync<T>(MeshScenario s, Func<Task<T>> action, string because)
     {
@@ -109,10 +110,43 @@ internal static class MeshHelpers
             {
                 return await action();
             }
-            catch (Exception ex) when (MeshOracle.Unwrap(ex) is DfsUnavailableException or DfsCommitOutcomeUnknownException)
+            catch (Exception ex) when (MeshOracle.Unwrap(ex) is DfsUnavailableException or DfsCommitOutcomeUnknownException or DfsOperationExpiredException)
             {
                 if (s.Cluster.Time.GetUtcNow() >= deadline)
                     Assert.Fail($"{because}: still failing after {s.Options.MustWithin}: {MeshOracle.Describe(MeshOracle.Unwrap(ex))}; net: {s.Net.Describe()}");
+            }
+
+            await s.Cluster.DelayAsync(TimeSpan.FromMilliseconds(250), s.Ct);
+        }
+    }
+
+    /// <summary>
+    /// Runs an operation whose success the specification does not promise in the current state (for example while node
+    /// clocks are skewed, LOCK-015): typed availability failures — and, for mutations, unknown outcomes or expired ids —
+    /// are retried until <see cref="MeshScenarioOptions.MustWithin"/>; any other failure fails the test. Returns
+    /// (true, result) on success and (false, default) when the operation still fails typed at the deadline.
+    /// </summary>
+    public static async Task<(bool Ok, T? Value)> TryWithinAsync<T>(MeshScenario s, Func<Task<T>> action, string because, bool mutation = true)
+    {
+        DateTimeOffset deadline = s.Cluster.Time.GetUtcNow() + s.Options.MustWithin;
+        while (true)
+        {
+            try
+            {
+                return (true, await action());
+            }
+            catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)
+            {
+                Exception e = MeshOracle.Unwrap(ex);
+                bool typed = e is DfsUnavailableException or DfsLeaseLostException or DfsPinExpiredException
+                    || (mutation && e is DfsOperationExpiredException)
+                    || (mutation && e is DfsCommitOutcomeUnknownException { OperationId.IsEmpty: false });
+                Assert.True(typed, $"{because}: may fail here, but only typed: {MeshOracle.Describe(e)}");
+                if (s.Cluster.Time.GetUtcNow() >= deadline)
+                {
+                    s.Note($"{because}: still failing typed after {s.Options.MustWithin}: {MeshOracle.Describe(e)}");
+                    return (false, default);
+                }
             }
 
             await s.Cluster.DelayAsync(TimeSpan.FromMilliseconds(250), s.Ct);
@@ -126,8 +160,14 @@ internal static class MeshHelpers
     /// </summary>
     public static MeshExpectation NotPromised(MeshExpectation expectation, MeshProbeKind kind, string why) =>
         expectation.Outcome == MeshTri.Must
-            ? MeshExpectation.Either([kind == MeshProbeKind.ControlChange ? MeshCause.ControlQuorum : MeshCause.MetadataQuorum, MeshCause.Unreachable],
-                why + "; otherwise " + expectation.Reason)
+            ? MeshExpectation.Either(kind switch
+            {
+                MeshProbeKind.ControlChange => [MeshCause.ControlQuorum, MeshCause.Unreachable],
+                // The data path (receipts, reads from storage nodes) is just as unpromised: a placement failure must still
+                // report the unchanged required counts and fewer achieved; a read may report no healthy replica.
+                MeshProbeKind.WriteSmall or MeshProbeKind.WriteLarge or MeshProbeKind.Append => [MeshCause.MetadataQuorum, MeshCause.Unreachable, MeshCause.Placement],
+                _ => [MeshCause.MetadataQuorum, MeshCause.Unreachable, MeshCause.NoHealthyReplica],
+            }, why + "; otherwise " + expectation.Reason)
             : expectation;
 
     /// <summary>Names of nodes, deterministic order.</summary>

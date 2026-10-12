@@ -93,41 +93,69 @@ public sealed class MeshSimulationTests
             await s.ProbeAsync("formed");
 
             // Every node is a working entry point: a client that knows only n_i writes, the client that knows only n_{i+1} reads.
-            var entries = new List<(string Client, string Node)>();
+            // On a partial mesh a node that is not adjacent to the leaders may hold a stale cluster map (no relaying), so
+            // connecting or entering through it may fail — but only typed (availability, or an unknown outcome carrying
+            // its id for the write), never with wrong bytes, and never as a false absence of the acknowledged file.
+            bool partial = cfg.Mesh != LinkMesh.Full;
+            var unavailable = new HashSet<MeshCause> { MeshCause.MetadataQuorum, MeshCause.Unreachable, MeshCause.NoHealthyReplica };
+            var entries = new string?[nodes];
             for (int i = 0; i < nodes; i++)
             {
                 string name = "e" + i.ToString(CultureInfo.InvariantCulture);
-                await s.ConnectClientAsync(name, [cluster[i].Name]);
-                entries.Add((name, cluster[i].Name));
+                try
+                {
+                    await s.ConnectClientAsync(name, [cluster[i].Name]);
+                    entries[i] = name;
+                }
+                catch (Exception ex) when (partial && ex is not Xunit.Sdk.XunitException)
+                {
+                    Assert.True(MeshOracle.Unwrap(ex) is DfsUnavailableException,
+                        $"connecting through {cluster[i].Name} of a {cfg.Mesh} mesh failed untyped: {MeshOracle.Describe(ex)}");
+                }
             }
 
             for (int i = 0; i < nodes; i++)
             {
                 byte[] data = TestData.Bytes(1000UL + (ulong)i, 6000);
-                string path = "/mesh/entry-" + entries[i].Node;
-                string writer = entries[i].Client;
-                string reader = entries[(i + 1) % nodes].Client;
-                if (cfg.Mesh == LinkMesh.Full)
+                string path = "/mesh/entry-" + cluster[i].Name;
+                string? writer = entries[i];
+                string? reader = entries[(i + 1) % nodes];
+                string route = $"written through entry {cluster[i].Name}, read through entry {cluster[(i + 1) % nodes].Name}";
+                if (!partial)
+                {
+                    await s.Client(writer!).GetVolume(Vol).Files.WriteAllBytesAsync(path, data, Ct);
+                    byte[] back = await s.Client(reader!).GetVolume(Vol).Files.ReadAllBytesAsync(path, Ct);
+                    MeshHelpers.BytesEqual(data, back, route);
+                    continue;
+                }
+
+                if (writer is null || reader is null)
+                    continue;
+                bool written = false;
+                try
                 {
                     await s.Client(writer).GetVolume(Vol).Files.WriteAllBytesAsync(path, data, Ct);
-                    byte[] back = await s.Client(reader).GetVolume(Vol).Files.ReadAllBytesAsync(path, Ct);
-                    MeshHelpers.BytesEqual(data, back, $"written through entry {entries[i].Node}, read through entry {entries[(i + 1) % nodes].Node}");
+                    written = true;
                 }
-                else
+                catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)
                 {
-                    // A node of a partial mesh that is not adjacent to the leaders may be stale; entering through it may
-                    // fail, but only with a typed availability error, and never with wrong bytes.
-                    try
-                    {
-                        await s.Client(writer).GetVolume(Vol).Files.WriteAllBytesAsync(path, data, Ct);
-                        byte[] back = await s.Client(reader).GetVolume(Vol).Files.ReadAllBytesAsync(path, Ct);
-                        MeshHelpers.BytesEqual(data, back, "partial-mesh entry round trip");
-                    }
-                    catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)
-                    {
-                        Assert.True(MeshOracle.Unwrap(ex) is DfsUnavailableException or DfsCommitOutcomeUnknownException or FileNotFoundException,
-                            $"entry through {entries[i].Node} of a {cfg.Mesh} mesh failed untyped: {MeshOracle.Describe(ex)}");
-                    }
+                    string? why = MeshOracle.CheckFailure(ex, unavailable, mutation: true, s.Policy);
+                    Assert.True(why is null, $"partial-mesh write {route}: {why}");
+                }
+
+                if (!written)
+                    continue;
+                try
+                {
+                    byte[] back = await s.Client(reader).GetVolume(Vol).Files.ReadAllBytesAsync(path, Ct);
+                    MeshHelpers.BytesEqual(data, back, "partial-mesh entry round trip " + route);
+                }
+                catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)
+                {
+                    Assert.False(MeshOracle.Unwrap(ex) is FileNotFoundException,
+                        $"acknowledged write reported absent ({route}): a stale entry node must not answer a live read (INV-03, INV-08)");
+                    string? why = MeshOracle.CheckFailure(ex, unavailable, mutation: false, s.Policy);
+                    Assert.True(why is null, $"partial-mesh read {route}: {why}");
                 }
             }
 
@@ -256,9 +284,16 @@ public sealed class MeshSimulationTests
 
             await s.RestartAsync(leader);
             await s.WaitSettledAsync();
-            GroupInspection? rejoined = await cluster.Node(leader).Inspect.GetGroupAsync(Vol);
-            Assert.NotNull(rejoined);
-            Assert.True(rejoined.Term >= termWhileDown, $"restarted {leader} must adopt the current term ({rejoined.Term} < {termWhileDown})");
+            // The restarted node learns the current term from the leader's heartbeats, so this is asserted (bounded) when it
+            // is directly linked to the current leader; on a partial mesh it may be adjacent only to other followers
+            // (no relaying) and is checked after healing by FinishAsync's convergence checks.
+            string current = await s.VolumeLeaderAsync();
+            if (current == leader || s.Net.Linked(leader, current))
+            {
+                await cluster.WaitUntilAsync(async () => (await cluster.Node(leader).Inspect.GetGroupAsync(Vol))?.Term >= termWhileDown,
+                    s.Options.MustWithin, $"restarted {leader} must adopt at least the term {termWhileDown} of the leader that served while it was down", Ct);
+            }
+
             await s.FinishAsync();
         }, Ct);
     }
@@ -704,28 +739,44 @@ public sealed class MeshSimulationTests
                 "ControlLeader" => await s.ControlLeaderAsync(),
                 _ => MeshHelpers.Names(s).Where(n => n != volumeLeader).OrderByDescending(n => n, StringComparer.Ordinal).First(),
             };
+            // OFF-021 needs stale work queued at the paused node: a client whose route points at the volume leader (it
+            // entered through it and wrote the key there) sends a write of the same key right after the pause, with an
+            // operation id reserved beforehand. When the volume leader is the paused node that request waits in its queue.
+            const string key = "/mesh/pause-key";
+            byte[] before = TestData.Bytes(4241, 300);
+            byte[] stale = TestData.Bytes(4243, 300);
+            byte[] during = TestData.Bytes(4242, 300);
+            DfsVolume staleVolume = (await s.ConnectClientAsync("stale", [volumeLeader])).GetVolume(Vol);
+            await MeshHelpers.MustAsync(s, () => staleVolume.Files.WriteAllBytesAsync(key, before, Ct), "initial value through the client routed to the leader");
+            DfsOperationId staleId = await staleVolume.NewOperationIdAsync(Ct);
+
             ulong term = (await s.VolumeGroupAsync()).Term;
             await s.PauseAsync(target);
+            Task<CommitToken> staleWrite = staleVolume.Files.WriteAllBytesAsync(key, stale, new DfsMutationOptions { OperationId = staleId }, Ct);
             await s.ProbeAsync("paused");
 
-            const string key = "/mesh/pause-key";
-            byte[] during = TestData.Bytes(4242, 300);
             MeshExpectation quorum = MeshOracle.Quorum(s.Net, s.VolumeVoters, "client:p0", MeshCause.MetadataQuorum);
             bool wrote = false;
             if (quorum.Outcome == MeshTri.Must)
             {
-                await cluster.WaitUntilAsync(async () =>
+                // Settle the stale write before the new authority's write: wait for the call, then fence its id through
+                // the new authority (resolve: true), so it can never take effect after `during`.
+                try
                 {
-                    try
-                    {
-                        await s.Client("p0").GetVolume(Vol).Files.WriteAllBytesAsync(key, during, Ct);
-                        return true;
-                    }
-                    catch (Exception ex) when (MeshOracle.Unwrap(ex) is DfsUnavailableException or DfsCommitOutcomeUnknownException)
-                    {
-                        return false;
-                    }
-                }, s.Options.MustWithin, "the new authority must accept writes while the old one is paused", Ct);
+                    await staleWrite;
+                }
+                catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)
+                {
+                    string? why = MeshOracle.CheckFailure(ex, new HashSet<MeshCause> { MeshCause.MetadataQuorum, MeshCause.Unreachable }, mutation: true, s.Policy);
+                    Assert.True(why is null, "write routed to the paused node: " + why);
+                }
+
+                DfsOperationOutcome fenced = await MeshHelpers.MustAsync(s, () => staleVolume.QueryOperationAsync(staleId, resolve: true, Ct),
+                    "the new authority must resolve the stale write's id");
+                Assert.True(fenced.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Aborted,
+                    $"resolve: true for {staleId} must be definite, got {fenced.Status} (OUT-013)");
+                await MeshHelpers.MustAsync(s, () => s.Client("p0").GetVolume(Vol).Files.WriteAllBytesAsync(key, during, Ct),
+                    "the new authority must accept writes while the old one is paused");
                 wrote = true;
             }
 
@@ -735,6 +786,20 @@ public sealed class MeshSimulationTests
             await s.ResumeAsync(target);
             await cluster.DelayAsync(s.ElectionWindow * 3, Ct);
             await cluster.Inspect.AssertNoSplitBrainAsync();
+            if (!wrote)
+            {
+                // No other authority existed (for example a single paused voter): the queued write runs on resume and may
+                // legitimately commit; it only has to end typed.
+                try
+                {
+                    await staleWrite;
+                }
+                catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)
+                {
+                    string? why = MeshOracle.CheckFailure(ex, new HashSet<MeshCause> { MeshCause.MetadataQuorum, MeshCause.Unreachable }, mutation: true, s.Policy);
+                    Assert.True(why is null, "write queued at the paused node: " + why);
+                }
+            }
             if (target == volumeLeader && quorum.Outcome == MeshTri.Must)
             {
                 // The remaining voters had a connected majority, so they elected a successor in a higher term while the
@@ -1034,6 +1099,7 @@ public sealed class MeshSimulationTests
                     return info is null || info.Status == DfsNodeStatus.Removed;
                 }, s.Options.RecoveryTimeout, $"{target} must be marked removed", Ct);
                 s.MarkRemoved(target);
+                s.SetConfiguredVoters(controlVoters: (await cluster.Inspect.GetControlGroupAsync()).Voters); // removal may change the control seats
                 await s.CrashAsync(target);
 
                 // The removed node returns with its old disk: it must not vote, lead or rejoin membership (CON-016, RSY-020).
@@ -1053,9 +1119,11 @@ public sealed class MeshSimulationTests
                 DfsNodeInfo info = (await admin.ListNodesAsync(Ct)).Single(i => i.Name == target);
                 Assert.True(info.Status == DfsNodeStatus.Draining,
                     $"drain of {target} cannot complete with {hosts} hosts/{zones} zones for target {s.Policy.TargetCopies}/{s.Policy.TargetDistinctZones}, but status is {info.Status}");
+                // OPS-002 names no error code for the rejection; it must be a typed refusal, not an internal error, a
+                // timeout or an unknown outcome (the removal must definitely not have happened).
                 DfsException rejected = await AssertEx.ThrowsDfsAsync<DfsException>(() => admin.RemoveNodeAsync(target, force: false, Ct));
-                Assert.True(rejected.ErrorCode is DfsErrorCode.PlacementUnavailable or DfsErrorCode.InvalidArgument or DfsErrorCode.InvalidPolicy
-                    or DfsErrorCode.QuorumUnavailable or DfsErrorCode.Unsupported, $"unsafe removal must be rejected with a typed reason, got {rejected.ErrorCode}");
+                Assert.True(rejected.ErrorCode is not (DfsErrorCode.None or DfsErrorCode.Internal or DfsErrorCode.OutcomeUnknown or DfsErrorCode.Timeout
+                    or DfsErrorCode.ProtocolError or DfsErrorCode.Cancelled), $"unsafe removal must be rejected with a typed reason, got {MeshOracle.Describe(rejected)}");
                 Assert.Contains(target, (await admin.ListNodesAsync(Ct)).Select(i => i.Name));
                 await s.ProbeAsync("drain-blocked", kinds: [MeshProbeKind.ReadSmall, MeshProbeKind.ReadLarge]);
                 await s.FinishAsync(requireFullRepair: false);
@@ -1132,9 +1200,11 @@ public sealed class MeshSimulationTests
 
     /// <summary>
     /// MESH-018: crash every node, then cold-restart them one by one in ascending, descending, voters-last or voters-first
-    /// order. With everything down every operation fails typed; after each restart availability is exactly the oracle's
-    /// (a majority of configured voters plus the data policy over restarted hosts); no bootstrap deadlock occurs; every
-    /// acknowledged write survives from the durable images only (CON-020, OFF-018).
+    /// order. With everything down every operation fails typed; after each restart availability is the oracle's (a
+    /// majority of configured voters plus the data policy over restarted hosts) — a node restarted before the control group
+    /// has a quorum again cannot re-register its incarnation yet (RCV-02), so until then it only bounds the expectation
+    /// (<see cref="MeshScenario.PendingRegistration"/>: required success only without it, required failure only with it);
+    /// no bootstrap deadlock occurs; every acknowledged write survives from the durable images only (CON-020, OFF-018).
     /// </summary>
     [Theory]
     [MemberData(nameof(TotalOutageMatrix))]
@@ -1169,6 +1239,8 @@ public sealed class MeshSimulationTests
                 await s.ProbeAsync("restarted-" + node);
             }
 
+            if (s.Net.IsFullyConnected)
+                Assert.Empty(s.PendingRegistration); // every node is back, so the control group can register every incarnation
             await s.FinishAsync();
         }, Ct);
     }
@@ -1420,7 +1492,9 @@ public sealed class MeshSimulationTests
         int count = cfg.Variant[^1] - '0';
         int perVolume = VotersPerVolume(nodes, cfg.Variant);
         string[] Block(int v) => Enumerable.Range(0, perVolume).Select(i => "n" + ((v * perVolume + i) % nodes).ToString(CultureInfo.InvariantCulture)).ToArray();
-        cfg = cfg with { VolumeVoters = perVolume, VolumeVoterNodes = shared ? null : Block(0) };
+        // Shared: every volume has exactly the same explicit voters (so spreading leadership is the implementation's job,
+        // FSD §3.2, not an accident of placement); Disjoint: consecutive non-overlapping blocks.
+        cfg = cfg with { VolumeVoters = perVolume, VolumeVoterNodes = Block(0) };
         TestClusterOptions options = MeshHelpers.Sim(cfg);
         string[] extra = Enumerable.Range(1, count - 1).Select(i => "vol" + (i + 1).ToString(CultureInfo.InvariantCulture)).ToArray();
         options = options with
@@ -1430,7 +1504,7 @@ public sealed class MeshSimulationTests
                 .. options.Volumes,
                 .. extra.Select((name, i) => new TestVolumeSpec(name)
                 {
-                    Metadata = shared ? cfg.VolumeMetadata() : new DfsMetadataPolicy { Voters = perVolume, Placement = DfsVoterPlacement.Explicit, ExplicitVoterNodes = Block(i + 1) },
+                    Metadata = new DfsMetadataPolicy { Voters = perVolume, Placement = DfsVoterPlacement.Explicit, ExplicitVoterNodes = shared ? Block(0) : Block(i + 1) },
                     DefaultPolicy = cfg.Policy(),
                 }),
             ],
@@ -1440,7 +1514,11 @@ public sealed class MeshSimulationTests
             MeshScenario s = await MeshScenario.StartAsync(cluster, cfg, MeshHelpers.Options(), Ct);
             var voters = new Dictionary<string, string[]>(StringComparer.Ordinal) { [Vol] = s.VolumeVoters.ToArray() };
             foreach (string name in extra)
+            {
                 voters[name] = (await cluster.Inspect.GetVolumeGroupAsync(name)).Voters.Order(StringComparer.Ordinal).ToArray();
+                string[] declared = (shared ? Block(0) : Block(Array.IndexOf(extra, name) + 1)).Order(StringComparer.Ordinal).ToArray();
+                Assert.True(voters[name].SequenceEqual(declared), $"{name} must have exactly its explicit voters [{string.Join(",", declared)}], has [{string.Join(",", voters[name])}] (INV-11)");
+            }
 
             if (shared && perVolume >= 2)
             {
@@ -1580,9 +1658,12 @@ public sealed class MeshSimulationTests
 
     /// <summary>
     /// MESH-025: keep a volume voter (or a control learner) down while more entries than the Raft snapshot threshold
-    /// commit — overwrites, deletions and renames for the volume; principal creations for the control group — so the log
-    /// it misses is compacted. On return it installs a checkpoint (its snapshot index exceeds what it had applied), catches
-    /// up to the leader's commit index, deleted names do not resurrect on it, and its replicated state equals the others.
+    /// commit — overwrites, deletions and renames for the volume (directory creations, deletions and renames instead of
+    /// overwrites when the data policy cannot acknowledge writes without that voter); principal creations for the control
+    /// group — so the log it misses is compacted. On return it installs a checkpoint (the snapshot-install point is
+    /// reached on it and its snapshot index exceeds what it had applied), catches up to the leader's commit index as of its
+    /// return, deleted/renamed names do not resurrect on it, principals created meanwhile authenticate through it alone,
+    /// and its replicated state equals the others.
     /// </summary>
     [Theory]
     [MemberData(nameof(LaggingMatrix))]
@@ -1596,10 +1677,14 @@ public sealed class MeshSimulationTests
             bool volume = cfg.Variant == "VolumeVoter";
             string group = volume ? Vol : "control";
             string leader = volume ? await s.VolumeLeaderAsync() : await s.ControlLeaderAsync();
-            // Control variant: prefer a pure learner (neither control nor volume voter), then a non-control-voter, then a
-            // control voter (the matrix constraint guarantees the control group tolerates losing it).
+            // Volume variant: prefer a follower whose loss still lets the data policy acknowledge writes (overwrites are then
+            // possible). Control variant: prefer a pure learner (neither control nor volume voter), then a
+            // non-control-voter, then a control voter (the matrix constraint guarantees the control group tolerates it).
             string lagger = volume
-                ? s.VolumeVoters.First(v => v != leader)
+                ? s.VolumeVoters.Where(n => n != leader)
+                    .OrderBy(n => s.ExpectIf(net => net.SetDown(n, true), MeshProbeKind.WriteSmall, "p0").Outcome == MeshTri.Must ? 0 : 1)
+                    .ThenBy(n => n, StringComparer.Ordinal)
+                    .First()
                 : MeshHelpers.Names(s).Where(n => n != leader)
                     .OrderBy(n => (s.ControlVoters.Contains(n) ? 2 : 0) + (s.VolumeVoters.Contains(n) ? 1 : 0))
                     .ThenBy(n => n, StringComparer.Ordinal)
@@ -1609,18 +1694,45 @@ public sealed class MeshSimulationTests
 
             DfsVolume v = s.Client("p0").GetVolume(Vol);
             int entries = s.Timings.RaftSnapshotThreshold + 40;
+            bool overwrites = volume && s.Expect(MeshProbeKind.WriteSmall, "p0").Outcome == MeshTri.Must;
             if (volume)
             {
-                await v.Directories.CreateDirectoryAsync("/mesh/lag", Ct);
+                await MeshHelpers.MustAsync(s, () => v.Directories.CreateDirectoryAsync("/mesh/lag", Ct), "create /mesh/lag");
                 for (int i = 0; i < entries; i++)
-                    await v.Files.WriteAllBytesAsync($"/mesh/lag/x{i % 16}", TestData.Bytes((ulong)i, 200), Ct);
-                await v.Files.DeleteAsync("/mesh/lag/x0", Ct);
-                await v.Files.MoveAsync("/mesh/lag/x1", "/mesh/lag/renamed", overwrite: false, Ct);
+                {
+                    int k = i;
+                    if (overwrites)
+                        await MeshHelpers.MustAsync(s, () => v.Files.WriteAllBytesAsync($"/mesh/lag/x{k % 16}", TestData.Bytes((ulong)k, 200), Ct), "overwrite while a voter is down");
+                    else
+                        await MeshHelpers.MustAsync(s, () => v.Directories.CreateDirectoryAsync($"/mesh/lag/x{k % 16}/s{k}", Ct), "metadata entry while a voter is down");
+                }
+
+                // Reserved ids: a retry after an unknown outcome returns the stored outcome instead of failing on the
+                // already-moved source.
+                var deleteId = new DfsMutationOptions { OperationId = await MeshHelpers.MustAsync(s, () => v.NewOperationIdAsync(Ct), "reserve an id") };
+                var moveId = new DfsMutationOptions { OperationId = await MeshHelpers.MustAsync(s, () => v.NewOperationIdAsync(Ct), "reserve an id") };
+                if (overwrites)
+                {
+                    await MeshHelpers.MustAsync(s, () => v.Files.DeleteAsync("/mesh/lag/x0", deleteId, Ct), "delete while a voter is down");
+                    await MeshHelpers.MustAsync(s, () => v.Files.MoveAsync("/mesh/lag/x1", "/mesh/lag/renamed", false, moveId, Ct), "rename while a voter is down");
+                }
+                else
+                {
+                    await MeshHelpers.MustAsync(s, () => v.Directories.DeleteAsync("/mesh/lag/x0", true, deleteId, Ct), "delete while a voter is down");
+                    await MeshHelpers.MustAsync(s, () => v.Directories.MoveAsync("/mesh/lag/x1", "/mesh/lag/renamed", moveId, Ct), "rename while a voter is down");
+                }
             }
             else
             {
                 for (int i = 0; i < entries; i++)
-                    await s.Client("p0").Admin.CreatePrincipalAsync("lag" + i.ToString(CultureInfo.InvariantCulture), "secret", clusterAdmin: false, Ct);
+                {
+                    string principal = "lag" + i.ToString(CultureInfo.InvariantCulture);
+                    await MeshHelpers.MustAsync(s, async () =>
+                    {
+                        await s.Client("p0").Admin.CreatePrincipalAsync(principal, "secret", clusterAdmin: false, Ct);
+                        return principal;
+                    }, "principal creation while a control member is down");
+                }
             }
 
             await cluster.WaitUntilAsync(async () =>
@@ -1629,23 +1741,52 @@ public sealed class MeshSimulationTests
                 return g.SnapshotIndex > appliedBefore;
             }, s.Options.RecoveryTimeout, $"the {group} leader must compact past index {appliedBefore} after {entries} entries (threshold {s.Timings.RaftSnapshotThreshold})", Ct);
 
+            // Observe the checkpoint-install path on the returning node (a no-op action; only reachability is asserted).
+            FaultArm install = cluster.Faults.Arm(new FaultMatch(FaultSites.RaftSnapshotInstall, Node: lagger, Count: 1_000_000), FaultAction.Delay(TimeSpan.Zero));
             await s.RestartAsync(lagger);
+            // The workload keeps committing, so "caught up" is measured against the leader's commit index at the return.
+            ulong target = (volume ? await s.VolumeGroupAsync() : await cluster.Inspect.GetControlGroupAsync()).CommitIndex;
             await cluster.WaitUntilAsync(async () =>
             {
-                GroupInspection l = volume ? await s.VolumeGroupAsync() : await cluster.Inspect.GetControlGroupAsync();
                 GroupInspection? mine = await cluster.Node(lagger).Inspect.GetGroupAsync(group);
-                return mine is not null && mine.AppliedIndex >= l.CommitIndex;
-            }, s.Options.RecoveryTimeout, $"{lagger} must catch up with the {group} leader", Ct);
+                return mine is not null && mine.AppliedIndex >= target;
+            }, s.Options.RecoveryTimeout, $"{lagger} must catch up with the {group} leader's commit index {target}", Ct);
             GroupInspection caught = (await cluster.Node(lagger).Inspect.GetGroupAsync(group))!;
+            cluster.Faults.AssertReached(install);
+            install.Disarm();
             Assert.True(caught.SnapshotIndex > appliedBefore,
                 $"{lagger} applied {appliedBefore} before going down; the missing log was compacted so it must have installed a checkpoint (snapshot index {caught.SnapshotIndex}, RCV-03)");
             if (volume)
             {
-                VolumeStateInspection state = (await cluster.Node(lagger).Inspect.GetVolumeStateAsync(Vol))!;
-                Assert.Null(state.GetFile("/mesh/lag/x0"));
-                Assert.Null(state.GetFile("/mesh/lag/x1"));
-                Assert.NotNull(state.GetFile("/mesh/lag/renamed"));
+                if (overwrites)
+                {
+                    VolumeStateInspection state = (await cluster.Node(lagger).Inspect.GetVolumeStateAsync(Vol))!;
+                    Assert.Null(state.GetFile("/mesh/lag/x0"));
+                    Assert.Null(state.GetFile("/mesh/lag/x1"));
+                    Assert.NotNull(state.GetFile("/mesh/lag/renamed"));
+                }
+                else
+                {
+                    Assert.False(await v.Directories.ExistsAsync("/mesh/lag/x0", Ct), "/mesh/lag/x0 was deleted while the voter was down");
+                    Assert.False(await v.Directories.ExistsAsync("/mesh/lag/x1", Ct), "/mesh/lag/x1 was renamed while the voter was down");
+                    Assert.True(await v.Directories.ExistsAsync("/mesh/lag/renamed", Ct), "the renamed directory exists");
+                }
+
+                // Identical replicated-state digests on every caught-up replica, the returned node included.
                 await cluster.Inspect.AssertReplicasConvergedAsync(Vol);
+            }
+            else
+            {
+                // The returned member serves the principals created while it was down (its control state caught up).
+                string last = "lag" + (entries - 1).ToString(CultureInfo.InvariantCulture);
+                await using DfsClient check = await cluster.ConnectAsync(new TestClientOptions
+                {
+                    Name = "lag-check",
+                    Credentials = new DfsCredentials(last, "secret"),
+                    SeedNodes = [lagger],
+                    OperationTimeout = s.Options.ClientOperationTimeout,
+                }, Ct);
+                Assert.Equal(last, check.Principal);
             }
 
             await s.FinishAsync();
@@ -1678,30 +1819,41 @@ public sealed class MeshSimulationTests
             string l1 = await s.VolumeLeaderAsync();
             await s.CrashAsync(l1);
             string l2 = await s.WaitForVolumeLeaderAmongAsync(s.VolumeVoters.Where(v => v != l1).ToArray(), "a second voter must take over");
+
+            // W: a file when the data policy can acknowledge it without L1 (else a directory: a metadata-only commit, so a
+            // policy that needs L1's host, e.g. ack 3 on three nodes, does not make "commit W" impossible).
+            const string wPath = "/mesh/w-after-l1";
             byte[] w = TestData.Bytes(2626, 400);
-            await cluster.WaitUntilAsync(async () =>
+            DfsVolume v = s.Client("p0").GetVolume(Vol);
+            bool wIsFile = s.Expect(MeshProbeKind.WriteSmall, "p0").Outcome == MeshTri.Must;
+            if (wIsFile)
+                await MeshHelpers.MustAsync(s, () => v.Files.WriteAllBytesAsync(wPath, w, Ct), "W must commit under L2");
+            else
+                await MeshHelpers.MustAsync(s, () => v.Directories.CreateDirectoryAsync(wPath, Ct), "W must commit under L2");
+            IReadOnlyList<IReadOnlyList<string>> wHolders = wIsFile ? await s.RecordHoldersAsync(wPath) : [];
+
+            async Task<bool> VerifyWAsync(string because)
             {
-                try
+                if (!wIsFile)
                 {
-                    await s.Client("p0").GetVolume(Vol).Files.WriteAllBytesAsync("/mesh/w-after-l1", w, Ct);
+                    Assert.True(await v.Directories.ExistsAsync(wPath, Ct), $"{because}: directory W reported absent");
                     return true;
                 }
-                catch (Exception ex) when (MeshOracle.Unwrap(ex) is DfsUnavailableException or DfsCommitOutcomeUnknownException)
-                {
-                    return false;
-                }
-            }, s.Options.MustWithin, "W must commit under L2", Ct);
+
+                MeshHelpers.BytesEqual(w, await v.Files.ReadAllBytesAsync(wPath, Ct), because);
+                return true;
+            }
 
             await s.CrashAsync(l2);
             await s.ProbeAsync("l1-l2-down");
             await s.AssertSafetyAsync("l1-l2-down");
             await s.RestartAsync(l1);
             await s.ProbeAsync("l1-back-l2-down");
-            if (MeshOracle.Quorum(s.Net, s.VolumeVoters, "client:p0", MeshCause.MetadataQuorum).Outcome == MeshTri.Must)
-                MeshHelpers.BytesEqual(w, await s.Client("p0").GetVolume(Vol).Files.ReadAllBytesAsync("/mesh/w-after-l1", Ct), "W committed under L2, read after L1 returned without it");
+            if (s.ExpectRead(wHolders, "p0").Outcome == MeshTri.Must)
+                await MeshHelpers.MustAsync(s, () => VerifyWAsync("W committed under L2, read after L1 returned without it (CON-005)"), "W must be readable");
             await s.RestartAsync(l2);
             await s.FinishAsync();
-            MeshHelpers.BytesEqual(w, await s.Client("p0").GetVolume(Vol).Files.ReadAllBytesAsync("/mesh/w-after-l1", Ct), "W after full recovery");
+            await VerifyWAsync("W after full recovery");
         }, Ct);
     }
 
@@ -1735,10 +1887,15 @@ public sealed class MeshSimulationTests
             string[] sideB = MeshHelpers.Names(s).Except(sideA).ToArray();
             s.PartitionNodes([[.. sideA, newName], sideB], client => client == "client:p1" ? 1 : 0);
 
-            Assert.Equal(MeshTri.Never, s.Expect(MeshProbeKind.ControlChange, "p1").Outcome);
+            MeshExpectation minorityControl = s.Expect(MeshProbeKind.ControlChange, "p1");
+            Assert.Equal(MeshTri.Never, minorityControl.Outcome);
+            // A well-formed request (so argument validation cannot be what rejects it). Its endpoint does not exist, so an
+            // implementation that contacts the new member before proposing may report it unavailable instead of the missing
+            // quorum: any typed availability failure (or an unknown outcome with its id) is legal, success never is.
+            var causes = new HashSet<MeshCause>(minorityControl.Causes) { MeshCause.Unreachable };
             Exception minority = await Assert.ThrowsAnyAsync<Exception>(() =>
-                s.Client("p1").Admin.AddNodeAsync("phantom", new DfsTopologyLabels("r1", "z1", "rk1", "phantom", "d1"), [], Ct));
-            string? why = MeshOracle.CheckFailure(minority, s.Expect(MeshProbeKind.ControlChange, "p1").Causes, mutation: true, s.Policy);
+                s.Client("p1").Admin.AddNodeAsync("phantom", new DfsTopologyLabels("r1", "z1", "rk1", "phantom", "d1"), ["mem://phantom"], Ct));
+            string? why = MeshOracle.CheckFailure(minority, causes, mutation: true, s.Policy);
             Assert.True(why is null, "adding a member through the minority side: " + why);
 
             string zone = cfg.Topology == TestTopology.OnePerZone ? "z" + (nodes + 1).ToString(CultureInfo.InvariantCulture) : "z1";
@@ -1765,11 +1922,14 @@ public sealed class MeshSimulationTests
     /// <summary>
     /// MESH-036: skew the node clocks under load — the volume leader's clock runs at 1.5× or 0.6×, its wall clock jumps
     /// back an hour, every follower's wall clock jumps forward an hour, or every node drifts (seeded rates 0.80–1.25 and
-    /// wall offsets of ±60 min). Wall-clock time never orders commits (NS-04, ARCHITECTURE §3.1.5): a later sequential
-    /// write gets a strictly greater commit token and revision and is the value read, also after authority moves to a
-    /// node with a skewed clock; a writer that keeps renewing is not fenced by drift within these bounds (leases are
-    /// tracked on the leader's monotonic clock and renewed every third of the lease); the oracle's availability holds;
-    /// histories stay linearizable/serializable and replicas converge.
+    /// wall offsets of ±60 min). Wall-clock time never orders commits (NS-04, ARCHITECTURE §3.1.5): every write that
+    /// succeeds gets a strictly greater commit token and revision than the writes acknowledged before it and is read back
+    /// exactly, also after authority moves to a node with a skewed clock (elections run on monotonic ticks, so a surviving
+    /// voter takes over). Server clock changes may reduce availability but never safety (LOCK-015, SEC-017): while skewed
+    /// every operation either succeeds correctly or fails typed (probes: the oracle's expectation with required successes
+    /// relaxed), and a writer whose lease is lost cannot publish (its commit fails, its bytes never appear, INV-05). Once
+    /// the clocks agree again the oracle's availability is required, the ordering holds for a new write, histories stay
+    /// linearizable/serializable and replicas converge.
     /// </summary>
     [Theory]
     [MemberData(nameof(ClockSkewMatrix))]
@@ -1782,9 +1942,45 @@ public sealed class MeshSimulationTests
             MeshScenario s = await MeshScenario.StartAsync(cluster, cfg, MeshHelpers.Options(), Ct);
             string leader = await s.VolumeLeaderAsync();
             DfsFileClient files = s.Client("p0").GetVolume(Vol).Files;
-            const string key = "/mesh/clock-key";
-            CommitToken t1 = await files.WriteAllBytesAsync(key, TestData.Bytes(3601, 300), Ct);
-            ulong r1 = (await files.GetInfoAsync(key, Ct)).Revision;
+
+            // Each step writes its own file once (retried with the same bytes), so a step that ends unknown can never be
+            // confused with another step's value; tokens and revisions (Raft indexes, ARCHITECTURE §2.2) order steps.
+            CommitToken last = CommitToken.None;
+            ulong lastRevision = 0;
+            async Task<bool> StepAsync(string name, bool required, string because)
+            {
+                string path = "/mesh/clock-" + name;
+                byte[] data = TestData.Bytes(3600UL + name[0], 300);
+                (bool ok, CommitToken t) = required
+                    ? (true, await MeshHelpers.MustAsync(s, () => files.WriteAllBytesAsync(path, data, Ct), because))
+                    : await MeshHelpers.TryWithinAsync(s, () => files.WriteAllBytesAsync(path, data, Ct), because);
+                if (!ok)
+                    return false;
+                if (!last.IsNone)
+                {
+                    Assert.True(t.IsComparableWith(last), $"tokens {last} and {t} of one volume and epoch must be comparable");
+                    Assert.True(t.CompareTo(last) > 0, $"{because}: write {t} must be ordered after the earlier acknowledged {last}, whatever the wall clocks say (NS-04)");
+                }
+
+                last = t;
+                (bool infoOk, DfsFileInfo? info) = required
+                    ? (true, await MeshHelpers.MustAsync(s, () => files.GetInfoAsync(path, Ct), because))
+                    : await MeshHelpers.TryWithinAsync(s, () => files.GetInfoAsync(path, Ct), because, mutation: false);
+                if (infoOk && info is not null)
+                {
+                    Assert.True(info.Revision > lastRevision, $"{because}: revision {info.Revision} must exceed the earlier {lastRevision}; wall-clock time never orders commits");
+                    lastRevision = info.Revision;
+                }
+
+                (bool readOk, byte[]? back) = required
+                    ? (true, await MeshHelpers.MustAsync(s, () => files.ReadAllBytesAsync(path, Ct), because))
+                    : await MeshHelpers.TryWithinAsync(s, () => files.ReadAllBytesAsync(path, Ct), because, mutation: false);
+                if (readOk && back is not null)
+                    MeshHelpers.BytesEqual(data, back, because);
+                return true;
+            }
+
+            await StepAsync("1", required: true, "write before the clock change");
 
             IRandomSource rng = new SeededRandom(cluster.Seed).Fork("clock");
             switch (cfg.Variant)
@@ -1813,49 +2009,101 @@ public sealed class MeshSimulationTests
             }
 
             s.Note("clocks skewed: " + string.Join(", ", cluster.Nodes.Select(n => $"{n.Name} rate {n.Clock.Rate:0.00} wall {n.Clock.GetUtcNow():HH:mm:ss}")));
+            await StepAsync("2", required: false, "sequential write after the clock change");
 
-            byte[] second = TestData.Bytes(3602, 300);
-            CommitToken t2 = await MeshHelpers.MustAsync(s, () => files.WriteAllBytesAsync(key, second, Ct), "sequential write after the clock change");
-            Assert.True(t2.IsComparableWith(t1), $"tokens {t1} and {t2} of one volume and epoch must be comparable");
-            Assert.True(t2.CompareTo(t1) > 0, $"the later sequential write {t2} must be ordered after {t1} whatever the wall clocks say (NS-04)");
-            DfsFileInfo info2 = await files.GetInfoAsync(key, Ct);
-            Assert.True(info2.Revision > r1, $"revision must increase ({r1} -> {info2.Revision}); wall-clock time never orders commits");
-            MeshHelpers.BytesEqual(second, await files.ReadAllBytesAsync(key, Ct), "value after the clock change");
-
-            // A writer that keeps its lease renewed is not fenced by bounded drift.
+            // A writer holding a lease across three lease durations of skewed time: renewals normally keep it valid (leases
+            // run on the leader's monotonic clock and are renewed every third of the lease), but a server clock change may
+            // cost availability (LOCK-015) — never a publication by a writer whose lease was lost.
             const string leased = "/mesh/clock-leased";
             byte[] leasedData = TestData.Bytes(3603, 5000);
-            await using (DfsStream writer = await files.OpenAsync(leased, FileMode.Create, FileAccess.Write, FileShare.Read, Ct))
+            OpOutcome leasedOutcome = OpOutcome.Failed;
+            CommitToken leasedToken = CommitToken.None;
+            (bool opened, DfsStream? writer) = await MeshHelpers.TryWithinAsync(s, () => files.OpenAsync(leased, FileMode.Create, FileAccess.Write, FileShare.Read, Ct), "open a writer under skew");
+            if (opened && writer is not null)
             {
-                await writer.WriteAsync(leasedData, Ct);
-                await cluster.DelayAsync(s.Timings.LeaseDuration * 3, Ct);
-                Assert.False(writer.IsFaulted, $"a renewing writer was faulted under bounded clock drift: {MeshOracle.Describe(writer.Fault)}");
-                CommitToken leasedToken = await writer.CommitAsync(Ct);
-                Assert.True(leasedToken.CompareTo(t2) > 0, $"commit {leasedToken} after {t2} must be ordered after it");
+                try
+                {
+                    await writer.WriteAsync(leasedData, Ct);
+                    await cluster.DelayAsync(s.Timings.LeaseDuration * 3, Ct);
+                    leasedToken = await writer.CommitAsync(Ct);
+                    leasedOutcome = OpOutcome.Ok;
+                }
+                catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)
+                {
+                    Exception e = MeshOracle.Unwrap(ex);
+                    Assert.True(e is DfsLeaseLostException or DfsUnavailableException or DfsCommitOutcomeUnknownException or DfsOperationExpiredException,
+                        $"committing a leased writer under skew may only fail typed: {MeshOracle.Describe(e)}");
+                    if (e is DfsLeaseLostException or DfsCommitOutcomeUnknownException)
+                        Assert.True(writer.IsFaulted, $"lease loss or an unknown publication must fault the stream (FSD §6.4): {MeshOracle.Describe(e)}");
+                    leasedOutcome = MeshOracle.ClassifyOutcome(e);
+                    try
+                    {
+                        await writer.AbortAsync(Ct); // never let disposal publish the staged bytes later
+                    }
+                    catch (Exception abort) when (abort is not Xunit.Sdk.XunitException)
+                    {
+                        s.Note("abort after the failed commit: " + MeshOracle.Describe(abort));
+                    }
+                }
+
+                try
+                {
+                    await writer.DisposeAsync();
+                }
+                catch (Exception ex) when (leasedOutcome != OpOutcome.Ok && ex is not Xunit.Sdk.XunitException)
+                {
+                    s.Note("dispose of the failed writer: " + MeshOracle.Describe(ex));
+                }
+
+                if (leasedOutcome == OpOutcome.Ok && !last.IsNone)
+                    Assert.True(leasedToken.CompareTo(last) > 0, $"commit {leasedToken} must be ordered after the earlier acknowledged {last}");
+                if (leasedOutcome == OpOutcome.Ok)
+                    last = leasedToken;
             }
 
-            MeshHelpers.BytesEqual(leasedData, await files.ReadAllBytesAsync(leased, Ct), "writer committed after three lease durations under skew");
-            await s.ProbeAsync("skewed");
+            await ProbeRelaxedAsync(s, "skewed", "node clocks are skewed (LOCK-015: availability may be reduced, safety may not)");
             await s.AssertSafetyAsync("skewed");
 
             if (MeshOracle.Tolerance(s.VolumeVoters.Count) >= 1)
             {
-                // Hand authority to a node whose clock differs from the old leader's.
+                // Hand authority to a node whose clock differs from the old leader's. Elections run on monotonic ticks
+                // (heartbeat 5 ticks vs election timeout 30-60 ticks), so drift of 0.6-1.5x cannot prevent one.
                 await s.CrashAsync(leader);
                 string successor = await s.WaitForVolumeLeaderAmongAsync(s.VolumeVoters.Where(v => v != leader).ToArray(), "a skewed-clock voter must take over");
-                byte[] third = TestData.Bytes(3604, 300);
-                CommitToken t3 = await MeshHelpers.MustAsync(s, () => files.WriteAllBytesAsync(key, third, Ct), "write under the successor " + successor);
-                Assert.True(t3.CompareTo(t2) > 0, $"write {t3} under {successor} must be ordered after {t2} written under {leader}");
-                Assert.True((await files.GetInfoAsync(key, Ct)).Revision > info2.Revision, "revision must increase across the failover");
-                MeshHelpers.BytesEqual(third, await files.ReadAllBytesAsync(key, Ct), "value written under the skewed successor");
-                await s.ProbeAsync("skewed-failover");
+                await StepAsync("3", required: false, "write under the skewed successor " + successor);
+                await ProbeRelaxedAsync(s, "skewed-failover", "node clocks are skewed (LOCK-015)");
                 await s.AssertSafetyAsync("skewed-failover");
                 await s.RestartAsync(leader);
+            }
+
+            // Clocks agree again (rate 1, wall time aligned with the harness clock): full availability and ordering return.
+            foreach (TestNode node in cluster.Nodes)
+            {
+                node.Clock.SetRate(1.0);
+                TimeSpan behind = cluster.Time.GetUtcNow() - node.Clock.GetUtcNow();
+                if (behind != TimeSpan.Zero)
+                    node.Clock.JumpWall(behind);
+            }
+
+            s.Note("clocks restored");
+            await StepAsync("4", required: true, "write after the clocks agree again");
+            if (opened)
+            {
+                // The creating open committed, so the file exists; its content shows whether the writer published.
+                byte[] leasedNow = await MeshHelpers.MustAsync(s, () => files.ReadAllBytesAsync(leased, Ct), "read the leased file after the clocks agree");
+                if (leasedOutcome == OpOutcome.Ok)
+                    MeshHelpers.BytesEqual(leasedData, leasedNow, "writer committed across three lease durations under skew");
+                else if (leasedOutcome == OpOutcome.Failed)
+                    Assert.False(leasedNow.AsSpan().SequenceEqual(leasedData), "a writer whose commit failed definitely (lease lost or unavailable) published its bytes (INV-05)");
             }
 
             await s.FinishAsync();
         }, Ct);
     }
+
+    /// <summary>Probes every kind against the oracle with required successes relaxed to "success or typed failure".</summary>
+    private static Task ProbeRelaxedAsync(MeshScenario s, string phase, string why) =>
+        Task.WhenAll(s.Options.ProbeKinds.Select(kind => s.ProbeOneAsync(phase, "p0", kind, MeshHelpers.NotPromised(s.Expect(kind, "p0"), kind, why))));
 
     // ============================================================================================================
     // MESH-037 — slow node links (below and above the election timeout)

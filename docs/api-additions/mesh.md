@@ -17,11 +17,11 @@ product, so it can serve as an independent oracle.
 | `MeshPairwise.cs` | `MeshDimension`, `MeshPairwiseResult`, `MeshPairwise` | Deterministic constraint-aware covering-array generator (critical rows exhaustive, non-critical pairs covered) with exact counts (critical, excluded, extra rows, coverable/covered pairs). |
 | `MeshNetworkModel.cs` | `MeshNetworkModel` | Test-side mirror of node liveness, placement eligibility and link state (mesh restriction, partitions, isolation, one-way cuts, black holes, heal). |
 | `MeshExpectation.cs` | `MeshTri`, `MeshCause`, `MeshProbeKind`, `MeshExpectation` | Three-valued availability expectation (`Must`/`Either`/`Never`) with the failure causes that are legal. |
-| `MeshOracle.cs` | `MeshOracle` | Independent availability oracle: quorum over configured voters, data acknowledgement policy over usable hosts/zones, replica holders, guaranteed metadata durability and the inline rule, legal-failure classification. |
+| `MeshOracle.cs` | `MeshOracle` | Independent availability oracle: quorum over configured voters, data acknowledgement policy over usable hosts/zones, replica holders, guaranteed metadata durability and the inline rule, legal-failure classification (`CheckFailure`, incl. expired ids after loss of the authority), `ClassifyOutcome` (an expired id is unknown, never a definite failure) and `Bound` (expectation when some nodes may or may not count). |
 | `MeshRenameModel.cs` | `MeshRenameModel` | `ISequentialModel<string>` for a token file renamed between two names (torn renames are impossible states). |
 | `MeshWorkload.cs` | `MeshWorkloadOptions`, `MeshWorkload` | Concurrent multi-client workload recorded in `TestCluster.History` and a transaction list; resolves unknown outcomes by id; checks linearizability, strict serializability, acknowledged-write durability and typed failures. |
 | `MeshNamespaceScript.cs` | `MeshNamespaceScript` | Single-process namespace script through faults (ids reserved before transmission, retries with the same id, unknown outcomes resolved), compared with `ReferenceNamespaceModel` including inode identity. |
-| `MeshScenario.cs` | `MeshScenarioOptions`, `MeshScenario` | Scenario driver: formation checks, probe files and holders, fault methods mirrored into the model, oracle probes, safety during faults, `WaitSettledAsync`, recovery and the final checks. |
+| `MeshScenario.cs` | `MeshScenarioOptions`, `MeshScenario` | Scenario driver: formation checks, probe files and holders, fault methods mirrored into the model, oracle probes (`Expect`, `ExpectIf` on a hypothetical network, `ExpectRead` for a file whose holders were recorded with `RecordHoldersAsync`), `PendingRegistration` (nodes restarted while the control group could not re-register them, RCV-02), safety during faults, `WaitSettledAsync`, recovery and the final checks. |
 
 Suite-local helpers (internal, per G conventions): `tests/Tedd.Tdfs.Tests.Simulation/Mesh/MeshHelpers.cs` (matrices,
 `MustAsync`, `NotPromised`, set partitions, generator reports) and `tests/Tedd.Tdfs.Tests.Integration/Mesh/MeshHelpers.cs`
@@ -64,3 +64,13 @@ or a signature change; the harness implementation should satisfy them (or the af
     timeout surface as `DfsUnavailableException` subclasses (or, after possible publication, as
     `DfsCommitOutcomeUnknownException` with the operation id) — never as a bare `TimeoutException` (FSD §13; the
     workload records a bare timeout as a violation).
+11. **Compaction point.** `GroupInspection.SnapshotIndex` is the index up to which that replica's log is compacted
+    (entries at or below it are no longer available for incremental catch-up). MESH-025 waits for the leader's
+    `SnapshotIndex` to pass the lagging node's applied index and then requires a checkpoint install.
+12. **Checkpoint-install fault site.** `FaultSites.RaftSnapshotInstall` is hit on the node that installs a leader-sent
+    checkpoint (`FaultContext.Node` = that node), and a `FaultAction.Delay(TimeSpan.Zero)` arm is a no-op that only
+    records reachability (MESH-025 asserts it was reached).
+13. **Node clocks vs the harness clock.** With rate 1 and no wall offset a node's `TestNode.Clock` shows the same wall time
+    as `TestCluster.Time` (in either mode), and `SetRate(1.0)` plus `JumpWall(TestCluster.Time - Clock)` realigns a
+    skewed node clock (MESH-036 restores agreement before requiring availability again). Restarting a node keeps or
+    resets its clock — the realignment works either way.

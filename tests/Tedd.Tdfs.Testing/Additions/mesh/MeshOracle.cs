@@ -233,7 +233,10 @@ public static class MeshOracle
     /// <summary>
     /// Checks that a failure is legal for an expectation's causes. Mutations may additionally report an unknown outcome
     /// (carrying a non-empty operation id) for every cause except <see cref="MeshCause.Placement"/> and
-    /// <see cref="MeshCause.NoHealthyReplica"/>, which are decided before anything is proposed.
+    /// <see cref="MeshCause.NoHealthyReplica"/>, which are decided before anything is proposed. When the cause is a
+    /// quorum/reachability problem an operation may also be rejected as expired (<see cref="DfsOperationExpiredException"/>):
+    /// a client cut off from the authority for longer than the session timeout has its session expired by the authority,
+    /// and FSD §13 requires ids outside the retained window to be rejected explicitly rather than replayed.
     /// </summary>
     /// <returns>Null when legal, otherwise the reason it is not.</returns>
     public static string? CheckFailure(Exception exception, IReadOnlySet<MeshCause> causes, bool mutation, DfsStoragePolicy policy)
@@ -245,12 +248,20 @@ public static class MeshOracle
         if (causes.Count == 0)
             return $"no failure is legal here, got {Describe(ex)}";
 
+        bool availabilityCause = causes.Any(c => c is MeshCause.MetadataQuorum or MeshCause.ControlQuorum or MeshCause.Unreachable);
         if (ex is DfsCommitOutcomeUnknownException unknown)
         {
-            bool unknownLegal = mutation && causes.Any(c => c is MeshCause.MetadataQuorum or MeshCause.ControlQuorum or MeshCause.Unreachable);
+            bool unknownLegal = mutation && availabilityCause;
             if (!unknownLegal)
                 return $"an unknown outcome is not legal for {(mutation ? "this mutation" : "a read")} with causes [{string.Join(",", causes)}]: {Describe(ex)}";
             return unknown.OperationId.IsEmpty ? $"unknown outcome without an operation id: {Describe(ex)}" : null;
+        }
+
+        if (ex is DfsOperationExpiredException)
+        {
+            return availabilityCause
+                ? null
+                : $"an expired operation id is only legal after the client lost the authority, causes [{string.Join(",", causes)}]: {Describe(ex)}";
         }
 
         foreach (MeshCause cause in causes)
@@ -285,6 +296,38 @@ public static class MeshOracle
         }
 
         return $"{Describe(ex)} is not a legal failure for causes [{string.Join(",", causes.OrderBy(c => c))}]";
+    }
+
+    /// <summary>
+    /// What a client may conclude about a mutation that failed with <paramref name="exception"/>: as
+    /// <see cref="HistoryRecorder.Classify"/>, except that an expired operation id is <see cref="OpOutcome.Unknown"/> — the
+    /// authority no longer retains the id's outcome, so the operation may or may not have taken effect (FSD §13: pending or
+    /// indeterminate status is never presented as a definite abort).
+    /// </summary>
+    public static OpOutcome ClassifyOutcome(Exception exception)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+        Exception ex = Unwrap(exception);
+        return ex is DfsOperationExpiredException ? OpOutcome.Unknown : HistoryRecorder.Classify(ex);
+    }
+
+    /// <summary>
+    /// The expectation when it is uncertain whether some nodes count (for example nodes restarted while the control group
+    /// could not re-register their incarnation, RCV-02): <paramref name="pessimistic"/> is computed without them,
+    /// <paramref name="optimistic"/> with them. Must only when even the pessimistic case is Must, Never only when even the
+    /// optimistic case is Never, otherwise Either with the failure causes of both.
+    /// </summary>
+    public static MeshExpectation Bound(MeshExpectation pessimistic, MeshExpectation optimistic, string why)
+    {
+        ArgumentNullException.ThrowIfNull(pessimistic);
+        ArgumentNullException.ThrowIfNull(optimistic);
+        if (pessimistic.Outcome == MeshTri.Must)
+            return pessimistic;
+        if (optimistic.Outcome == MeshTri.Never)
+            return optimistic;
+        var causes = new HashSet<MeshCause>(pessimistic.Causes);
+        causes.UnionWith(optimistic.Causes);
+        return MeshExpectation.Either(causes, $"{why}: between {pessimistic} and {optimistic}");
     }
 
     /// <summary>Unwraps aggregate/target-invocation wrappers.</summary>

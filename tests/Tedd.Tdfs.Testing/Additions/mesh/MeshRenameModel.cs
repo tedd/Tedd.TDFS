@@ -6,8 +6,10 @@ namespace Tedd.Tdfs.Testing.Mesh;
 /// </summary>
 /// <remarks>
 /// Kinds: <c>"move"</c> — input <c>"a&gt;b"</c> or <c>"b&gt;a"</c>; output <c>"moved"</c> (the rename happened, so the
-/// state must have been the source) or <c>"absent"</c> (the server answered that the source does not exist, so the
-/// state must have been the other name; no change). <c>"probe"</c> — output is the set of names observed in one pinned
+/// state must have been the source), <c>"absent"</c> (the server answered that the source does not exist) or
+/// <c>"dest-exists"</c> (the server answered that the destination exists; with a missing source and an existing destination
+/// the specification does not fix which of the two errors is reported) — both mean the state was the other name and
+/// nothing changed. <c>"probe"</c> — output is the set of names observed in one pinned
 /// directory listing encoded as <c>"a"</c>, <c>"b"</c>, <c>"none"</c> or <c>"both"</c>; only the current state is legal
 /// (a torn rename would show "none" or "both"). Unknown-outcome moves may or may not have happened.
 /// </remarks>
@@ -45,7 +47,10 @@ public sealed class MeshRenameModel : ISequentialModel<string>
                         next = to;
                         return true;
                     case "absent":
-                        return state != from;
+                    case "dest-exists":
+                        // Exactly one of the two names holds the token, so "source absent" and "destination exists"
+                        // both mean it was at the destination already (a torn rename would make one of them a lie).
+                        return state == to;
                     default:
                         return false;
                 }

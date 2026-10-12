@@ -202,6 +202,26 @@ public sealed class MeshUnitTests
         Assert.NotNull(MeshOracle.CheckFailure(new DfsQuorumUnavailableException("q"), new HashSet<MeshCause>(), mutation: true, policy));
         Assert.Null(MeshOracle.CheckFailure(new DfsIntegrityException("missing"), new HashSet<MeshCause> { MeshCause.NoHealthyReplica }, false, policy));
 
+        // An id rejected as expired (session expired while the client was cut off) is legal only for availability causes
+        // and is never a definite failure.
+        var unreachable = new HashSet<MeshCause> { MeshCause.Unreachable };
+        Assert.Null(MeshOracle.CheckFailure(new DfsOperationExpiredException("expired"), unreachable, mutation: true, policy));
+        Assert.Null(MeshOracle.CheckFailure(new DfsOperationExpiredException("expired"), quorum, mutation: false, policy));
+        Assert.NotNull(MeshOracle.CheckFailure(new DfsOperationExpiredException("expired"), placement, mutation: true, policy));
+        Assert.Equal(OpOutcome.Unknown, MeshOracle.ClassifyOutcome(new DfsOperationExpiredException("expired")));
+        Assert.Equal(OpOutcome.Unknown, MeshOracle.ClassifyOutcome(new AggregateException(new DfsCommitOutcomeUnknownException(new DfsOperationId(1, 2), "?"))));
+        Assert.Equal(OpOutcome.Failed, MeshOracle.ClassifyOutcome(new DfsQuorumUnavailableException("q")));
+
+        // Bounds for nodes whose participation is uncertain (restarted before the control group could register them).
+        MeshExpectation must = MeshExpectation.Must("m");
+        MeshExpectation never = MeshExpectation.Never(MeshCause.MetadataQuorum, "n");
+        Assert.Equal(MeshTri.Must, MeshOracle.Bound(must, must, "w").Outcome);
+        Assert.Equal(MeshTri.Never, MeshOracle.Bound(never, never, "w").Outcome);
+        MeshExpectation between = MeshOracle.Bound(never, must, "w");
+        Assert.Equal(MeshTri.Either, between.Outcome);
+        Assert.Equal(MeshCause.MetadataQuorum, Assert.Single(between.Causes));
+        Assert.Equal(MeshTri.Either, MeshOracle.Bound(MeshExpectation.Either([MeshCause.Unreachable], "e"), must, "w").Outcome);
+
         MeshExpectation combined = MeshExpectation.Combine(MeshExpectation.Must("m"), MeshExpectation.Never(MeshCause.Placement, "p"));
         Assert.Equal(MeshTri.Never, combined.Outcome);
         Assert.Equal(MeshCause.Placement, Assert.Single(combined.Causes));
@@ -227,6 +247,11 @@ public sealed class MeshUnitTests
         Assert.True(model.Step("a", Op("move", "b>a", OpOutcome.Ok, "absent"), out next));
         Assert.Equal("a", next);
         Assert.False(model.Step("b", Op("move", "b>a", OpOutcome.Ok, "absent"), out _));
+        // Source missing and destination existing: either error may be reported; both mean "already at the destination".
+        Assert.True(model.Step("a", Op("move", "b>a", OpOutcome.Ok, "dest-exists"), out next));
+        Assert.Equal("a", next);
+        Assert.False(model.Step("b", Op("move", "b>a", OpOutcome.Ok, "dest-exists"), out _));
+        Assert.False(model.Step("a", Op("move", "a>b", OpOutcome.Ok, "unexpected"), out _));
         Assert.False(model.Step("a", Op("probe", null, OpOutcome.Ok, "both"), out _));
         Assert.False(model.Step("a", Op("probe", null, OpOutcome.Ok, "none"), out _));
         Assert.True(model.Step("a", Op("probe", null, OpOutcome.Ok, "a"), out _));

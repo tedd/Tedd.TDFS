@@ -73,6 +73,7 @@ public sealed class MeshScenario
     private readonly List<string> _ackedPrincipals = [];
     private readonly HashSet<string> _paused = new(StringComparer.Ordinal);
     private readonly HashSet<string> _removed = new(StringComparer.Ordinal);
+    private readonly SortedSet<string> _pendingRegistration = new(StringComparer.Ordinal);
     private readonly List<string> _trace = [];
     private int _counter;
     private byte[] _small = [];
@@ -134,6 +135,24 @@ public sealed class MeshScenario
 
     /// <summary>Every client network name known to the scenario (workload, script, probes, ad-hoc).</summary>
     public IReadOnlyCollection<string> ClientNetworkNames => _clientNetworkNames;
+
+    /// <summary>
+    /// Nodes restarted while the control group could not re-register their new incarnation (no connected control-voter
+    /// majority they can reach). RCV-02 lets a returning member be distrusted until it re-established its incarnation, so
+    /// whether such a node already counts for volume quorums, receipts and reads is not fixed by the specification; the
+    /// expectations treat it as "maybe down" (<see cref="MeshOracle.Bound"/>) until the control group can register it.
+    /// </summary>
+    public IReadOnlyCollection<string> PendingRegistration
+    {
+        get
+        {
+            lock (_lock)
+                return _pendingRegistration.ToArray();
+        }
+    }
+
+    /// <summary>True when the small probe file is stored inline (metadata durability satisfies the acknowledgement policy).</summary>
+    public bool SmallIsInline => _smallInline;
 
     /// <summary>Nodes that are neither volume nor control voters.</summary>
     public IReadOnlyList<string> NonVoters => Net.NodeNames.Where(n => !VolumeVoters.Contains(n) && !ControlVoters.Contains(n)).ToArray();
@@ -266,6 +285,44 @@ public sealed class MeshScenario
         Net.SetDown(node, false);
         Assert.Equal(TestNodeState.Running, n.State);
         Assert.True(n.Incarnation == before + 1, $"restart of {node} must advance its incarnation durably by one ({before} -> {n.Incarnation}, RCV-02)");
+        lock (_lock)
+        {
+            if (CanRegister(node))
+            {
+                _pendingRegistration.Remove(node);
+            }
+            else
+            {
+                _pendingRegistration.Add(node);
+                _trace.Add($"[{Cluster.Time.GetUtcNow():HH:mm:ss.fff}] {node} restarted while the control group cannot register its incarnation (RCV-02): maybe-down until it can");
+            }
+        }
+    }
+
+    /// <summary>
+    /// True when a running node can re-register its incarnation: a connected, fully linked majority of the configured
+    /// control voters exists and the node reaches every control voter of it (so it reaches the control leader).
+    /// </summary>
+    private bool CanRegister(string node)
+    {
+        if (Net.IsDown(node) || ControlVoters.Count == 0)
+            return false;
+        IReadOnlySet<string>? side = MeshOracle.QuorumSide(Net, ControlVoters);
+        if (side is null || !MeshOracle.IsClique(Net, side))
+            return false;
+        return ControlVoters.Where(side.Contains).All(v => v == node || Net.Linked(node, v));
+    }
+
+    private void RefreshRegistrations()
+    {
+        lock (_lock)
+        {
+            foreach (string node in _pendingRegistration.Where(CanRegister).ToArray())
+            {
+                _pendingRegistration.Remove(node);
+                _trace.Add($"[{Cluster.Time.GetUtcNow():HH:mm:ss.fff}] {node} can now register its incarnation with the control group");
+            }
+        }
     }
 
     /// <summary>Pauses a node (memory retained).</summary>
@@ -387,22 +444,81 @@ public sealed class MeshScenario
     /// <paramref name="metadata"/> replaces the volume-quorum component when the test knows more than the generic oracle
     /// (for example which node is leader); the reasoning must be documented at the call site.
     /// </summary>
-    public MeshExpectation Expect(MeshProbeKind kind, string client, MeshExpectation? metadata = null)
+    public MeshExpectation Expect(MeshProbeKind kind, string client, MeshExpectation? metadata = null) => ExpectWith(Net, kind, client, metadata);
+
+    /// <summary>
+    /// The oracle's expectation for <paramref name="kind"/> if <paramref name="change"/> were applied to the current network
+    /// (evaluated on a copy; nothing changes). Used to choose fault targets that keep a precondition.
+    /// </summary>
+    public MeshExpectation ExpectIf(Action<MeshNetworkModel> change, MeshProbeKind kind, string client)
+    {
+        ArgumentNullException.ThrowIfNull(change);
+        MeshNetworkModel what = Net.Clone();
+        change(what);
+        return ExpectWith(what, kind, client, null);
+    }
+
+    /// <summary>
+    /// Expectation for a live read of a file whose verified holders were recorded with <see cref="RecordHoldersAsync"/>
+    /// (no holders = inline: the metadata quorum alone decides).
+    /// </summary>
+    public MeshExpectation ExpectRead(IReadOnlyList<IReadOnlyList<string>> holders, string client)
+    {
+        ArgumentNullException.ThrowIfNull(holders);
+        string net = ClientNet(client);
+        return Bounded(Net, n =>
+        {
+            MeshExpectation quorum = MeshOracle.Quorum(n, VolumeVoters, net, MeshCause.MetadataQuorum);
+            return holders.Count == 0 ? quorum : MeshExpectation.Combine(quorum, MeshOracle.Holders(n, holders, net));
+        });
+    }
+
+    /// <summary>Records the verified holders of every object of an acknowledged file (empty when it is stored inline).</summary>
+    public async Task<IReadOnlyList<IReadOnlyList<string>>> RecordHoldersAsync(string path)
+    {
+        FileInspection file = await Cluster.Inspect.GetFileAsync(Volume, path)
+            ?? throw new InvalidOperationException(path + " missing from the leader's applied state");
+        return file.IsInline ? [] : await HoldersAsync(file, requireTarget: false);
+    }
+
+    private MeshExpectation ExpectWith(MeshNetworkModel network, MeshProbeKind kind, string client, MeshExpectation? metadata)
     {
         string net = ClientNet(client);
-        MeshExpectation quorum = metadata ?? MeshOracle.Quorum(Net, VolumeVoters, net, MeshCause.MetadataQuorum);
-        IReadOnlySet<string>? side = MeshOracle.QuorumSide(Net, VolumeVoters);
-        MeshExpectation Placement() => MeshOracle.Placement(Net, Policy, net, side);
-        return kind switch
+        if (kind == MeshProbeKind.ControlChange)
         {
-            MeshProbeKind.WriteSmall => _smallInline ? quorum : MeshExpectation.Combine(quorum, Placement()),
-            MeshProbeKind.WriteLarge => MeshExpectation.Combine(quorum, Placement()),
-            MeshProbeKind.ReadSmall => _smallInline ? quorum : MeshExpectation.Combine(quorum, MeshOracle.Holders(Net, _smallHolders, net)),
-            MeshProbeKind.ReadLarge => MeshExpectation.Combine(quorum, MeshOracle.Holders(Net, _largeHolders, net)),
-            MeshProbeKind.Append => AppendStaysInline(client) ? quorum : MeshExpectation.Combine(quorum, Placement()),
-            MeshProbeKind.ControlChange => MeshOracle.Quorum(Net, ControlVoters, net, MeshCause.ControlQuorum),
-            _ => throw new ArgumentOutOfRangeException(nameof(kind)),
-        };
+            // Re-registration is itself a control-group operation, so restarted control voters take part without it.
+            return MeshOracle.Quorum(network, ControlVoters, net, MeshCause.ControlQuorum);
+        }
+
+        return Bounded(network, n =>
+        {
+            MeshExpectation quorum = metadata ?? MeshOracle.Quorum(n, VolumeVoters, net, MeshCause.MetadataQuorum);
+            IReadOnlySet<string>? side = MeshOracle.QuorumSide(n, VolumeVoters);
+            MeshExpectation Placement() => MeshOracle.Placement(n, Policy, net, side);
+            return kind switch
+            {
+                MeshProbeKind.WriteSmall => _smallInline ? quorum : MeshExpectation.Combine(quorum, Placement()),
+                MeshProbeKind.WriteLarge => MeshExpectation.Combine(quorum, Placement()),
+                MeshProbeKind.ReadSmall => _smallInline ? quorum : MeshExpectation.Combine(quorum, MeshOracle.Holders(n, _smallHolders, net)),
+                MeshProbeKind.ReadLarge => MeshExpectation.Combine(quorum, MeshOracle.Holders(n, _largeHolders, net)),
+                MeshProbeKind.Append => AppendStaysInline(client) ? quorum : MeshExpectation.Combine(quorum, Placement()),
+                _ => throw new ArgumentOutOfRangeException(nameof(kind)),
+            };
+        });
+    }
+
+    /// <summary>Applies the RCV-02 uncertainty of <see cref="PendingRegistration"/> to an expectation computed on <paramref name="network"/>.</summary>
+    private MeshExpectation Bounded(MeshNetworkModel network, Func<MeshNetworkModel, MeshExpectation> compute)
+    {
+        RefreshRegistrations();
+        string[] pending = PendingRegistration.ToArray();
+        if (pending.Length == 0)
+            return compute(network);
+        MeshNetworkModel without = network.Clone();
+        foreach (string node in pending)
+            without.SetDown(node, true);
+        return MeshOracle.Bound(compute(without), compute(network),
+            $"[{string.Join(",", pending)}] restarted while the control group could not re-register their incarnation (RCV-02)");
     }
 
     private bool AppendStaysInline(string client)
@@ -506,7 +622,7 @@ public sealed class MeshScenario
     }
 
     private static bool IsTransient(Exception ex) => MeshOracle.Unwrap(ex) is DfsUnavailableException or DfsCommitOutcomeUnknownException or TimeoutException
-        or DfsLeaseLostException or DfsOperationExpiredException or DfsException { ErrorCode: DfsErrorCode.Timeout or DfsErrorCode.NotLeader };
+        or DfsLeaseLostException or DfsPinExpiredException or DfsOperationExpiredException or DfsException { ErrorCode: DfsErrorCode.Timeout or DfsErrorCode.NotLeader };
 
     private async Task ExecuteAsync(string phase, string client, MeshProbeKind kind, int attempt)
     {
@@ -530,7 +646,7 @@ public sealed class MeshScenario
                 catch (Exception ex)
                 {
                     Exception e = MeshOracle.Unwrap(ex);
-                    write.Status = HistoryRecorder.Classify(e);
+                    write.Status = MeshOracle.ClassifyOutcome(e);
                     if (e is DfsCommitOutcomeUnknownException u)
                         write.OperationId = u.OperationId;
                     throw;
@@ -578,7 +694,7 @@ public sealed class MeshScenario
                 catch (Exception ex)
                 {
                     Exception e = MeshOracle.Unwrap(ex);
-                    entry.Status = HistoryRecorder.Classify(e);
+                    entry.Status = MeshOracle.ClassifyOutcome(e);
                     throw;
                 }
 

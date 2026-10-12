@@ -89,7 +89,8 @@ public sealed class MeshWorkload
 
     /// <summary>
     /// Unexpected failures observed so far: anything but typed availability (<see cref="DfsUnavailableException"/>),
-    /// unknown outcome with an id (mutations only), sharing/transaction conflicts and lease loss. Bare timeouts are
+    /// unknown outcome with an id (mutations only), sharing/transaction conflicts, lease loss and expired session
+    /// ids/pins after an outage longer than the session timeout. Bare timeouts are
     /// violations: a deadline must surface as a typed availability error or, after possible transmission, as an unknown
     /// outcome carrying the operation id (FSD §13).
     /// </summary>
@@ -508,7 +509,7 @@ public sealed class MeshWorkload
         {
             Exception e = MeshOracle.Unwrap(ex);
             entry.Error = MeshOracle.Describe(e);
-            entry.Status = HistoryRecorder.Classify(e);
+            entry.Status = MeshOracle.ClassifyOutcome(e);
             if (e is DfsCommitOutcomeUnknownException u)
                 entry.OperationId = u.OperationId;
             NoteViolation(e, mutation: true, "ledger write " + entry.Path);
@@ -567,7 +568,7 @@ public sealed class MeshWorkload
             }
             else
             {
-                tx.Outcome = HistoryRecorder.Classify(e);
+                tx.Outcome = MeshOracle.ClassifyOutcome(e);
             }
 
             NoteViolation(e, mutation: true, "transaction " + tx.Id);
@@ -593,7 +594,7 @@ public sealed class MeshWorkload
     private void Fail(long id, Exception ex, bool mutation, string what)
     {
         Exception e = MeshOracle.Unwrap(ex);
-        OpOutcome outcome = HistoryRecorder.Classify(e);
+        OpOutcome outcome = MeshOracle.ClassifyOutcome(e);
         _cluster.History.Complete(id, outcome, e);
         if (outcome == OpOutcome.Unknown && e is DfsCommitOutcomeUnknownException u)
         {
@@ -623,6 +624,12 @@ public sealed class MeshWorkload
             DfsSharingViolationException => true,
             DfsTransactionConflictException => true,
             DfsLeaseLostException => true,
+
+            // A client cut off from the authority longer than the session timeout (partitions, isolation) has its
+            // session expired: in-flight ids are rejected as expired (FSD §13) and an internal read handle/pin may have
+            // expired (LOCK-05). Both are explicit, typed outcomes; an expired mutation is recorded as unknown.
+            DfsOperationExpiredException => true,
+            DfsPinExpiredException => true,
             OperationCanceledException => _ct.IsCancellationRequested,
             _ => false,
         };

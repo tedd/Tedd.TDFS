@@ -5,8 +5,10 @@ namespace Tedd.Tdfs.Testing.Mesh;
 /// <summary>
 /// A single-process namespace script (create directory/file, move file/directory, delete file/directory, including
 /// deliberately invalid steps) executed through faults and compared with <see cref="ReferenceNamespaceModel"/> (PROP-002
-/// style). Every step uses an operation id reserved before transmission; definite availability failures are retried
-/// with the same id, unknown outcomes are resolved with <c>QueryOperationAsync(resolve: true)</c> before the next step,
+/// style). Every step uses an operation id reserved before transmission; definite availability failures and sharing
+/// violations (a reservation left by an earlier step until its lease expires) are retried with the same id, unknown or
+/// expired outcomes are resolved with <c>QueryOperationAsync(resolve: true)</c> before the next step — and, when the
+/// authority no longer retains the id (session expired during a long outage), by observing the script's own subtree —
 /// so the model is updated exactly once per committed step. At the end the whole subtree (paths, kinds) and the inode
 /// identities observed after creation must match the model.
 /// </summary>
@@ -175,8 +177,10 @@ public sealed class MeshNamespaceScript
                 return;
             }
 
-            if (failure is DfsCommitOutcomeUnknownException || failure is TimeoutException || failure is DfsException { ErrorCode: DfsErrorCode.Timeout })
+            if (failure is DfsCommitOutcomeUnknownException or DfsOperationExpiredException or TimeoutException || failure is DfsException { ErrorCode: DfsErrorCode.Timeout })
             {
+                // Unknown outcome (or an id the authority no longer retains after the session expired during an outage):
+                // narrow it by id; when the outcome itself is no longer retained, observe the single-writer subtree.
                 DfsOperationOutcome outcome = await ResolveAsync(id, deadline);
                 if (outcome.Status == DfsOutcomeStatus.Committed)
                 {
@@ -191,15 +195,59 @@ public sealed class MeshNamespaceScript
                     return;
                 }
 
+                if (outcome.Status == DfsOutcomeStatus.Expired)
+                {
+                    if (await ObservedAppliedAsync(kind, a, deadline))
+                        await ApplyAsync(step, kind, a, b, flag, succeeded: true, null);
+                    else
+                        _log.Add($"#{step} {kind} {a} {b}: id expired, effect not observed (not applied)");
+                    return;
+                }
+
                 _log.Add($"#{step} {kind} {a} {b}: aborted after unknown outcome ({outcome.Error})");
                 return; // definitely not applied
             }
 
-            if (!IsAvailability(failure))
+            // A sharing violation is a definite rejection (no effect): a handle of an earlier create whose close failed
+            // during an outage, or whose open reply was lost, keeps its reservation until its lease expires.
+            if (!IsAvailability(failure) && failure is not DfsSharingViolationException)
                 throw new InvalidOperationException($"namespace step #{step} {kind} {a} {b} failed with an untyped error: {MeshOracle.Describe(failure)}", failure);
             if (_cluster.Time.GetUtcNow() >= deadline)
                 throw new TimeoutException($"namespace step #{step} {kind} {a} {b} stayed unavailable for {_maxWait}: {MeshOracle.Describe(failure)}");
             await _cluster.DelayAsync(TimeSpan.FromMilliseconds(250), _ct); // definite failure: retry with the same id
+        }
+    }
+
+    /// <summary>
+    /// Whether a step whose id expired took effect, decided from the namespace itself: this script is the only writer of
+    /// its subtree and the model holds the state before the step, so the step's own effect is observable.
+    /// </summary>
+    private async Task<bool> ObservedAppliedAsync(string kind, string a, DateTimeOffset deadline)
+    {
+        return kind switch
+        {
+            "mkdir" => !_model.Exists(a) && await RetryAsync(() => _volume.Directories.ExistsAsync(a, _ct), deadline),
+            "create" => !_model.Exists(a) && await RetryAsync(() => _volume.Files.ExistsAsync(a, _ct), deadline),
+            "movefile" or "deletefile" => _model.IsFile(a) && !await RetryAsync(() => _volume.Files.ExistsAsync(a, _ct), deadline),
+            "movedir" or "deletedir" => _model.IsDirectory(a) && !await RetryAsync(() => _volume.Directories.ExistsAsync(a, _ct), deadline),
+            _ => throw new ArgumentException("Unknown step " + kind),
+        };
+    }
+
+    private async Task<T> RetryAsync<T>(Func<Task<T>> action, DateTimeOffset deadline)
+    {
+        while (true)
+        {
+            try
+            {
+                return await action();
+            }
+            catch (Exception ex) when (IsAvailability(ex))
+            {
+                if (_cluster.Time.GetUtcNow() >= deadline)
+                    throw new TimeoutException($"namespace script could not observe its subtree within {_maxWait}: {MeshOracle.Describe(ex)}", ex);
+                await _cluster.DelayAsync(TimeSpan.FromMilliseconds(250), _ct);
+            }
         }
     }
 
@@ -296,8 +344,10 @@ public sealed class MeshNamespaceScript
             try
             {
                 DfsOperationOutcome outcome = await _volume.QueryOperationAsync(id, resolve: true, _ct);
-                Assert.True(outcome.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Aborted,
-                    $"QueryOperationAsync(resolve: true) for {id} must be definite, got {outcome.Status} (OUT-013/014)");
+                // resolve: true fences an undecided id, so the answer is definite; only an id whose retention window has
+                // passed (session expired during a long outage) may legitimately answer Expired (FSD §13).
+                Assert.True(outcome.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Aborted or DfsOutcomeStatus.Expired,
+                    $"QueryOperationAsync(resolve: true) for {id} must be definite (or expired), got {outcome.Status} (OUT-013/014)");
                 return outcome;
             }
             catch (Exception ex) when (IsAvailability(ex))
