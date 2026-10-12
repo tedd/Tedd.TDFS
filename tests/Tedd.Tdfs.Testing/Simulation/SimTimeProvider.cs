@@ -16,7 +16,8 @@ namespace Tedd.Tdfs.Testing.Simulation;
 /// </para>
 /// <para>
 /// <b>Timers</b> are due on the monotonic reading and are translated into global virtual time for the scheduler (and
-/// re-translated whenever the rate, freezing or a jump changes the mapping). A timer belongs to a process (see
+/// re-translated whenever the rate, freezing or a jump changes the mapping); a frozen clock still fires the timers its
+/// reading has reached, but no others. A timer belongs to a process (see
 /// <see cref="SimClockOptions.BindToProcess"/>); its callback runs as a background work item of that process (no
 /// synchronization context, like a thread-pool timer callback), is held while the process is paused (firing once on
 /// resume; missed periods are not replayed) and never runs after the process was killed. Periodic timers are re-armed when
@@ -193,7 +194,10 @@ public sealed class SimTimeProvider : TimeProvider
         }
     }
 
-    /// <summary>Stops the clock (monotonic and wall); its timers stop firing until <see cref="Unfreeze"/>.</summary>
+    /// <summary>
+    /// Stops the clock (monotonic and wall); timers that are not yet due stop firing until <see cref="Unfreeze"/>. Timers
+    /// whose due time the frozen reading has reached (already due, due now, or made due by <see cref="Advance"/>) still fire.
+    /// </summary>
     /// <exception cref="InvalidOperationException">This is the global clock.</exception>
     public void Freeze()
     {
@@ -424,16 +428,21 @@ public sealed class SimTimeProvider : TimeProvider
     }
 
     /// <summary>
-    /// Smallest global virtual time at which this clock reads at least <paramref name="localDue"/>, or
-    /// <see cref="long.MaxValue"/> when it never will under the current mapping (frozen, or beyond the representable range).
+    /// Smallest global virtual time (never before now) at which this clock reads at least <paramref name="localDue"/>, or
+    /// <see cref="long.MaxValue"/> when it never will under the current mapping (frozen before reaching it, or beyond the
+    /// representable range).
     /// </summary>
     private long GlobalDueLocked(long localDue)
     {
-        if (_frozen || localDue >= long.MaxValue - 1)
+        if (localDue >= long.MaxValue - 1)
             return long.MaxValue;
         long now = _scheduler.NowTicksLocked;
+
+        // Already due (also on a frozen clock whose reading reached the due time, e.g. after Advance): fire now.
         if (localDue <= LocalNowLocked())
             return now;
+        if (_frozen)
+            return long.MaxValue;
         double need = (localDue - _anchorLocal) / _rate;
         if (need >= (double)(long.MaxValue / 4) - _anchorGlobal)
             return long.MaxValue;

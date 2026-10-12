@@ -288,6 +288,11 @@ public sealed class SimScheduler
     /// reported as a violation). Code that completes tasks awaited by SDK-style code while running on a simulated main lane
     /// (a node loop or the client context) should therefore complete them through this method. Continuations that captured
     /// a synchronization context are still posted to it.
+    /// <para>
+    /// It cannot help a <c>Task.Delay(..., ct)</c> that completes because <c>ct</c> was cancelled: the runtime always runs
+    /// its <c>ConfigureAwait(false)</c> continuations on the thread pool (reported as a violation). Simulation-compatible code
+    /// implements cancellable waits with a completion source and a token registration instead.
+    /// </para>
     /// </remarks>
     public static void CompleteWithoutContext(Action completion)
     {
@@ -544,6 +549,7 @@ public sealed class SimScheduler
         Task? task = null;
         try
         {
+            ThrowIfCannotDrive(); // before posting: a rejected run must not leave its body queued for another run
             ClientProcess.Post(() => task = StartBody(body), "RunAsync body");
             RunUntil(() => task is { IsCompleted: true }, virtualTimeout, "the RunAsync body to complete");
         }
@@ -562,6 +568,7 @@ public sealed class SimScheduler
         Task<T>? task = null;
         try
         {
+            ThrowIfCannotDrive();
             ClientProcess.Post(() => task = StartBody(body), "RunAsync body");
             RunUntil(() => task is { IsCompleted: true }, virtualTimeout, "the RunAsync body to complete");
         }
@@ -1244,19 +1251,30 @@ public sealed class SimScheduler
             throw failure;
     }
 
+    /// <summary>Throws (as <see cref="EnterDriver"/> would) when the calling thread cannot start driving now.</summary>
+    private void ThrowIfCannotDrive()
+    {
+        lock (_lock)
+            ThrowIfDrivingLocked(Environment.CurrentManagedThreadId);
+    }
+
+    private void ThrowIfDrivingLocked(int id)
+    {
+        if (_driverThreadId == id)
+            throw new InvalidOperationException("The simulation is already being driven on this thread: Run* methods cannot be called from simulated work or from a run condition.");
+        if (_driverThreadId != 0)
+        {
+            RecordForeign("drive the simulation", $"thread {_driverThreadId} is already driving it");
+            throw new InvalidOperationException($"The simulation is already being driven by thread {_driverThreadId}.");
+        }
+    }
+
     private void EnterDriver()
     {
         int id = Environment.CurrentManagedThreadId;
         lock (_lock)
         {
-            if (_driverThreadId == id)
-                throw new InvalidOperationException("The simulation is already being driven on this thread: Run* methods cannot be called from simulated work or from a run condition.");
-            if (_driverThreadId != 0)
-            {
-                RecordForeign("drive the simulation", $"thread {_driverThreadId} is already driving it");
-                throw new InvalidOperationException($"The simulation is already being driven by thread {_driverThreadId}.");
-            }
-
+            ThrowIfDrivingLocked(id);
             _driverThreadId = id;
             _homeThreadId = id;
             _hasRun = true;

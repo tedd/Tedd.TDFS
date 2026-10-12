@@ -136,7 +136,7 @@ public sealed class SimNetwork : IRpcTransportFactory
     /// <summary>Messages delivered to an open receiving end.</summary>
     public long MessagesDelivered => Interlocked.Read(ref _messagesDelivered);
 
-    /// <summary>Messages discarded by the policy or because the receiving end was closed on arrival.</summary>
+    /// <summary>Messages discarded by the policy, or because the receiving end was closed (or its process dead) on arrival.</summary>
     public long MessagesDropped => Interlocked.Read(ref _messagesDropped);
 
     /// <summary>Messages the policy duplicated.</summary>
@@ -371,6 +371,7 @@ public sealed class SimNetwork : IRpcTransportFactory
         long now = _scheduler.NowTicks;
         var attempt = new ConnectAttempt(this, from, address, now, ct);
         long arrival = SaturatingAdd(now, SampleLatency(from.LocalName, targetName));
+        from.AddConnectAbort(attempt.Abort);
         _scheduler.ScheduleOnNewLane(null, "net/connect", arrival, new SimWorkItem(attempt.OnArrived, $"connect {from.LocalName} -> {key}"), "connect");
         if (ct.CanBeCanceled)
             attempt.Registration = ct.Register(static s => ((ConnectAttempt)s!).Cancel(), attempt);
@@ -392,6 +393,10 @@ public sealed class SimNetwork : IRpcTransportFactory
 
         foreach (SimConnectionEnd end in transport.SnapshotConnections())
             end.CloseLocal(null, notifyPeer: true);
+
+        // Outstanding connects fail now (ObjectDisposedException); a handshake still in flight is torn down when it lands.
+        foreach (Action abort in transport.TakeConnectAborts())
+            abort();
     }
 
     /// <summary>Hands one envelope from <paramref name="from"/> to its peer, applying the link policy.</summary>
@@ -486,7 +491,11 @@ public sealed class SimNetwork : IRpcTransportFactory
         long now = _scheduler.NowTicks;
         long sent = TransmissionEnd(fromName, toName, envelope.Payload.Length, now);
         long arrival = SaturatingAdd(SaturatingAdd(sent, SampleLatency(fromName, toName)), extraTicks);
-        var item = new SimWorkItem(() => to.Receive(envelope), envelope.Describe(from.ConnectionId, fromName, toName));
+
+        // A message discarded because the receiving process is dead (killed before or after it arrived) was dropped at a
+        // closed end; transport-level close frames are not application messages and are not counted.
+        Action? onDiscard = envelope.Kind == SimEnvelopeKind.Close ? null : CountDroppedAtClosedEnd;
+        var item = new SimWorkItem(() => to.Receive(envelope), envelope.Describe(from.ConnectionId, fromName, toName), onDiscard);
         if (fifo)
         {
             arrival = to.ReserveArrival(arrival);
@@ -613,15 +622,19 @@ public sealed class SimNetwork : IRpcTransportFactory
             _address = address;
             _startTicks = startTicks;
             _ct = ct;
+            Abort = OnTransportDisposed;
         }
 
         public CancellationTokenRegistration Registration { get; set; }
 
         public Task<IRpcConnection> Task => _source.Task;
 
+        /// <summary>Fails the attempt because its transport was disposed (registered with the transport).</summary>
+        public Action Abort { get; }
+
         public void Cancel()
         {
-            Registration.Dispose();
+            Finish();
             SimScheduler.CompleteWithoutContext(() => _source.TrySetCanceled(_ct));
         }
 
@@ -630,6 +643,14 @@ public sealed class SimNetwork : IRpcTransportFactory
         {
             if (_source.Task.IsCompleted)
                 return;
+            if (_from.IsDead || _from.Owner.IsKilled)
+            {
+                // The connecting process died while its request was in flight: nobody completes the handshake, so the
+                // destination must not end up with a half-open connection. (The dead process's code never observes this.)
+                Finish();
+                return;
+            }
+
             string key = _address.ToString();
             SimTransport? target;
             lock (_network._gate)
@@ -661,7 +682,7 @@ public sealed class SimNetwork : IRpcTransportFactory
 
         private void Fail(Exception error)
         {
-            Registration.Dispose();
+            Finish();
             if (_source.Task.IsCompleted)
                 return;
             Interlocked.Increment(ref _network._connectionsFailed);
@@ -670,7 +691,7 @@ public sealed class SimNetwork : IRpcTransportFactory
 
         private void Complete(SimConnectionPair pair)
         {
-            Registration.Dispose();
+            Finish();
             if (_from.IsDisposed || _source.Task.IsCompleted)
             {
                 // Cancelled (or the transport went away) while the handshake was in flight: close the server side.
@@ -679,6 +700,18 @@ public sealed class SimNetwork : IRpcTransportFactory
             }
 
             SimScheduler.CompleteWithoutContext(() => _source.TrySetResult(pair.Client));
+        }
+
+        private void OnTransportDisposed()
+        {
+            Registration.Dispose();
+            SimScheduler.CompleteWithoutContext(() => _source.TrySetException(new ObjectDisposedException(_from.ToString())));
+        }
+
+        private void Finish()
+        {
+            Registration.Dispose();
+            _from.RemoveConnectAbort(Abort);
         }
     }
 }

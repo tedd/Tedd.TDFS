@@ -33,6 +33,7 @@ internal sealed class SimTransport : IRpcTransport
 {
     private readonly SimNetwork _network;
     private readonly List<SimConnectionEnd> _connections = [];
+    private readonly List<Action> _connectAborts = [];
 
     public SimTransport(SimNetwork network, string localName, string localEndpoint, SimProcess owner)
     {
@@ -85,6 +86,30 @@ internal sealed class SimTransport : IRpcTransport
     {
         lock (_connections)
             _connections.Remove(end);
+    }
+
+    /// <summary>Registers the abort callback of an outstanding connect (run when the transport is disposed).</summary>
+    public void AddConnectAbort(Action abort)
+    {
+        lock (_connections)
+            _connectAborts.Add(abort);
+    }
+
+    public void RemoveConnectAbort(Action abort)
+    {
+        lock (_connections)
+            _connectAborts.Remove(abort);
+    }
+
+    /// <summary>Removes and returns the abort callbacks of every outstanding connect, in start order.</summary>
+    public Action[] TakeConnectAborts()
+    {
+        lock (_connections)
+        {
+            Action[] aborts = [.. _connectAborts];
+            _connectAborts.Clear();
+            return aborts;
+        }
     }
 
     public override string ToString() => $"SimTransport({LocalName}, {LocalEndpoint})";
@@ -269,6 +294,31 @@ internal sealed class SimConnectionEnd : IRpcConnection
         if (notifyPeer && !Transport.IsDead)
             _network.Transmit(this, new SimEnvelope(SimEnvelopeKind.Close, 0, [], error));
 
+        // Cancelling the handler token, failing calls and raising Closed complete tasks that SDK-style code awaits with
+        // ConfigureAwait(false). The close may be initiated from a simulated main lane (DisposeAsync on a node loop or the
+        // client context); without removing that context the runtime would queue those continuations to the thread pool.
+        SimScheduler.CompleteWithoutContext(() => NotifyClosed(error, calls, handlers));
+    }
+
+    /// <summary>
+    /// Marks the end closed because its process died: nothing observable happens on this side (its code no longer runs).
+    /// Pending calls stay registered so callers that live in another process (a test body using this transport) still
+    /// complete through their own timeout or cancellation; replies are no longer accepted. Returns true when it was open.
+    /// </summary>
+    public bool MarkDead()
+    {
+        lock (_sync)
+        {
+            if (_closed)
+                return false;
+            _closed = true;
+            _closedHandlers = null;
+            return true;
+        }
+    }
+
+    private void NotifyClosed(Exception? error, PendingCall[] calls, Action<IRpcConnection, Exception?>? handlers)
+    {
         try
         {
             _handlerCts.Cancel();
@@ -294,23 +344,6 @@ internal sealed class SimConnectionEnd : IRpcConnection
             {
                 _network.ReportCallbackFailure(this, "Closed handler", ex);
             }
-        }
-    }
-
-    /// <summary>
-    /// Marks the end closed because its process died: nothing observable happens on this side (its code no longer runs).
-    /// Returns true when it was open.
-    /// </summary>
-    public bool MarkDead()
-    {
-        lock (_sync)
-        {
-            if (_closed)
-                return false;
-            _closed = true;
-            _pending.Clear();
-            _closedHandlers = null;
-            return true;
         }
     }
 
