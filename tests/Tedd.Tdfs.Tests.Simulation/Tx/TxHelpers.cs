@@ -294,6 +294,48 @@ internal static class TxHelpers
         ex is InvalidOperationException
         || ex is DfsException { ErrorCode: DfsErrorCode.InvalidHandle or DfsErrorCode.TransactionAborted };
 
+    /// <summary>
+    /// Runs a transactional write staged after one of the transaction's dependencies may already have been invalidated.
+    /// Returns null when the write was staged, or the typed conflict when the implementation detected the invalid
+    /// dependency (or aborted the transaction) early — FSD §8.3 only requires conflicts to abort with a typed exception,
+    /// not that detection waits for CommitAsync. Every other failure propagates.
+    /// </summary>
+    public static async Task<DfsTransactionConflictException?> StageOrEarlyConflictAsync(Func<Task> stage)
+    {
+        try
+        {
+            await stage();
+            return null;
+        }
+        catch (DfsTransactionConflictException ex)
+        {
+            return ex;
+        }
+    }
+
+    /// <summary>
+    /// Completes a transaction that must not commit: when staging already reported an early conflict, records it as
+    /// failed and proves a later commit attempt is refused too; otherwise commits and asserts a validation conflict.
+    /// </summary>
+    public static async Task<TxResult> CommitExpectingConflictAsync(DfsTransaction tx, TxLog log, DfsTransactionConflictException? early, string because)
+    {
+        if (early is null)
+        {
+            TxResult result = await CommitAsync(tx, log);
+            AssertConflict(result, tx, because);
+            return result;
+        }
+
+        log.Complete(OpOutcome.Failed);
+        Assert.True(early.IsRetryable, $"An early transaction conflict is retryable by the application ({because}).");
+        Assert.Equal(tx.Id, early.TransactionId);
+        Exception? late = await CaptureAsync(() => tx.CommitAsync(Ct));
+        Assert.True(late is DfsTransactionConflictException or InvalidOperationException,
+            $"After an early conflict the transaction can never commit ({because}); CommitAsync returned {late?.GetType().Name ?? "success"}.");
+        Assert.NotEqual(DfsTransactionState.Committed, tx.State);
+        return new TxResult(OpOutcome.Failed, early, CommitToken.None);
+    }
+
     /// <summary>Asserts the transaction was rejected by validation (TransactionConflict), i.e. definitely not committed.</summary>
     public static void AssertConflict(TxResult result, DfsTransaction tx, string because)
     {

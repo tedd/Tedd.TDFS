@@ -65,7 +65,7 @@ public sealed class TxSimulationTests
                 t.Read("/guard", await ReadLabelAsync(tx.Files, "/guard", labels));
             await tx.Files.WriteAllBytesAsync("/x", x1, Ct);
             t.Write("/x", "x1");
-            await using (DfsStream s = await tx.Files.OpenAsync("/new", FileMode.CreateNew, FileAccess.Write, FileShare.None, Ct))
+            await using (DfsStream s = await tx.Files.OpenAsync("/new", FileMode.CreateNew, FileAccess.Write, FileShare.Read, Ct))
             {
                 await s.WriteAsync(n1, Ct);
                 await s.FlushAsync(Ct);
@@ -110,9 +110,10 @@ public sealed class TxSimulationTests
                 {
                     TxResult wr = await StandaloneAsync(history, "W-guard", l => l.Write("/guard", "g1"), () => o.Files.WriteAllBytesAsync("/guard", g1, Ct));
                     Assert.Equal(OpOutcome.Ok, wr.Outcome);
-                    await tx.Files.WriteAllBytesAsync("/guard", gT, Ct);
-                    t.Write("/guard", "gT");
-                    AssertConflict(await CommitAsync(tx, t), tx, "T read /guard, which a committed standalone write changed (lost update)");
+                    DfsTransactionConflictException? early = await StageOrEarlyConflictAsync(() => tx.Files.WriteAllBytesAsync("/guard", gT, Ct));
+                    if (early is null)
+                        t.Write("/guard", "gT");
+                    await CommitExpectingConflictAsync(tx, t, early, "T read /guard, which a committed standalone write changed (lost update)");
                     finalView = new Dictionary<string, string?>(initialView, StringComparer.Ordinal) { ["/guard"] = "g1" };
                     break;
                 }
@@ -238,19 +239,27 @@ public sealed class TxSimulationTests
             await first.Files.WriteAllTextAsync("/ctr", "1", null, Ct);
             firstLog.Write("/ctr", "1");
             TxResult firstResult;
-            TxResult secondResult;
+            DfsTransactionConflictException? early = null;
+            const string because = "both transactions read version 0 and overwrote it; the later commit would discard the first update";
             if (schedule == LostUpdateSchedule.FirstCommitsBeforeSecondWrites)
             {
                 firstResult = await CommitAsync(first, firstLog);
-                await second.Files.WriteAllTextAsync("/ctr", "1", null, Ct);
-                secondLog.Write("/ctr", "1");
-                secondResult = await CommitAsync(second, secondLog);
+                Assert.Equal(OpOutcome.Ok, firstResult.Outcome);
+                early = await StageOrEarlyConflictAsync(() => second.Files.WriteAllTextAsync("/ctr", "1", null, Ct));
+                if (early is null)
+                    secondLog.Write("/ctr", "1");
             }
             else
             {
-                // The second writer cannot take the writer reservation the first holds (immediate, never waiting).
+                // The second writer cannot take the writer reservation the first holds (immediate, never waiting). The
+                // implementation may also abort the refused transaction outright (LOCK-019 policy): then its next write
+                // reports that typed abort early.
                 Exception? blocked = await CaptureAsync(() => second.Files.WriteAllTextAsync("/ctr", "1", null, Ct));
-                if (blocked is not null)
+                if (blocked is DfsTransactionConflictException earlyAbort)
+                {
+                    early = earlyAbort;
+                }
+                else if (blocked is not null)
                 {
                     DfsSharingViolationException sv = Assert.IsAssignableFrom<DfsSharingViolationException>(blocked);
                     Assert.True(sv.ErrorCode is DfsErrorCode.SharingViolation or DfsErrorCode.WriterConflict, $"Unexpected code {sv.ErrorCode}.");
@@ -262,17 +271,18 @@ public sealed class TxSimulationTests
                 }
 
                 firstResult = await CommitAsync(first, firstLog);
-                if (blocked is not null)
+                Assert.Equal(OpOutcome.Ok, firstResult.Outcome);
+                if (blocked is DfsSharingViolationException)
                 {
-                    await second.Files.WriteAllTextAsync("/ctr", "1", null, Ct); // reservation released by the first commit
-                    secondLog.Write("/ctr", "1");
+                    // The reservation was released by the first commit; the stale read must still prevent a lost update.
+                    early = await StageOrEarlyConflictAsync(() => second.Files.WriteAllTextAsync("/ctr", "1", null, Ct));
+                    if (early is null)
+                        secondLog.Write("/ctr", "1");
                 }
-
-                secondResult = await CommitAsync(second, secondLog);
             }
 
-            Assert.Equal(OpOutcome.Ok, firstResult.Outcome);
-            AssertConflict(secondResult, second, "both transactions read version 0 and overwrote it; the later commit would discard the first update");
+            TxResult secondResult = await CommitExpectingConflictAsync(second, secondLog, early, because);
+            Assert.Equal(OpOutcome.Failed, secondResult.Outcome);
             Assert.Equal("1", await ReadLabelAsync(obs.Files, "/ctr"));
 
             // The application (not the SDK) explicitly retries the loser: it reads the new version and increments it.
@@ -289,7 +299,8 @@ public sealed class TxSimulationTests
 
             await t1.DisposeAsync();
             await t2.DisposeAsync();
-            Assert.True((await cluster.Inspect.GetTotalCountersAsync()).TransactionConflicts > conflictsBefore, "The conflict is counted in node metrics.");
+            if (early is null)
+                Assert.True((await cluster.Inspect.GetTotalCountersAsync()).TransactionConflicts > conflictsBefore, "The commit-time validation conflict is counted in node metrics.");
             history.AssertStrictlySerializable(initial);
         }, Ct);
 
@@ -324,10 +335,14 @@ public sealed class TxSimulationTests
                             log.Read("/ctr", current);
                             string next = (int.Parse(current!, CultureInfo.InvariantCulture) + 1).ToString(CultureInfo.InvariantCulture);
                             Exception? stage = await CaptureAsync(() => tx.Files.WriteAllTextAsync("/ctr", next, null, Ct));
-                            if (stage is DfsSharingViolationException)
+                            if (stage is DfsSharingViolationException or DfsTransactionConflictException)
                             {
-                                await tx.AbortAsync(Ct);
+                                // Reservation refused, or the stale read detected early: abort and retry explicitly.
+                                await CaptureAsync(() => tx.AbortAsync(Ct));
+                                Assert.NotEqual(DfsTransactionState.Committed, tx.State);
                                 log.Complete(OpOutcome.Failed);
+                                if (stage is DfsTransactionConflictException)
+                                    Interlocked.Increment(ref conflicts);
                             }
                             else if (stage is not null)
                             {
@@ -505,22 +520,37 @@ public sealed class TxSimulationTests
 
                 // Invariant (application): /pool keeps at least one member. Each transaction enumerates the pool, sees two
                 // members and removes a different one.
-                async Task<(DfsTransaction Tx, TxLog Log)> PlanAsync(DfsVolume v, string id, string victim)
+                async Task<(DfsTransaction Tx, TxLog Log, Exception? StageError)> PlanAsync(DfsVolume v, string id, string victim)
                 {
                     TxLog log = history.Start(id);
                     DfsTransaction tx = await v.Transactions.BeginAsync(null, Ct);
                     string[] names = await ListNamesAsync(tx.Directories, "/pool");
                     Assert.Equal(["m1", "m2"], names);
                     log.Enumerated("/pool", names);
-                    await tx.Files.DeleteAsync("/pool/" + victim, Ct);
-                    log.Write("/pool/" + victim, null);
-                    return (tx, log);
+                    Exception? stage = await CaptureAsync(() => tx.Files.DeleteAsync("/pool/" + victim, Ct));
+                    if (stage is null)
+                        log.Write("/pool/" + victim, null);
+                    else
+                        Assert.IsAssignableFrom<DfsSharingViolationException>(stage); // an early reservation refusal (e.g. of the shared parent) is a legal prevention
+                    return (tx, log, stage);
                 }
 
-                (DfsTransaction Tx, TxLog Log) p1 = await PlanAsync(v1, "T1", "m1");
-                (DfsTransaction Tx, TxLog Log) p2 = await PlanAsync(v2, "T2", "m2");
-                (TxResult r1, TxResult r2) = await CommitInOrderAsync(order, p1, p2);
-                AssertExactlyOneCommitted(order, (p1.Tx, r1), (p2.Tx, r2));
+                (DfsTransaction Tx, TxLog Log, Exception? StageError) p1 = await PlanAsync(v1, "T1", "m1");
+                (DfsTransaction Tx, TxLog Log, Exception? StageError) p2 = await PlanAsync(v2, "T2", "m2");
+                TxResult r1, r2;
+                if (p1.StageError is null && p2.StageError is null)
+                {
+                    (r1, r2) = await CommitInOrderAsync(order, (p1.Tx, p1.Log), (p2.Tx, p2.Log));
+                    AssertExactlyOneCommitted(order, (p1.Tx, r1), (p2.Tx, r2));
+                }
+                else
+                {
+                    Assert.Null(p1.StageError); // the first stager cannot be refused
+                    p2.Log.Complete(OpOutcome.Failed);
+                    r2 = new TxResult(OpOutcome.Failed, p2.StageError, CommitToken.None);
+                    r1 = await CommitAsync(p1.Tx, p1.Log);
+                    Assert.Equal(OpOutcome.Ok, r1.Outcome);
+                }
 
                 string[] remaining = await ListNamesAsync(obs.Directories, "/pool");
                 Assert.NotEmpty(remaining);
@@ -705,21 +735,16 @@ public sealed class TxSimulationTests
                 await CreatePhantomAsync(history, v2, creator, "/slot/x");
                 Assert.True(await obs.Files.ExistsAsync("/slot/x", Ct), "The phantom is committed and visible to others.");
 
-                Exception? stage = await CaptureAsync(() => tx.Files.WriteAllTextAsync("/slot/x", "t", null, Ct));
-                TxResult result;
-                if (stage is null)
-                {
+                DfsTransactionConflictException? early = await StageOrEarlyConflictAsync(() => tx.Files.WriteAllTextAsync("/slot/x", "t", null, Ct));
+                if (early is null)
                     t.Write("/slot/x", "t");
-                    result = await CommitAsync(tx, t);
-                    AssertConflict(result, tx, "T's absence read of /slot/x was invalidated by a committed create");
-                }
                 else
-                {
-                    t.Complete(OpOutcome.Failed);
-                    DfsTransactionConflictException early = Assert.IsAssignableFrom<DfsTransactionConflictException>(stage);
                     Assert.Equal(DfsErrorCode.TransactionConflict, early.ErrorCode);
-                }
+                await CommitExpectingConflictAsync(tx, t, early, "T's absence read of /slot/x was invalidated by a committed create");
 
+                // The final state is observed and checked with the history: T must not have replaced the phantom.
+                TxRun final = await RunTxAsync(history, "U", obs, async (ro, log) => log.Read("/slot/x", await ReadLabelAsync(ro.Files, "/slot/x")));
+                Assert.Equal(OpOutcome.Ok, final.Result.Outcome);
                 Assert.Equal("w", await ReadLabelAsync(obs.Files, "/slot/x"));
                 await tx.DisposeAsync();
                 history.AssertStrictlySerializable(initial);
@@ -926,18 +951,17 @@ public sealed class TxSimulationTests
                 TxResult w = await StandaloneAsync(history, "W", l => l.Write("/queue/" + next, "w"), () => v2.Files.WriteAllTextAsync("/queue/" + next, "w", null, Ct));
                 Assert.Equal(OpOutcome.Ok, w.Outcome);
 
-                Exception? stage = await CaptureAsync(() => tx.Files.WriteAllTextAsync("/queue/" + next, "t", null, Ct));
-                if (stage is null)
-                {
+                DfsTransactionConflictException? early = await StageOrEarlyConflictAsync(() => tx.Files.WriteAllTextAsync("/queue/" + next, "t", null, Ct));
+                if (early is null)
                     t.Write("/queue/" + next, "t");
-                    AssertConflict(await CommitAsync(tx, t), tx, "T's enumeration predicate on /queue was invalidated by a committed matching entry");
-                }
                 else
-                {
-                    t.Complete(OpOutcome.Failed);
-                    Assert.Equal(DfsErrorCode.TransactionConflict, Assert.IsAssignableFrom<DfsTransactionConflictException>(stage).ErrorCode);
-                }
+                    Assert.Equal(DfsErrorCode.TransactionConflict, early.ErrorCode);
+                await CommitExpectingConflictAsync(tx, t, early, "T's enumeration predicate on /queue was invalidated by a committed matching entry");
 
+                // The final state is observed and checked with the history: T must not have overwritten the new entry.
+                TxRun final = await RunTxAsync(history, "U", obs, async (ro, log) =>
+                    log.Enumerated("/queue", await ListNamesAsync(ro.Directories, "/queue")).Read("/queue/" + next, await ReadLabelAsync(ro.Files, "/queue/" + next)));
+                Assert.Equal(OpOutcome.Ok, final.Result.Outcome);
                 Assert.Equal("w", await ReadLabelAsync(obs.Files, "/queue/" + next));
                 await tx.DisposeAsync();
                 history.AssertStrictlySerializable(initial);
@@ -1385,12 +1409,14 @@ public sealed class TxSimulationTests
 
                 IReadOnlyDictionary<string, string?> after = await ApplyStandaloneMutationAsync(history, v2, mutation);
 
+                DfsTransactionConflictException? early = null;
                 if (construction == ConflictConstruction.ReadModifyWrite)
                 {
                     // T now writes the value it computed from its stale read; committing would lose the standalone update.
-                    Exception? stage = await CaptureAsync(() => tx.Files.WriteAllTextAsync("/f", read + "+T", null, Ct));
-                    Assert.Null(stage);
-                    t.Write("/f", read + "+T");
+                    // (The stale read may also be detected already while staging this write.)
+                    early = await StageOrEarlyConflictAsync(() => tx.Files.WriteAllTextAsync("/f", read + "+T", null, Ct));
+                    if (early is null)
+                        t.Write("/f", read + "+T");
                 }
                 else
                 {
@@ -1399,7 +1425,15 @@ public sealed class TxSimulationTests
                     Assert.Equal(OpOutcome.Ok, u.Result.Outcome);
                 }
 
-                AssertConflict(await CommitAsync(tx, t), tx, $"{mutation} committed after T read /f; ordinary writes must participate in validation");
+                await CommitExpectingConflictAsync(tx, t, early, $"{mutation} committed after T read /f; ordinary writes must participate in validation");
+
+                // The final state is observed and checked with the history: the ordinary mutation's result survives.
+                TxRun final = await RunTxAsync(history, "F", obs, async (ro, log) =>
+                {
+                    foreach (string key in after.Keys.Append("/out"))
+                        log.Read(key, await ReadLabelAsync(ro.Files, key));
+                });
+                Assert.Equal(OpOutcome.Ok, final.Result.Outcome);
                 foreach ((string key, string? expected) in after)
                     Assert.Equal(expected, await ReadLabelAsync(obs.Files, key));
                 Assert.False(await obs.Files.ExistsAsync("/out", Ct));
@@ -1500,9 +1534,10 @@ public sealed class TxSimulationTests
             t.Read("/d", await ReadLabelAsync(tx.Files, "/d"));
             TxResult copy = await StandaloneAsync(history, "Copy", l => l.Read("/s", "s0").Write("/d", "s0"), () => v2.Files.CopyAsync("/s", "/d", true, Ct));
             Assert.Equal(OpOutcome.Ok, copy.Outcome);
-            await tx.Files.WriteAllTextAsync("/s", "sT", null, Ct);
-            t.Write("/s", "sT");
-            AssertConflict(await CommitAsync(tx, t), tx, "T read /d before an ordinary Copy replaced it");
+            DfsTransactionConflictException? early = await StageOrEarlyConflictAsync(() => tx.Files.WriteAllTextAsync("/s", "sT", null, Ct));
+            if (early is null)
+                t.Write("/s", "sT");
+            await CommitExpectingConflictAsync(tx, t, early, "T read /d before an ordinary Copy replaced it");
             Assert.Equal(("s0", "s0"), (await ReadLabelAsync(v2.Files, "/s"), await ReadLabelAsync(v2.Files, "/d")));
             await tx.DisposeAsync();
             history.AssertStrictlySerializable(new Dictionary<string, string?> { ["/s"] = "s0", ["/d"] = "d0" });
@@ -1551,7 +1586,11 @@ public sealed class TxSimulationTests
             history.AssertStrictlySerializable(new Dictionary<string, string?> { ["/f"] = "f0" });
         }, Ct);
 
-    /// <summary>Blind writes (no reads) from a transaction and an ordinary helper both commit; the commit order decides the winner.</summary>
+    /// <summary>
+    /// Blind writes (no reads) from a transaction and an ordinary helper: the later commit position decides the winner.
+    /// When the ordinary write lands while T is open, strict serializability allows T either to commit (serialized after
+    /// it) or to abort with a typed conflict; it may never commit "before" a write it then overwrites in the log.
+    /// </summary>
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
@@ -1570,16 +1609,40 @@ public sealed class TxSimulationTests
             TxResult w = standaloneFirst
                 ? await StandaloneAsync(history, "W", l => l.Write("/f", "w"), () => v2.Files.WriteAllTextAsync("/f", "w", null, Ct))
                 : new TxResult(OpOutcome.Unknown, null, CommitToken.None);
-            await tx.Files.WriteAllTextAsync("/f", "t", null, Ct);
-            t.Write("/f", "t");
-            TxResult tr = await CommitAsync(tx, t);
+            DfsTransactionConflictException? early = await StageOrEarlyConflictAsync(() => tx.Files.WriteAllTextAsync("/f", "t", null, Ct));
+            TxResult tr;
+            if (early is null)
+            {
+                t.Write("/f", "t");
+                tr = await CommitAsync(tx, t);
+            }
+            else
+            {
+                Assert.True(standaloneFirst, $"Without a concurrent writer T's blind write cannot conflict: {early.Message}");
+                tr = await CommitExpectingConflictAsync(tx, t, early, "early conflict with the concurrent blind write");
+            }
+
             if (!standaloneFirst)
                 w = await StandaloneAsync(history, "W", l => l.Write("/f", "w"), () => v2.Files.WriteAllTextAsync("/f", "w", null, Ct));
 
-            Assert.Equal(OpOutcome.Ok, tr.Outcome);
             Assert.Equal(OpOutcome.Ok, w.Outcome);
-            string winner = tr.Token.CompareTo(w.Token) > 0 ? "t" : "w";
-            Assert.Equal(standaloneFirst ? "t" : "w", winner);
+            string winner;
+            if (standaloneFirst && tr.Outcome != OpOutcome.Ok)
+            {
+                if (early is null)
+                    AssertConflict(tr, tx, "a transaction that does not commit after a concurrent blind write must abort with a typed conflict");
+                winner = "w";
+            }
+            else
+            {
+                // With no concurrent writer (T commits before W begins) there is nothing to conflict with.
+                Assert.Equal(OpOutcome.Ok, tr.Outcome);
+                winner = tr.Token.CompareTo(w.Token) > 0 ? "t" : "w";
+                Assert.Equal(standaloneFirst ? "t" : "w", winner);
+            }
+
+            TxRun final = await RunTxAsync(history, "U", v2, async (ro, log) => log.Read("/f", await ReadLabelAsync(ro.Files, "/f")));
+            Assert.Equal(OpOutcome.Ok, final.Result.Outcome);
             Assert.Equal(winner, await ReadLabelAsync(v2.Files, "/f"));
             await tx.DisposeAsync();
             history.AssertStrictlySerializable(new Dictionary<string, string?> { ["/f"] = "f0" });
@@ -1620,7 +1683,7 @@ public sealed class TxSimulationTests
             {
                 if (kind == PendingKind.BufferedSmall || all)
                 {
-                    DfsStream s = await tx.Files.OpenAsync("/n1", FileMode.CreateNew, FileAccess.Write, FileShare.None, Ct);
+                    DfsStream s = await tx.Files.OpenAsync("/n1", FileMode.CreateNew, FileAccess.Write, FileShare.Read, Ct);
                     byte[] data = TestData.Bytes(510, 100);
                     await s.WriteAsync(data, Ct);
                     openStreams.Add(s);
@@ -1629,7 +1692,7 @@ public sealed class TxSimulationTests
 
                 if (kind == PendingKind.UploadedChunksPlusBuffer || all)
                 {
-                    DfsStream s = await tx.Files.OpenAsync("/n2", FileMode.CreateNew, FileAccess.Write, FileShare.None, Ct);
+                    DfsStream s = await tx.Files.OpenAsync("/n2", FileMode.CreateNew, FileAccess.Write, FileShare.Read, Ct);
                     byte[] data = TestData.Bytes(511, 300_007);
                     for (int offset = 0; offset < data.Length; offset += 10_000)
                         await s.WriteAsync(data.AsMemory(offset, Math.Min(10_000, data.Length - offset)), Ct);
@@ -1641,7 +1704,7 @@ public sealed class TxSimulationTests
                 if (kind == PendingKind.PartialOverwriteOfExisting || all)
                 {
                     var model = new ReferenceFileModel(e0);
-                    DfsStream s = await tx.Files.OpenAsync("/e", FileMode.Open, FileAccess.ReadWrite, FileShare.None, Ct);
+                    DfsStream s = await tx.Files.OpenAsync("/e", FileMode.Open, FileAccess.ReadWrite, FileShare.Read, Ct);
                     byte[] p1 = TestData.Bytes(512, 5000);
                     byte[] p2 = TestData.Bytes(513, 100);
                     s.Seek(70_000, SeekOrigin.Begin);
@@ -1658,7 +1721,7 @@ public sealed class TxSimulationTests
                 if (kind == PendingKind.SetLengthAndHole)
                 {
                     var model = new ReferenceFileModel(k0);
-                    DfsStream s = await tx.Files.OpenAsync("/k", FileMode.Open, FileAccess.ReadWrite, FileShare.None, Ct);
+                    DfsStream s = await tx.Files.OpenAsync("/k", FileMode.Open, FileAccess.ReadWrite, FileShare.Read, Ct);
                     await s.SetLengthAsync(30_000, Ct);
                     model.SetLength(30_000);
                     byte[] p = TestData.Bytes(514, 1000);
@@ -1672,7 +1735,7 @@ public sealed class TxSimulationTests
 
                 if (kind == PendingKind.FlushedThenPending)
                 {
-                    DfsStream s = await tx.Files.OpenAsync("/n3", FileMode.CreateNew, FileAccess.Write, FileShare.None, Ct);
+                    DfsStream s = await tx.Files.OpenAsync("/n3", FileMode.CreateNew, FileAccess.Write, FileShare.Read, Ct);
                     byte[] part1 = TestData.Bytes(515, 2000);
                     byte[] part2 = TestData.Bytes(516, 3000);
                     await s.WriteAsync(part1, Ct);
@@ -1791,7 +1854,7 @@ public sealed class TxSimulationTests
 
             TxLog t = history.Start("T");
             DfsTransaction tx = await w.Transactions.BeginAsync(null, Ct);
-            DfsStream pending = await tx.Files.OpenAsync("/a", FileMode.Open, FileAccess.ReadWrite, FileShare.None, Ct);
+            DfsStream pending = await tx.Files.OpenAsync("/a", FileMode.Open, FileAccess.ReadWrite, FileShare.Read, Ct);
             await pending.SetLengthAsync(0, Ct);
             await pending.WriteAsync(a1, Ct);   // left pending: the commit uploads it and validates its receipts
             await tx.Files.WriteAllBytesAsync("/b", b1, Ct);
@@ -1801,16 +1864,19 @@ public sealed class TxSimulationTests
                 new FaultMatch(site, Node: leader.Name, Operation: site == FaultSites.CommitReceiptValidated ? null : DfsOperationKind.TxCommit),
                 FaultAction.CrashNode(CrashMode.LoseUnflushed));
 
+            // Only T's commit is in flight when the fault is armed: the observers below start after the crash fired, so
+            // their own read-only commits (TxCommit to the same leader) can never be the operation that trips it.
+            Task<TxResult> commit = CommitAsync(tx, t);
+            await arm.WaitTriggeredAsync(Liveness);
+            cluster.Faults.AssertReached(arm);
+            Assert.Equal(TestNodeState.Crashed, leader.State);
+
             // Safety is checked during the failure and the recovery, not only after convergence.
             var stop = new TaskCompletionSource();
             var observations = new List<string>();
             Task readers = ObserveDuringRecoveryAsync(cluster, r, history, labels, stop.Task, observations);
 
-            TxResult result = await CommitAsync(tx, t);
-            await arm.WaitTriggeredAsync(Liveness);
-            cluster.Faults.AssertReached(arm);
-            Assert.Equal(TestNodeState.Crashed, leader.State);
-
+            TxResult result = await commit;
             switch (result.Outcome)
             {
                 case OpOutcome.Ok:
@@ -1819,7 +1885,10 @@ public sealed class TxSimulationTests
                 case OpOutcome.Failed:
                     Assert.False(decisionDurable,
                         $"The commit decision was quorum-durable before the crash at {site}; a definite failure ({result.Error?.GetType().Name}) would misreport a committed transaction as rolled back.");
-                    Assert.IsAssignableFrom<DfsTransactionConflictException>(result.Error); // TransactionAborted after the leader change
+                    // TransactionAborted after the leader change, or a typed availability failure; the resolution below
+                    // must confirm the definite failure was true.
+                    Assert.True(result.Error is DfsTransactionConflictException or DfsUnavailableException,
+                        $"A definite commit failure must be typed; got {result.Error?.GetType().Name}: {result.Error?.Message}");
                     break;
                 default:
                 {
@@ -1846,9 +1915,13 @@ public sealed class TxSimulationTests
             if (result.Outcome == OpOutcome.Unknown)
                 t.Resolve(committed ? OpOutcome.Ok : OpOutcome.Failed);
 
+            await cluster.WaitUntilAsync(() => Task.FromResult(observations.Count > 0 || readers.IsCompleted), Liveness,
+                "a transactional observer completes a read of /a and /b during the recovery", Ct);
             stop.SetResult();
             await readers;
             Assert.NotEmpty(observations);
+            if (!committed)
+                Assert.All(observations, pair => Assert.Equal("a0/b0", pair)); // an aborted transaction was never visible
 
             await AssertBytesAsync(committed ? a1 : a0, RetryTransientAsync(cluster, () => r.Files.ReadAllBytesAsync("/a", Ct), "read /a"), "all of the transaction or none of it");
             await AssertBytesAsync(committed ? b1 : b0, RetryTransientAsync(cluster, () => r.Files.ReadAllBytesAsync("/b", Ct), "read /b"), "all of the transaction or none of it");
@@ -1930,6 +2003,10 @@ public sealed class TxSimulationTests
             long beginsBefore = cluster.Network.Log.CountMessages(beginFilter);
             TxLog log = history.Start("app-1");
             DfsTransaction tx = await v.Transactions.BeginAsync(null, Ct);
+            // SDK-internal retries of the begin itself (same operation id) are allowed; what matters is that nothing begins
+            // again once the application body has run.
+            long beginsAfterBegin = cluster.Network.Log.CountMessages(beginFilter);
+            Assert.True(beginsAfterBegin > beginsBefore, "BeginAsync sends TxBegin.");
             FaultArm? arm = null;
             MessageRule? duplicate = null;
             TxResult first;
@@ -1947,8 +2024,11 @@ public sealed class TxSimulationTests
                 }
 
                 string next = (int.Parse(firstRead!, CultureInfo.InvariantCulture) + 1).ToString(CultureInfo.InvariantCulture);
-                await tx.Files.WriteAllTextAsync("/ctr", next, null, Ct);
-                log.Write("/ctr", next);
+                DfsTransactionConflictException? early = await StageOrEarlyConflictAsync(() => tx.Files.WriteAllTextAsync("/ctr", next, null, Ct));
+                if (early is not null)
+                    Assert.Equal(RetryForcing.ReadConflict, forcing); // only the interfering write can invalidate the read this early
+                else
+                    log.Write("/ctr", next);
                 switch (forcing)
                 {
                     case RetryForcing.LeaderChangeAbort:
@@ -1968,19 +2048,21 @@ public sealed class TxSimulationTests
                         break;
                 }
 
-                first = await CommitAsync(tx, log);
+                first = forcing == RetryForcing.ReadConflict
+                    ? await CommitExpectingConflictAsync(tx, log, early, "an ordinary write changed the counter the transaction read")
+                    : await CommitAsync(tx, log);
             }
 
             // The SDK neither re-ran the body nor silently began another transaction to retry it.
             Assert.Equal(1, bodyRuns);
             Assert.Equal(["notify-1"], sideEffects);
-            Assert.Equal(beginsBefore + 1, cluster.Network.Log.CountMessages(beginFilter));
+            Assert.Equal(beginsAfterBegin, cluster.Network.Log.CountMessages(beginFilter));
 
             bool firstCommitted;
             switch (forcing)
             {
                 case RetryForcing.ReadConflict:
-                    AssertConflict(first, tx, "an ordinary write changed the counter the transaction read");
+                    Assert.Equal(OpOutcome.Failed, first.Outcome);
                     firstCommitted = false;
                     Assert.Equal("100", await ReadLabelAsync(o.Files, "/ctr"));
                     break;
@@ -2261,10 +2343,29 @@ public sealed class TxSimulationTests
                 }
 
                 default:
+                {
                     start.SetResult();
-                    token = await v.Files.WriteAllBytesAsync("/a", a1, new DfsMutationOptions { CommitSnapshotName = "exact" }, Ct);
+                    // The overwriter now races this helper for /a's short implicit writer reservation; a refused attempt is
+                    // retried explicitly (it published nothing and created no snapshot).
+                    CommitToken? committed = null;
+                    for (int attempt = 0; committed is null; attempt++)
+                    {
+                        Assert.True(attempt < 50, "The commit-and-snapshot helper never obtained /a's writer reservation.");
+                        try
+                        {
+                            committed = await v.Files.WriteAllBytesAsync("/a", a1, new DfsMutationOptions { CommitSnapshotName = "exact" }, Ct);
+                        }
+                        catch (DfsSharingViolationException)
+                        {
+                            Assert.DoesNotContain("exact", (await obs.Snapshots.ListAsync(Ct)).Select(i => i.Name));
+                            await cluster.DelayAsync(TimeSpan.FromMilliseconds(13), Ct);
+                        }
+                    }
+
+                    token = committed.Value;
                     exact = await obs.Snapshots.GetAsync("exact", Ct);
                     break;
+                }
             }
 
             await overwriter;
@@ -2413,7 +2514,9 @@ public sealed class TxSimulationTests
             Exception? followUpError = followUp == UnknownFollowUp.DisposeAsync
                 ? await CaptureAsync(() => tx.DisposeAsync().AsTask())
                 : await CaptureAsync(() => tx.AbortAsync(Ct));
-            Assert.True(followUpError is null or InvalidOperationException or DfsException,
+            // While the client is still cut off, the abort request itself may fail (typed I/O failure or timeout); what it
+            // must never do is report or cause a rollback.
+            Assert.True(followUpError is null or InvalidOperationException or IOException or TimeoutException or OperationCanceledException,
                 $"Unexpected {followUpError?.GetType().Name} from {followUp} after an unknown commit outcome.");
             Assert.NotEqual(DfsTransactionState.Aborted, tx.State);
 
@@ -2496,7 +2599,7 @@ public sealed class TxSimulationTests
             DfsTransaction tx = await v1.Transactions.BeginAsync(null, Ct);
             t.Read("/a", await ReadLabelAsync(tx.Files, "/a", labels)).Read("/b", await ReadLabelAsync(tx.Files, "/b", labels));
             await tx.Files.WriteAllTextAsync("/a", "0", null, Ct);
-            await using (DfsStream s = await tx.Files.OpenAsync("/c", FileMode.CreateNew, FileAccess.Write, FileShare.None, Ct))
+            await using (DfsStream s = await tx.Files.OpenAsync("/c", FileMode.CreateNew, FileAccess.Write, FileShare.Read, Ct))
             {
                 await s.WriteAsync(staged, Ct);
                 await s.FlushAsync(Ct);

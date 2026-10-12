@@ -9,7 +9,9 @@ namespace Tedd.Tdfs.Tests.Unit.Tx;
 /// TX suite, level U: SDK contract of volume-scoped ACID transactions (FSD §8, §11; ARCHITECTURE §5.6, §9.5) against the
 /// default three-zone in-memory cluster. Each test proves the specific property with exact bytes, inode identity,
 /// revisions, commit tokens, outcome statuses and typed errors; staged changes are always shown to exist inside the
-/// transaction first so "nothing visible" assertions cannot pass vacuously.
+/// transaction first so "nothing visible" assertions cannot pass vacuously. Transaction-bound writers whose files other
+/// clients read while the transaction is active use <see cref="FileShare.Read"/> (test plan §5: visibility tests use
+/// compatible sharing options, so a setup-level sharing conflict is never mistaken for publication evidence).
 /// </summary>
 public sealed class TxUnitTests
 {
@@ -124,13 +126,13 @@ public sealed class TxUnitTests
                 Assert.True((await tx.Files.WriteAllBytesAsync("/b", newB, Ct)).IsNone, "Transaction-bound helpers return CommitToken.None.");
                 break;
             case "streams":
-                await using (DfsStream a = await tx.Files.OpenAsync("/a", FileMode.Create, FileAccess.Write, FileShare.None, Ct))
+                await using (DfsStream a = await tx.Files.OpenAsync("/a", FileMode.Create, FileAccess.Write, FileShare.Read, Ct))
                 {
                     Assert.True(a.IsTransactionBound);
                     await a.WriteAsync(newA, Ct);
                 }
 
-                await using (DfsStream b = await tx.Files.OpenAsync("/b", FileMode.Truncate, FileAccess.Write, FileShare.None, Ct))
+                await using (DfsStream b = await tx.Files.OpenAsync("/b", FileMode.Truncate, FileAccess.Write, FileShare.Read, Ct))
                 {
                     Assert.True(b.IsTransactionBound);
                     await b.WriteAsync(newB, Ct);
@@ -139,7 +141,7 @@ public sealed class TxUnitTests
                 break;
             case "mixed":
                 await tx.Files.WriteAllBytesAsync("/a", newA, Ct);
-                await using (DfsStream b = await tx.Files.OpenAsync("/b", FileMode.Open, FileAccess.ReadWrite, FileShare.None, Ct))
+                await using (DfsStream b = await tx.Files.OpenAsync("/b", FileMode.Open, FileAccess.ReadWrite, FileShare.Read, Ct))
                 {
                     await b.SetLengthAsync(0, Ct);
                     await b.WriteAsync(newB, Ct);
@@ -251,14 +253,18 @@ public sealed class TxUnitTests
             DfsOperationOutcome outcome = await vol.Transactions.QueryOutcomeAsync(tx.Id, false, Ct);
             Assert.Equal(DfsOutcomeStatus.Aborted, outcome.Status);
 
+            // Disposal after abort is idempotent and still does not change anything. (Checked before the reservation probes
+            // below, which open writer handles of their own.)
+            await tx.DisposeAsync();
+            Assert.Equal(DfsTransactionState.Aborted, tx.State);
+            AssertTreesEqual(before, await CaptureTreeAsync(obs), "a second disposal changes nothing");
+
             await WaitNoActiveTransactionsAsync(cluster, "the aborted transaction's server state is released");
             await AssertWriterReservationFreeAsync(obs, "/keep/f1", "reservation taken by the aborted overwrite");
+            await AssertWriterReservationFreeAsync(obs, "/keep/f2", "reservation taken by the aborted append");
             await AssertWriterReservationFreeAsync(obs, "/keep/f3", "reservation taken by the aborted stream write");
             await AssertWriterReservationFreeAsync(obs, "/keep/f4", "reservation taken by the aborted truncation");
-
-            // Disposal after abort is idempotent and still does not change anything.
-            await tx.DisposeAsync();
-            AssertTreesEqual(before, await CaptureTreeAsync(obs), "a second disposal changes nothing");
+            await AssertContentAsync(obs.Files, "/keep/f4", TestData.Bytes(4, 9000), "the aborted truncation left /keep/f4 intact");
         }, Ct);
 
     private static async Task SeedAbortFixtureAsync(DfsVolume vol)
@@ -281,13 +287,13 @@ public sealed class TxUnitTests
     {
         await tx.Files.WriteAllBytesAsync("/keep/f1", TestData.Bytes(11, 4000), Ct);
         await tx.Files.AppendAllBytesAsync("/keep/f2", TestData.Bytes(12, 500), Ct);
-        await using (DfsStream f3 = await tx.Files.OpenAsync("/keep/f3", FileMode.Open, FileAccess.ReadWrite, FileShare.None, Ct))
+        await using (DfsStream f3 = await tx.Files.OpenAsync("/keep/f3", FileMode.Open, FileAccess.ReadWrite, FileShare.Read, Ct))
         {
             f3.Seek(10, SeekOrigin.Begin);
             await f3.WriteAsync(TestData.Bytes(13, 100), Ct);
         }
 
-        await using (DfsStream f4 = await tx.Files.OpenAsync("/keep/f4", FileMode.Open, FileAccess.ReadWrite, FileShare.None, Ct))
+        await using (DfsStream f4 = await tx.Files.OpenAsync("/keep/f4", FileMode.Open, FileAccess.ReadWrite, FileShare.Read, Ct))
             await f4.SetLengthAsync(3, Ct);
 
         await tx.Directories.CreateDirectoryAsync("/new", Ct);
@@ -383,7 +389,7 @@ public sealed class TxUnitTests
             case OwnOp.StreamPartialWrite:
             {
                 var model = new ReferenceFileModel(f0);
-                await using DfsStream s = await tx.Files.OpenAsync("/f", FileMode.Open, FileAccess.ReadWrite, FileShare.None, Ct);
+                await using DfsStream s = await tx.Files.OpenAsync("/f", FileMode.Open, FileAccess.ReadWrite, FileShare.Read, Ct);
                 s.Seek(100, SeekOrigin.Begin);
                 await s.WriteAsync(x.AsMemory(0, 50), Ct);
                 model.Write(100, x.AsSpan(0, 50));
@@ -404,7 +410,7 @@ public sealed class TxUnitTests
 
             case OwnOp.TruncateThenExtendViaStream:
             {
-                await using DfsStream s = await tx.Files.OpenAsync("/f", FileMode.Open, FileAccess.ReadWrite, FileShare.None, Ct);
+                await using DfsStream s = await tx.Files.OpenAsync("/f", FileMode.Open, FileAccess.ReadWrite, FileShare.Read, Ct);
                 await s.SetLengthAsync(10, Ct);
                 await s.SetLengthAsync(20, Ct);
                 byte[] expected = [.. f0[..10], .. new byte[10]];
@@ -569,7 +575,7 @@ public sealed class TxUnitTests
             {
                 Mode = FileMode.Create,
                 Access = FileAccess.ReadWrite,
-                Share = FileShare.None,
+                Share = FileShare.Read,
                 WriteMode = flush == StageFlush.WriteThrough ? DfsWriteMode.WriteThrough : DfsWriteMode.OnFlush,
             };
 
@@ -659,8 +665,8 @@ public sealed class TxUnitTests
             s2Model.Flush();
 
             DfsTransaction tx = await vol.Transactions.BeginAsync(null, Ct);
-            DfsStream s1 = await tx.Files.OpenAsync("/s1", FileMode.CreateNew, FileAccess.Write, FileShare.None, Ct);
-            DfsStream s2 = await tx.Files.OpenAsync("/s2", FileMode.Open, FileAccess.ReadWrite, FileShare.None, Ct);
+            DfsStream s1 = await tx.Files.OpenAsync("/s1", FileMode.CreateNew, FileAccess.Write, FileShare.Read, Ct);
+            DfsStream s2 = await tx.Files.OpenAsync("/s2", FileMode.Open, FileAccess.ReadWrite, FileShare.Read, Ct);
             await s1.WriteAsync(s1Data, Ct);                 // unflushed: disposal must stage it
             s2.Seek(500, SeekOrigin.Begin);
             await s2.WriteAsync(s2Patch, Ct);
@@ -729,7 +735,7 @@ public sealed class TxUnitTests
 
             await using DfsTransaction tx = await vol.Transactions.BeginAsync(null, Ct);
             await tx.Files.WriteAllBytesAsync("/other", other, Ct);
-            DfsStream s = await tx.Files.OpenAsync("/s", FileMode.Create, FileAccess.Write, FileShare.None, Ct);
+            DfsStream s = await tx.Files.OpenAsync("/s", FileMode.Create, FileAccess.Write, FileShare.Read, Ct);
             await s.WriteAsync(streamed, Ct);
             long commitFilesBefore = cluster.Network.Log.CountMessages(commitFilter);
             long txCommitsBefore = cluster.Network.Log.CountMessages(txCommitFilter);
@@ -844,7 +850,7 @@ public sealed class TxUnitTests
                 {
                     DfsTransaction t = await vol.Transactions.BeginAsync(null, Ct);
                     await StageAsync(t);
-                    openStream = await t.Files.OpenAsync("/streamed", FileMode.CreateNew, FileAccess.Write, FileShare.None, Ct);
+                    openStream = await t.Files.OpenAsync("/streamed", FileMode.CreateNew, FileAccess.Write, FileShare.Read, Ct);
                     await openStream.WriteAsync(TestData.Bytes(43, 5000), Ct);   // pending, never flushed
                     await t.DisposeAsync();
                     break;
@@ -903,7 +909,7 @@ public sealed class TxUnitTests
 
             await using DfsTransaction tx = await vol.Transactions.BeginAsync(null, Ct);
             await tx.Files.WriteAllBytesAsync("/other", other, Ct);
-            DfsStream s = await tx.Files.OpenAsync("/s", FileMode.CreateNew, FileAccess.Write, FileShare.None, Ct);
+            DfsStream s = await tx.Files.OpenAsync("/s", FileMode.CreateNew, FileAccess.Write, FileShare.Read, Ct);
             await s.WriteAsync(first, Ct);
 
             CommitToken token;
@@ -977,7 +983,7 @@ public sealed class TxUnitTests
             SortedDictionary<string, string> before = await CaptureTreeAsync(obs);
 
             DfsTransaction tx = await vol.Transactions.BeginAsync(null, Ct);
-            DfsStream writer = await tx.Files.OpenAsync("/f", FileMode.Open, FileAccess.ReadWrite, FileShare.None, Ct);
+            DfsStream writer = await tx.Files.OpenAsync("/f", FileMode.Open, FileAccess.ReadWrite, FileShare.Read, Ct);
             await writer.SetLengthAsync(0, Ct);
             await writer.WriteAsync(newF, Ct);
             await writer.FlushAsync(Ct);
@@ -1059,13 +1065,14 @@ public sealed class TxUnitTests
 
     public enum TxLimit { Duration, TimeoutOption, TouchedInodes, StagedBytes, Pins }
 
+    // Touched inodes are exercised by TX_022_TransactionLimitsFailAtomically_TouchedInodesBoundaryProbe: whether resolved
+    // parent directories count as touched is not pinned by the FSD, so the boundary is located by growing one inode at a
+    // time instead of being assumed.
     [Theory]
     [InlineData(TxLimit.Duration, false)]
     [InlineData(TxLimit.Duration, true)]
     [InlineData(TxLimit.TimeoutOption, false)]
     [InlineData(TxLimit.TimeoutOption, true)]
-    [InlineData(TxLimit.TouchedInodes, false)]
-    [InlineData(TxLimit.TouchedInodes, true)]
     [InlineData(TxLimit.StagedBytes, false)]
     [InlineData(TxLimit.StagedBytes, true)]
     [InlineData(TxLimit.Pins, false)]
@@ -1093,9 +1100,6 @@ public sealed class TxUnitTests
                 case TxLimit.TimeoutOption:
                     await DurationLimitAsync(cluster, vol, obs, limit, beyondLimit);
                     break;
-                case TxLimit.TouchedInodes:
-                    await TouchedInodesLimitAsync(vol, obs, beyondLimit);
-                    break;
                 case TxLimit.StagedBytes:
                     await StagedBytesLimitAsync(vol, obs, beyondLimit);
                     break;
@@ -1103,6 +1107,68 @@ public sealed class TxUnitTests
                     await PinLimitAsync(vol, obs, beyondLimit);
                     break;
             }
+        }, Ct);
+
+    /// <summary>
+    /// Touched-inode limit (8): transaction n overwrites the existing files /t/0../t/{n-1} (never creating names, so only a
+    /// constant number of directories can be touched besides them). Each step touches exactly one inode more than the
+    /// previous one, so the first failing step requests limit+1 and the step before it touched exactly the limit. Writing
+    /// nine files exceeds eight touched inodes however directories are counted.
+    /// </summary>
+    [Fact]
+    [Catalog("TX-022", "U", "INV-02")]
+    public Task TX_022_TransactionLimitsFailAtomically_TouchedInodesBoundaryProbe() =>
+        ClusterTest.RunAsync(LimitCluster(LimitsFor(TxLimit.TouchedInodes)), async cluster =>
+        {
+            const int limit = 8;
+            await using DfsClient client = await ConnectAsync(cluster, "c1");
+            await using DfsClient observerClient = await ConnectAsync(cluster, "observer");
+            DfsVolume vol = client.GetVolume(Vol);
+            DfsVolume obs = observerClient.GetVolume(Vol);
+            Assert.Equal(limit, (await vol.GetInfoAsync(Ct)).Limits.MaxTransactionTouchedInodes);
+
+            await vol.Directories.CreateDirectoryAsync("/t", Ct);
+            for (int i = 0; i <= limit + 1; i++)
+                await vol.Files.WriteAllBytesAsync($"/t/{i}", TestData.Bytes((ulong)(100 + i), 64), Ct);
+
+            int lastCommitted = 0;
+            for (int n = 1; n <= limit + 2; n++)
+            {
+                SortedDictionary<string, string> before = await CaptureTreeAsync(obs);
+                DfsTransaction tx = await vol.Transactions.BeginAsync(null, Ct);
+                Exception? failure;
+                await using (tx)
+                {
+                    failure = await CaptureAsync(async () =>
+                    {
+                        for (int i = 0; i < n; i++)
+                            await tx.Files.WriteAllBytesAsync($"/t/{i}", TestData.Bytes((ulong)(1000 * n + i), 64), Ct);
+                        await tx.CommitAsync(Ct);
+                    });
+                }
+
+                if (failure is null)
+                {
+                    for (int i = 0; i < n; i++)
+                        await AssertContentAsync(obs.Files, $"/t/{i}", TestData.Bytes((ulong)(1000 * n + i), 64), $"a transaction touching {n} files commits every one of them");
+                    lastCommitted = n;
+                    continue;
+                }
+
+                AssertLimitExceeded(failure, nameof(DfsVolumeLimits.MaxTransactionTouchedInodes), limit);
+                DfsLimitExceededException ex = (DfsLimitExceededException)failure;
+                Assert.True(ex.Requested == limit + 1,
+                    $"The first failing transaction touches exactly one inode more than the last committed one; it reported {ex.Requested}.");
+                Assert.True(n <= limit + 1, $"Overwriting {n} files touches more than {limit} inodes and must fail.");
+                Assert.True(lastCommitted >= 2 && lastCommitted == n - 1,
+                    $"The boundary case (one inode fewer than the failing one) must commit; last committed n={lastCommitted}, failing n={n}.");
+                Assert.Equal(DfsTransactionState.Aborted, tx.State);
+                Assert.Equal(DfsOutcomeStatus.Aborted, (await obs.Transactions.QueryOutcomeAsync(tx.Id, true, Ct)).Status);
+                AssertTreesEqual(before, await CaptureTreeAsync(obs), "touching one inode more than the limit publishes nothing");
+                return;
+            }
+
+            Assert.Fail($"MaxTransactionTouchedInodes={limit} was never enforced for transactions overwriting up to {limit + 2} files.");
         }, Ct);
 
     [Fact]
@@ -1205,43 +1271,22 @@ public sealed class TxUnitTests
         }
 
         Assert.NotNull(failure);
-        bool legal = failure is DfsTransactionAbortedException { ErrorCode: DfsErrorCode.TransactionAborted }
-            || failure is DfsLimitExceededException { ErrorCode: DfsErrorCode.LimitExceeded, LimitName: nameof(DfsVolumeLimits.MaxTransactionDuration) };
-        Assert.True(legal, $"An expired transaction must fail with TransactionAborted or LimitExceeded(MaxTransactionDuration); got {failure.GetType().Name}: {failure.Message}");
+        // The server-advertised duration limit has a typed surface (FSD §8.3, API A.2). The per-transaction Timeout option
+        // is an SDK deadline whose error type the FSD does not pin; any typed rejection is acceptable there. Either way the
+        // authoritative outcome below must be Aborted and nothing may be published.
+        bool legal = limit == TxLimit.Duration
+            ? failure is DfsTransactionAbortedException { ErrorCode: DfsErrorCode.TransactionAborted }
+                || failure is DfsLimitExceededException { ErrorCode: DfsErrorCode.LimitExceeded, LimitName: nameof(DfsVolumeLimits.MaxTransactionDuration) }
+            : failure is DfsTransactionConflictException or DfsLimitExceededException or TimeoutException or OperationCanceledException
+                || failure is DfsException { ErrorCode: DfsErrorCode.Timeout or DfsErrorCode.Cancelled };
+        Assert.True(legal, $"An expired transaction ({limit}) must fail with a typed rejection; got {failure.GetType().Name}: {failure.Message}");
         Assert.NotEqual(DfsTransactionState.Committed, tx.State);
         AssertTreesEqual(before, await CaptureTreeAsync(obs), "an expired transaction publishes no part of itself");
-        await AssertWriterReservationFreeAsync(obs, "/f", "expiry releases the transaction's writer reservation");
-    }
-
-    private static async Task TouchedInodesLimitAsync(DfsVolume vol, DfsVolume obs, bool beyond)
-    {
-        // Files are pre-created so the transaction overwrites existing inodes only: it touches exactly the files it
-        // writes; their parent directory is neither modified nor enumerated.
-        await vol.Directories.CreateDirectoryAsync("/t", Ct);
-        for (int i = 0; i < 9; i++)
-            await vol.Files.WriteAllBytesAsync($"/t/{i}", TestData.Bytes((ulong)(100 + i), 64), Ct);
-        SortedDictionary<string, string> before = await CaptureTreeAsync(obs);
-
-        int touched = beyond ? 9 : 8;
-        await using DfsTransaction tx = await vol.Transactions.BeginAsync(null, Ct);
-        Exception? failure = await CaptureAsync(async () =>
-        {
-            for (int i = 0; i < touched; i++)
-                await tx.Files.WriteAllBytesAsync($"/t/{i}", TestData.Bytes((ulong)(200 + i), 64), Ct);
-            await tx.CommitAsync(Ct);
-        });
-
-        if (!beyond)
-        {
-            Assert.Null(failure);
-            for (int i = 0; i < touched; i++)
-                await AssertContentAsync(obs.Files, $"/t/{i}", TestData.Bytes((ulong)(200 + i), 64), "touching exactly the limit commits every file");
-            return;
-        }
-
-        AssertLimitExceeded(failure, nameof(DfsVolumeLimits.MaxTransactionTouchedInodes), 8);
-        Assert.NotEqual(DfsTransactionState.Committed, tx.State);
-        AssertTreesEqual(before, await CaptureTreeAsync(obs), "touching one inode more than the limit publishes nothing");
+        Assert.Equal(DfsOutcomeStatus.Aborted, (await obs.Transactions.QueryOutcomeAsync(tx.Id, true, Ct)).Status);
+        await tx.DisposeAsync();
+        await AssertWriterReservationFreeAsync(obs, "/f", "an expired (and disposed) transaction no longer holds its writer reservation");
+        await AssertContentAsync(obs.Files, "/f", old, "the expired transaction's staged overwrite never appears later");
+        await AssertFileAbsentAsync(obs.Files, "/n", "the expired transaction's staged create never appears later");
     }
 
     private static async Task StagedBytesLimitAsync(DfsVolume vol, DfsVolume obs, bool beyond)
