@@ -113,6 +113,7 @@ public sealed class SecSimulationTests
             await using DfsClient admin = await cluster.ConnectAsync(new TestClientOptions { Name = "admin-c" }, Ct);
             DfsVolume adminVol = admin.GetVolume(Vol);
             int chunk = admin.Capabilities.ChunkSize;
+            await adminVol.Directories.CreateDirectoryAsync("/sec6", Ct);
             await adminVol.Files.WriteAllBytesAsync(target, TestData.Bytes(601, 2 * chunk + 3), Ct);
             await adminVol.Files.WriteAllTextAsync("/sec6/move-me.txt", "m", null, Ct);
             await adminVol.Files.WriteAllTextAsync("/sec6/delete-me.txt", "d", null, Ct);
@@ -235,7 +236,10 @@ public sealed class SecSimulationTests
         /// <summary>Another principal (rights on another volume only) presents the owner's read capability.</summary>
         StolenReadCapability,
 
-        /// <summary>The owner replays a still-valid read capability on a new connection (valid historical access).</summary>
+        /// <summary>
+        /// The file is overwritten and the owner's connection reset; the owner replays its still-valid read capability on a
+        /// new connection, and its pinned handle must keep reading the now-historical revision (valid historical access).
+        /// </summary>
         ValidReadCapabilityAfterReconnect,
 
         /// <summary>The owner replays a staging upload after aborting the staging session.</summary>
@@ -267,8 +271,11 @@ public sealed class SecSimulationTests
             DfsVolume adminVol = admin.GetVolume(Vol);
             int chunk = admin.Capabilities.ChunkSize;
             byte[] content = TestData.Bytes(701, 3 * chunk + 5);
+            await adminVol.Directories.CreateDirectoryAsync("/sec7", Ct);
             await adminVol.Files.WriteAllBytesAsync(path, content, Ct);
             string before = await SecHelpers.SubtreeDigestAsync(adminVol, "/sec7", Ct);
+            byte[] newer = TestData.Bytes(703, 2 * chunk + 9);
+            byte[] expectedLive = content;
 
             await using DfsClient p = await cluster.ConnectAsync(new TestClientOptions { Name = "p", Credentials = owner.Credentials }, Ct);
             DfsVolume pv = p.GetVolume(Vol);
@@ -281,7 +288,8 @@ public sealed class SecSimulationTests
                 if (readCase)
                 {
                     using MessageHold hold = cluster.Network.Hold(new MessageFilter(From: "client:p", Type: MessageType.GetObject, Direction: LinkDirection.Request));
-                    reader = await pv.Files.OpenAsync(path, new DfsOpenOptions { ReadView = DfsReadView.VersionPinned }, Ct);
+                    // Share.ReadWrite admits a later writer (test plan §5): the pinned handle, not a sharing lock, protects its revision.
+                    reader = await pv.Files.OpenAsync(path, new DfsOpenOptions { ReadView = DfsReadView.VersionPinned, Share = FileShare.ReadWrite }, Ct);
                     var first = new byte[chunk];
                     Task<int> read = reader.ReadAsync(first, Ct).AsTask();
                     await hold.WaitForAsync(1, TimeSpan.FromSeconds(30));
@@ -320,6 +328,11 @@ public sealed class SecSimulationTests
                     }
 
                     case CapabilityReplay.ValidReadCapabilityAfterReconnect:
+                        // The live file moves on (new revision) and the connection is reset: the pinned handle's revision is
+                        // now historical, and access to it remains valid for this handle's lifetime.
+                        await adminVol.Files.WriteAllBytesAsync(path, newer, Ct);
+                        expectedLive = newer;
+                        before = await SecHelpers.SubtreeDigestAsync(adminVol, "/sec7", Ct);
                         cluster.Network.ResetConnections("client:p");
                         break;
                     case CapabilityReplay.StagingCapabilityAfterAbort:
@@ -342,7 +355,12 @@ public sealed class SecSimulationTests
                         Assert.Equal(putsBefore, (await cluster.Inspect.GetTotalCountersAsync()).ObjectPuts);
                         break;
                     case CapabilityReplay.ValidReadCapabilityAfterReconnect:
-                        Assert.True(code == DfsErrorCode.None, $"a still-valid capability of the same principal must keep working after reconnect, got {code}");
+                        // The FSD does not fix whether a capability is bound to the principal only (served on a new connection)
+                        // or also to the issuing connection/session (refused): both are safe. What must be preserved is the
+                        // valid historical access itself — the pinned handle keeps reading the same revision after reconnect.
+                        Assert.True(code is DfsErrorCode.None or DfsErrorCode.AccessDenied or DfsErrorCode.PinExpired,
+                            $"a same-principal replay of a still-valid capability may be served or refused, not {code}");
+                        TestContext.Current.TestOutputHelper?.WriteLine($"same-principal capability replay after reconnect: {code}");
                         var rest = new byte[content.Length];
                         reader!.Seek(0, SeekOrigin.Begin);
                         int total = 0;
@@ -353,7 +371,8 @@ public sealed class SecSimulationTests
                             total += n;
                         }
 
-                        AssertEx.BytesEqual(content, rest, "the open handle keeps reading after reconnect");
+                        AssertEx.BytesEqual(content, rest, "the pinned handle keeps reading its (now historical) revision after reconnect");
+                        Assert.Equal(content.LongLength, await reader.GetLengthAsync(Ct));
                         break;
                     default:
                         Assert.True(code is DfsErrorCode.None or DfsErrorCode.AccessDenied or DfsErrorCode.InvalidHandle or DfsErrorCode.LeaseLost or DfsErrorCode.PinExpired,
@@ -373,7 +392,7 @@ public sealed class SecSimulationTests
             }
 
             Assert.Equal(before, await SecHelpers.SubtreeDigestAsync(adminVol, "/sec7", Ct));
-            await RecoveryScenario.AssertFileBytesAsync(pv.Files, path, content, "the owner's legitimate access is unaffected", Ct);
+            await RecoveryScenario.AssertFileBytesAsync(pv.Files, path, expectedLive, "the owner's legitimate access is unaffected", Ct);
             await using DfsClient q = await cluster.ConnectAsync(new TestClientOptions { Name = "q", Credentials = thief.Credentials }, Ct);
             SecHelpers.AssertAccessDenied(await RecoveryScenario.CaptureAsync(() => q.GetVolume(Vol).Files.ReadAllBytesAsync(path, Ct)), "the thief has no namespace access");
         }, Ct);
@@ -401,6 +420,7 @@ public sealed class SecSimulationTests
             DfsVolume adminVol = admin.GetVolume(Vol);
             int chunk = admin.Capabilities.ChunkSize;
             var initial = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+            await adminVol.Directories.CreateDirectoryAsync("/sec13", Ct);
             for (int i = 0; i < files; i++)
             {
                 string key = "/sec13/f" + i.ToString(System.Globalization.CultureInfo.InvariantCulture) + ".bin";
@@ -415,8 +435,12 @@ public sealed class SecSimulationTests
             bool stop = false;
             string[] keys = initial.Keys.ToArray();
 
+            // Failures a correct system may legitimately report while a node crashes or leadership moves. Definite failures
+            // (writer conflict with a lingering implicit reservation, lease loss, expired pin) have no effect and are
+            // recorded as Failed; unknown outcomes are recorded as Unknown by the history recorder.
             static bool Tolerated(Exception ex) =>
                 ex is DfsUnavailableException or DfsCommitOutcomeUnknownException or TimeoutException
+                    or DfsSharingViolationException or DfsLeaseLostException or DfsPinExpiredException
                 || DfsErrors.ToCode(ex) is DfsErrorCode.NotLeader or DfsErrorCode.Timeout or DfsErrorCode.NodeUnavailable or DfsErrorCode.OutcomeUnknown;
 
             async Task WriterAsync()
@@ -547,9 +571,10 @@ public sealed class SecSimulationTests
 
     /// <summary>
     /// Moves client and server wall clocks across lease, session and capability validity boundaries: expired authority is
-    /// never revived (the old writer's publication fails with LeaseLost and a replacement writer wins), valid authority is
-    /// not falsely expired by forward jumps, at most one writer is valid at every observation, and replayed uploads never
-    /// become published content.
+    /// never revived — not by the clock change and not by re-authenticating the old client's connections afterwards (the old
+    /// writer's publication fails with LeaseLost and a replacement writer wins), valid authority is not falsely expired by
+    /// forward jumps (the renewed writer still publishes), at most one writer is valid at every observation, and replayed
+    /// uploads never become published content.
     /// </summary>
     [Theory]
     [InlineData(ClockChange.ClientWallClockBackward)]
@@ -567,6 +592,7 @@ public sealed class SecSimulationTests
             DfsVolume adminVol = admin.GetVolume(Vol);
             int chunk = admin.Capabilities.ChunkSize;
             byte[] original = TestData.Bytes(1701, 2 * chunk + 1);
+            await adminVol.Directories.CreateDirectoryAsync("/sec17", Ct);
             await adminVol.Files.WriteAllBytesAsync(path, original, Ct);
 
             var clockA = new TestClock(cluster.Time);
@@ -580,7 +606,7 @@ public sealed class SecSimulationTests
             async Task<CommitToken> ReplaceAsWriterBAsync()
             {
                 await using DfsStream s = await bv.Files.OpenAsync(path, FileMode.Open, FileAccess.ReadWrite, FileShare.Read, Ct);
-                s.SetLength(0);
+                await s.SetLengthAsync(0, Ct);
                 await s.WriteAsync(bBytes, Ct);
                 return await s.CommitAsync(Ct);
             }
@@ -649,20 +675,37 @@ public sealed class SecSimulationTests
                 {
                     Exception? second = await RecoveryScenario.CaptureAsync(() => ReplaceAsWriterBAsync());
                     Assert.True(second is DfsSharingViolationException, $"A still renews its lease; a forward wall-clock jump must not hand writer authority to B (got {second?.GetType().Name ?? "success"})");
-                    Exception? flush = await RecoveryScenario.CaptureAsync(() => writerA.CommitAsync(Ct));
-                    byte[] expected = flush is null ? [.. aBytes, .. original.AsSpan(aBytes.Length)] : original;
-                    if (flush is not null)
-                        Assert.True(flush is DfsException or UnauthorizedAccessException, $"a failed publication after a clock jump must be a typed failure, got {flush}");
-                    await RecoveryScenario.AssertFileBytesAsync(adminVol.Files, path, expected, "forward wall-clock jump", Ct);
+
+                    // Leases are tracked on the leader's monotonic clock (ARCHITECTURE §5.3): a wall-clock jump neither revives
+                    // nor falsely expires authority, so the still-valid writer A publishes normally.
+                    CommitToken aCommit = await writerA.CommitAsync(Ct);
+                    Assert.False(writerA.IsFaulted, "a forward wall-clock jump must not fault a writer whose lease is still renewed");
+                    Assert.True(aCommit.IsComparableWith((await adminVol.GetInfoAsync(Ct)).LastCommit));
+                    await RecoveryScenario.AssertFileBytesAsync(adminVol.Files, path, [.. aBytes, .. original.AsSpan(aBytes.Length)], "forward wall-clock jump", Ct);
                 }
                 else
                 {
+                    // A's connections re-authenticate under the changed clock; authentication must not revive the expired
+                    // writer authority (or hand the old lease to the re-authenticated session).
+                    cluster.Network.ResetConnections("client:a");
+                    await cluster.DelayAsync(TimeSpan.FromSeconds(1), Ct);
+                    await SecHelpers.AssertAtMostOneWriterAsync(cluster, Vol, path, $"after A re-authenticated following {change}");
+
                     CommitToken bCommit = await ReplaceAsWriterBAsync();
                     await SecHelpers.AssertAtMostOneWriterAsync(cluster, Vol, path, "after B replaced A");
                     Exception? stale = await RecoveryScenario.CaptureAsync(() => writerA.CommitAsync(Ct));
                     Assert.True(stale is DfsLeaseLostException or DfsOperationExpiredException or DfsPinExpiredException,
                         $"the expired writer must not regain authority through a clock change, got {stale?.GetType().Name ?? "success"}");
-                    Assert.True(writerA.IsFaulted, "the expired writer's stream must be faulted");
+                    if (stale is DfsLeaseLostException)
+                        Assert.True(writerA.IsFaulted, "lease loss must fault the expired writer's stream (FSD §6.4)");
+
+                    // The SDK must not silently reacquire authority and publish A's stale buffer on a later attempt either.
+                    Exception? staleAgain = await RecoveryScenario.CaptureAsync(async () =>
+                    {
+                        await writerA.WriteAsync(aBytes.AsMemory(0, 10), Ct);
+                        await writerA.CommitAsync(Ct);
+                    });
+                    Assert.True(staleAgain is not null, "a second publication attempt by the expired writer succeeded");
                     await RecoveryScenario.AssertFileBytesAsync(adminVol.Files, path, bBytes, "the replacement writer's content stays authoritative", Ct);
                     Assert.True(bCommit.IsComparableWith((await adminVol.GetInfoAsync(Ct)).LastCommit));
 

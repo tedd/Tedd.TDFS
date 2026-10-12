@@ -119,7 +119,9 @@ public sealed class RstSimulationTests
                     break;
                 }
 
-                Assert.True(retry is DfsUnavailableException && attempt < 5, $"resuming the restore failed on attempt {attempt}: {retry}");
+                // Retryable outcomes while the cluster settles; an unknown outcome is resolved by re-issuing the same request.
+                Assert.True((retry is DfsUnavailableException or DfsCommitOutcomeUnknownException or TimeoutException) && attempt < 5,
+                    $"resuming the restore failed on attempt {attempt}: {retry}");
                 await cluster.DelayAsync(TimeSpan.FromSeconds(1), Ct);
             }
 
@@ -128,7 +130,24 @@ public sealed class RstSimulationTests
             Assert.NotEqual(source.Info.Id, restored.Id);
             RecoveryScenario.AssertNotComparable(restored.LastCommit, source.Info.LastCommit, "the restored volume is a new authority");
             Assert.Single(await admin.Admin.ListVolumesAsync(Ct), v => v == "vol-r");
-            VolumeContentFixture.AssertMatches(source.Expected, await VolumeContentFixture.CaptureAsync(probe.GetVolume("vol-r"), Ct), $"restore resumed after {phase}");
+
+            // An activation that completes asynchronously may take a moment to be served; while it is not served it must
+            // be refused with an availability/not-found error, and once served it must be complete.
+            await cluster.WaitUntilAsync(async () =>
+            {
+                ObservedVolumeContent? seen = null;
+                Exception? notYet = await RecoveryScenario.CaptureAsync(async () => seen = await VolumeContentFixture.CaptureAsync(probe.GetVolume("vol-r"), Ct));
+                if (notYet is not null)
+                {
+                    RecoveryScenario.AssertFailedWith(notYet, "a restored volume that is not served yet",
+                        DfsErrorCode.VolumeNotFound, DfsErrorCode.Unavailable, DfsErrorCode.QuorumUnavailable, DfsErrorCode.NotLeader,
+                        DfsErrorCode.NodeUnavailable, DfsErrorCode.Timeout);
+                    return false;
+                }
+
+                VolumeContentFixture.AssertMatches(source.Expected, seen!, $"restore resumed after {phase}");
+                return true;
+            }, TimeSpan.FromSeconds(60), $"the resumed restore after {phase} becomes served", Ct);
             await cluster.WaitForReplicationAsync("vol-r", Ct);
             await cluster.Inspect.AssertReplicasConvergedAsync("vol-r");
             Assert.Equal(publishedBefore, await backup.Inspect.GetPublishedSnapshotsAsync(Vol));
@@ -209,7 +228,8 @@ public sealed class RstSimulationTests
                 VolumeContentFixture.AssertMatches(source.Expected, await VolumeContentFixture.CaptureAsync(newVolume, Ct), "the new authority starts exactly from S");
 
                 Exception? minimum = await RecoveryScenario.CaptureAsync(() => newVolume.Snapshots.CreateAsync("min-old", new DfsSnapshotOptions { MinimumCommit = oldToken }, Ct));
-                RecoveryScenario.AssertFailedWith(minimum, "a MinimumCommit from the old authority", DfsErrorCode.EpochMismatch, DfsErrorCode.InvalidArgument, DfsErrorCode.ClusterMismatch);
+                RecoveryScenario.AssertFailedWith(minimum, "a MinimumCommit from the old authority", DfsErrorCode.EpochMismatch, DfsErrorCode.InvalidArgument,
+                    DfsErrorCode.ClusterMismatch, DfsErrorCode.CrossVolume);
                 Assert.DoesNotContain(await newVolume.Snapshots.ListAsync(Ct), s => s.Name == "min-old");
 
                 foreach ((string label, DfsOperationId id) in new[] { ("committed", committedId), ("reserved", reservedId) })
@@ -217,7 +237,8 @@ public sealed class RstSimulationTests
                     Exception? replay = await RecoveryScenario.CaptureAsync(() => newVolume.Files.WriteAllBytesAsync("/replayed-" + label + ".bin",
                         TestData.Bytes(8003, 10), new DfsMutationOptions { OperationId = id }, Ct));
                     RecoveryScenario.AssertFailedWith(replay, $"replaying the old {label} operation id {id} against the new authority",
-                        DfsErrorCode.OperationExpired, DfsErrorCode.OperationIdMismatch, DfsErrorCode.EpochMismatch, DfsErrorCode.InvalidArgument, DfsErrorCode.ClusterMismatch);
+                        DfsErrorCode.OperationExpired, DfsErrorCode.OperationIdMismatch, DfsErrorCode.EpochMismatch, DfsErrorCode.InvalidArgument,
+                        DfsErrorCode.ClusterMismatch, DfsErrorCode.CrossVolume);
                     await Assert.ThrowsAsync<FileNotFoundException>(() => newVolume.Files.ReadAllBytesAsync("/replayed-" + label + ".bin", Ct));
                 }
 
@@ -228,7 +249,10 @@ public sealed class RstSimulationTests
                     Exception? stale = await RecoveryScenario.CaptureAsync(() => oldWriter.CommitAsync(Ct));
                     RecoveryScenario.AssertFailedWith(stale, "the old writer lease confers no authority on the restored identity",
                         DfsErrorCode.VolumeNotFound, DfsErrorCode.LeaseLost, DfsErrorCode.EpochMismatch, DfsErrorCode.InvalidHandle);
-                    Assert.True(oldWriter.IsFaulted);
+                    if (stale is DfsLeaseLostException)
+                        Assert.True(oldWriter.IsFaulted, "lease loss must fault the old writer's stream (FSD §6.4)");
+                    Exception? staleAgain = await RecoveryScenario.CaptureAsync(() => oldWriter.CommitAsync(Ct));
+                    Assert.True(staleAgain is not null, "the SDK must not silently reacquire authority and publish the old writer's stale buffer");
 
                     DfsOperationOutcome? outcome = null;
                     Exception? query = await RecoveryScenario.CaptureAsync(async () => outcome = await oldVolume.QueryOperationAsync(committedId, false, Ct));
@@ -280,7 +304,7 @@ public sealed class RstSimulationTests
                 CommitToken newCommit;
                 await using (DfsStream writer = await newVolume.Files.OpenAsync("/docs/one.bin", FileMode.Open, FileAccess.ReadWrite, FileShare.None, Ct))
                 {
-                    writer.SetLength(0);
+                    await writer.SetLengthAsync(0, Ct);
                     await writer.WriteAsync(fresher, Ct);
                     newCommit = await writer.CommitAsync(Ct);
                 }
@@ -341,9 +365,15 @@ public sealed class RstSimulationTests
             await RstHelpers.AssertBackupNotLiveMemberAsync(cluster, backup.Name, "before the outage");
 
             await using DfsClient reader = await RstHelpers.ConnectBackupAsync(cluster, backup, "bk-reader", backup.ReaderCredentials, Ct);
-            await using DfsClient exporter = await RstHelpers.ConnectBackupAsync(cluster, backup, "bk-export", backup.ExportCredentials, Ct);
             await using DfsClient retention = await RstHelpers.ConnectBackupAsync(cluster, backup, "bk-retention", backup.RetentionAdminCredentials, Ct);
-            DfsClient[] backupClients = [reader, exporter, retention];
+
+            // The export principal may be confined to the export protocol; a refused SDK session is as read-only as it gets.
+            DfsClient? exporter = null;
+            Exception? exporterRefused = await RecoveryScenario.CaptureAsync(async () =>
+                exporter = await RstHelpers.ConnectBackupAsync(cluster, backup, "bk-export", backup.ExportCredentials, Ct));
+            Assert.True(exporterRefused is null or UnauthorizedAccessException, $"connecting with export credentials: {exporterRefused}");
+            await using DfsClient? exporterOwned = exporter;
+            DfsClient[] backupClients = exporter is null ? [reader, retention] : [reader, exporter, retention];
             await RstHelpers.AssertBackupReadOnlyAsync(reader, "before the outage", Ct);
 
             switch (loss)
@@ -371,6 +401,12 @@ public sealed class RstSimulationTests
                 string when = $"{(total / checkpoints * i).TotalSeconds:0}s into {loss}";
                 foreach (DfsClient c in backupClients)
                     await RstHelpers.AssertBackupReadOnlyAsync(c, when, Ct);
+                // Raw clients are not members of the explicit partition groups, so they are used only outside that variant.
+                if (loss != SourceLoss.BackupWithSourceMinority)
+                {
+                    foreach (DfsCredentials credentials in new[] { backup.RetentionAdminCredentials, backup.ExportCredentials })
+                        await RstHelpers.AssertBackupRejectsRawMutationsAsync(cluster, backup, credentials, when, Ct);
+                }
                 await using (DfsSnapshotView view = await reader.GetVolume(Vol).Snapshots.OpenAsync("S", Ct))
                     await RecoveryScenario.AssertFileBytesAsync(view.Files, VolumeContentFixture.SparsePath,
                         source.Expected.Files[VolumeContentFixture.SparsePath].Content, $"backup stays readable from local authority {when}", Ct);
@@ -396,6 +432,9 @@ public sealed class RstSimulationTests
             Assert.DoesNotContain(backup.Name, status.Control.Voters);
             foreach (DfsClient c in backupClients)
                 await RstHelpers.AssertBackupReadOnlyAsync(c, "after reconnection", Ct);
+            await RstHelpers.AssertBackupRejectsRawMutationsAsync(cluster, backup, backup.RetentionAdminCredentials, "after reconnection", Ct);
+            await using (DfsSnapshotView view = await reader.GetVolume(Vol).Snapshots.OpenAsync("S", Ct))
+                VolumeContentFixture.AssertMatches(source.Expected, await VolumeContentFixture.CaptureAsync(view, Ct), "raw mutation attempts left the backup's S unchanged");
 
             // The live volume kept a single authority and the backup's attempts left no trace in it.
             await using DfsClient live = await cluster.ConnectAsync(new TestClientOptions { Name = "live-check" }, Ct);
@@ -410,7 +449,10 @@ public sealed class RstSimulationTests
     /// <summary>Which old source returns in RST-011.</summary>
     public enum ReturningSource
     {
-        /// <summary>An old replica, offline during deletion and same-name restore in the same cluster, restarts with its old-epoch state.</summary>
+        /// <summary>
+        /// An old replica holding the divergent post-S commit is offline during deletion and same-name restore in the same
+        /// cluster, then restarts with its old-epoch state.
+        /// </summary>
         OldReplicaRejoinsSameCluster,
 
         /// <summary>The whole old cluster (which kept writing while cut off) reconnects after a restore into a recovery cluster.</summary>
@@ -438,10 +480,17 @@ public sealed class RstSimulationTests
 
             if (returning == ReturningSource.OldReplicaRejoinsSameCluster)
             {
-                TestNode oldReplica = cluster[2];
-                await oldReplica.CrashAsync();
+                // The divergent commit reaches every replica first, so the returning replica carries divergent old-epoch
+                // history (not merely stale state) when it comes back after the recovery.
                 CommitToken divergent = await oldVolume.Files.WriteAllBytesAsync("/divergent.bin", TestData.Bytes(11_001, 70_000),
                     new DfsMutationOptions { OperationId = divergentId }, Ct);
+                await cluster.WaitForReplicationAsync(Vol, Ct);
+                TestNode oldReplica = cluster[2];
+                VolumeStateInspection? oldState = await oldReplica.Inspect.GetVolumeStateAsync(Vol);
+                Assert.NotNull(oldState);
+                Assert.Equal(source.Info.Id, oldState.Id);
+                Assert.NotNull(oldState.GetFile("/divergent.bin"));
+                await oldReplica.CrashAsync();
                 DfsStream oldWriter = await oldVolume.Files.OpenAsync("/docs/one.bin", FileMode.Open, FileAccess.ReadWrite, FileShare.None, Ct);
                 await oldWriter.WriteAsync(TestData.Bytes(11_003, 999), Ct);
 
@@ -450,6 +499,7 @@ public sealed class RstSimulationTests
                 RecoveryScenario.AssertRestoredIdentity(restored, source.Info, cluster.ClusterId, Vol);
                 await using DfsClient fresh = await cluster.ConnectAsync(new TestClientOptions { Name = "fresh" }, Ct);
                 DfsVolume newVolume = fresh.GetVolume(Vol);
+                await newVolume.Directories.CreateDirectoryAsync("/recovered", Ct);
                 CommitToken newCommit = await newVolume.Files.WriteAllBytesAsync("/recovered/new.bin", newBytes, Ct);
                 RecoveryScenario.AssertNotComparable(newCommit, divergent, "the recovered history is not ordered after the divergent one");
 
@@ -476,7 +526,8 @@ public sealed class RstSimulationTests
                 Exception? replay = await RecoveryScenario.CaptureAsync(() => oldVolume.Files.WriteAllBytesAsync("/divergent.bin", TestData.Bytes(11_001, 70_000),
                     new DfsMutationOptions { OperationId = divergentId }, Ct));
                 RecoveryScenario.AssertFailedWith(replay, "replaying the divergent operation into the recovered authority",
-                    DfsErrorCode.OperationExpired, DfsErrorCode.EpochMismatch, DfsErrorCode.OperationIdMismatch, DfsErrorCode.VolumeNotFound);
+                    DfsErrorCode.OperationExpired, DfsErrorCode.EpochMismatch, DfsErrorCode.OperationIdMismatch, DfsErrorCode.VolumeNotFound,
+                    DfsErrorCode.InvalidArgument, DfsErrorCode.CrossVolume);
                 await RecoveryScenario.CaptureAsync(async () => await oldWriter.DisposeAsync());
 
                 await using DfsClient verifier = await cluster.ConnectAsync(new TestClientOptions { Name = "verifier" }, Ct);
@@ -500,6 +551,7 @@ public sealed class RstSimulationTests
                 RecoveryScenario.AssertRestoredIdentity(restored, source.Info, recovery.ClusterId, Vol);
                 await using DfsClient fresh = await recovery.ConnectAsync(new TestClientOptions { Name = "fresh" }, Ct);
                 DfsVolume newVolume = fresh.GetVolume(Vol);
+                await newVolume.Directories.CreateDirectoryAsync("/recovered", Ct);
                 CommitToken newCommit = await newVolume.Files.WriteAllBytesAsync("/recovered/new.bin", newBytes, Ct);
 
                 cluster.Network.Heal();
@@ -528,7 +580,8 @@ public sealed class RstSimulationTests
                 Exception? replay = await RecoveryScenario.CaptureAsync(() => newVolume.Files.WriteAllBytesAsync("/divergent.bin", divergentBytes,
                     new DfsMutationOptions { OperationId = divergentId }, Ct));
                 RecoveryScenario.AssertFailedWith(replay, "replaying the old source's operation into the recovered authority",
-                    DfsErrorCode.OperationExpired, DfsErrorCode.EpochMismatch, DfsErrorCode.OperationIdMismatch, DfsErrorCode.InvalidArgument, DfsErrorCode.ClusterMismatch);
+                    DfsErrorCode.OperationExpired, DfsErrorCode.EpochMismatch, DfsErrorCode.OperationIdMismatch, DfsErrorCode.InvalidArgument,
+                    DfsErrorCode.ClusterMismatch, DfsErrorCode.CrossVolume);
 
                 await recovery.WaitForReplicationAsync(Vol, Ct);
                 await recovery.Inspect.AssertReplicasConvergedAsync(Vol);

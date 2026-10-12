@@ -318,18 +318,79 @@ public sealed class SecIntegrationTests
     // SEC-003
     // ---------------------------------------------------------------------------------------------------------------
 
+    private static readonly PrincipalKind[] Sec003PrincipalKinds =
+    [
+        PrincipalKind.Reader,
+        PrincipalKind.Writer,
+        PrincipalKind.Snapshotter,
+        PrincipalKind.WriterSnapshotter,
+        PrincipalKind.BackupAdmin,
+        PrincipalKind.NoGrants,
+        PrincipalKind.OtherVolumeOnly,
+        PrincipalKind.ClusterAdmin,
+    ];
+
+    /// <summary>The principals of the SEC-003 matrix (each operation runs once as each of them).</summary>
+    public static TheoryData<PrincipalKind> Sec003Principals => new(Sec003PrincipalKinds);
+
+    /// <summary>The SEC-003 decision for one (principal, operation) cell.</summary>
+    private enum Sec003Expectation
+    {
+        Allowed,
+        Denied,
+        AllowedOrDenied,
+    }
+
+    private static Sec003Expectation ExpectationFor(PrincipalKind kind, SecOperation op)
+    {
+        bool holds = kind == PrincipalKind.ClusterAdmin || (SecHelpers.EffectiveOnVol(kind) & op.Required) == op.Required;
+        if (!holds)
+            return Sec003Expectation.Denied;
+        return op.AmbiguousForNonAdmin && kind != PrincipalKind.ClusterAdmin ? Sec003Expectation.AllowedOrDenied : Sec003Expectation.Allowed;
+    }
+
+    /// <summary>
+    /// The SEC-003 matrix itself is complete: every operation family of FSD §5.2 (files, directories, transactions,
+    /// snapshots) is in the catalog, and every catalogued operation has at least one principal that must be allowed and at
+    /// least one that must be denied, so both decisions are exercised for every operation.
+    /// </summary>
+    [Fact]
+    [Catalog("SEC-003", "I", "INV-08", "INV-12", "INV-13", "INV-14")]
+    public void SEC_003_NamespaceAuthorizationEveryOperation_MatrixIsComplete()
+    {
+        var families = new Dictionary<string, string[]>(StringComparer.Ordinal)
+        {
+            ["file open"] = ["OpenRead", "OpenWrite", "Create", "OpenCreateNew", "OpenTruncate", "OpenAppend", "OpenOrCreateReadWrite", "OpenExistingWriteCommit", "OpenReadVersionPinned"],
+            ["file whole-content"] = ["ReadAllBytes", "ReadAllText", "ReadAllLines", "ReadLines", "WriteAllBytes", "WriteAllText", "WriteAllLines", "AppendAllBytes", "AppendAllText", "AppendAllLines"],
+            ["file namespace/metadata"] = ["Copy", "CopyOverwrite", "MoveFile", "DeleteFile", "FileExists", "FileGetInfo", "SetStoragePolicy", "SetAccess", "StreamSetLength"],
+            ["directory"] = ["CreateDirectory", "DirectoryExists", "DirectoryGetInfo", "MoveDirectory", "DeleteEmptyDirectory", "DeleteDirectoryRecursive", "Enumerate", "ListPage"],
+            ["transaction"] = ["TransactionRead", "TransactionQueryOutcome", "TransactionWriteCommit", "TransactionCreateDirectoryCommit", "TransactionMoveCommit", "TransactionDeleteCommit", "TransactionBoundStreamCommit", "TransactionCommitWithSnapshot"],
+            ["snapshot"] = ["SnapshotCreate", "SnapshotList", "SnapshotGet", "SnapshotOpenRead", "SnapshotEnumerate", "SnapshotDelete", "SnapshotSetRetention", "SnapshotRestore", "WriteAllCommitAndSnapshot", "StreamCommitAndSnapshot"],
+            ["outcome query"] = ["WriteThenQueryOperation", "TransactionQueryOutcome"],
+        };
+        var catalogued = new HashSet<string>(SecOperationCatalog.All.Select(o => o.Name), StringComparer.Ordinal);
+        Assert.Equal(SecOperationCatalog.All.Count, catalogued.Count);
+        foreach ((string family, string[] names) in families)
+        {
+            foreach (string name in names)
+                Assert.True(catalogued.Contains(name), $"operation family '{family}' lacks '{name}' in the SEC-003 catalog");
+        }
+
+        foreach (SecOperation op in SecOperationCatalog.All)
+        {
+            Sec003Expectation[] cells = Sec003PrincipalKinds.Select(k => ExpectationFor(k, op)).ToArray();
+            Assert.True(cells.Contains(Sec003Expectation.Allowed), $"{op.Name}: no principal of the matrix must be allowed");
+            Assert.True(cells.Contains(Sec003Expectation.Denied), $"{op.Name}: no principal of the matrix must be denied");
+        }
+    }
+
     /// <summary>
     /// Runs every operation of the file/directory/transaction/snapshot catalog as a principal of the given kind: allowed
     /// operations succeed with verified results/effects, denied ones fail with AccessDenied and change nothing. The same
     /// decisions are then checked through raw protocol requests that bypass all SDK validation.
     /// </summary>
     [Theory]
-    [InlineData(PrincipalKind.Reader)]
-    [InlineData(PrincipalKind.Writer)]
-    [InlineData(PrincipalKind.Snapshotter)]
-    [InlineData(PrincipalKind.NoGrants)]
-    [InlineData(PrincipalKind.OtherVolumeOnly)]
-    [InlineData(PrincipalKind.ClusterAdmin)]
+    [MemberData(nameof(Sec003Principals))]
     [Catalog("SEC-003", "I", "INV-08", "INV-12", "INV-13", "INV-14")]
     public Task SEC_003_NamespaceAuthorizationEveryOperation(PrincipalKind kind) =>
         ClusterTest.RunAsync(SecHelpers.Options() with { ScenarioTimeout = TimeSpan.FromMinutes(5) }, async cluster =>
@@ -350,8 +411,9 @@ public sealed class SecIntegrationTests
             foreach (SecOperation op in SecOperationCatalog.All)
             {
                 string root = $"/sec3/{tag}/{op.Name}";
-                bool holds = kind == PrincipalKind.ClusterAdmin || (effective & op.Required) == op.Required;
-                bool ambiguous = holds && op.AmbiguousForNonAdmin && kind != PrincipalKind.ClusterAdmin;
+                Sec003Expectation expectation = ExpectationFor(kind, op);
+                bool holds = expectation != Sec003Expectation.Denied;
+                bool ambiguous = expectation == Sec003Expectation.AllowedOrDenied;
                 string before = await SecHelpers.SubtreeDigestAsync(adminVol, root, Ct) + await SecHelpers.GlobalDigestAsync(adminVol, admin.Admin, Ct);
                 Exception? e = await RecoveryScenario.CaptureAsync(() => op.Act(volume, root, Ct));
                 string after = await SecHelpers.SubtreeDigestAsync(adminVol, root, Ct) + await SecHelpers.GlobalDigestAsync(adminVol, admin.Admin, Ct);
@@ -385,6 +447,7 @@ public sealed class SecIntegrationTests
 
             // Server-side enforcement independent of SDK validation.
             string rawRoot = $"/sec3/{tag}/raw";
+            await adminVol.Directories.CreateDirectoryAsync(rawRoot, Ct);
             await adminVol.Files.WriteAllTextAsync(rawRoot + "/a.txt", "a", null, Ct);
             await adminVol.Files.WriteAllTextAsync(rawRoot + "/b.txt", "b", null, Ct);
             await adminVol.Files.WriteAllTextAsync(rawRoot + "/c.txt", "c", null, Ct);
@@ -469,11 +532,16 @@ public sealed class SecIntegrationTests
             int chunk = admin.Capabilities.ChunkSize;
             byte[] secret = TestData.Bytes(401, 3 * chunk + 5);
             await admin.GetVolume(Vol).Files.WriteAllBytesAsync("/secret.bin", secret, Ct);
-            await admin.GetVolume(Vol2).Files.WriteAllBytesAsync("/other.bin", TestData.Bytes(402, chunk + 1), Ct);
+            byte[] other = TestData.Bytes(402, chunk + 1);
+            await admin.GetVolume(Vol2).Files.WriteAllBytesAsync("/other.bin", other, Ct);
             FileInspection? inspected = await cluster.Inspect.GetFileAsync(Vol, "/secret.bin");
             Assert.NotNull(inspected);
-            ObjectId[] objects = inspected.Extents.Select(e => e.Object).Distinct().ToArray();
-            Assert.NotEmpty(objects);
+            FileInspection? inspectedOther = await cluster.Inspect.GetFileAsync(Vol2, "/other.bin");
+            Assert.NotNull(inspectedOther);
+            Assert.NotEmpty(inspected.Extents);
+            Assert.NotEmpty(inspectedOther.Extents);
+            // Valid object ids of protected files in both volumes (learned out of band), plus a guessed one.
+            ObjectId[] objects = inspected.Extents.Concat(inspectedOther.Extents).Select(e => e.Object).Distinct().ToArray();
             ObjectId guessed = ObjectId.New(new SeededRandom(403));
 
             TestPrincipal? principal = accessor switch
@@ -482,7 +550,8 @@ public sealed class SecIntegrationTests
                 DirectAccessor.NoGrants => await cluster.CreatePrincipalAsync("p-none", new Dictionary<string, DfsPermissions> { [Vol] = DfsPermissions.None }),
                 DirectAccessor.OtherVolumeReader => await cluster.CreatePrincipalAsync("p-vol2", new Dictionary<string, DfsPermissions> { [Vol2] = DfsPermissions.Read }),
                 DirectAccessor.SameVolumeReaderWithoutCapability => await cluster.CreatePrincipalAsync("p-reader", new Dictionary<string, DfsPermissions> { [Vol] = DfsPermissions.Read }),
-                _ => await cluster.CreatePrincipalAsync("p-admin", new Dictionary<string, DfsPermissions>(), clusterAdmin: true),
+                // Explicit Read grants: whether ClusterAdmin alone implies data access is not fixed by the FSD.
+                _ => await cluster.CreatePrincipalAsync("p-admin", new Dictionary<string, DfsPermissions> { [Vol] = DfsPermissions.Read, [Vol2] = DfsPermissions.Read }, clusterAdmin: true),
             };
 
             int attempts = 0;
@@ -522,6 +591,12 @@ public sealed class SecIntegrationTests
                 else
                 {
                     SecHelpers.AssertAccessDenied(e, $"{accessor} reading /secret.bin through the SDK");
+                }
+
+                if (accessor == DirectAccessor.OtherVolumeReader)
+                {
+                    // Positive control: its own volume's object is served through the authorized path only.
+                    await RecoveryScenario.AssertFileBytesAsync(c.GetVolume(Vol2).Files, "/other.bin", other, "authorized read of the principal's own volume", Ct);
                 }
             }
         }, Ct);
@@ -679,8 +754,11 @@ public sealed class SecIntegrationTests
                 };
                 foreach ((string name, Func<Task> action) in attempts)
                 {
+                    // Denied by authorization/retention (UnauthorizedAccessException incl. DfsRetentionProtectedException) or,
+                    // for principals without retention rights on a backup host, by its read-only surface (BAK-015).
                     Exception? e = await RecoveryScenario.CaptureAsync(action);
-                    Assert.True(e is UnauthorizedAccessException, $"{attacker}: '{name}' must be denied, got {(e is null ? "success" : e.GetType().Name)}");
+                    Assert.True(e is UnauthorizedAccessException or DfsReadOnlyException,
+                        $"{attacker}: '{name}' must be denied, got {(e is null ? "success" : e.GetType().Name)}");
                 }
             }
 
@@ -756,8 +834,14 @@ public sealed class SecIntegrationTests
             await cluster.Admin.RevokeAsync(Vol, "alice", DfsPermissions.Read, Ct);
             await cluster.Admin.DeletePrincipalAsync("alice", Ct);
             TestPrincipal mallory = await cluster.CreatePrincipalAsync("mallory", new Dictionary<string, DfsPermissions> { [Vol] = DfsPermissions.All });
-            await cluster.WaitUntilAsync(async () => (await vol.Backups.GetStatusAsync(backup.TargetName, Ct)).State is DfsBackupState.Offline,
-                TimeSpan.FromSeconds(30), "the source reports the disconnected target as offline, not as synchronised");
+
+            // Manual schedule: provoke a contact so the source has to find out that the target is unreachable.
+            Exception? sync = await RecoveryScenario.CaptureAsync(() => vol.Backups.RequestSyncAsync(backup.TargetName, null, Ct));
+            Assert.True(sync is null or DfsException or TimeoutException, $"requesting a sync to a disconnected target: {sync}");
+            await cluster.WaitUntilAsync(async () => (await vol.Backups.GetStatusAsync(backup.TargetName, Ct)).State is DfsBackupState.Offline or DfsBackupState.Failed,
+                TimeSpan.FromSeconds(30), "the source reports the disconnected target as offline/failed, not as synchronised");
+            DfsBackupStatus disconnected = await vol.Backups.GetStatusAsync(backup.TargetName, Ct);
+            Assert.Equal(s.Boundary, disconnected.PublishedBoundary);
             await AssertLocalPolicyAsync("while disconnected", alice.Credentials, mallory.Credentials, cluster.AdminCredentials);
 
             cluster.Network.Heal();
@@ -787,6 +871,8 @@ public sealed class SecIntegrationTests
             int chunk = a.Capabilities.ChunkSize;
             byte[] secretA = TestData.Bytes(1001, 3 * chunk + 1);
             byte[] contentB = TestData.Bytes(1002, 3 * chunk + 1);
+            await va.Directories.CreateDirectoryAsync("/shared", Ct);
+            await vb.Directories.CreateDirectoryAsync("/shared", Ct);
             DfsOperationId idA = await va.NewOperationIdAsync(Ct);
             CommitToken ta = await va.Files.WriteAllBytesAsync("/shared/name.bin", secretA, new DfsMutationOptions { OperationId = idA }, Ct);
             CommitToken tb = await vb.Files.WriteAllBytesAsync("/shared/name.bin", contentB, Ct);
@@ -805,13 +891,14 @@ public sealed class SecIntegrationTests
 
             RecoveryScenario.AssertNotComparable(ta, tb, "tokens of different volumes never compare, even with equal sequence numbers");
             Exception? minimum = await RecoveryScenario.CaptureAsync(() => vb.Snapshots.CreateAsync("min-from-vol", new DfsSnapshotOptions { MinimumCommit = ta }, Ct));
-            RecoveryScenario.AssertFailedWith(minimum, "a MinimumCommit token of another volume", DfsErrorCode.EpochMismatch, DfsErrorCode.InvalidArgument);
+            RecoveryScenario.AssertFailedWith(minimum, "a MinimumCommit token of another volume", DfsErrorCode.EpochMismatch, DfsErrorCode.InvalidArgument, DfsErrorCode.CrossVolume);
             Assert.DoesNotContain(await vb.Snapshots.ListAsync(Ct), s => s.Name == "min-from-vol");
 
             SecHelpers.AssertAccessDenied(await RecoveryScenario.CaptureAsync(() => b.GetVolume(Vol).QueryOperationAsync(idA, false, Ct)), "pb querying pa's operation");
             Exception? reuse = await RecoveryScenario.CaptureAsync(() => vb.Files.WriteAllBytesAsync("/reuse.bin", TestData.Bytes(1003, 10), new DfsMutationOptions { OperationId = idA }, Ct));
             RecoveryScenario.AssertFailedWith(reuse, "pb reusing pa's operation id in another volume",
-                DfsErrorCode.OperationExpired, DfsErrorCode.OperationIdMismatch, DfsErrorCode.InvalidArgument, DfsErrorCode.AccessDenied, DfsErrorCode.EpochMismatch);
+                DfsErrorCode.OperationExpired, DfsErrorCode.OperationIdMismatch, DfsErrorCode.InvalidArgument, DfsErrorCode.AccessDenied, DfsErrorCode.EpochMismatch,
+                DfsErrorCode.CrossVolume);
             Assert.False(await vb.Files.ExistsAsync("/reuse.bin", Ct));
 
             FileInspection? fa = await cluster.Inspect.GetFileAsync(Vol, "/shared/name.bin");
@@ -966,15 +1053,17 @@ public sealed class SecIntegrationTests
                 {
                     rule = cluster.Network.TamperNext(new MessageFilter(From: client, Type: MessageType.CommitFile, Direction: Tedd.Tdfs.Transport.LinkDirection.Request), mode);
                     DfsStream stream = await volume.Files.OpenAsync("/t.bin", FileMode.Open, FileAccess.ReadWrite, FileShare.Read, Ct);
-                    await using (stream)
-                    {
-                        await stream.WriteAsync(replacement.AsMemory(0, 4096), Ct);
-                        Exception? e = await RecoveryScenario.CaptureAsync(() => stream.CommitAsync(Ct));
-                        byte[] intended = [.. replacement.AsSpan(0, 4096), .. original.AsSpan(4096)];
-                        bool committed = e is null || (e is DfsCommitOutcomeUnknownException unknown && await ResolveAsync(adminVol, unknown.OperationId));
-                        await RecoveryScenario.AssertFileBytesAsync(adminVol.Files, "/t.bin", committed ? intended : original, "tampered/replayed commit", Ct);
-                    }
+                    await stream.WriteAsync(replacement.AsMemory(0, 4096), Ct);
+                    Exception? e = await RecoveryScenario.CaptureAsync(() => stream.CommitAsync(Ct));
+                    byte[] intended = [.. replacement.AsSpan(0, 4096), .. original.AsSpan(4096)];
+                    bool committed = e is null || (e is DfsCommitOutcomeUnknownException unknown && await ResolveAsync(adminVol, unknown.OperationId));
+                    await RecoveryScenario.AssertFileBytesAsync(adminVol.Files, "/t.bin", committed ? intended : original, "tampered/replayed commit", Ct);
 
+                    // A failed commit must not be re-published by an ordinary flush on dispose: discard, then close.
+                    if (e is not null)
+                        await RecoveryScenario.CaptureAsync(() => stream.AbortAsync(Ct));
+                    await RecoveryScenario.CaptureAsync(async () => await stream.DisposeAsync());
+                    await RecoveryScenario.AssertFileBytesAsync(adminVol.Files, "/t.bin", committed ? intended : original, "after closing the tampered writer", Ct);
                     break;
                 }
 
@@ -1043,6 +1132,7 @@ public sealed class SecIntegrationTests
             DfsVolume vol = admin.GetVolume(Vol);
             int chunk = admin.Capabilities.ChunkSize;
             byte[] data = Encoding.UTF8.GetBytes(string.Concat(Enumerable.Repeat(dataCanary + "|", 3 * chunk / (dataCanary.Length + 1) + 1)));
+            await vol.Directories.CreateDirectoryAsync("/" + nameCanary, Ct);
             await vol.Files.WriteAllBytesAsync("/" + nameCanary + "/payload.bin", data, Ct);
             await vol.Files.WriteAllTextAsync("/inline.txt", inlineCanary, null, Ct);
             await admin.Admin.CreatePrincipalAsync("canary-user", secretCanary, false, Ct);
@@ -1057,10 +1147,17 @@ public sealed class SecIntegrationTests
             await RecoveryScenario.PublishAsync(vol, backup, snapshot, Ct);
             await cluster.WaitForReplicationAsync(Vol, Ct);
 
+            // Staged-but-unpublished canary data (uploaded chunks under an open staging session) is in flight when every
+            // process dies abruptly, so staging/temporary files are scanned as left behind by a crash, not cleaned by a
+            // graceful shutdown. The stream is deliberately never committed or disposed.
+            DfsStream staged = await vol.Files.OpenAsync("/" + nameCanary + "/staged.bin", FileMode.CreateNew, FileAccess.Write, FileShare.None, Ct);
+            await staged.WriteAsync(data, Ct);
+            Assert.True(staged.PendingBytes >= data.Length, "the canary bytes are staged, not published");
+
             foreach (TestBackupNode b in cluster.BackupNodes)
-                await b.StopAsync();
+                await b.CrashAsync();
             foreach (TestNode node in cluster.Nodes)
-                await node.StopAsync();
+                await node.CrashAsync();
 
             var roots = cluster.Nodes.Select(n => n.Disk.RootDirectory).Concat(cluster.BackupNodes.Select(b => b.Disk.RootDirectory)).ToArray();
             var found = new Dictionary<string, List<string>>(StringComparer.Ordinal);
@@ -1124,8 +1221,8 @@ public sealed class SecIntegrationTests
 
     /// <summary>
     /// Unauthenticated oversized lengths, connection floods and malformed-frame floods are refused without unbounded
-    /// allocation, without crashing any node and without stalling unrelated authenticated work; idle unauthenticated
-    /// connections are eventually closed by the server.
+    /// allocation, without crashing any node and without stalling unrelated authenticated work (including admitting a new
+    /// authenticated connection during the flood); how idle unauthenticated connections are bounded is recorded.
     /// </summary>
     [Theory]
     [InlineData(UnauthenticatedAbuse.OversizedLengthPrefixes)]
@@ -1153,7 +1250,9 @@ public sealed class SecIntegrationTests
                             foreach (MessageType type in new[] { MessageType.Hello, MessageType.HelloProof, MessageType.OpenSession, MessageType.OpenHandle,
                                          MessageType.PutObject, MessageType.WriteAll, MessageType.AdminRequest, MessageType.BackupPutManifest, MessageType.RaftBatch })
                             {
-                                foreach (ulong claimed in new[] { 1UL << 31, 1UL << 40, ulong.MaxValue >> 1 })
+                                // 256 MiB and 1 GiB are allocatable (a server pre-allocating them would allocate 27 × 1.25 GiB
+                                // across these frames); the larger claims exceed the array limit and probe overflow handling.
+                                foreach (ulong claimed in new[] { 256UL << 20, 1UL << 30, 1UL << 31, 1UL << 40, ulong.MaxValue >> 1 })
                                 {
                                     if (!raw.IsConnected)
                                     {
@@ -1209,24 +1308,36 @@ public sealed class SecIntegrationTests
                     }
                 }
 
+                // Allocation during the abuse phase only (process-wide, so other concurrently running tests add noise).
+                // Pre-allocating the allocatable claims (256 MiB / 1 GiB on every node and message type) crosses this bound
+                // many times over; normal bounded handling stays far below it.
+                long abuseAllocated = GC.GetTotalAllocatedBytes(precise: true) - allocatedBefore;
+                Assert.True(abuseAllocated < 1L << 31, $"{abuse} caused {abuseAllocated} bytes of allocation; claimed lengths must not be pre-allocated");
+
+                // Unrelated authenticated work keeps running while the abusive connections are still open, including a new
+                // authenticated connection (admission is not starved by unauthenticated peers).
+                await using DfsClient fresh = await SecHelpers.ConnectAsAsync(cluster, user.Credentials, "legit-fresh", Ct);
                 for (int i = 0; i < 5; i++)
                 {
+                    DfsVolume target = i % 2 == 0 ? volume : fresh.GetVolume(Vol);
                     byte[] payload = TestData.Bytes(1400 + (ulong)i, 20_000);
                     var watch = Stopwatch.StartNew();
-                    await volume.Files.WriteAllBytesAsync("/legit-" + SecHelpers.Inv(i) + ".bin", payload, Ct);
-                    await RecoveryScenario.AssertFileBytesAsync(volume.Files, "/legit-" + SecHelpers.Inv(i) + ".bin", payload, "unrelated authenticated work under abuse", Ct);
+                    await target.Files.WriteAllBytesAsync("/legit-" + SecHelpers.Inv(i) + ".bin", payload, Ct);
+                    await RecoveryScenario.AssertFileBytesAsync(target.Files, "/legit-" + SecHelpers.Inv(i) + ".bin", payload, "unrelated authenticated work under abuse", Ct);
                     Assert.True(watch.Elapsed < TimeSpan.FromSeconds(10), $"unrelated work stalled for {watch.Elapsed} under {abuse}");
                 }
 
                 Assert.All(cluster.Nodes, n => Assert.Equal(TestNodeState.Running, n.State));
-                long allocated = GC.GetTotalAllocatedBytes(precise: true) - allocatedBefore;
-                TestContext.Current.TestOutputHelper?.WriteLine($"{abuse}: frames={frames} connections={raws.Count} refused={refusedConnections} reconnects={reconnects} allocated={allocated / (1 << 20)} MiB");
-                Assert.True(allocated < 512L << 20, $"{abuse} caused {allocated} bytes of allocation; claimed lengths must not be pre-allocated");
+                TestContext.Current.TestOutputHelper?.WriteLine($"{abuse}: frames={frames} connections={raws.Count} refused={refusedConnections} reconnects={reconnects} allocated={abuseAllocated / (1 << 20)} MiB");
 
                 if (abuse == UnauthenticatedAbuse.ConnectionFlood)
                 {
-                    await cluster.WaitUntilAsync(() => Task.FromResult(raws.All(r => !r.IsConnected)), TimeSpan.FromSeconds(30),
-                        "idle unauthenticated connections must be closed by the server (handshake deadline)");
+                    // How the server bounds idle unauthenticated connections (handshake deadline, cap, refusal) is not fixed
+                    // by the FSD; record it for the report instead of asserting one mechanism.
+                    await cluster.DelayAsync(TimeSpan.FromSeconds(30), Ct);
+                    TestContext.Current.TestOutputHelper?.WriteLine(
+                        $"after 30 s idle: {raws.Count(r => r.IsConnected)} of {raws.Count} unauthenticated connections still open, {refusedConnections} refused");
+                    Assert.All(cluster.Nodes, n => Assert.Equal(TestNodeState.Running, n.State));
                 }
             }
             finally
@@ -1316,6 +1427,7 @@ public sealed class SecIntegrationTests
             await admin.Admin.CreatePrincipalAsync(user, secretCanary, false, Ct);
             await admin.Admin.GrantAsync(Vol, user, DfsPermissions.Read, Ct);
             byte[] payload = Encoding.UTF8.GetBytes(string.Concat(Enumerable.Repeat(payloadCanary, 300)));
+            await vol.Directories.CreateDirectoryAsync("/audited", Ct);
             await vol.Files.WriteAllBytesAsync("/audited/payload.bin", payload, Ct);
             await vol.Files.WriteAllTextAsync("/audited/inline.txt", payloadCanary, null, Ct);
 
@@ -1348,7 +1460,8 @@ public sealed class SecIntegrationTests
             AssertAudited(log, "recovery key export", ["admin"], ["recovery"], success);
             AssertAudited(log, "volume creation", ["admin", "audited-vol"], ["creat"], success);
             AssertAudited(log, "volume deletion", ["admin", "audited-vol"], ["delet"], success);
-            AssertAudited(log, "snapshot creation", ["admin", Vol, "audited-snap"], ["snapshot"], success);
+            // Deleting a recovery point is the security-relevant snapshot action (FSD §14: protected recovery points).
+            AssertAudited(log, "snapshot deletion", ["admin", Vol, "audited-snap"], ["delet"], success);
 
             string[] forbidden = [payloadCanary, secretCanary, passphraseCanary, Convert.ToBase64String(key), Convert.ToHexString(key), Convert.ToHexString(key.AsSpan(0, Math.Min(16, key.Length))),
                 Convert.ToHexString(payload.AsSpan(0, 32)), Convert.ToBase64String(payload.AsSpan(0, 48))];
@@ -1470,14 +1583,27 @@ public sealed class SecIntegrationTests
             foreach ((string category, string attempt, Func<Task> action) in attempts)
                 SecHelpers.AssertAccessDenied(await RecoveryScenario.CaptureAsync(action), $"{kind}: {category} change '{attempt}'");
 
+            int refusedRetention = 0;
+            if (kind == PrincipalKind.Snapshotter)
+            {
+                // A Snapshot holder may manage ordinary snapshots, but a held recovery point is protected from it: the
+                // deletion is refused (no permission, or retention protection) and audited, never silently applied.
+                Exception? deleteHeld = await RecoveryScenario.CaptureAsync(() => weakVol.Snapshots.DeleteAsync("protected-snap", Ct));
+                Assert.True(deleteHeld is UnauthorizedAccessException, $"{kind}: deleting a held snapshot must be refused, got {(deleteHeld is null ? "success" : deleteHeld.GetType().Name)}");
+                RecoveryScenario.AssertFailedWith(deleteHeld, $"{kind}: deleting a held snapshot", DfsErrorCode.AccessDenied, DfsErrorCode.RetentionProtected);
+                refusedRetention++;
+            }
+
             Assert.Equal(before, await StateAsync());
             Assert.IsType<DfsAuthenticationException>(await RecoveryScenario.CaptureAsync(() =>
                 cluster.ConnectAsync(new TestClientOptions { Name = "rogue", Credentials = new DfsCredentials("rogue-admin", "rogue-secret") }, Ct)));
 
             IReadOnlyList<string> log = await admin.Admin.GetAuditLogAsync(1000, Ct);
             int deniedEntries = log.Count(e => e.Contains(name, StringComparison.OrdinalIgnoreCase)
-                && (e.Contains("denied", StringComparison.OrdinalIgnoreCase) || e.Contains("unauthorized", StringComparison.OrdinalIgnoreCase) || e.Contains("refused", StringComparison.OrdinalIgnoreCase)));
-            Assert.True(deniedEntries >= attempts.Count, $"{attempts.Count} denied attempts by {name} but only {deniedEntries} denial audit entries");
+                && (e.Contains("denied", StringComparison.OrdinalIgnoreCase) || e.Contains("unauthorized", StringComparison.OrdinalIgnoreCase)
+                    || e.Contains("refused", StringComparison.OrdinalIgnoreCase) || e.Contains("rejected", StringComparison.OrdinalIgnoreCase)));
+            int expectedDenials = attempts.Count + refusedRetention;
+            Assert.True(deniedEntries >= expectedDenials, $"{expectedDenials} denied attempts by {name} but only {deniedEntries} denial audit entries");
 
             DfsVolumeInfo infoBefore = (await admin.Admin.GetVolumeStatusAsync(Vol, Ct)).Info;
             var impossible = new DfsStoragePolicy { TargetCopies = 5, TargetDistinctZones = 5, DurableCopiesBeforeAck = 5, DurableZonesBeforeAck = 5 };

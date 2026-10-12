@@ -9,7 +9,10 @@ public sealed partial class TestNetwork
     /// destination is <paramref name="name"/>, counted when the sender hands it to the transport — whether it was
     /// delivered, dropped, delayed, black-holed, refused by a cut/partition/isolation, or addressed to a crashed,
     /// stopped or destroyed endpoint. Senders on a recovery cluster sharing the fabric
-    /// (<see cref="TestCluster.StartRecoveryClusterAsync"/>) are counted too. Used to prove that a recovery procedure made
+    /// (<see cref="TestCluster.StartRecoveryClusterAsync"/>) are counted too, and so are backup nodes and every client a
+    /// test created. Excluded is only the harness's own traffic towards endpoints of the cluster that owns them (that
+    /// cluster's <see cref="TestCluster.Admin"/> client, inspectors and stability/invariant checks), which is not part of any
+    /// recovery environment and may keep reconnecting to a destroyed node. Used to prove that a recovery procedure made
     /// no undeclared call to a source service (test plan §9.8).
     /// </summary>
     public long CountAttemptsTo(string name) => throw Stub.NotYet("TestNetwork.CountAttemptsTo");

@@ -161,7 +161,8 @@ public sealed class RstIntegrationTests
     /// <summary>
     /// Multi-file transactions (account rewrites, counter, rename, directory creation) are restored whole: the restored
     /// volume shows exactly the last generation at or before the snapshot boundary, never a mix, and nothing from aborted,
-    /// uncommitted or later transactions.
+    /// uncommitted or later transactions. Restore follows test plan §9.8: the source is destroyed and S is restored on a
+    /// clean recovery cluster that never contacts a source node.
     /// </summary>
     [Theory]
     [InlineData(TxBoundaryKind.CommitWithSnapshot)]
@@ -188,8 +189,8 @@ public sealed class RstIntegrationTests
             const int lastGeneration = 6;
             DfsSnapshotInfo snapshot;
             DfsTransaction pending = await volume.Transactions.BeginAsync(null, Ct);
-            await pending.Files.WriteAllBytesAsync("/tx/pending-a.bin", TestData.Bytes(3001, 9000), Ct);
-            await pending.Directories.CreateDirectoryAsync("/tx/pending-dir", Ct);
+            await pending.Files.WriteAllBytesAsync(RstHelpers.PendingFile, TestData.Bytes(3001, RstHelpers.PendingFileLength), Ct);
+            await pending.Directories.CreateDirectoryAsync(RstHelpers.PendingSubdirectory, Ct);
             switch (kind)
             {
                 case TxBoundaryKind.CommitWithSnapshot:
@@ -248,20 +249,31 @@ public sealed class RstIntegrationTests
             int boundaryGeneration = committed.Where(c => c.Token.CompareTo(snapshot.Boundary) <= 0).Select(c => c.Generation).DefaultIfEmpty(0).Max();
             if (kind != TxBoundaryKind.SnapshotDuringConcurrentTransactions)
                 Assert.Equal(3, boundaryGeneration);
+            else
+                Assert.True(boundaryGeneration >= 2, $"the snapshot was taken after two commits completed, boundary generation {boundaryGeneration}");
 
             await RecoveryScenario.PublishAsync(volume, backup, snapshot, Ct);
-            await RstHelpers.AssertLedgerAsync(volume.Files, volume.Directories, lastGeneration, lastGeneration, "live volume after all commits", Ct);
+            // In the concurrent case the pending transaction committed after the boundary: whole on the live volume, absent from S.
+            bool pendingCommittedLive = kind == TxBoundaryKind.SnapshotDuringConcurrentTransactions;
+            await RstHelpers.AssertLedgerAsync(volume.Files, volume.Directories, lastGeneration, lastGeneration, "live volume after all commits", Ct,
+                pendingCommitted: pendingCommittedLive);
 
-            DfsVolumeInfo restored = await cluster.Admin.RestoreFromBackupAsync(RecoveryScenario.RestoreRequest(backup, "S", "vol-tx"), Ct);
-            Assert.Equal("vol-tx", restored.Name);
-            await using DfsClient verifier = await cluster.ConnectAsync(new TestClientOptions { Name = "verifier" }, Ct);
-            DfsVolume restoredVolume = verifier.GetVolume("vol-tx");
+            // Test plan §9.8: no source service, disk or client cache survives into the recovery environment.
+            IReadOnlyDictionary<string, long> baseline = await RecoveryScenario.DestroySourceAsync(cluster, client);
+            await using TestCluster recovery = await cluster.StartRecoveryClusterAsync(RstHelpers.RecoveryOptions(), Ct);
+            DfsVolumeInfo restored = await recovery.Admin.RestoreFromBackupAsync(RecoveryScenario.RestoreRequest(backup, "S", Vol), Ct);
+            Assert.Equal(Vol, restored.Name);
+            Assert.Equal(recovery.ClusterId, restored.LastCommit.ClusterId);
+            RecoveryScenario.AssertNotComparable(restored.LastCommit, committed[^1].Token, "the restored ledger is a new authority");
+            await using DfsClient verifier = await recovery.ConnectAsync(new TestClientOptions { Name = "verifier" }, Ct);
+            DfsVolume restoredVolume = verifier.GetVolume(Vol);
             await RstHelpers.AssertLedgerAsync(restoredVolume.Files, restoredVolume.Directories, boundaryGeneration, lastGeneration,
                 $"restored S ({kind}) contains whole transactions through generation {boundaryGeneration}", Ct);
 
             await using DfsClient reader = await RstHelpers.ConnectBackupReaderAsync(cluster, backup, "bk-reader", Ct);
             await using DfsSnapshotView view = await reader.GetVolume(Vol).Snapshots.OpenAsync("S", Ct);
             await RstHelpers.AssertLedgerAsync(view.Files, view.Directories, boundaryGeneration, lastGeneration, "backup host view of S", Ct);
+            RecoveryScenario.AssertNoSourceContact(cluster, baseline, "while restoring the transaction ledger");
         }, Ct);
 
     // ---------------------------------------------------------------------------------------------------------------
@@ -274,7 +286,14 @@ public sealed class RstIntegrationTests
         /// <summary>The backup host was stopped before the later commits.</summary>
         BackupTargetOffline,
 
-        /// <summary>The backup host was online but no synchronisation was requested after S.</summary>
+        /// <summary>The backup host kept running but every link between it and the live nodes was cut before the later commits.</summary>
+        BackupUnreachable,
+
+        /// <summary>
+        /// The backup host was online and reachable but no synchronisation was requested after S
+        /// (<see cref="RecoveryScenario.ManualSchedule"/>: the target only syncs on an explicit request; a barrier is a wait,
+        /// not a sync request).
+        /// </summary>
         NoSyncRequested,
     }
 
@@ -285,6 +304,7 @@ public sealed class RstIntegrationTests
     /// </summary>
     [Theory]
     [InlineData(BackupLagCause.BackupTargetOffline)]
+    [InlineData(BackupLagCause.BackupUnreachable)]
     [InlineData(BackupLagCause.NoSyncRequested)]
     [Catalog("RST-004", "I", "INV-08", "INV-10", "INV-12", "INV-13", "INV-19")]
     public Task RST_004_RestoreNoLaterUnreplicatedGuarantee(BackupLagCause cause) =>
@@ -295,6 +315,11 @@ public sealed class RstIntegrationTests
             DfsVolume volume = source.Volume;
             if (cause == BackupLagCause.BackupTargetOffline)
                 await backup.StopAsync();
+            if (cause == BackupLagCause.BackupUnreachable)
+            {
+                foreach (TestNode node in cluster.Nodes)
+                    cluster.Network.CutBoth(node.Name, backup.Name);
+            }
 
             DfsOperationId overwriteId = await volume.NewOperationIdAsync(Ct);
             byte[] overwritten = TestData.Bytes(4001, 3333);
@@ -310,14 +335,18 @@ public sealed class RstIntegrationTests
             Assert.Equal(source.Snapshot.Boundary, status.PublishedBoundary);
             Assert.True(status.PublishedBoundary.CompareTo(t1) < 0, "the published recovery boundary must not be reported beyond what reached the backup");
 
+            // T never reaches the target (offline, unreachable, or never requested), so both barriers must time out reporting
+            // the actual last published checkpoint. The later assertions (the host holds only S) depend on this as well.
             DfsBackupNotReachedException notReached = await Assert.ThrowsAsync<DfsBackupNotReachedException>(
                 () => volume.Backups.AwaitBackupAsync(backup.TargetName, t3, TimeSpan.FromSeconds(2), Ct));
             Assert.Equal(backup.TargetName, notReached.Target);
             Assert.NotNull(notReached.LastPublished);
             Assert.Equal("S", notReached.LastPublished.SnapshotName);
             Assert.Equal(source.Snapshot.Boundary, notReached.LastPublished.CoveredCommit);
-            await Assert.ThrowsAsync<DfsBackupNotReachedException>(
+            DfsBackupNotReachedException exactNotReached = await Assert.ThrowsAsync<DfsBackupNotReachedException>(
                 () => volume.Backups.AwaitBackupSnapshotAsync(backup.TargetName, "S2", TimeSpan.FromSeconds(2), Ct));
+            Assert.Equal("S", exactNotReached.LastPublished?.SnapshotName);
+
             await RecoveryScenario.AssertFileBytesAsync(volume.Files, "/docs/one.bin", overwritten, "a barrier timeout must not undo live commits", Ct);
 
             IReadOnlyDictionary<string, long> baseline = await RecoveryScenario.DestroySourceAsync(cluster, source.Client);
@@ -440,6 +469,8 @@ public sealed class RstIntegrationTests
             int chunk = source.Client.Capabilities.ChunkSize;
             var history = new List<(string Snapshot, ExpectedVolumeContent Expected)> { ("S0", source.Expected) };
             ExpectedVolumeContent current = source.Expected.Clone();
+            await source.Volume.Directories.CreateDirectoryAsync("/rotated", Ct);
+            current.AddDirectory("/rotated");
             for (int r = 1; r <= rotations; r++)
             {
                 await cluster.Admin.RotateDataKeyAsync(Vol, Ct);
@@ -549,7 +580,8 @@ public sealed class RstIntegrationTests
                     RecoveryScenario.AssertRestoredIdentity(restored, source.Info, cluster.ClusterId, Vol);
                     Exception? stale = await RecoveryScenario.CaptureAsync(() => oldWriter.CommitAsync(Ct));
                     Assert.NotNull(stale);
-                    Assert.True(oldWriter.IsFaulted, "the old writer's stream must stay faulted after recovery");
+                    if (fenced is DfsLeaseLostException)
+                        Assert.True(oldWriter.IsFaulted, "lease loss must fault the old writer's stream (FSD §6.4)");
                     RecoveryScenario.AssertNotComparable(restored.LastCommit, oldToken, "old tokens cannot order the recovered identity");
                     VolumeContentFixture.AssertMatches(source.Expected, await RstHelpers.CaptureFreshAsync(cluster, Vol, "verifier", Ct),
                         "the recovered identity holds exactly S; nothing from the fenced writer");
@@ -591,8 +623,9 @@ public sealed class RstIntegrationTests
 
     /// <summary>
     /// Snapshots with an expiry, a hold and default retention are published; the backup host and checkpoints disclose the
-    /// exact retention of each; before expiry S1 is protected and restorable; after the destination clock passes the
-    /// expiry, S1 is gone and requests for it fail precisely with SnapshotNotFound while held/later points stay restorable.
+    /// exact retention of each; before expiry S1 is protected and restorable; history the host never held fails precisely
+    /// with SnapshotNotFound (no substitution); after the destination clock passes the expiry, S1 is either gone (requests
+    /// fail precisely) or disclosed as no longer protected and still restored exactly, while held/later points stay restorable.
     /// </summary>
     [Fact]
     [Catalog("RST-012", "I", "INV-08", "INV-10", "INV-12", "INV-13", "INV-19")]
@@ -605,7 +638,9 @@ public sealed class RstIntegrationTests
             TestBackupNode backup = cluster.BackupNodes[0];
             await backup.RegisterAsync(Vol, RecoveryScenario.ManualSchedule);
 
-            DateTimeOffset expiry = backup.Clock.GetUtcNow() + TimeSpan.FromMinutes(2);
+            // Generous margin: everything up to the early restore must happen before the expiry; expiry is then crossed by
+            // advancing the destination clock, never by waiting.
+            DateTimeOffset expiry = backup.Clock.GetUtcNow() + TimeSpan.FromMinutes(10);
             DfsSnapshotInfo s1 = await volume.Snapshots.CreateAsync("S1", new DfsSnapshotOptions { Retention = new DfsRetention(expiry) }, Ct);
             DfsBackupCheckpoint c1 = await RecoveryScenario.PublishAsync(volume, backup, s1, Ct);
             Assert.False(c1.Held);
@@ -637,26 +672,72 @@ public sealed class RstIntegrationTests
             Assert.True(Assert.Single(listed, s => s.Name == "S2").Retention.Hold);
             Assert.Single(listed, s => s.Name == "S3");
 
-            await Assert.ThrowsAsync<DfsRetentionProtectedException>(() => held.DeleteAsync("S1", Ct));
+            // Before expiry S1 (and the held S2) are protected against the source's export credentials (FSD 12.4): the
+            // client session is refused, or the deletion is denied/read-only.
+            foreach (string protectedName in new[] { "S1", "S2" })
+            {
+                Exception? exportDelete = await RecoveryScenario.CaptureAsync(async () =>
+                {
+                    await using DfsClient exporter = await cluster.ConnectBackupAsync(backup.Index,
+                        new TestClientOptions { Name = "bk-export", Credentials = backup.ExportCredentials }, Ct);
+                    await exporter.GetVolume(Vol).Snapshots.DeleteAsync(protectedName, Ct);
+                });
+                Assert.True(exportDelete is UnauthorizedAccessException or DfsReadOnlyException,
+                    $"export credentials must not delete protected {protectedName}, got {(exportDelete is null ? "success" : exportDelete.GetType().Name)}");
+            }
+
+            Assert.Equal(new[] { "S1", "S2", "S3" }, (await held.ListAsync(Ct)).Select(s => s.Name).Order(StringComparer.Ordinal));
             DfsVolumeInfo early = await cluster.Admin.RestoreFromBackupAsync(RecoveryScenario.RestoreRequest(backup, "S1", "r1-early"), Ct);
             Assert.Equal("r1-early", early.Name);
-            VolumeContentFixture.AssertMatches(e1, await RstHelpers.CaptureFreshAsync(cluster, "r1-early", "v-r1", Ct), "S1 restored just before its expiry");
+            VolumeContentFixture.AssertMatches(e1, await RstHelpers.CaptureFreshAsync(cluster, "r1-early", "v-r1", Ct), "S1 restored before its expiry");
 
-            backup.Clock.Advance(TimeSpan.FromMinutes(5));
+            // Requested history the host never held fails precisely, with no substitution by the latest point (S3).
+            DfsSnapshotInfo unsynced = await volume.Snapshots.CreateAsync("S4-unsynced", null, Ct);
+            DfsBackupNotReachedException notHeld = await Assert.ThrowsAsync<DfsBackupNotReachedException>(
+                () => volume.Backups.AwaitBackupSnapshotAsync(backup.TargetName, unsynced.Name, TimeSpan.FromSeconds(2), Ct));
+            Assert.Equal("S3", notHeld.LastPublished?.SnapshotName);
+            Exception? neverHeld = await RecoveryScenario.CaptureAsync(() => cluster.Admin.RestoreFromBackupAsync(RecoveryScenario.RestoreRequest(backup, unsynced.Name, "r4"), Ct));
+            RecoveryScenario.AssertFailedWith(neverHeld, "history the backup never held; no substitution by a later point", DfsErrorCode.SnapshotNotFound);
+            Assert.DoesNotContain("r4", await cluster.Admin.ListVolumesAsync(Ct));
+
+            // Cross the expiry on the destination clock. Expiry ends protection; it does not oblige the host to delete. The
+            // retention admin's delete may succeed, find S1 already reclaimed, or be refused by a host whose SDK surface is
+            // read-only (BAK-015) — but never as "protected" any more.
+            backup.Clock.Advance(TimeSpan.FromMinutes(15));
             Exception? deleteExpired = await RecoveryScenario.CaptureAsync(() => held.DeleteAsync("S1", Ct));
-            if (deleteExpired is not null)
-                RecoveryScenario.AssertFailedWith(deleteExpired, "an expired snapshot is deletable or already reclaimed", DfsErrorCode.SnapshotNotFound);
+            if (deleteExpired is not null && deleteExpired is not DfsReadOnlyException)
+                RecoveryScenario.AssertFailedWith(deleteExpired, "an expired snapshot is deletable by the retention admin or already reclaimed", DfsErrorCode.SnapshotNotFound);
+            bool removed = deleteExpired is null || RecoveryScenario.CodeOf(deleteExpired) == DfsErrorCode.SnapshotNotFound;
 
-            RecoveryScenario.AssertFailedWith(await RecoveryScenario.CaptureAsync(() => held.GetAsync("S1", Ct)), "S1 is no longer held", DfsErrorCode.SnapshotNotFound);
-            Assert.DoesNotContain(await held.ListAsync(Ct), s => s.Name == "S1");
+            DfsSnapshotInfo? stillListed = (await held.ListAsync(Ct)).SingleOrDefault(s => s.Name == "S1");
+            if (removed)
+                Assert.True(stillListed is null, "a deleted/reclaimed recovery point must not be reported as held");
             Exception? late = await RecoveryScenario.CaptureAsync(() => cluster.Admin.RestoreFromBackupAsync(RecoveryScenario.RestoreRequest(backup, "S1", "r1-late"), Ct));
-            RecoveryScenario.AssertFailedWith(late, "requested history is no longer available; no substitution by a later point", DfsErrorCode.SnapshotNotFound);
-            Assert.DoesNotContain("r1-late", await cluster.Admin.ListVolumesAsync(Ct));
+            if (stillListed is not null)
+            {
+                // Retained beyond its expiry by host policy: it must disclose that it is no longer protected, and while it is
+                // still available a restore must yield exactly S1 (or fail precisely if reclaimed in the meantime).
+                Assert.False(stillListed.Retention.Hold, "an expired, never-held point must not be reported as held");
+                Assert.True(stillListed.Retention.ExpiresUtc is null || stillListed.Retention.ExpiresUtc <= backup.Clock.GetUtcNow(),
+                    $"S1 is listed after its expiry {expiry:O} but still discloses protection until {stillListed.Retention.ExpiresUtc:O}");
+                if (late is null)
+                    VolumeContentFixture.AssertMatches(e1, await RstHelpers.CaptureFreshAsync(cluster, "r1-late", "v-r1-late", Ct), "S1 restored after expiry while still held");
+                else
+                    RecoveryScenario.AssertFailedWith(late, "S1 reclaimed between listing and restore", DfsErrorCode.SnapshotNotFound);
+            }
+            else
+            {
+                RecoveryScenario.AssertFailedWith(await RecoveryScenario.CaptureAsync(() => held.GetAsync("S1", Ct)), "S1 is no longer held", DfsErrorCode.SnapshotNotFound);
+                RecoveryScenario.AssertFailedWith(late, "requested history is no longer available; no substitution by a later point", DfsErrorCode.SnapshotNotFound);
+            }
+
+            if (late is not null)
+                Assert.DoesNotContain("r1-late", await cluster.Admin.ListVolumesAsync(Ct));
+            TestContext.Current.TestOutputHelper?.WriteLine($"S1 after expiry: {(stillListed is null ? "removed" : "retained unprotected")}, delete outcome {RecoveryScenario.CodeOf(deleteExpired)}");
 
             IReadOnlyList<DfsSnapshotInfo> remaining = await held.ListAsync(Ct);
-            Assert.True(Assert.Single(remaining, s => s.Name == "S2").Retention.Hold);
+            Assert.True(Assert.Single(remaining, s => s.Name == "S2").Retention.Hold, "the held S2 survives S1's expiry with its hold disclosed");
             Assert.Single(remaining, s => s.Name == "S3");
-            await Assert.ThrowsAsync<DfsRetentionProtectedException>(() => held.DeleteAsync("S2", Ct));
             await cluster.Admin.RestoreFromBackupAsync(RecoveryScenario.RestoreRequest(backup, "S2", "r2"), Ct);
             VolumeContentFixture.AssertMatches(e2, await RstHelpers.CaptureFreshAsync(cluster, "r2", "v-r2", Ct), "held S2 after S1 expired");
             await cluster.Admin.RestoreFromBackupAsync(RecoveryScenario.RestoreRequest(backup, "S3", "r3"), Ct);
@@ -699,44 +780,73 @@ public sealed class RstIntegrationTests
             await backup.DestroyDiskAsync();
             if (loss == BackupHostLoss.DiskDestroyedHostRestartedEmpty)
             {
+                // The host itself discloses the loss: nothing published, nothing listed, nothing restorable.
                 await backup.RestartAsync();
                 Assert.Empty(await backup.Inspect.GetPublishedSnapshotsAsync(Vol));
+                await using (DfsClient reader = await RstHelpers.ConnectBackupReaderAsync(cluster, backup, "bk-reader", Ct))
+                {
+                    Exception? list = await RecoveryScenario.CaptureAsync(async () =>
+                        Assert.DoesNotContain(await reader.GetVolume(Vol).Snapshots.ListAsync(Ct), s => s.Name == "S"));
+                    if (list is not null && list is not DfsException)
+                        throw list;
+                }
+
+                Exception? emptyRestore = await RecoveryScenario.CaptureAsync(() => cluster.Admin.RestoreFromBackupAsync(RecoveryScenario.RestoreRequest(backup, "S", "from-lost-host"), Ct));
+                RecoveryScenario.AssertFailedWith(emptyRestore, "restore of a snapshot the emptied host no longer holds",
+                    DfsErrorCode.SnapshotNotFound, DfsErrorCode.BackupTargetNotFound, DfsErrorCode.VolumeNotFound);
+            }
+            else
+            {
+                Exception? downRestore = await RecoveryScenario.CaptureAsync(() => cluster.Admin.RestoreFromBackupAsync(RecoveryScenario.RestoreRequest(backup, "S", "from-lost-host"), Ct));
+                RecoveryScenario.AssertFailedWith(downRestore, "restore from a destroyed, offline backup host",
+                    DfsErrorCode.NodeUnavailable, DfsErrorCode.Unavailable, DfsErrorCode.BackupTargetNotFound, DfsErrorCode.Timeout);
             }
 
+            Assert.DoesNotContain("from-lost-host", await cluster.Admin.ListVolumesAsync(Ct));
+
+            // Live service is independent of the lost host.
             ExpectedVolumeContent live = source.Expected.Clone();
             byte[] afterLoss = TestData.Bytes(13_001, 9000);
             await volume.Files.WriteAllBytesAsync("/after-loss.bin", afterLoss, Ct);
             live.SetFile(new ExpectedFile("/after-loss.bin", afterLoss, null, new DfsInodeAccess(), []));
 
+            // The source learns about the loss on its next contact with the target (manual schedule: provoke one). It must
+            // then stop claiming the lost S under the old lineage: offline/failed when the host is down; reseed-required,
+            // failed, nothing published or a fresh lineage when the host came back empty — unless the contact itself
+            // re-transferred S, in which case the claim is true again and the host must genuinely hold S.
+            Exception? sync = await RecoveryScenario.CaptureAsync(() => volume.Backups.RequestSyncAsync(backup.TargetName, null, Ct));
+            Assert.True(sync is null or DfsException or TimeoutException, $"requesting a sync to a lost target must succeed or fail with a typed error, got {sync}");
             DfsBackupStatus? reported = null;
             await cluster.WaitUntilAsync(async () =>
             {
                 reported = await volume.Backups.GetStatusAsync(backup.TargetName, Ct);
-                return loss == BackupHostLoss.DiskDestroyedHostDown
-                    ? reported.State is DfsBackupState.Offline or DfsBackupState.Failed
-                    : reported.ReseedRequired || reported.State is DfsBackupState.ReseedRequired or DfsBackupState.Failed || reported.LatestPublished is null;
+                if (loss == BackupHostLoss.DiskDestroyedHostDown)
+                    return reported.State is DfsBackupState.Offline or DfsBackupState.Failed;
+                bool disclosesLoss = reported.ReseedRequired || reported.State is DfsBackupState.ReseedRequired or DfsBackupState.Failed
+                    || reported.LatestPublished is null || reported.LineageId != before.LineageId;
+                bool republished = reported.LatestPublished is { SnapshotName: "S" } && (await backup.Inspect.GetPublishedSnapshotsAsync(Vol)).Contains("S");
+                return disclosesLoss || republished;
             }, TimeSpan.FromSeconds(30), "the source must report the single backup host's loss");
             Assert.NotNull(reported);
             if (loss == BackupHostLoss.DiskDestroyedHostRestartedEmpty)
             {
-                Assert.True(reported.LatestPublished is null || reported.ReseedRequired,
-                    "a host that lost its only disk must not still be reported as holding S");
-                await Assert.ThrowsAsync<DfsBackupNotReachedException>(
-                    () => volume.Backups.AwaitBackupSnapshotAsync(backup.TargetName, "S", TimeSpan.FromSeconds(2), Ct));
+                bool claimsS = reported.LatestPublished is { SnapshotName: "S" } && !reported.ReseedRequired && reported.LineageId == before.LineageId;
+                if (claimsS)
+                {
+                    // Only truthful if the host really holds a complete S again.
+                    Assert.Contains("S", await backup.Inspect.GetPublishedSnapshotsAsync(Vol));
+                    await using DfsClient reader = await RstHelpers.ConnectBackupReaderAsync(cluster, backup, "bk-reader-2", Ct);
+                    await using DfsSnapshotView view = await reader.GetVolume(Vol).Snapshots.OpenAsync("S", Ct);
+                    VolumeContentFixture.AssertMatches(source.Expected, await VolumeContentFixture.CaptureAsync(view, Ct),
+                        "a status that still claims S after the disk loss must be backed by a complete re-transferred S");
+                }
             }
 
+            // Exactly one target is reported: the backup role is not itself replicated.
             DfsVolumeStatus after = await cluster.Admin.GetVolumeStatusAsync(Vol, Ct);
             DfsBackupStatus only = Assert.Single(after.Backups);
             Assert.Equal(backup.TargetName, only.Target);
-
-            Exception? restore = await RecoveryScenario.CaptureAsync(() => cluster.Admin.RestoreFromBackupAsync(RecoveryScenario.RestoreRequest(backup, "S", "from-lost-host"), Ct));
-            if (loss == BackupHostLoss.DiskDestroyedHostDown)
-                RecoveryScenario.AssertFailedWith(restore, "restore from a destroyed, offline backup host",
-                    DfsErrorCode.NodeUnavailable, DfsErrorCode.Unavailable, DfsErrorCode.BackupTargetNotFound, DfsErrorCode.Timeout);
-            else
-                RecoveryScenario.AssertFailedWith(restore, "restore of a snapshot the empty host no longer holds",
-                    DfsErrorCode.SnapshotNotFound, DfsErrorCode.BackupTargetNotFound);
-            Assert.DoesNotContain("from-lost-host", await cluster.Admin.ListVolumesAsync(Ct));
+            Assert.Equal(new[] { backup.TargetName }, await volume.Backups.ListTargetsAsync(Ct));
 
             VolumeContentFixture.AssertMatches(live, await VolumeContentFixture.CaptureAsync(volume, Ct), "live service is independent of the lost backup host");
         }, Ct);
@@ -811,6 +921,8 @@ public sealed class RstIntegrationTests
             DfsVolume volume = client.GetVolume(Vol);
             ExpectedVolumeContent next = source.Expected.Clone();
             var tokens = new List<CommitToken>();
+            await volume.Directories.CreateDirectoryAsync("/new", Ct);
+            next.AddDirectory("/new");
             byte[] created = TestData.Bytes(15_001, 200_000);
             tokens.Add(await volume.Files.WriteAllBytesAsync("/new/created.bin", created, Ct));
             next.SetFile(new ExpectedFile("/new/created.bin", created, null, new DfsInodeAccess(), []));
@@ -871,8 +983,9 @@ public sealed class RstIntegrationTests
     /// <summary>
     /// An ApplicationConsistent snapshot carries its adapter identity and restore requirements through backup and restore;
     /// application recovery executes each declared requirement (version check, checkpoint load, WAL replay) against the
-    /// restored volume and is declared complete only when every step reports success and yields the prepared state. A
-    /// failing adapter never yields a (downgraded) snapshot.
+    /// volume restored on a clean recovery cluster after the source was destroyed (test plan §9.8) and is declared complete
+    /// only when every step reports success and yields the prepared state. A failing adapter never yields a (downgraded)
+    /// snapshot.
     /// </summary>
     [Fact]
     [Catalog("RST-016", "I", "INV-08", "INV-10", "INV-12", "INV-13", "INV-19")]
@@ -914,29 +1027,38 @@ public sealed class RstIntegrationTests
             Assert.DoesNotContain(await volume.Snapshots.ListAsync(Ct), s => s.Name == "S-fail");
 
             await RecoveryScenario.PublishAsync(volume, backup, snapshot, Ct);
+            DfsAdapterRecord backupRecord;
             await using (DfsClient reader = await RstHelpers.ConnectBackupReaderAsync(cluster, backup, "bk-reader", Ct))
             {
                 DfsSnapshotInfo onBackup = await reader.GetVolume(Vol).Snapshots.GetAsync("S-app", Ct);
                 Assert.Equal(DfsConsistencyLabel.ApplicationConsistent, onBackup.Label);
-                AssertAdapterRecord(adapter, Assert.Single(onBackup.Adapters));
+                backupRecord = Assert.Single(onBackup.Adapters);
+                AssertAdapterRecord(adapter, backupRecord);
                 Assert.DoesNotContain(await reader.GetVolume(Vol).Snapshots.ListAsync(Ct), s => s.Name == "S-fail");
             }
 
-            await cluster.Admin.RestoreFromBackupAsync(RecoveryScenario.RestoreRequest(backup, "S-app", "app-restored"), Ct);
-            await using DfsClient verifier = await cluster.ConnectAsync(new TestClientOptions { Name = "app-recovery" }, Ct);
-            DfsVolume restoredVolume = verifier.GetVolume("app-restored");
+            // Test plan §9.8: the source is gone; restore on a clean recovery cluster that never contacts a source node.
+            IReadOnlyDictionary<string, long> baseline = await RecoveryScenario.DestroySourceAsync(cluster, client);
+            await using TestCluster recovery = await cluster.StartRecoveryClusterAsync(RstHelpers.RecoveryOptions(), Ct);
+            DfsVolumeInfo restored = await recovery.Admin.RestoreFromBackupAsync(RecoveryScenario.RestoreRequest(backup, "S-app", Vol), Ct);
+            Assert.Equal(Vol, restored.Name);
+            Assert.Equal(recovery.ClusterId, restored.LastCommit.ClusterId);
+            await using DfsClient verifier = await recovery.ConnectAsync(new TestClientOptions { Name = "app-recovery" }, Ct);
+            DfsVolume restoredVolume = verifier.GetVolume(Vol);
 
-            IReadOnlyDictionary<string, bool> steps = await MiniWalApplication.RecoverAsync(restoredVolume, record, Ct);
-            Assert.Equal(record.RestoreRequirements.Keys.Order(StringComparer.Ordinal), steps.Keys.Order(StringComparer.Ordinal));
+            // Application recovery is driven only by what the backup host disclosed (the source is gone).
+            IReadOnlyDictionary<string, bool> steps = await MiniWalApplication.RecoverAsync(restoredVolume, backupRecord, Ct);
+            Assert.Equal(backupRecord.RestoreRequirements.Keys.Order(StringComparer.Ordinal), steps.Keys.Order(StringComparer.Ordinal));
             Assert.All(steps, s => Assert.True(s.Value, $"application recovery step '{s.Key}' did not succeed"));
             IReadOnlyDictionary<string, string> recovered = await MiniWalApplication.ReadRecoveredStateAsync(restoredVolume, Ct);
             Assert.Equal(preparedState.OrderBy(p => p.Key, StringComparer.Ordinal), recovered.OrderBy(p => p.Key, StringComparer.Ordinal));
             Assert.DoesNotContain(recovered.Values, v => v.StartsWith("late", StringComparison.Ordinal));
 
-            var stricter = new DfsAdapterRecord(record.Id, record.Version,
-                new Dictionary<string, string>(record.RestoreRequirements, StringComparer.Ordinal) { [MiniWalApplication.MinVersionRequirement] = "99" });
+            var stricter = new DfsAdapterRecord(backupRecord.Id, backupRecord.Version,
+                new Dictionary<string, string>(backupRecord.RestoreRequirements, StringComparer.Ordinal) { [MiniWalApplication.MinVersionRequirement] = "99" });
             IReadOnlyDictionary<string, bool> refused = await MiniWalApplication.RecoverAsync(restoredVolume, stricter, Ct);
             Assert.False(refused[MiniWalApplication.MinVersionRequirement], "an unsatisfied restore requirement must be reported, not skipped");
+            RecoveryScenario.AssertNoSourceContact(cluster, baseline, "during application-consistent restore and recovery");
         }, Ct);
 
     private static void AssertAdapterRecord(WalCheckpointAdapter adapter, DfsAdapterRecord record)

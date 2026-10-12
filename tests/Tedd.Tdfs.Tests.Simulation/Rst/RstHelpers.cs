@@ -68,6 +68,38 @@ internal static class RstHelpers
     }
 
     /// <summary>
+    /// Sends raw mutation requests straight to the backup host (bypassing every SDK-side read-only check) authenticated
+    /// as <paramref name="credentials"/>; the host itself must refuse each one, so no election, timeout or credential
+    /// makes it writable server-side.
+    /// </summary>
+    public static async Task AssertBackupRejectsRawMutationsAsync(TestCluster cluster, TestBackupNode backup, DfsCredentials credentials, string because, CancellationToken ct)
+    {
+        await using RawProtocolClient raw = await cluster.ConnectRawAsync(backup.Name, ct);
+        DfsErrorCode auth = await raw.AuthenticateAsync(credentials);
+        if (auth != DfsErrorCode.None)
+        {
+            // A principal the host does not admit to client sessions at all cannot mutate anything either.
+            Assert.True(auth is DfsErrorCode.AuthenticationFailed or DfsErrorCode.AccessDenied,
+                $"authenticating {credentials.Principal} at backup host {backup.Name} failed with {auth} ({because})");
+            return;
+        }
+
+        var attempts = new (DfsOperationKind Kind, string Path, string? Path2)[]
+        {
+            (DfsOperationKind.WriteAll, "/raw-promoted.bin", null),
+            (DfsOperationKind.Open, "/raw-promoted-open.bin", null),
+            (DfsOperationKind.CreateDirectory, "/raw-promoted-dir", null),
+            (DfsOperationKind.Delete, "/docs/one.bin", null),
+            (DfsOperationKind.Move, "/docs/one.bin", "/raw-moved.bin"),
+        };
+        foreach ((DfsOperationKind kind, string path, string? path2) in attempts)
+        {
+            DfsErrorCode code = await raw.SendPathOperationAsync(Vol, kind, path, path2);
+            Assert.True(code != DfsErrorCode.None, $"raw {kind} {path} sent to backup host {backup.Name} as {credentials.Principal} succeeded ({because})");
+        }
+    }
+
+    /// <summary>
     /// Attempts every mutation family through a backup-host client and asserts each is rejected with
     /// <see cref="DfsReadOnlyException"/>; also asserts the facades advertise read-only.
     /// </summary>

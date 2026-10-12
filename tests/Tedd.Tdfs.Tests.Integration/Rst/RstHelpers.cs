@@ -63,7 +63,20 @@ internal static class RstHelpers
     // ---- RST-003 transaction ledger -------------------------------------------------------------------------------
 
     public const int Accounts = 4;
+    public const int PendingFileLength = 9000;
     public const string Counter = "/tx/counter";
+
+    /// <summary>
+    /// Directory of the separate "pending" transaction. It is disjoint from <c>/tx</c> so that the pending transaction
+    /// shares no read/absent-name/enumeration predicate with the ledger generations and cannot legitimately conflict.
+    /// </summary>
+    public const string PendingDirectory = "/txp";
+
+    /// <summary>The pending transaction's file.</summary>
+    public const string PendingFile = PendingDirectory + "/pending-a.bin";
+
+    /// <summary>The pending transaction's directory.</summary>
+    public const string PendingSubdirectory = PendingDirectory + "/pending-dir";
 
     public static string Account(int i) => "/tx/acct-" + i.ToString(CultureInfo.InvariantCulture);
 
@@ -79,6 +92,7 @@ internal static class RstHelpers
     public static async Task InitLedgerAsync(DfsVolume volume, CancellationToken ct)
     {
         await volume.Directories.CreateDirectoryAsync("/tx", ct);
+        await volume.Directories.CreateDirectoryAsync(PendingDirectory, ct);
         for (int i = 0; i < Accounts; i++)
             await volume.Files.WriteAllTextAsync(Account(i), GenerationText(0), null, ct);
         await volume.Files.WriteAllTextAsync(Counter, "0", null, ct);
@@ -118,9 +132,12 @@ internal static class RstHelpers
     /// <summary>
     /// Asserts the ledger shows exactly generation <paramref name="generation"/> and every transaction up to it in whole:
     /// all accounts and the counter at that generation, exactly one token file, generation directories 1..g and nothing
-    /// from later, aborted or uncommitted transactions.
+    /// from later, aborted or uncommitted transactions. <paramref name="pendingCommitted"/> states whether the separate
+    /// "pending" transaction (<see cref="PendingFile"/> + <see cref="PendingSubdirectory"/>) is committed in this view: then
+    /// both of its entries must be present, otherwise neither.
     /// </summary>
-    public static async Task AssertLedgerAsync(DfsFileClient files, DfsDirectoryClient directories, int generation, int maxGenerationAttempted, string because, CancellationToken ct)
+    public static async Task AssertLedgerAsync(DfsFileClient files, DfsDirectoryClient directories, int generation, int maxGenerationAttempted, string because, CancellationToken ct,
+        bool pendingCommitted = false)
     {
         for (int i = 0; i < Accounts; i++)
             Assert.True(string.Equals(GenerationText(generation), await files.ReadAllTextAsync(Account(i), null, ct), StringComparison.Ordinal),
@@ -138,7 +155,22 @@ internal static class RstHelpers
                 $"generation directory gen-{g} presence must be {expected} for boundary generation {generation} ({because})");
         }
 
+        var pendingNames = new List<string>();
+        await foreach (DfsEntryInfo e in directories.EnumerateAsync(PendingDirectory, null, ct))
+            pendingNames.Add(e.Name);
+        string[] pending = pendingNames.Order(StringComparer.Ordinal).ToArray();
         Assert.DoesNotContain(names, n => n.StartsWith("pending", StringComparison.Ordinal));
+        if (pendingCommitted)
+        {
+            Assert.True(pending.SequenceEqual(["pending-a.bin", "pending-dir"]),
+                $"the committed pending transaction must be visible whole, found [{string.Join(", ", pending)}] ({because})");
+            Assert.Equal(PendingFileLength, (await files.GetInfoAsync(PendingFile, ct)).Length);
+        }
+        else
+        {
+            Assert.True(pending.Length == 0, $"no part of an uncommitted or later pending transaction may be visible, found [{string.Join(", ", pending)}] ({because})");
+        }
+
         Assert.DoesNotContain(names, n => n is "gen-900" or "gen-999" or "token-900" or "token-999");
     }
 }

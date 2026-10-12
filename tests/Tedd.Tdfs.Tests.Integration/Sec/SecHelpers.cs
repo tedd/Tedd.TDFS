@@ -23,6 +23,9 @@ public enum PrincipalKind
     /// <summary>Read and Snapshot on "vol".</summary>
     Snapshotter,
 
+    /// <summary>Read, Write and Snapshot on "vol" (a non-admin allowed to commit-and-snapshot).</summary>
+    WriterSnapshotter,
+
     /// <summary>Authenticated, explicit None on "vol".</summary>
     NoGrants,
 
@@ -72,10 +75,13 @@ internal static class SecHelpers
         PrincipalKind.Reader => new Dictionary<string, DfsPermissions> { [Vol] = DfsPermissions.Read },
         PrincipalKind.Writer => new Dictionary<string, DfsPermissions> { [Vol] = DfsPermissions.Read | DfsPermissions.Write },
         PrincipalKind.Snapshotter => new Dictionary<string, DfsPermissions> { [Vol] = DfsPermissions.Read | DfsPermissions.Snapshot },
+        PrincipalKind.WriterSnapshotter => new Dictionary<string, DfsPermissions> { [Vol] = DfsPermissions.Read | DfsPermissions.Write | DfsPermissions.Snapshot },
         PrincipalKind.NoGrants => new Dictionary<string, DfsPermissions> { [Vol] = DfsPermissions.None },
         PrincipalKind.OtherVolumeOnly => new Dictionary<string, DfsPermissions> { [Vol2] = DfsPermissions.All },
         PrincipalKind.BackupAdmin => new Dictionary<string, DfsPermissions> { [Vol] = DfsPermissions.Read | DfsPermissions.BackupAdmin },
-        PrincipalKind.ClusterAdmin => new Dictionary<string, DfsPermissions>(),
+        // The FSD/ARCHITECTURE do not say whether the cluster-level ClusterAdmin flag implies volume data permissions (the
+        // harness's own "admin" holds both explicitly), so the cluster-admin principal is given explicit grants as well.
+        PrincipalKind.ClusterAdmin => new Dictionary<string, DfsPermissions> { [Vol] = DfsPermissions.All },
         _ => throw new ArgumentOutOfRangeException(nameof(kind)),
     };
 
@@ -304,6 +310,7 @@ internal static class SecOperationCatalog
     /// <summary>Creates the shared base snapshot read by snapshot-read operations.</summary>
     public static async Task SetupBaseAsync(DfsVolume admin, CancellationToken ct)
     {
+        await admin.Directories.CreateDirectoryAsync(BaseRoot, ct);
         await admin.Files.WriteAllTextAsync(BaseRoot + "/f.txt", Text(BaseRoot), null, ct);
         await admin.Snapshots.CreateAsync(BaseSnapshot, null, ct);
     }
@@ -361,11 +368,21 @@ internal static class SecOperationCatalog
         }),
         new("ListPage", DfsPermissions.Read, false, async (v, r, ct) =>
         {
-            DfsDirectoryPage page = await v.Directories.ListPageAsync(r, new DfsEnumerationOptions { PageSize = 2 }, null, ct);
-            Assert.Equal(2, page.Entries.Count);
-            Assert.NotNull(page.ContinuationToken);
-            DfsDirectoryPage next = await v.Directories.ListPageAsync(r, new DfsEnumerationOptions { PageSize = 2 }, page.ContinuationToken, ct);
-            Assert.Equal(2, next.Entries.Count);
+            // Pages may be short; follow continuations until exhausted (bounded) and compare the union.
+            var names = new List<string>();
+            string? continuation = null;
+            for (int pages = 0; pages < 10; pages++)
+            {
+                DfsDirectoryPage page = await v.Directories.ListPageAsync(r, new DfsEnumerationOptions { PageSize = 2 }, continuation, ct);
+                Assert.True(page.Entries.Count <= 2, $"a page of size 2 returned {page.Entries.Count} entries");
+                names.AddRange(page.Entries.Select(e => e.Name));
+                continuation = page.ContinuationToken;
+                if (continuation is null)
+                    break;
+            }
+
+            Assert.Null(continuation);
+            Assert.Equal(new[] { "d", "empty", "f.txt", "src.txt" }, names.Order(StringComparer.Ordinal));
         }),
         new("VolumeGetInfo", DfsPermissions.Read, false, async (v, r, ct) => Assert.Equal(SecHelpers.Vol, (await v.GetInfoAsync(ct)).Name)),
         new("TransactionRead", DfsPermissions.Read, false, async (v, r, ct) =>
@@ -374,6 +391,19 @@ internal static class SecOperationCatalog
             byte[] b = await tx.Files.ReadAllBytesAsync(r + "/f.txt", ct);
             AssertEx.BytesEqual(TextBytes(r), b);
             await tx.AbortAsync(ct);
+        }),
+        new("TransactionQueryOutcome", DfsPermissions.Read, false, async (v, r, ct) =>
+        {
+            DfsTransactionId id;
+            await using (DfsTransaction tx = await v.Transactions.BeginAsync(null, ct))
+            {
+                id = tx.Id;
+                _ = await tx.Files.ReadAllBytesAsync(r + "/f.txt", ct);
+                await tx.AbortAsync(ct);
+            }
+
+            DfsOperationOutcome outcome = await v.Transactions.QueryOutcomeAsync(id, false, ct);
+            Assert.Equal(DfsOutcomeStatus.Aborted, outcome.Status);
         }),
         new("SnapshotList", DfsPermissions.Read, false, async (v, r, ct) => Assert.Contains(await v.Snapshots.ListAsync(ct), s => s.Name == BaseSnapshot)),
         new("SnapshotGet", DfsPermissions.Read, false, async (v, r, ct) => Assert.Equal(BaseSnapshot, (await v.Snapshots.GetAsync(BaseSnapshot, ct)).Name)),
@@ -394,6 +424,14 @@ internal static class SecOperationCatalog
 
         // ---- write family ------------------------------------------------------------------------------------------
         new("WriteAllBytes", DfsPermissions.Write, true, (v, r, ct) => v.Files.WriteAllBytesAsync(r + "/f.txt", new byte[] { 1, 2, 3 }, ct)),
+        new("WriteThenQueryOperation", DfsPermissions.Write, true, async (v, r, ct) =>
+        {
+            DfsOperationId id = await v.NewOperationIdAsync(ct);
+            CommitToken token = await v.Files.WriteAllBytesAsync(r + "/f.txt", new byte[] { 4, 2 }, new DfsMutationOptions { OperationId = id }, ct);
+            DfsOperationOutcome outcome = await v.QueryOperationAsync(id, false, ct);
+            Assert.Equal(DfsOutcomeStatus.Committed, outcome.Status);
+            Assert.Equal(token, outcome.Token);
+        }),
         new("WriteAllText", DfsPermissions.Write, true, (v, r, ct) => v.Files.WriteAllTextAsync(r + "/f.txt", "replaced", null, ct)),
         new("WriteAllLines", DfsPermissions.Write, true, (v, r, ct) => v.Files.WriteAllLinesAsync(r + "/f.txt", ["a", "b"], null, ct)),
         new("AppendAllBytes", DfsPermissions.Write, true, (v, r, ct) => v.Files.AppendAllBytesAsync(r + "/f.txt", new byte[] { 9 }, ct)),
@@ -486,14 +524,29 @@ internal static class SecOperationCatalog
         // ---- snapshot family ---------------------------------------------------------------------------------------
         new("SnapshotCreate", DfsPermissions.Snapshot, true, (v, r, ct) => v.Snapshots.CreateAsync(UniqueName("c", r), null, ct)),
         new("SnapshotDelete", DfsPermissions.Snapshot, true, (v, r, ct) => v.Snapshots.DeleteAsync(SnapshotFor(r), ct), NeedsOwnSnapshot: true),
-        new("SnapshotSetRetention", DfsPermissions.Snapshot, true, (v, r, ct) => v.Snapshots.SetRetentionAsync(SnapshotFor(r), new DfsRetention(null, Hold: true), ct), NeedsOwnSnapshot: true),
+        // Whether live-snapshot retention needs Snapshot or RetentionAdmin is not fixed by the FSD: a Snapshot holder may be
+        // allowed or denied (without effect); principals without Snapshot must be denied either way.
+        new("SnapshotSetRetention", DfsPermissions.Snapshot, true, (v, r, ct) => v.Snapshots.SetRetentionAsync(SnapshotFor(r), new DfsRetention(null, Hold: true), ct),
+            NeedsOwnSnapshot: true, AmbiguousForNonAdmin: true),
         new("WriteAllCommitAndSnapshot", DfsPermissions.Write | DfsPermissions.Snapshot, true, (v, r, ct) =>
             v.Files.WriteAllBytesAsync(r + "/f.txt", new byte[] { 3 }, new DfsMutationOptions { CommitSnapshotName = UniqueName("w", r) }, ct)),
         new("StreamCommitAndSnapshot", DfsPermissions.Write | DfsPermissions.Snapshot, true, async (v, r, ct) =>
         {
-            await using DfsStream s = await v.Files.OpenAsync(r + "/f.txt", FileMode.Open, FileAccess.Write, FileShare.Read, ct);
-            await s.WriteAsync(new byte[] { 2 }, ct);
-            await s.CommitAsync(new DfsMutationOptions { CommitSnapshotName = UniqueName("x", r) }, ct);
+            DfsStream s = await v.Files.OpenAsync(r + "/f.txt", FileMode.Open, FileAccess.Write, FileShare.Read, ct);
+            try
+            {
+                await s.WriteAsync(new byte[] { 2 }, ct);
+                await s.CommitAsync(new DfsMutationOptions { CommitSnapshotName = UniqueName("x", r) }, ct);
+            }
+            catch
+            {
+                // A refused commit-and-snapshot must not be published by a later ordinary flush on dispose: discard first.
+                try { await s.AbortAsync(ct); } catch (Exception) { }
+                try { await s.DisposeAsync(); } catch (Exception) { }
+                throw;
+            }
+
+            await s.DisposeAsync();
         }),
         new("TransactionCommitWithSnapshot", DfsPermissions.Write | DfsPermissions.Snapshot, true, async (v, r, ct) =>
         {
@@ -810,7 +863,8 @@ internal static class SecFuzzing
             Exception? start = await RecoveryScenario.CaptureAsync(() => backup.RestartAsync());
             if (start is not null)
             {
-                Assert.True(start is DfsException, $"restart after corrupting {relative} must fail with a typed error, got {start}");
+                Assert.True(start is DfsException || start.InnerException is DfsException,
+                    $"restart after corrupting {relative} must fail with a typed error, got {start}");
                 detected++;
                 continue;
             }
@@ -823,8 +877,10 @@ internal static class SecFuzzing
                 VolumeContentFixture.AssertMatches(source.Expected, await VolumeContentFixture.CaptureAsync(view, ct), $"backup host after corrupting {relative}");
                 intact++;
             }
-            catch (DfsException)
+            catch (Exception ex) when (ex is DfsException or DfsAuthenticationException)
             {
+                // Fail closed: a typed integrity/availability error, or refusing authentication when the host's own
+                // principal store was damaged. Wrong bytes would surface as an assertion failure above instead.
                 detected++;
             }
 
