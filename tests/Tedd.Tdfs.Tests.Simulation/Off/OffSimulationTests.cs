@@ -85,7 +85,12 @@ public sealed class OffSimulationTests
 
             // Still configured voters (never implicitly removed); reported unreachable rather than current.
             Assert.Equal(voters.OrderBy(x => x, StringComparer.Ordinal), (await GetVolumeVotersAsync(cluster)).OrderBy(x => x, StringComparer.Ordinal));
+            // Reachability is learned from missed heartbeats, so wait for it (bounded) instead of sampling once.
+            await cluster.WaitUntilAsync(async () =>
+                (await cluster.Admin.ListNodesAsync(Ct)).Where(n => offlineNames.Contains(n.Name)).All(n => !n.IsReachable),
+                Bounded, "the offline followers are reported unreachable", Ct);
             IReadOnlyList<DfsNodeInfo> nodes = await cluster.Admin.ListNodesAsync(Ct);
+            Assert.Equal(offlineNames.Count, nodes.Count(n => offlineNames.Contains(n.Name)));
             foreach (DfsNodeInfo info in nodes.Where(n => offlineNames.Contains(n.Name)))
             {
                 Assert.False(info.IsReachable, $"{info.Name} must not be reported reachable while offline");
@@ -186,17 +191,25 @@ public sealed class OffSimulationTests
             }
 
             DfsStream stream = await v.Files.OpenAsync(path, new DfsOpenOptions { Mode = FileMode.Open, Access = FileAccess.ReadWrite, Share = FileShare.Read }, Ct);
-            await stream.WriteAsync(replacement, Ct);
-            await stream.SetLengthAsync(newLength, Ct);
+            // B's data flush is held from the start of staging: complete chunks may be uploaded while writing (memory
+            // bound), so arming only before the final commit could miss every B flush and test nothing.
             FaultArm holdFlushOnB = cluster.Faults.Arm(new FaultMatch(FaultSites.ObjectBeforeFlush, Node: b.Name, Count: int.MaxValue), FaultAction.Block());
             long writeOp = history.Invoke("writer", "write", path, expected, k);
-            Task<CommitToken> commit = stream.CommitAsync(new DfsMutationOptions { OperationId = k }, Ct);
+            async Task<CommitToken> StageAndCommitAsync()
+            {
+                await stream.WriteAsync(replacement, Ct);
+                await stream.SetLengthAsync(newLength, Ct);
+                return await stream.CommitAsync(new DfsMutationOptions { OperationId = k }, Ct);
+            }
+
+            Task<CommitToken> commit = StageAndCommitAsync();
 
             // Success must not happen before B's copy is durable: the flush is held, readers still see the old revision.
             await holdFlushOnB.WaitTriggeredAsync(Bounded);
             await cluster.DelayAsync(TimeSpan.FromSeconds(1), Ct);
             Assert.False(commit.IsCompleted, "FlushAsync/commit completed before the second durable copy existed");
-            byte[] midRead = await history.RecordAsync("reader", "read", path, null, () => r.Files.ReadAllBytesAsync(path, Ct));
+            // The concurrent reader uses a compatible share mode (writer Share.Read, reader Share.ReadWrite), test plan §5.
+            byte[] midRead = await history.RecordAsync("reader", "read", path, null, () => ReadSharedAsync(r, path, Ct));
             AssertEx.BytesEqual(initial, midRead, "no intermediate revision is exposed while the commit is pending");
 
             holdFlushOnB.Release();
@@ -226,9 +239,11 @@ public sealed class OffSimulationTests
             await cluster.WaitForStableAsync(Bounded, Ct);
             foreach (ObjectId obj in objects)
             {
+                // C answering is not a copy: it may only be counted as a holder of objects it really stores (repair may be
+                // copying concurrently, so only this direction is race-free).
                 IReadOnlyList<string> holders = await cluster.Inspect.GetObjectHoldersAsync(obj);
-                bool cHolds = holders.Contains(c.Name);
-                Assert.Equal(cHolds, await c.Inspect.HasObjectAsync(obj));
+                if (holders.Contains(c.Name))
+                    Assert.True(await c.Inspect.HasObjectAsync(obj), $"{obj}: C is counted as a holder without storing the object");
             }
 
             await cluster.WaitForRepairAsync(Volume, Bounded, Ct);
@@ -271,7 +286,8 @@ public sealed class OffSimulationTests
     public Task OFF_002_LeaderOfflineBeforeWrite(int nodeCount, OfflineMode mode) =>
         ClusterTest.RunAsync(Sim(nodeCount), async cluster =>
         {
-            (DfsClient client, DfsVolume v) = await ConnectAsync(cluster, "c0", Ct);
+            // Generous deadline: failing over from a paused/disconnected (unresponsive) leader is required, not a schedule.
+            (DfsClient client, DfsVolume v) = await ConnectAsync(cluster, "c0", Ct, operationTimeout: ProgressOperation);
             await using var own = client;
             IReadOnlyList<(string Path, byte[] Bytes)> acknowledged = await WriteDataSetAsync(v, "/o2", Ct);
             DfsOperationId k = await v.NewOperationIdAsync(Ct);
@@ -349,7 +365,8 @@ public sealed class OffSimulationTests
         ClusterTest.RunAsync(Sim(nodeCount), async cluster =>
         {
             const string path = "/o3/f";
-            (DfsClient client, DfsVolume v) = await ConnectAsync(cluster, "c0", Ct);
+            // Generous deadline: failing over from a paused/disconnected (unresponsive) replica is required, not a schedule.
+            (DfsClient client, DfsVolume v) = await ConnectAsync(cluster, "c0", Ct, operationTimeout: ProgressOperation);
             await using var own = client;
             await v.Directories.CreateDirectoryAsync("/o3", Ct);
             await v.Files.WriteAllBytesAsync(path, Big1, Ct);
@@ -479,9 +496,11 @@ public sealed class OffSimulationTests
         phase is MutationPhase.ObjectWrite or MutationPhase.ObjectBeforeFlush or MutationPhase.ObjectAfterFlushBeforeReceipt;
 
     /// <summary>
-    /// Applicable (role, phase, chunk, mutation) cases. Excluded with reason: metadata stages other than local append run
-    /// only on the leader (request acceptance for the commit, staging registration, receipt validation, proposal,
-    /// application and reply are leader responsibilities); chunk occurrences apply only to per-object data stages.
+    /// Applicable (role, phase, chunk, mutation) cases. Followers persist and apply log entries too, so the follower is
+    /// crashed after its local append and after commit before its own apply, besides the data stages and after the reply.
+    /// Excluded with reason: request acceptance for the commit, staging registration, receipt validation, proposal,
+    /// application-before-reply and reply transmission are leader responsibilities; chunk occurrences apply only to
+    /// per-object data stages.
     /// </summary>
     public static TheoryData<PhaseRole, MutationPhase, ChunkOccurrence, PhaseMutation> MutationPhaseCases
     {
@@ -496,7 +515,7 @@ public sealed class OffSimulationTests
                     foreach (ChunkOccurrence occurrence in occurrences)
                     {
                         data.Add(PhaseRole.MetadataLeader, phase, occurrence, mutation);
-                        if (IsDataPhase(phase) || phase == MutationPhase.AfterReplyReceived)
+                        if (IsDataPhase(phase) || phase is MutationPhase.AfterReplyReceived or MutationPhase.AfterLocalAppend or MutationPhase.AfterCommitBeforeApply)
                             data.Add(PhaseRole.Follower, phase, occurrence, mutation);
                     }
                 }
@@ -541,6 +560,9 @@ public sealed class OffSimulationTests
             await using var own1 = c1;
             await v.Directories.CreateDirectoryAsync("/o4", Ct);
             await v.Files.WriteAllBytesAsync(path, old, Ct);
+            // Let the asynchronous third copies of the old revision land first, so per-node object-write occurrences
+            // count the publication's own chunks rather than background repair of earlier objects.
+            await cluster.WaitForRepairAsync(Volume, Bounded, Ct);
             DfsOperationId k = await v.NewOperationIdAsync(Ct);
             var history = new HistoryRecorder();
             history.Complete(history.Invoke("c0", "write", path, old), OpOutcome.Ok);
@@ -611,7 +633,8 @@ public sealed class OffSimulationTests
             }
 
             byte[] expectedNow = during.Status == DfsOutcomeStatus.Committed ? expectedNew : old;
-            OffAttempt<byte[]> duringRead = await TryAsync(() => history.RecordAsync("c1", "read", path, null, () => r.Files.ReadAllBytesAsync(path, Ct)));
+            // Reads use a writer-compatible share mode: the faulted stream's handle may still be held until it expires.
+            OffAttempt<byte[]> duringRead = await TryAsync(() => history.RecordAsync("c1", "read", path, null, () => ReadSharedAsync(r, path, Ct)));
             if (duringRead.Succeeded)
                 AssertEx.BytesEqual(expectedNow, duringRead.Value, "exactly one complete revision during the outage");
             else
@@ -621,7 +644,7 @@ public sealed class OffSimulationTests
             await target.RestartAsync();
             await cluster.WaitForStableAsync(Bounded, Ct);
             await cluster.WaitForRepairAsync(Volume, Bounded, Ct);
-            byte[] afterRecovery = await history.RecordAsync("c1", "read", path, null, () => r.Files.ReadAllBytesAsync(path, Ct));
+            byte[] afterRecovery = await history.RecordAsync("c1", "read", path, null, () => ReadSharedAsync(r, path, Ct));
             AssertEx.BytesEqual(expectedNow, afterRecovery, "exactly one complete revision after recovery");
             DfsOperationOutcome after = await r.QueryOperationAsync(k, resolve: false, Ct);
             Assert.Equal(during.Status, after.Status);
@@ -900,12 +923,19 @@ public sealed class OffSimulationTests
             bool placement = CanMeetAckPolicy(policy, cluster.Nodes.Where(n => !offline.Contains(n.Name)).Select(n => n.Labels));
             int liveServers = cluster.Nodes.Count - zoneNodes.Length;
 
+            // The id is reserved while the whole cluster is up (reservation may need the volume leader). The probing
+            // client gets a generous deadline where progress is required (failover is required, a retry schedule is
+            // not) and a short one where only an honest failure is expected.
+            DfsOperationId k = await v.NewOperationIdAsync(Ct);
+            (DfsClient prober, DfsVolume pv) = await ConnectAsync(cluster, "c-zone", Ct,
+                operationTimeout: metadata && placement ? ProgressOperation : ShortOperation);
+            await using var ownProber = prober;
+
             foreach (TestNode node in zoneNodes)
                 await node.StopAsync();
 
-            DfsOperationId k = await v.NewOperationIdAsync(Ct);
-            OffAttempt<CommitToken> write = await TryAsync(() => v.Files.WriteAllBytesAsync("/o6/f", Big2, new DfsMutationOptions { OperationId = k }, Ct));
-            OffAttempt<byte[]> read = await TryAsync(() => v.Files.ReadAllBytesAsync("/o6/f", Ct));
+            OffAttempt<CommitToken> write = await TryAsync(() => pv.Files.WriteAllBytesAsync("/o6/f", Big2, new DfsMutationOptions { OperationId = k }, Ct));
+            OffAttempt<byte[]> read = await TryAsync(() => pv.Files.ReadAllBytesAsync("/o6/f", Ct));
 
             string context = $"{topology}, zone {zone} offline ({liveServers} live servers): metadata={metadata}, placement={placement}, control={control}";
             if (metadata && placement && control)
@@ -988,8 +1018,8 @@ public sealed class OffSimulationTests
                         continue;
                     }
 
-                    SubsetMode[] modes = n == 3 ? Enum.GetValues<SubsetMode>() : [SubsetMode.Crash, SubsetMode.Disconnect, SubsetMode.Mixed];
-                    foreach (SubsetMode mode in modes)
+                    // Every incarnation (crash, pause, disconnect, mixed) for every nonempty subset of both models (test plan §5).
+                    foreach (SubsetMode mode in Enum.GetValues<SubsetMode>())
                         data.Add(n, mask, mode);
                 }
             }
@@ -1020,19 +1050,25 @@ public sealed class OffSimulationTests
         ClusterTest.RunAsync(Sim(nodeCount), async cluster =>
         {
             const string path = "/o7/f";
-            (DfsClient client, DfsVolume v) = await ConnectAsync(cluster, "c0", Ct, operationTimeout: ShortOperation);
+            IReadOnlyList<string> voters = await GetVolumeVotersAsync(cluster);
+            IReadOnlyList<int> members = Members(offlineMask, nodeCount);
+            var offline = members.Select(i => cluster[i].Name).ToHashSet(StringComparer.Ordinal);
+            DfsStoragePolicy policy;
+            await using (DfsClient probe = await cluster.ConnectAsync(new TestClientOptions { Name = "policy-probe" }, Ct))
+                policy = await GetVolumePolicyAsync(probe.GetVolume(Volume), Ct);
+            bool expectProgress = HasConfiguredMajority(voters, offline)
+                && CanMeetAckPolicy(policy, cluster.Nodes.Where(n => !offline.Contains(n.Name)).Select(n => n.Labels));
+
+            // With progress expected, the client gets a bounded but generous deadline (failing over from a paused or
+            // disconnected leader/storage target is required, a particular retry schedule is not); without it, a short
+            // deadline keeps the honest-failure checks fast.
+            (DfsClient client, DfsVolume v) = await ConnectAsync(cluster, "c0", Ct, operationTimeout: expectProgress ? ProgressOperation : ShortOperation);
             await using var own = client;
             await v.Directories.CreateDirectoryAsync("/o7", Ct);
             var history = new HistoryRecorder();
             await history.RecordAsync("c0", "write", path, V1, () => v.Files.WriteAllBytesAsync(path, V1, Ct));
             DfsStream stream = await v.Files.OpenAsync("/o7/s", new DfsOpenOptions { Mode = FileMode.CreateNew, Access = FileAccess.ReadWrite, Share = FileShare.Read }, Ct);
 
-            IReadOnlyList<string> voters = await GetVolumeVotersAsync(cluster);
-            IReadOnlyList<int> members = Members(offlineMask, nodeCount);
-            var offline = members.Select(i => cluster[i].Name).ToHashSet(StringComparer.Ordinal);
-            DfsStoragePolicy policy = await GetVolumePolicyAsync(v, Ct);
-            bool expectProgress = HasConfiguredMajority(voters, offline)
-                && CanMeetAckPolicy(policy, cluster.Nodes.Where(n => !offline.Contains(n.Name)).Select(n => n.Labels));
             DfsOperationId kWrite = await v.NewOperationIdAsync(Ct);
             var withId = new DfsMutationOptions { OperationId = kWrite };
             var modes = members.ToDictionary(i => i, i => ModeFor(mode, i, offlineMask));
@@ -1246,14 +1282,36 @@ public sealed class OffSimulationTests
     // OFF-009 MetadataQuorumLostWithAllPayloads
     // ================================================================================================================
 
-    public static TheoryData<int, OfflineMode> MetadataLossCases
+    /// <summary>How the volume voters n1/n2 are lost in OFF-009.</summary>
+    public enum MetadataLossMode
+    {
+        Crash,
+        Pause,
+        Disconnect,
+
+        /// <summary>
+        /// Only the links between the three volume voters are cut: every node process, including n1 and n2, stays up and
+        /// reachable by clients and by the other storage nodes, so every payload copy remains available.
+        /// </summary>
+        VoterLinksCut,
+    }
+
+    private static OfflineMode AsOfflineMode(MetadataLossMode mode) => mode switch
+    {
+        MetadataLossMode.Crash => OfflineMode.Crash,
+        MetadataLossMode.Pause => OfflineMode.Pause,
+        MetadataLossMode.Disconnect => OfflineMode.Disconnect,
+        _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "not a whole-node outage"),
+    };
+
+    public static TheoryData<int, MetadataLossMode> MetadataLossCases
     {
         get
         {
-            var data = new TheoryData<int, OfflineMode>();
+            var data = new TheoryData<int, MetadataLossMode>();
             foreach (int nodes in new[] { 5, 7 })
             {
-                foreach (OfflineMode mode in new[] { OfflineMode.Crash, OfflineMode.Pause, OfflineMode.Disconnect })
+                foreach (MetadataLossMode mode in Enum.GetValues<MetadataLossMode>())
                     data.Add(nodes, mode);
             }
 
@@ -1262,14 +1320,16 @@ public sealed class OffSimulationTests
     }
 
     /// <summary>
-    /// OFF-009: volume voters n0..n2 (explicit) lose their majority while every data node stays healthy. No new live read
+    /// OFF-009: volume voters n0..n2 (explicit) lose their majority while the data nodes stay healthy (in the
+    /// voter-links-cut variant every storage node, holding every payload copy, stays up and reachable). No new live read
     /// or write is authorized from data availability alone (reads, existence, metadata, enumeration and writes fail
-    /// honestly), and storage nodes refuse direct object reads without a capability.
+    /// honestly), storage nodes refuse direct object reads without a capability, and refused mutations resolve
+    /// consistently once the majority returns.
     /// </summary>
     [Theory]
     [MemberData(nameof(MetadataLossCases))]
     [Catalog("OFF-009", "S", "INV-03", "INV-08", "INV-12")]
-    public Task OFF_009_MetadataQuorumLostWithAllPayloads(int nodeCount, OfflineMode mode) =>
+    public Task OFF_009_MetadataQuorumLostWithAllPayloads(int nodeCount, MetadataLossMode mode) =>
         ClusterTest.RunAsync(ExplicitVoters(nodeCount), async cluster =>
         {
             const string path = "/o9/f";
@@ -1283,9 +1343,21 @@ public sealed class OffSimulationTests
             IReadOnlyList<ObjectId> objects = await GetFileObjectsAsync(cluster, path);
             Assert.Equal(new[] { "n0", "n1", "n2" }, (await GetVolumeVotersAsync(cluster)).Order(StringComparer.Ordinal));
 
-            TestNode[] lost = [cluster.Node("n1"), cluster.Node("n2")];
-            foreach (TestNode node in lost)
-                await TakeOfflineAsync(cluster, node, mode);
+            DfsOperationId kWrite = await v.NewOperationIdAsync(Ct);
+            DfsOperationId kAppend = await v.NewOperationIdAsync(Ct);
+            DfsOperationId kMkdir = await v.NewOperationIdAsync(Ct);
+            TestNode[] lost = mode == MetadataLossMode.VoterLinksCut ? [] : [cluster.Node("n1"), cluster.Node("n2")];
+            if (mode == MetadataLossMode.VoterLinksCut)
+            {
+                cluster.Network.CutBoth("n0", "n1");
+                cluster.Network.CutBoth("n0", "n2");
+                cluster.Network.CutBoth("n1", "n2");
+            }
+            else
+            {
+                foreach (TestNode node in lost)
+                    await TakeOfflineAsync(cluster, node, AsOfflineMode(mode));
+            }
 
             // Every payload is still stored on healthy nodes ...
             foreach (ObjectId obj in objects)
@@ -1294,30 +1366,37 @@ public sealed class OffSimulationTests
                 foreach (TestNode node in cluster.Nodes.Where(n => n.State == TestNodeState.Running && !lost.Contains(n)))
                     healthyHolders += await node.Inspect.HasObjectAsync(obj) ? 1 : 0;
                 Assert.True(healthyHolders >= 1, $"{obj} must remain stored on a healthy node for this scenario");
+                if (mode == MetadataLossMode.VoterLinksCut)
+                    Assert.True(healthyHolders >= 3, $"{obj}: every repaired copy stays on a running, client-reachable node ({healthyHolders})");
             }
 
-            // ... but nothing live is authorized without the metadata majority.
-            var probes = new (string Name, Func<Task> Probe)[]
+            // ... but nothing live is authorized without the metadata majority. Mutations carry ids (reserved while the
+            // majority was available) so that an uncertain failure, which may legally commit once the majority returns,
+            // is resolved instead of assumed to be absent.
+            var probes = new (string Name, DfsOperationId? Id, Func<Task> Probe)[]
             {
-                ("ReadAllBytes", () => v.Files.ReadAllBytesAsync(path, Ct)),
-                ("OpenRead", async () =>
+                ("ReadAllBytes", null, () => v.Files.ReadAllBytesAsync(path, Ct)),
+                ("OpenRead", null, async () =>
                 {
                     await using DfsStream s = await v.Files.OpenReadAsync(path, Ct);
                     await ReadToEndAsync(s);
                 }),
-                ("Exists", async () => Assert.Fail($"Exists returned {await v.Files.ExistsAsync(path, Ct)} without authority")),
-                ("GetInfo", () => v.Files.GetInfoAsync(path, Ct)),
-                ("Enumerate", async () => await v.Directories.EnumerateAsync("/o9", null, Ct).ToListAsync(Ct)),
-                ("WriteAll", () => v.Files.WriteAllBytesAsync(path, Big2, Ct)),
-                ("Append", () => v.Files.AppendAllBytesAsync("/o9/other", V2, Ct)),
-                ("CreateDirectory", () => v.Directories.CreateDirectoryAsync("/o9/new", Ct)),
+                ("Exists", null, async () => Assert.Fail($"Exists returned {await v.Files.ExistsAsync(path, Ct)} without authority")),
+                ("GetInfo", null, () => v.Files.GetInfoAsync(path, Ct)),
+                ("Enumerate", null, async () => await v.Directories.EnumerateAsync("/o9", null, Ct).ToListAsync(Ct)),
+                ("WriteAll", kWrite, () => v.Files.WriteAllBytesAsync(path, Big2, new DfsMutationOptions { OperationId = kWrite }, Ct)),
+                ("Append", kAppend, () => v.Files.AppendAllBytesAsync("/o9/other", V2, new DfsMutationOptions { OperationId = kAppend }, Ct)),
+                ("CreateDirectory", kMkdir, () => v.Directories.CreateDirectoryAsync("/o9/new", new DfsMutationOptions { OperationId = kMkdir }, Ct)),
             };
-            foreach ((string name, Func<Task> probe) in probes)
+            var mutationClass = new Dictionary<DfsOperationId, OpOutcome>();
+            foreach ((string name, DfsOperationId? id, Func<Task> probe) in probes)
             {
                 OffAttempt<bool> attempt = await TryAsync(probe);
                 Assert.False(attempt.Succeeded, $"{name} succeeded without a metadata majority");
                 Assert.True(IsNoSuccessFailure(attempt.Error!), $"{name}: expected honest unavailability, got {attempt.Error}");
                 Assert.False(attempt.Error is FileNotFoundException or DirectoryNotFoundException, $"{name}: unavailability must not be reported as absence");
+                if (id is not null)
+                    mutationClass[id.Value] = attempt.Classification;
             }
 
             // Storage nodes do not serve payloads on object identity alone.
@@ -1328,12 +1407,29 @@ public sealed class OffSimulationTests
                 Assert.Equal(DfsErrorCode.AccessDenied, direct);
             }
 
+            if (mode == MetadataLossMode.VoterLinksCut)
+                cluster.Network.Heal();
             foreach (TestNode node in lost)
-                await BringOnlineAsync(cluster, node, mode);
+                await BringOnlineAsync(cluster, node, AsOfflineMode(mode));
             await cluster.WaitForStableAsync(Bounded, Ct);
-            await ExpectContentAsync(Big1, v.Files.ReadAllBytesAsync(path, Ct), "after the metadata majority returns");
-            await ExpectContentAsync(V1, v.Files.ReadAllBytesAsync("/o9/other", Ct), "no write leaked through");
-            Assert.False(await v.Directories.ExistsAsync("/o9/new", Ct));
+
+            // Each refused mutation resolves definitely; a definite failure must resolve as aborted, and the visible state
+            // matches the resolution exactly (no partial or invented effect, no silent loss of a committed one).
+            async Task<bool> ResolveCommittedAsync(DfsOperationId id)
+            {
+                DfsOperationOutcome outcome = await v.QueryOperationAsync(id, resolve: true, Ct);
+                Assert.True(outcome.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Aborted, $"{id}: {outcome.Status}");
+                if (mutationClass[id] == OpOutcome.Failed)
+                    Assert.Equal(DfsOutcomeStatus.Aborted, outcome.Status);
+                return outcome.Status == DfsOutcomeStatus.Committed;
+            }
+
+            bool writeCommitted = await ResolveCommittedAsync(kWrite);
+            bool appendCommitted = await ResolveCommittedAsync(kAppend);
+            bool mkdirCommitted = await ResolveCommittedAsync(kMkdir);
+            await ExpectContentAsync(writeCommitted ? Big2 : Big1, v.Files.ReadAllBytesAsync(path, Ct), "after the metadata majority returns");
+            await ExpectContentAsync(appendCommitted ? Concat(V1, V2) : V1, v.Files.ReadAllBytesAsync("/o9/other", Ct), "no write leaked through");
+            Assert.Equal(mkdirCommitted, await v.Directories.ExistsAsync("/o9/new", Ct));
         }, Ct);
 
     // ================================================================================================================
@@ -1388,7 +1484,7 @@ public sealed class OffSimulationTests
                 await using DfsSnapshotView view = await bv.Snapshots.OpenAsync("s1", Ct);
                 Assert.True(view.Files.IsReadOnly);
                 await AssertFilesAsync(view.Files, files, "backup snapshot while every live node is offline", Ct);
-                await Assert.ThrowsAsync<FileNotFoundException>(() => view.Files.ReadAllBytesAsync("/o10/live-only", Ct));
+                await Assert.ThrowsAnyAsync<FileNotFoundException>(() => view.Files.ReadAllBytesAsync("/o10/live-only", Ct));
             }
 
             // Restart: durable state recovered.
@@ -1461,7 +1557,7 @@ public sealed class OffSimulationTests
             {
                 await using DfsSnapshotView view = await bc.GetVolume(Volume).Snapshots.OpenAsync("s1", Ct);
                 await AssertFilesAsync(view.Files, files, "retained backup snapshot", Ct);
-                await Assert.ThrowsAsync<FileNotFoundException>(() => view.Files.ReadAllBytesAsync("/o11/unreplicated", Ct));
+                await Assert.ThrowsAnyAsync<FileNotFoundException>(() => view.Files.ReadAllBytesAsync("/o11/unreplicated", Ct));
             }
 
             // Recovery runbook: the clean hosts are bootstrapped as a new cluster identity, then the snapshot is restored.
@@ -1761,7 +1857,8 @@ public sealed class OffSimulationTests
                     stream = await v.Files.OpenAsync("/o13/f", new DfsOpenOptions { Mode = FileMode.Truncate, Access = FileAccess.Write, Share = FileShare.Read }, Ct);
                     await stream.WriteAsync(Big2, Ct);
                     invoke = () => stream.CommitAsync(withK, Ct);
-                    assertOnce = () => ExpectContentAsync(Big2, r.Files.ReadAllBytesAsync("/o13/f", Ct), "stream revision");
+                    // The (faulted) writer handle may still be held: read with a writer-compatible share mode.
+                    assertOnce = () => ExpectContentAsync(Big2, ReadSharedAsync(r, "/o13/f", Ct), "stream revision");
                     break;
                 default:
                     kind = DfsOperationKind.TxCommit;
@@ -1827,6 +1924,16 @@ public sealed class OffSimulationTests
                     if (again.Succeeded)
                         Assert.Equal(outcome.Token, again.Value);
                     await TryAsync(() => tx!.DisposeAsync().AsTask());
+                    break;
+                }
+
+                case ReplyCutMutation.CreateDirectory:
+                {
+                    // CreateDirectory returns metadata: its ObservedAt is "read at or after" the creating commit.
+                    InodeId created = (await r.Directories.GetInfoAsync("/o13/d", Ct)).InodeId;
+                    DfsDirectoryInfo again = await v.Directories.CreateDirectoryAsync("/o13/d", withK, Ct);
+                    Assert.Equal(created, again.InodeId);
+                    Assert.True(again.ObservedAt.IsAtOrAfter(outcome.Token));
                     break;
                 }
 
@@ -2031,6 +2138,8 @@ public sealed class OffSimulationTests
             await using var ownS = setup;
             await sv.Directories.CreateDirectoryAsync("/h", Ct);
             await sv.Files.WriteAllBytesAsync("/h/f", Big1, Ct);
+            // Every node (so also the minority side) holds every object: the pinned view's data are available there.
+            await cluster.WaitForRepairAsync(Volume, Bounded, Ct);
             DfsSnapshotInfo snapshot = await sv.Snapshots.CreateAsync("s1", null, Ct);
             ulong revision1 = (await sv.Files.GetInfoAsync("/h/f", Ct)).Revision;
 
@@ -2062,10 +2171,17 @@ public sealed class OffSimulationTests
             void AssertHistoricalOrExplicitFailure(OffAttempt<byte[]> attempt, string what, bool allowAvailability = true)
             {
                 if (attempt.Succeeded)
+                {
                     AssertEx.BytesEqual(Big1, attempt.Value, $"{what}: a pinned/historical read returns exactly the pinned revision");
+                }
                 else
-                    Assert.True(attempt.Error is DfsPinExpiredException || (allowAvailability && IsAvailabilityFailure(attempt.Error!)),
+                {
+                    // An expired pin/handle is an explicit, typed failure (LOCK-05: never data from reclaimed extents).
+                    bool expired = attempt.Error is DfsPinExpiredException or DfsLeaseLostException
+                        || attempt.Error is DfsException { ErrorCode: DfsErrorCode.PinExpired or DfsErrorCode.LeaseLost or DfsErrorCode.InvalidHandle };
+                    Assert.True(expired || (allowAvailability && IsAvailabilityFailure(attempt.Error!)),
                         $"{what}: must fail explicitly, got {attempt.Error}");
+                }
             }
 
             async Task<byte[]> ReadPinnedFromStartAsync()
@@ -2141,6 +2257,11 @@ public sealed class OffSimulationTests
             bool configuredMajority = HasConfiguredMajority(voters, disconnected);
             int reachableVoters = voters.Count(x => !disconnected.Contains(x));
             DfsOperationId k = await v.NewOperationIdAsync(Ct);
+            // Generous deadline where progress is required (pooled connections to cut nodes must be abandoned, a retry
+            // schedule is not prescribed); short where only an honest failure is expected.
+            (DfsClient prober, DfsVolume pv) = await ConnectAsync(cluster, "c-voters", Ct,
+                operationTimeout: configuredMajority ? ProgressOperation : ShortOperation);
+            await using var ownProber = prober;
 
             foreach (string name in disconnected)
                 cluster.Network.Isolate(name);
@@ -2159,7 +2280,7 @@ public sealed class OffSimulationTests
                 Assert.Equal(controlVoters, c.Voters.Order(StringComparer.Ordinal));
             }
 
-            OffAttempt<CommitToken> write = await TryAsync(() => v.Files.WriteAllBytesAsync("/o16/f", V2, new DfsMutationOptions { OperationId = k }, Ct));
+            OffAttempt<CommitToken> write = await TryAsync(() => pv.Files.WriteAllBytesAsync("/o16/f", V2, new DfsMutationOptions { OperationId = k }, Ct));
             string context = $"{nodeCount} voters, disconnected {{{string.Join(",", disconnected.Order(StringComparer.Ordinal))}}}: {reachableVoters} of {voters.Length} configured voters reachable";
             if (configuredMajority)
             {
@@ -2286,10 +2407,13 @@ public sealed class OffSimulationTests
                                 break;
                             case OfflineMode.Pause:
                             {
-                                using MessageHold hold = cluster.Network.Hold(new MessageFilter(From: netName));
+                                // Everything the client sends is held for a lease duration, then delivered late; disposing
+                                // the hold also stops capturing, so the remaining work is not silently held forever.
+                                MessageHold hold = cluster.Network.Hold(new MessageFilter(From: netName));
                                 Task during = WorkAsync(v, process);
                                 await cluster.DelayAsync(cluster.Options.Timings.LeaseDuration, Ct);
                                 hold.ReleaseAll();
+                                hold.Dispose();
                                 await during;
                                 break;
                             }
@@ -2385,7 +2509,11 @@ public sealed class OffSimulationTests
 
             // Five nodes, explicit volume voters n0..n2: L = old volume leader, V = other volume voters, D = data-only nodes.
             foreach (string order in Permutations("LVD"))
+            {
                 data.Add(5, order, false);
+                data.Add(5, order, true);
+            }
+
             return data;
         }
     }
@@ -2645,8 +2773,10 @@ public sealed class OffSimulationTests
             foreach (ObjectId obj in objects)
             {
                 IReadOnlyList<string> holders = await cluster.Inspect.GetObjectHoldersAsync(obj);
-                if (rejoined.Succeeded)
-                    Assert.Equal(await target.Inspect.HasObjectAsync(obj), holders.Contains(target.Name));
+                // Only objects the replacement really stores may be counted (repair may be copying concurrently, so only
+                // this direction of the check is race-free).
+                if (rejoined.Succeeded && holders.Contains(target.Name))
+                    Assert.True(await target.Inspect.HasObjectAsync(obj), $"{obj}: the empty replacement is counted as a holder");
                 if (heldBefore[obj] && !holders.Contains(target.Name))
                 {
                     DfsReplicaHealth health = await cluster.Inspect.GetReplicaHealthAsync(Volume);
@@ -2946,8 +3076,13 @@ public sealed class OffSimulationTests
                     await follower.RestartAsync();
                     await cluster.WaitForStableAsync(Bounded, Ct);
                     Assert.True(follower.Incarnation > incarnation0, "a restarted node must register a new incarnation");
+                    // The re-registration is a control-group commit: wait (bounded) until the cluster map reflects it.
+                    await cluster.WaitUntilAsync(async () =>
+                        (await cluster.Admin.ListNodesAsync(Ct)).Single(n => n.Name == follower.Name).Incarnation == follower.Incarnation,
+                        Bounded, "the restarted node's new incarnation is registered with the control group", Ct);
                     DfsNodeInfo registered = (await cluster.Admin.ListNodesAsync(Ct)).Single(n => n.Name == follower.Name);
                     Assert.Equal(follower.Incarnation, registered.Incarnation);
+                    Assert.Equal(DfsNodeStatus.Active, registered.Status);
                     await cluster.WaitForReplicationAsync(Volume, Ct);
                     await cluster.Inspect.AssertReplicasConvergedAsync(Volume);
 

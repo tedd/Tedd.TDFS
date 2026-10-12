@@ -37,8 +37,11 @@ public enum MutatingApi
     StreamCommit,
     StreamWriteThrough,
     StreamSetLengthWriteThrough,
+    StreamAbort,
+    StreamDispose,
     TransactionBegin,
     TransactionCommit,
+    TransactionCommitWithSnapshot,
     TransactionAbort,
     SnapshotCreate,
     SnapshotDelete,
@@ -145,7 +148,7 @@ internal static class OutHelpers
     [
         MutatingApi.WriteAllBytes, MutatingApi.AppendAllBytes, MutatingApi.CopyFile, MutatingApi.MoveFile,
         MutatingApi.DeleteFile, MutatingApi.CreateDirectory, MutatingApi.MoveDirectory, MutatingApi.OpenCreateNew,
-        MutatingApi.StreamCommit, MutatingApi.TransactionCommit, MutatingApi.SnapshotCreate,
+        MutatingApi.StreamCommit, MutatingApi.TransactionCommit, MutatingApi.TransactionCommitWithSnapshot, MutatingApi.SnapshotCreate,
     ];
 
     private static readonly byte[] Small = TestData.Bytes(0x0F_0001, 333);
@@ -395,7 +398,10 @@ internal static class OutHelpers
                         DfsDirectoryInfo info = sync
                             ? v.Directories.CreateDirectory(path, new DfsMutationOptions { OperationId = id })
                             : await v.Directories.CreateDirectoryAsync(path, new DfsMutationOptions { OperationId = id }, ct);
-                        return info.ObservedAt;
+                        // ObservedAt is the token at which the returned metadata was read (at or after the creating commit),
+                        // not the operation's commit token, so it is not compared with the resolved outcome.
+                        Assert.False(info.ObservedAt.IsNone);
+                        return null;
                     },
                     AssertApplied = async (v, ct) =>
                     {
@@ -467,6 +473,10 @@ internal static class OutHelpers
             case MutatingApi.StreamSetLengthWriteThrough:
                 return StreamProbe(api, root);
 
+            case MutatingApi.StreamAbort:
+            case MutatingApi.StreamDispose:
+                return ReleaseProbe(api, root);
+
             case MutatingApi.TransactionBegin:
             {
                 DfsTransaction? tx = null;
@@ -526,6 +536,40 @@ internal static class OutHelpers
                 };
             }
 
+            case MutatingApi.TransactionCommitWithSnapshot:
+            {
+                string path = root + "/tx-snap";
+                string snapshot = "tx-snap-" + api;
+                DfsTransaction? tx = null;
+                return new MutationProbe
+                {
+                    Api = api,
+                    Operation = DfsOperationKind.TxCommit,
+                    IsTransactionCommit = true,
+                    TransactionId = () => tx?.Id,
+                    Setup = async (v, ct) =>
+                    {
+                        await v.Directories.CreateDirectoryAsync(root, ct);
+                        tx = await v.Transactions.BeginAsync(null, ct);
+                        await tx.Files.WriteAllBytesAsync(path, Small, ct);
+                    },
+                    Invoke = async (_, _, ct) => (await tx!.CommitWithSnapshotAsync(snapshot, ct)).Boundary,
+                    AssertApplied = async (v, ct) =>
+                    {
+                        await ExpectContentAsync(Small, v.Files.ReadAllBytesAsync(path, ct), path);
+                        // Commit and snapshot are one decision: exactly one snapshot, holding the committed file.
+                        Assert.Single(await v.Snapshots.ListAsync(ct), s => s.Name == snapshot);
+                        await using DfsSnapshotView view = await v.Snapshots.OpenAsync(snapshot, ct);
+                        await ExpectContentAsync(Small, view.Files.ReadAllBytesAsync(path, ct), "snapshot taken with the commit");
+                    },
+                    Cleanup = async () =>
+                    {
+                        if (tx is not null)
+                            await DisposeQuietlyAsync(tx);
+                    },
+                };
+            }
+
             case MutatingApi.TransactionAbort:
             {
                 string path = root + "/tx-aborted";
@@ -564,7 +608,12 @@ internal static class OutHelpers
                     Operation = DfsOperationKind.CreateSnapshot,
                     SupportsCallerId = true,
                     Setup = async (v, ct) => await v.Files.WriteAllBytesAsync("/snap-src", Small, ct),
-                    Invoke = async (v, id, ct) => (await v.Snapshots.CreateAsync(name, new DfsSnapshotOptions { OperationId = id }, ct)).Boundary,
+                    Invoke = async (v, id, ct) =>
+                    {
+                        // The snapshot boundary is not by contract the creating operation's commit token: not compared.
+                        await v.Snapshots.CreateAsync(name, new DfsSnapshotOptions { OperationId = id }, ct);
+                        return null;
+                    },
                     AssertApplied = async (v, ct) =>
                     {
                         IReadOnlyList<DfsSnapshotInfo> all = await v.Snapshots.ListAsync(ct);
@@ -621,7 +670,14 @@ internal static class OutHelpers
                         await v.Files.WriteAllBytesAsync("/restore-me", Small, ct);
                         await v.Snapshots.CreateAsync(name, null, ct);
                     },
-                    Invoke = async (v, _, ct) => (await v.Snapshots.RestoreAsync(name, newVolume, ct)).LastCommit,
+                    Invoke = async (v, _, ct) =>
+                    {
+                        // The restored volume's LastCommit belongs to a different volume history than the restore
+                        // operation's outcome token on the source volume, so it is never compared with it.
+                        DfsVolumeInfo info = await v.Snapshots.RestoreAsync(name, newVolume, ct);
+                        Assert.Equal(newVolume, info.Name);
+                        return null;
+                    },
                     AssertApplied = async (v, ct) =>
                     {
                         DfsVolume restored = v.Client.GetVolume(newVolume);
@@ -739,7 +795,8 @@ internal static class OutHelpers
                 if (stream is not null)
                     await DisposeQuietlyAsync(stream);
                 stream = null;
-                await ExpectContentAsync(expected, v.Files.ReadAllBytesAsync(path, ct), path);
+                // A faulted (outcome-unknown) writer may keep its handle until it expires: read with a compatible share mode.
+                await ExpectContentAsync(expected, ReadSharedAsync(v, path, ct), path);
             },
             Cleanup = async () =>
             {
@@ -747,6 +804,68 @@ internal static class OutHelpers
                     await DisposeQuietlyAsync(stream);
             },
         };
+    }
+
+    /// <summary>
+    /// Reservation release (<see cref="DfsStream.AbortAsync"/> discarding staged bytes, or disposal of a clean writer):
+    /// the release is a mutation of its own (CloseHandle) and must carry its operation id from the first transmission.
+    /// </summary>
+    private static MutationProbe ReleaseProbe(MutatingApi api, string root)
+    {
+        string path = root + "/released";
+        DfsStream? stream = null;
+        bool abort = api == MutatingApi.StreamAbort;
+        return new MutationProbe
+        {
+            Api = api,
+            Operation = DfsOperationKind.CloseHandle,
+            Setup = async (v, ct) =>
+            {
+                await v.Directories.CreateDirectoryAsync(root, ct);
+                await v.Files.WriteAllBytesAsync(path, Small, ct);
+                stream = await v.Files.OpenAsync(path, new DfsOpenOptions { Mode = FileMode.Open, Access = FileAccess.ReadWrite, Share = FileShare.Read }, ct);
+                if (abort)
+                    await stream.WriteAsync(Small2, ct);   // staged only; discarded by the abort
+            },
+            Invoke = async (_, _, ct) =>
+            {
+                if (abort)
+                    await stream!.AbortAsync(ct);
+                else
+                    await stream!.DisposeAsync();
+                return null;
+            },
+            AssertApplied = async (v, ct) =>
+            {
+                // The writer reservation is released (an exclusive writer can open) and nothing staged was published.
+                await using (DfsStream exclusive = await v.Files.OpenAsync(path, new DfsOpenOptions { Mode = FileMode.Open, Access = FileAccess.ReadWrite, Share = FileShare.None }, ct))
+                    Assert.Equal(Small.Length, await exclusive.GetLengthAsync(ct));
+                await ExpectContentAsync(Small, v.Files.ReadAllBytesAsync(path, ct), path);
+            },
+            Cleanup = async () =>
+            {
+                if (stream is not null)
+                    await DisposeQuietlyAsync(stream);
+            },
+        };
+    }
+
+    /// <summary>
+    /// Whole-file read that coexists with a writer handle that may still be open: a version-pinned handle with
+    /// <c>FileShare.ReadWrite | FileShare.Delete</c> (test plan §5: concurrent readers use compatible sharing).
+    /// </summary>
+    public static async Task<byte[]> ReadSharedAsync(DfsVolume volume, string path, CancellationToken ct)
+    {
+        await using DfsStream s = await volume.Files.OpenAsync(path, new DfsOpenOptions
+        {
+            Mode = FileMode.Open,
+            Access = FileAccess.Read,
+            Share = FileShare.ReadWrite | FileShare.Delete,
+            ReadView = DfsReadView.VersionPinned,
+        }, ct);
+        using var ms = new MemoryStream();
+        await s.CopyToAsync(ms, ct);
+        return ms.ToArray();
     }
 
     /// <summary>Awaits a whole-file read and asserts its exact bytes.</summary>

@@ -153,6 +153,25 @@ internal static class OutHelpers
         AssertEx.BytesEqual(expected, actual, because);
     }
 
+    /// <summary>
+    /// Whole-file read that coexists with an open writer: a version-pinned handle (one revision selected at open) with
+    /// <c>FileShare.ReadWrite | FileShare.Delete</c>, so a sharing conflict with a writer that is still open is never
+    /// mistaken for a publication result (test plan §5).
+    /// </summary>
+    public static async Task<byte[]> ReadSharedAsync(DfsVolume volume, string path, CancellationToken ct)
+    {
+        await using DfsStream s = await volume.Files.OpenAsync(path, new DfsOpenOptions
+        {
+            Mode = FileMode.Open,
+            Access = FileAccess.Read,
+            Share = FileShare.ReadWrite | FileShare.Delete,
+            ReadView = DfsReadView.VersionPinned,
+        }, ct);
+        using var ms = new MemoryStream();
+        await s.CopyToAsync(ms, ct);
+        return ms.ToArray();
+    }
+
     public static byte[] Concat(params byte[][] parts)
     {
         var result = new byte[parts.Sum(p => p.Length)];
@@ -398,7 +417,13 @@ internal static class OutHelpers
                     Invoke = async (v, id, ct) =>
                     {
                         DfsDirectoryInfo info = await v.Directories.CreateDirectoryAsync(dir, new DfsMutationOptions { OperationId = id }, ct);
-                        return new Fingerprint(info.ObservedAt, info.InodeId);
+                        // The API returns metadata, not the commit token: ObservedAt is only "read at or after" the
+                        // creating commit, so the operation's token comes from its durable outcome record.
+                        DfsOperationOutcome outcome = await v.QueryOperationAsync(id, resolve: false, ct);
+                        Assert.Equal(DfsOutcomeStatus.Committed, outcome.Status);
+                        Assert.True(info.ObservedAt.IsAtOrAfter(outcome.Token),
+                            $"directory metadata observed at {info.ObservedAt} precedes its creating commit {outcome.Token}");
+                        return new Fingerprint(outcome.Token, info.InodeId);
                     },
                     AssertAppliedOnce = async (v, ct) =>
                     {

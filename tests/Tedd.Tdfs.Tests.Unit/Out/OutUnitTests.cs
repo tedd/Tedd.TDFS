@@ -190,22 +190,24 @@ public sealed class OutUnitTests
                 string marker = $"injected-cause-{api}-{cause}";
                 using var callerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
-                FaultArm arm = cause switch
+                // The same fault also covers outcome queries (QueryOperation), so an SDK that tries to resolve the lost
+                // outcome internally cannot turn the scenario into a plain success: the unknown-outcome surface is forced.
+                FaultArm ArmFor(DfsOperationKind operation) => cause switch
                 {
                     UnknownCause.ServerReplyDropped => cluster.Faults.Arm(
-                        new FaultMatch(FaultSites.RpcReplySend, Operation: probe.Operation, Count: int.MaxValue), FaultAction.DropReply()),
+                        new FaultMatch(FaultSites.RpcReplySend, Operation: operation, Count: int.MaxValue), FaultAction.DropReply()),
                     UnknownCause.ConnectionResetDuringReply => cluster.Faults.Arm(
-                        new FaultMatch(FaultSites.RpcReplySend, Operation: probe.Operation, Count: int.MaxValue),
+                        new FaultMatch(FaultSites.RpcReplySend, Operation: operation, Count: int.MaxValue),
                         FaultAction.Custom(_ =>
                         {
                             cluster.Network.ResetConnections("client:" + clientName);
                             throw new IOException("reply transmission interrupted by connection reset");
                         })),
                     UnknownCause.ClientReceivePathFailed => cluster.Faults.Arm(
-                        new FaultMatch(FaultSites.ClientReplyReceived, Operation: probe.Operation, Count: int.MaxValue),
+                        new FaultMatch(FaultSites.ClientReplyReceived, Operation: operation, Count: int.MaxValue),
                         FaultAction.Throw(() => new IOException(marker))),
                     UnknownCause.CallerCancelledAfterApply => cluster.Faults.Arm(
-                        new FaultMatch(FaultSites.ApplyAfterBeforeReply, Operation: probe.Operation, Count: 1),
+                        new FaultMatch(FaultSites.ApplyAfterBeforeReply, Operation: operation, Count: 1),
                         FaultAction.Custom(_ =>
                         {
                             callerCts.Cancel();
@@ -213,6 +215,10 @@ public sealed class OutUnitTests
                         })),
                     _ => throw new ArgumentOutOfRangeException(nameof(cause), cause, null),
                 };
+
+                FaultArm arm = ArmFor(probe.Operation);
+                if (cause != UnknownCause.CallerCancelledAfterApply)
+                    ArmFor(DfsOperationKind.QueryOperation);
 
                 CommitToken? returned = null;
                 Exception? failure = null;

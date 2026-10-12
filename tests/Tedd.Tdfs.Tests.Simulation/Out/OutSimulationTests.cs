@@ -86,12 +86,17 @@ public sealed class OutSimulationTests
                 case RetryTiming.WhileOriginalInFlight:
                 {
                     TestNode leader = await cluster.GetLeaderAsync(Volume, Ct);
+                    var accepted = new List<FaultContext>();
+                    Capture(cluster, new FaultMatch(FaultSites.RpcRequestAccepted, Node: leader.Name, Operation: scenario.Operation), accepted);
                     FaultArm block = cluster.Faults.Arm(
                         new FaultMatch(FaultSites.RaftAfterLocalAppend, Node: leader.Name, Operation: scenario.Operation), FaultAction.Block());
                     Task<Fingerprint> originalTask = scenario.Invoke(v0, id, Ct);
                     await block.WaitTriggeredAsync(Bounded);
                     Task<Fingerprint> retryTask = scenario.Invoke(v1, id, Ct);
-                    await cluster.DelayAsync(TimeSpan.FromMilliseconds(300), Ct);
+                    // Release as soon as the leader has accepted the retry while the original is still in flight (a
+                    // condition, not a fixed sleep: holding the leader's append longer than needed could force an election).
+                    await cluster.WaitUntilAsync(() => Task.FromResult(Hits(accepted).Count(h => h.OperationId == id) >= 2), Bounded,
+                        "the leader accepts the same-id retry while the original is in flight", Ct);
                     block.Release();
                     cluster.Faults.AssertReached(block);
                     retry = await retryTask;
@@ -269,7 +274,14 @@ public sealed class OutSimulationTests
                     };
                     break;
                 case PayloadMismatch.CreateDirectoryDifferentPath:
-                    original = async () => (await v.Directories.CreateDirectoryAsync(root + "/d1", withId, Ct)).ObservedAt;
+                    original = async () =>
+                    {
+                        // CreateDirectory returns metadata (ObservedAt is "read at or after"), so the token is the outcome's.
+                        DfsDirectoryInfo info = await v.Directories.CreateDirectoryAsync(root + "/d1", withId, Ct);
+                        CommitToken created = (await v.QueryOperationAsync(id, resolve: false, Ct)).Token;
+                        Assert.True(info.ObservedAt.IsAtOrAfter(created));
+                        return created;
+                    };
                     conflicting = () => v.Directories.CreateDirectoryAsync(root + "/d2", withId, Ct);
                     assertOriginalOnly = async () =>
                     {
@@ -592,9 +604,12 @@ public sealed class OutSimulationTests
             long appendOp = history.Invoke("c0", "append", log, s, k);
             Task<CommitToken> first = v0.Files.AppendAllBytesAsync(log, s, new DfsMutationOptions { OperationId = k }, Ct);
 
-            // Durable metadata commit finished (the entry was applied on the leader) before the caller dies.
-            await cluster.WaitUntilAsync(() => Task.FromResult(Hits(applied).Length > 0 || (crash?.Triggered ?? false)), Bounded,
-                "append K is applied by the leader", Ct);
+            // Durable metadata commit finished (the entry was applied on the leader) and its reply was lost (or the leader
+            // died before replying) before the caller dies. Waiting for the drop itself avoids racing KillClient's
+            // isolation against the reply transmission.
+            await cluster.WaitUntilAsync(
+                () => Task.FromResult(crash is not null ? crash.Triggered : Hits(applied).Length > 0 && dropAll.Matched > 0), Bounded,
+                "append K is applied by the leader and its reply is lost", Ct);
             cluster.Faults.AssertReached(crash ?? appliedArm);
             Assert.True(dropAll.Matched > 0 || crash is not null, "the reply to the caller must have been lost");
             cluster.KillClient(c0);
@@ -632,10 +647,9 @@ public sealed class OutSimulationTests
                 await using var own1 = c2;
                 await GenerateLoadAsync(v2, cluster.Options.Timings.RaftSnapshotThreshold + 50, Ct);
                 await WaitForCompactionAsync(cluster, before.Token.Sequence, Bounded, Ct);
-                TestNode follower = await GetFollowerAsync(cluster, Ct);
-                await follower.CrashAsync();
-                await follower.RestartAsync();
-                await cluster.WaitForStableAsync(Bounded, Ct);
+                // Every replica (whichever becomes leader and answers the query/retry) restarts from a checkpoint taken at or
+                // beyond K's entry, so K's outcome must come from checkpointed state. Still within the outcome window.
+                await CrashAndRestartAllAsync(cluster, Ct);
             }
 
             if (variant == AppendReplyLossVariant.BeyondRetentionWindow)
@@ -833,15 +847,19 @@ public sealed class OutSimulationTests
                 case CreateKind.OpenCreateNew:
                     if (retry.Succeeded)
                     {
-                        // A replayed open may only describe the original incarnation, never the new occupant.
+                        // A replayed open may only describe the original incarnation, never the new occupant. Its handle is
+                        // the original (closed or expired) one, so releasing it may legitimately fail: not asserted.
                         Assert.Equal(originalInode, retry.Value.Inode);
-                        await retry.Value.Stream!.DisposeAsync();
+                        await TryAsync(() => retry.Value.Stream!.DisposeAsync().AsTask());
                     }
                     else
                     {
                         Assert.False(retry.Error is DfsAlreadyExistsException,
                             "the retry must resolve the original event, not re-execute CreateNew against the current occupant");
-                        Assert.True(retry.Error is DfsException { ErrorCode: DfsErrorCode.InvalidHandle or DfsErrorCode.LeaseLost or DfsErrorCode.OperationExpired },
+                        Assert.True(retry.Error is DfsException
+                            {
+                                ErrorCode: DfsErrorCode.InvalidHandle or DfsErrorCode.LeaseLost or DfsErrorCode.PinExpired or DfsErrorCode.OperationExpired,
+                            },
                             $"unexpected answer to a replayed create-open: {retry.Error}");
                     }
 
@@ -1204,7 +1222,12 @@ public sealed class OutSimulationTests
             if (block is not null)
                 await block.WaitTriggeredAsync(Bounded);
             if (drop is not null)
-                await cluster.WaitUntilAsync(() => Task.FromResult(Hits(applied).Length > 0), Bounded, "the mutation is applied", Ct);
+            {
+                // Wait for the lost reply itself, so KillClient's isolation cannot race the reply transmission.
+                await cluster.WaitUntilAsync(() => Task.FromResult(Hits(applied).Length > 0 && drop.Matched > 0), Bounded,
+                    "the mutation is applied and its reply is lost", Ct);
+            }
+
             cluster.KillClient(c0);
 
             (DfsClient c1, DfsVolume v1) = await ConnectAsync(cluster, "c1", Ct);
@@ -1305,7 +1328,7 @@ public sealed class OutSimulationTests
 
             // A definitely failed operation (source absent) also keeps a non-committed answer.
             DfsOperationId failedId = await v0.NewOperationIdAsync(Ct);
-            await Assert.ThrowsAsync<FileNotFoundException>(() => v0.Files.MoveAsync("/o/missing", "/o/never", false, new DfsMutationOptions { OperationId = failedId }, Ct));
+            await Assert.ThrowsAnyAsync<FileNotFoundException>(() => v0.Files.MoveAsync("/o/missing", "/o/never", false, new DfsMutationOptions { OperationId = failedId }, Ct));
 
             ulong highest = committed.Max(c => c.Result.Token.Sequence);
 
@@ -1323,8 +1346,11 @@ public sealed class OutSimulationTests
                     await follower.CrashAsync();
                     await follower.RestartAsync();
                     await cluster.WaitForStableAsync(Bounded, Ct);
+                    // Stop a replica other than the restarted one (the leader, unless the restarted replica leads): the
+                    // checkpoint-restored replica must now be part of every serving quorum.
                     TestNode leader = await cluster.GetLeaderAsync(Volume, Ct);
-                    await leader.StopAsync();   // the restarted replica must now be part of the serving quorum
+                    TestNode other = leader.Name != follower.Name ? leader : cluster.Nodes.First(n => n.Name != follower.Name);
+                    await other.StopAsync();
                     await cluster.WaitForStableAsync(Bounded, Ct);
                     break;
                 }
@@ -1536,7 +1562,8 @@ public sealed class OutSimulationTests
                     block = cluster.Faults.Arm(new FaultMatch(FaultSites.RaftBeforePropose, Node: leader.Name, Operation: scenario.Operation), FaultAction.Block());
                     break;
                 case DelayedPath.DelayedInNetworkPastDecision:
-                    delay = cluster.Network.DelayNext(requestFilter, TimeSpan.FromSeconds(6), count: 1);
+                    // Every copy of the request (including SDK retries with the same id) is delayed past the decision.
+                    delay = cluster.Network.DelayNext(requestFilter, TimeSpan.FromSeconds(6), count: 1_000);
                     break;
             }
 
@@ -1557,6 +1584,7 @@ public sealed class OutSimulationTests
             {
                 case DelayedPath.HeldInNetworkThenReleased:
                     hold!.ReleaseAll();
+                    hold.Dispose();   // stop capturing: later retries are delivered too
                     break;
                 case DelayedPath.BlockedBeforeProposalThenReleased:
                     block!.Release();
@@ -1581,14 +1609,17 @@ public sealed class OutSimulationTests
                     await leader.RestartAsync();
                     await cluster.WaitForStableAsync(Bounded, Ct);
                     hold!.ReleaseAll();
+                    hold.Dispose();
                     break;
             }
 
             Attempt<Fingerprint> original = await TryAsync(originalTask);
             AssertNotSuccess(original, "the fenced original must not report success");
 
-            // No late commit, now or later.
-            await cluster.DelayAsync(TimeSpan.FromSeconds(3), Ct);
+            // No late commit, now or later (long enough for every still-delayed copy of the request to arrive).
+            await cluster.DelayAsync(TimeSpan.FromSeconds(delayed == DelayedPath.DelayedInNetworkPastDecision ? 7 : 3), Ct);
+            if (delay is not null)
+                delay.Cancel();
             await scenario.AssertNotApplied(v1, Ct);
             Assert.Equal(DfsOutcomeStatus.Aborted, (await v1.QueryOperationAsync(k, resolve: false, Ct)).Status);
             Attempt<Fingerprint> lateRetry = await TryAsync(() => scenario.Invoke(v1, k, Ct));
@@ -1639,7 +1670,7 @@ public sealed class OutSimulationTests
             await ExpectContentAsync(ContentA, v1.Files.ReadAllBytesAsync("/t1", Ct), "no partial or late transaction effect");
             Assert.False(await v1.Files.ExistsAsync("/t2", Ct));
             Assert.Equal(DfsOutcomeStatus.Aborted, (await v1.Transactions.QueryOutcomeAsync(tx.Id, resolve: false, Ct)).Status);
-            await tx.DisposeAsync();
+            await TryAsync(() => tx.DisposeAsync().AsTask());   // disposal of the fenced transaction is not the property
             hold?.Dispose();
         }, Ct);
 
@@ -1756,20 +1787,25 @@ public sealed class OutSimulationTests
             Attempt<CommitToken> result = await TryAsync(write);
 
             DfsOperationOutcome final = AssertDefinite(await v1.QueryOperationAsync(k, resolve: true, Ct), k);
-            Assert.Equal(DfsOutcomeStatus.Committed, final.Status);
+            if (point == QueryPoint.BlockedAfterApplyBeforeReply)
+                Assert.Equal(DfsOutcomeStatus.Committed, final.Status);   // it was already applied when queried
             if (result.Succeeded)
             {
+                Assert.Equal(DfsOutcomeStatus.Committed, final.Status);
                 Assert.Equal(final.Token, result.Value);
                 history.Complete(opIndex, OpOutcome.Ok);
             }
             else
             {
+                // A held/blocked leader may lose leadership meanwhile; the SDK may then report the outcome as unknown, and
+                // the authoritative resolution decides it (the pending answer above was never treated as an abort).
                 Assert.Equal(OpOutcome.Unknown, result.Classification);
-                history.Resolve(opIndex, OpOutcome.Ok);
+                history.Complete(opIndex, OpOutcome.Unknown, result.Error);
+                history.Resolve(opIndex, final.Status == DfsOutcomeStatus.Committed ? OpOutcome.Ok : OpOutcome.Failed);
             }
 
             byte[] read = await history.RecordAsync("c1", "read", path, null, () => v1.Files.ReadAllBytesAsync(path, Ct));
-            AssertEx.BytesEqual(ContentB, read, "committed write visible");
+            AssertEx.BytesEqual(final.Status == DfsOutcomeStatus.Committed ? ContentB : ContentA, read, "visible state matches the resolved outcome");
             LinearizabilityChecker.Check(history.Operations, new RegisterModel(ContentA)).AssertValid();
             hold?.Dispose();
         }, Ct);
@@ -1870,7 +1906,8 @@ public sealed class OutSimulationTests
 
             async Task AssertUnpublished()
             {
-                await ExpectContentAsync(ContentA, v1.Files.ReadAllBytesAsync(path, Ct), "committed state unchanged by a cancelled operation");
+                // The cancelled stream's writer handle may still be open: read with a writer-compatible share mode.
+                await ExpectContentAsync(ContentA, ReadSharedAsync(v1, path, Ct), "committed state unchanged by a cancelled operation");
                 Assert.False(await v1.Files.ExistsAsync("/x/g", Ct));
             }
 
@@ -2072,7 +2109,8 @@ public sealed class OutSimulationTests
             Assert.Equal(DfsOutcomeStatus.Committed, outcome.Status);
             if (result.Succeeded)
                 Assert.Equal(result.Value, outcome.Token);
-            await ExpectContentAsync(expected, v1.Files.ReadAllBytesAsync(path, Ct), "committed contents after cancellation");
+            // The stream (if any) is still open here: read with a writer-compatible share mode.
+            await ExpectContentAsync(expected, ReadSharedAsync(v1, path, Ct), "committed contents after cancellation");
 
             if (stream is not null)
                 await TryAsync(() => stream.DisposeAsync().AsTask());
@@ -2107,7 +2145,33 @@ public sealed class OutSimulationTests
         SessionExpiryCrashAllJustAfterDeadline,
     }
 
-    public static TheoryData<RetirementCrash> RetirementCrashes => new(Enum.GetValues<RetirementCrash>());
+    /// <summary>
+    /// Which further WriteAll of the session retires K depends on how many of the session's outcomes are still retained
+    /// (setup operations, acknowledgement watermark), so the leader-crash variants crash at every candidate entry 1..W+2
+    /// (W = per-session outcome window); the others take no occurrence (0).
+    /// </summary>
+    public static TheoryData<RetirementCrash, int> RetirementCrashes
+    {
+        get
+        {
+            var data = new TheoryData<RetirementCrash, int>();
+            int window = SmallOutcomeWindow().MaxOutcomesPerSession;
+            foreach (RetirementCrash crash in Enum.GetValues<RetirementCrash>())
+            {
+                if (crash is RetirementCrash.LeaderCrashAfterLocalAppendOfRetiringEntry or RetirementCrash.LeaderCrashAfterCommitOfRetiringEntry)
+                {
+                    for (int occurrence = 1; occurrence <= window + 2; occurrence++)
+                        data.Add(crash, occurrence);
+                }
+                else
+                {
+                    data.Add(crash, 0);
+                }
+            }
+
+            return data;
+        }
+    }
 
     /// <summary>
     /// OUT-019: crashes while the session/outcome retirement watermark advances (and around session-expiry deadlines,
@@ -2117,7 +2181,7 @@ public sealed class OutSimulationTests
     [Theory]
     [MemberData(nameof(RetirementCrashes))]
     [Catalog("OUT-019", "S", "INV-06", "INV-01")]
-    public Task OUT_019_OutcomeWindowRetirementIsDurable(RetirementCrash crash) =>
+    public Task OUT_019_OutcomeWindowRetirementIsDurable(RetirementCrash crash, int crashOccurrence) =>
         ClusterTest.RunAsync(Sim(3, SmallOutcomeWindow()), async cluster =>
         {
             NodeTimings timings = cluster.Options.Timings;
@@ -2177,14 +2241,15 @@ public sealed class OutSimulationTests
                 case RetirementCrash.LeaderCrashAfterLocalAppendOfRetiringEntry:
                 case RetirementCrash.LeaderCrashAfterCommitOfRetiringEntry:
                 {
-                    // The (MaxOutcomes)-th further WriteAll of the session is the entry that pushes K out of the window.
+                    // One of the further WriteAlls of the session is the entry that pushes K out of the window; the theory
+                    // crashes the leader at each candidate (crashOccurrence = 1..W+2), one of which is the retiring entry.
                     string site = crash == RetirementCrash.LeaderCrashAfterLocalAppendOfRetiringEntry
                         ? FaultSites.RaftAfterLocalAppend
                         : FaultSites.RaftAfterCommitBeforeApply;
                     FaultArm crashArm = cluster.Faults.Arm(
-                        new FaultMatch(site, Node: leader.Name, Operation: DfsOperationKind.WriteAll, Occurrence: timings.MaxOutcomesPerSession),
+                        new FaultMatch(site, Node: leader.Name, Operation: DfsOperationKind.WriteAll, Occurrence: crashOccurrence),
                         FaultAction.CrashNode());
-                    await FillWindowAsync(v0, timings.MaxOutcomesPerSession);
+                    await FillWindowAsync(v0, timings.MaxOutcomesPerSession + 2);
                     cluster.Faults.AssertReached(crashArm);
                     await leader.RestartAsync();
                     await cluster.WaitForStableAsync(Bounded, Ct);

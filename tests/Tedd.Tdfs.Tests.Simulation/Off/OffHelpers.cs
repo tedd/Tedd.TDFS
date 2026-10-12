@@ -39,6 +39,12 @@ internal static class OffHelpers
     /// <summary>Per-operation timeout for clients that probe unavailable configurations.</summary>
     public static readonly TimeSpan ShortOperation = TimeSpan.FromSeconds(4);
 
+    /// <summary>
+    /// Per-operation deadline where progress is required: long enough to fail over from paused or disconnected leaders
+    /// and storage targets (several election timeouts and RPC retries), still well inside <see cref="Bounded"/>.
+    /// </summary>
+    public static readonly TimeSpan ProgressOperation = TimeSpan.FromSeconds(20);
+
     public static readonly byte[] V1 = TestData.Bytes(0x0FF_0001, 900);
     public static readonly byte[] V2 = TestData.Bytes(0x0FF_0002, 1100);
     public static readonly byte[] Big1 = TestData.Bytes(0x0FF_0003, 4 * (64 << 10));
@@ -302,6 +308,25 @@ internal static class OffHelpers
         foreach ((string path, byte[] bytes) in files)
             await volume.Files.WriteAllBytesAsync(path, bytes, ct);
         return files;
+    }
+
+    /// <summary>
+    /// Whole-file live read that coexists with an open writer: a version-pinned handle (one revision selected
+    /// linearizably at open) with <c>FileShare.ReadWrite | FileShare.Delete</c>, so a sharing conflict with a writer that
+    /// may still hold the file is never mistaken for a publication or availability result (test plan §5).
+    /// </summary>
+    public static async Task<byte[]> ReadSharedAsync(DfsVolume volume, string path, CancellationToken ct)
+    {
+        await using DfsStream s = await volume.Files.OpenAsync(path, new DfsOpenOptions
+        {
+            Mode = FileMode.Open,
+            Access = FileAccess.Read,
+            Share = FileShare.ReadWrite | FileShare.Delete,
+            ReadView = DfsReadView.VersionPinned,
+        }, ct);
+        using var ms = new MemoryStream();
+        await s.CopyToAsync(ms, ct);
+        return ms.ToArray();
     }
 
     public static Task AssertDataSetAsync(DfsVolume volume, IReadOnlyList<(string Path, byte[] Bytes)> files, string because, CancellationToken ct) =>
