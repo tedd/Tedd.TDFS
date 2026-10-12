@@ -93,8 +93,10 @@ internal sealed partial class ControlStateMachine : IReplicatedStateMachine, ICo
     /// <inheritdoc />
     public void RestoreCheckpoint(ReadOnlySequence<byte> data, ulong index, ulong term)
     {
+        // The image carries the index of the last applied control command; the checkpoint position may be a later
+        // configuration or no-op entry. Keeping the serialized value (instead of overwriting it with the position) keeps the
+        // state byte-identical on replicas that installed the image and on replicas that applied the log.
         State.Read(data.IsSingleSegment ? data.FirstSpan : data.ToArray());
-        State.AppliedIndex = index;
         Changed?.Invoke(index);
     }
 

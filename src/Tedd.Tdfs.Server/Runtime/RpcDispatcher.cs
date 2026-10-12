@@ -92,6 +92,9 @@ internal sealed class ConnectionState(IRpcConnection connection, bool outbound)
 
     public PrincipalVerifier? Verifier { get; set; }
 
+    /// <summary>True when <see cref="Verifier"/> belongs to an existing principal (otherwise it is the fake verifier).</summary>
+    public bool PrincipalKnown { get; set; }
+
     public RpcPeerIdentity? Identity { get; set; }
 
     /// <summary>Boot id announced by a node peer (0 for clients and outbound connections).</summary>

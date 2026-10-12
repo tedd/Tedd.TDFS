@@ -134,6 +134,9 @@ internal sealed class NodeMetrics : IDisposable
         Interlocked.Read(ref _rpcRequestsHandled),
         Interlocked.Read(ref _rejectedStaleWrites));
 
-    /// <summary>Disposes the meter.</summary>
+    /// <summary>The meter (test use: listeners can tell this node's instruments apart).</summary>
+    internal Meter Meter => _meter;
+
+    /// <summary>Disposes the meter (thread-safe; also called by a crash, from outside the stopped loop).</summary>
     public void Dispose() => _meter.Dispose();
 }

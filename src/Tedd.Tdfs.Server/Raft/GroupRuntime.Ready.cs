@@ -1,5 +1,6 @@
 using Tedd.Tdfs.Consensus;
 using Tedd.Tdfs.Server.Runtime;
+using Tedd.Tdfs.Storage;
 
 namespace Tedd.Tdfs.Server.Raft;
 
@@ -68,9 +69,10 @@ internal sealed partial class GroupRuntime
         catch (Exception ex) when (!_closed && IsRecoverablePersistFailure(ex))
         {
             _s.Error("raft", NodeServices.Inv($"{Name}: persisting a Ready failed ({ex.GetType().Name}: {ex.Message}); resetting from durable state."));
+            _resetting = true; // the current core is abandoned: no proposals, ticks or inbound traffic until it is rebuilt
             await Task.Delay(PersistRetryDelay, _s.Time);
             if (!_closed)
-                await ResetFromDurableStateAsync("persist failure");
+                await ResetFromDurableStateAsync("persist failure", reopenLog: true);
             return false;
         }
 
@@ -232,7 +234,7 @@ internal sealed partial class GroupRuntime
 
     private ProposalContext DescribeEntry(RaftEntry entry)
     {
-        if (_proposals.TryGetValue(entry.Index, out PendingProposal? p) && p.Term == entry.Term)
+        if (_proposals.TryGetValue((entry.Index, entry.Term), out PendingProposal? p))
             return p.Context;
         return entry.Kind switch
         {
@@ -259,12 +261,12 @@ internal sealed partial class GroupRuntime
         // Proposals below the applied index whose entries never reached apply (snapshot install) are completed elsewhere.
         while (_proposals.Count > 0)
         {
-            KeyValuePair<ulong, PendingProposal> first = _proposals.First();
-            if (first.Key > entry.Index)
+            KeyValuePair<(ulong Index, ulong Term), PendingProposal> first = _proposals.First();
+            if (first.Key.Index > entry.Index)
                 break;
             _proposals.Remove(first.Key);
             PendingProposal p = first.Value;
-            if (first.Key < entry.Index)
+            if (first.Key.Index < entry.Index)
             {
                 Exception skipped = OutcomeUnknown(p.Context, $"entry {p.Index} was skipped by the local apply sequence");
                 Defer(() => p.Completion.TrySetException(skipped));
@@ -387,44 +389,129 @@ internal sealed partial class GroupRuntime
 
     /// <summary>
     /// Rebuilds the Raft core from the durable log and checkpoint after a failed install or persist (the in-memory Ready is
-    /// abandoned; messages depending on it were never sent). Local proposals become outcome-unknown.
+    /// abandoned; messages depending on it were never sent). Local proposals become outcome-unknown. After a storage failure
+    /// (<paramref name="reopenLog"/>) the log store is reopened from the medium first: a failed write or flush faults the
+    /// journal for good, and the in-memory store may hold appended entries that never became durable, which the rebuilt core
+    /// would otherwise treat as persisted and acknowledge (CON-004). Inbound traffic and ticks are ignored meanwhile.
     /// </summary>
-    private async Task ResetFromDurableStateAsync(string reason)
+    private async Task ResetFromDurableStateAsync(string reason, bool reopenLog)
     {
-        foreach (PendingProposal p in _proposals.Values)
+        _resetting = true;
+        try
         {
-            Exception unknown = OutcomeUnknown(p.Context, "the group was reset after a " + reason);
-            Defer(() => p.Completion.TrySetException(unknown));
-        }
-
-        _proposals.Clear();
-        var resetError = new DfsUnavailableException(DfsErrorCode.NotLeader, $"Group '{DisplayName}' was reset after a {reason}.");
-        foreach (PendingRead r in _reads.Values)
-            Defer(() => r.Completion.TrySetException(resetError));
-        _reads.Clear();
-        _chunkCaptures.Clear();
-        _postInstallCatchUp = false;
-
-        if (_appliedIndex < _view.Snapshot.Index)
-        {
-            RaftSnapshot? latest = await LoadLatestCheckpointAsync(_checkpoints, null, default);
-            if (latest is null || latest.Meta.Index != _view.Snapshot.Index
-                || !SnapshotEnvelope.TryDecode(latest.Data, latest.Meta, out _, out ReadOnlyMemory<byte> state, out string? error))
+            foreach (PendingProposal p in _proposals.Values)
             {
-                throw new DfsIntegrityException($"Group '{Name}': cannot restore the state at the compacted index {_view.Snapshot.Index}.");
+                Exception unknown = OutcomeUnknown(p.Context, "the group was reset after a " + reason);
+                Defer(() => p.Completion.TrySetException(unknown));
             }
 
-            _ = error;
-            _sm.RestoreCheckpoint(new System.Buffers.ReadOnlySequence<byte>(state), latest.Meta.Index, latest.Meta.Term);
-            _latestSnapshot = latest;
-            _appliedIndex = latest.Meta.Index;
-            _appliedTerm = latest.Meta.Term;
-            _appliedConf = latest.Meta.ConfState;
+            _proposals.Clear();
+            var resetError = new DfsUnavailableException(DfsErrorCode.NotLeader, $"Group '{DisplayName}' was reset after a {reason}.");
+            foreach (PendingRead r in _reads.Values)
+                Defer(() => r.Completion.TrySetException(resetError));
+            _reads.Clear();
+            _chunkCaptures.Clear();
+            _postInstallCatchUp = false;
+
+            if (reopenLog && !await ReopenLogAsync())
+                return;
+
+            if (_appliedIndex < _view.Snapshot.Index)
+            {
+                RaftSnapshot? latest = await LoadLatestCheckpointAsync(_checkpoints, null, default);
+                if (latest is null || latest.Meta.Index != _view.Snapshot.Index
+                    || !SnapshotEnvelope.TryDecode(latest.Data, latest.Meta, out _, out ReadOnlyMemory<byte> state, out string? error))
+                {
+                    throw new DfsIntegrityException($"Group '{Name}': cannot restore the state at the compacted index {_view.Snapshot.Index}.");
+                }
+
+                _ = error;
+                _sm.RestoreCheckpoint(new System.Buffers.ReadOnlySequence<byte>(state), latest.Meta.Index, latest.Meta.Term);
+                _latestSnapshot = latest;
+                _appliedIndex = latest.Meta.Index;
+                _appliedTerm = latest.Meta.Term;
+                _appliedConf = latest.Meta.ConfState;
+            }
+
+            CreateNode(_appliedIndex);
+        }
+        finally
+        {
+            _resetting = false;
         }
 
-        CreateNode(_appliedIndex);
         _host.OnLeadershipChanged(this);
         Kick();
+    }
+
+    /// <summary>
+    /// Makes every journal byte written so far durable (a later successful flush of a file covers earlier failed ones),
+    /// then reopens the log store from the medium, which also lets journal recovery drop torn records. Retries while the
+    /// medium keeps failing; false when the group was closed meanwhile.
+    /// </summary>
+    private async Task<bool> ReopenLogAsync()
+    {
+        RaftLogStore old = _view.Store;
+        try
+        {
+            await old.DisposeAsync();
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or DfsException or UnauthorizedAccessException)
+        {
+            _s.Warn("raft", NodeServices.Inv($"{Name}: closing the failed log store: {ex.Message}"));
+        }
+
+        string logDirectory = LogDirectoryOf(Directory);
+        while (!_closed)
+        {
+            try
+            {
+                await SyncJournalAsync(StoragePath.Combine(logDirectory, RaftLogStore.LogDirectoryName));
+                RaftLogStore store = await RaftLogStore.OpenAsync(_s.Env.Medium, logDirectory, _storeOptions);
+                try
+                {
+                    await RepairHardStateAsync(store, default);
+                }
+                catch
+                {
+                    await store.DisposeAsync();
+                    throw;
+                }
+
+                if (_closed)
+                {
+                    await store.DisposeAsync();
+                    return false;
+                }
+
+                _view = new RaftStorageAdapter(store);
+                _s.Info("raft", NodeServices.Inv($"{Name}: reopened the log after a storage failure (last {store.LastIndex}, commit {store.HardState.Commit})."));
+                return true;
+            }
+            catch (Exception ex) when (IsRecoverablePersistFailure(ex))
+            {
+                _s.Warn("raft", NodeServices.Inv($"{Name}: reopening the log failed ({ex.GetType().Name}: {ex.Message}); retrying."));
+                await Task.Delay(PersistRetryDelay, _s.Time);
+            }
+        }
+
+        return false;
+    }
+
+    private async Task SyncJournalAsync(string directory)
+    {
+        IStorageMedium medium = _s.Env.Medium;
+        if (!await medium.ExistsAsync(directory))
+            return;
+        foreach (string name in await medium.ListAsync(directory))
+        {
+            if (!name.EndsWith(Journal.SegmentExtension, StringComparison.Ordinal))
+                continue;
+            await using IStorageFile file = await medium.OpenAsync(StoragePath.Combine(directory, name), StorageOpenMode.OpenExisting);
+            await file.FlushAsync();
+        }
+
+        await medium.FlushDirectoryAsync(directory);
     }
 
     private void Fail(Exception ex)

@@ -54,20 +54,13 @@ internal sealed partial class RpcDispatcher
                     return new ErrorReplyMessage(DfsErrorCode.AuthenticationFailed, "A principal is required; anonymous access is not possible.");
                 }
 
+                // An unknown principal gets a fake verifier (deterministic fake salt, default iterations) that the proof is
+                // checked against like a real one: existence is disclosed neither by the challenge nor by the reply timing.
                 PrincipalRecord? principal = control.FindPrincipal(hello.Principal);
-                if (principal is not null)
-                {
-                    state.Verifier = principal.Verifier;
-                    salt = state.Verifier.Salt;
-                    iterations = state.Verifier.Iterations;
-                }
-                else
-                {
-                    state.Verifier = null;
-                    salt = _s.Keys.FakeSalt(hello.Principal);
-                    iterations = HandshakeAuth.DefaultIterations;
-                }
-
+                state.PrincipalKnown = principal is not null;
+                state.Verifier = principal?.Verifier ?? _s.Keys.FakeVerifier(hello.Principal);
+                salt = state.Verifier.Salt;
+                iterations = state.Verifier.Iterations;
                 break;
             }
 
@@ -126,7 +119,8 @@ internal sealed partial class RpcDispatcher
         }
 
         PrincipalVerifier? verifier = state.Verifier;
-        if (verifier is null || !HandshakeAuth.VerifyClientProof(verifier, transcript, proof.Proof.Span))
+        bool proven = verifier is not null && HandshakeAuth.VerifyClientProof(verifier, transcript, proof.Proof.Span);
+        if (!proven || !state.PrincipalKnown || verifier is null)
             return Refuse(state, DfsErrorCode.AuthenticationFailed, "Authentication failed.", hello.Principal);
         string principal = hello.Principal!;
         bool isBackup = hello.Role == PeerRole.Backup;

@@ -172,6 +172,47 @@ public sealed class ControlStateMachineTests
         Assert.Equal(DfsErrorCode.ProtocolError, garbage.Code);
     }
 
+    [Fact]
+    public void Checkpoint_TakenAfterANonCommandEntry_IsIdenticalOnTheInstallingReplica()
+    {
+        // The group's applied index often lies past the last control command (a configuration change or a leader's no-op
+        // is not applied by the state machine). A replica installing that checkpoint must hold byte-identical state.
+        (ControlStateMachine sm, _) = Bootstrapped();
+        Apply(sm, new GroupCommand(Admin(), ControlCommandKind.CreateGroup, "eng", null));
+        ulong position = sm.AppliedIndex + 2;
+        byte[] image = Checkpoint(sm);
+
+        var installed = new ControlStateMachine();
+        installed.RestoreCheckpoint(new ReadOnlySequence<byte>(image), position, 3);
+        Assert.Equal(image, Checkpoint(installed));
+        Assert.Equal(sm.AppliedIndex, installed.AppliedIndex);
+
+        byte[] next = ControlCommandCodec.Encode(new GroupCommand(Admin(), ControlCommandKind.CreateGroup, "ops", null));
+        Assert.True(sm.Apply(position + 1, 3, next).IsSuccess);
+        Assert.True(installed.Apply(position + 1, 3, next).IsSuccess);
+        Assert.Equal(Checkpoint(sm), Checkpoint(installed));
+    }
+
+    [Fact]
+    public void AddMember_OfAStaleOrClonedIncarnation_DoesNotRewriteTheMember()
+    {
+        (ControlStateMachine sm, NodeId[] ids) = Bootstrapped();
+        var labels = new DfsTopologyLabels("r1", "z1", "rk", "h1", "d");
+        Assert.True(Apply(sm, new RegisterIncarnationCommand(Admin(), ids[1], 3, 77, labels, ["mem://n1b"], 100)).IsSuccess);
+
+        Assert.Equal(DfsErrorCode.StaleIncarnation, Apply(sm, new AddMemberCommand(Admin(), ids[1], "n1", labels, ["mem://old"], 2, 76, 1, 1, [])).Code);
+        Assert.Equal(DfsErrorCode.StaleIncarnation, Apply(sm, new AddMemberCommand(Admin(), ids[1], "n1", labels, ["mem://clone"], 3, 78, 1, 1, [])).Code);
+        MemberRecord member = sm.State.FindMember(ids[1])!;
+        Assert.Equal("mem://n1b", member.Endpoints[0]);
+        Assert.Equal((3UL, (UInt128)77), (member.Incarnation, member.BootId));
+
+        // The registered process re-joining, and a newer incarnation joining, are accepted.
+        Assert.True(Apply(sm, new AddMemberCommand(Admin(), ids[1], "n1", labels, ["mem://n1b"], 3, 77, 1, 1, [])).IsSuccess);
+        Assert.True(Apply(sm, new AddMemberCommand(Admin(), ids[1], "n1", labels, ["mem://n1c"], 4, 80, 1, 1, [])).IsSuccess);
+        Assert.Equal(4UL, sm.State.FindMember(ids[1])!.Incarnation);
+        Assert.Equal("mem://n1c", sm.State.FindMember(ids[1])!.Endpoints[0]);
+    }
+
     private static byte[] Checkpoint(ControlStateMachine sm)
     {
         var buffer = new ArrayBufferWriter<byte>();

@@ -26,6 +26,16 @@ internal sealed class MembershipManager
     /// <summary>Entries a learner may lag behind the commit index and still be promoted.</summary>
     public ulong CatchUpLag => (ulong)Math.Max(8, Math.Min(256, _s.Timings.RaftSnapshotThreshold / 4));
 
+    /// <summary>
+    /// True when the learner described by <paramref name="progress"/> may be promoted: it acknowledged replicated entries
+    /// (the leader streams to it in <see cref="RaftProgressState.Replicate"/> with a positive match; the progress of a
+    /// just-added member starts "recently active" with match 0 and must not count as caught up while the commit index is
+    /// below the lag) and lags the commit index by at most <see cref="CatchUpLag"/>.
+    /// </summary>
+    public bool IsCaughtUp(RaftPeerProgress progress, ulong commit)
+        => progress.IsLearner && progress.RecentActive && progress.State == RaftProgressState.Replicate && progress.Match > 0
+            && progress.Match + CatchUpLag >= commit;
+
     /// <summary>One reconciliation round (no-op unless this node leads the control group).</summary>
     public async Task RunOnceAsync()
     {
@@ -118,7 +128,7 @@ internal sealed class MembershipManager
             if (state.FindMember(id) is { IsLive: false } removed && !(conf.IsVoter(id) && conf.Voters.Count == 1))
             {
                 _s.Info("membership", NodeServices.Inv($"Removing {removed.Name} from the control group (removed member)."));
-                await group.ProposeConfChangeAsync(new RaftConfChange(RaftConfChangeKind.RemoveNode, id));
+                await ProposeChangeAsync(group, new RaftConfChange(RaftConfChangeKind.RemoveNode, id));
                 return true;
             }
         }
@@ -129,7 +139,7 @@ internal sealed class MembershipManager
             if (m.IsLive && !m.PendingAdmission && !conf.Contains(m.Id))
             {
                 _s.Info("membership", NodeServices.Inv($"Adding {m.Name} to the control group as a learner."));
-                await group.ProposeConfChangeAsync(new RaftConfChange(RaftConfChangeKind.AddLearner, m.Id));
+                await ProposeChangeAsync(group, new RaftConfChange(RaftConfChangeKind.AddLearner, m.Id));
                 return true;
             }
         }
@@ -141,7 +151,7 @@ internal sealed class MembershipManager
         if (activeVoters < target && PickPromotion(group, conf, state) is { } promote)
         {
             _s.Info("membership", NodeServices.Inv($"Promoting {_s.Control.NameOf(promote)} to control voter."));
-            await group.ProposeConfChangeAsync(new RaftConfChange(RaftConfChangeKind.PromoteLearner, promote));
+            await ProposeChangeAsync(group, new RaftConfChange(RaftConfChangeKind.PromoteLearner, promote));
             return true;
         }
 
@@ -153,7 +163,7 @@ internal sealed class MembershipManager
                 if (state.FindMember(voter) is { Status: WireNodeStatus.Draining or WireNodeStatus.Drained } draining && conf.Voters.Count > 1)
                 {
                     _s.Info("membership", NodeServices.Inv($"Removing draining {draining.Name} from the control voters."));
-                    await group.ProposeConfChangeAsync(new RaftConfChange(RaftConfChangeKind.RemoveNode, voter));
+                    await ProposeChangeAsync(group, new RaftConfChange(RaftConfChangeKind.RemoveNode, voter));
                     return true;
                 }
             }
@@ -162,13 +172,24 @@ internal sealed class MembershipManager
         return false;
     }
 
+    /// <summary>
+    /// Proposes one membership change with a deadline: if this node loses leadership right after appending it, the entry's
+    /// fate may stay open indefinitely in an idle group, and the membership job must keep running (the next round
+    /// re-evaluates the actual configuration).
+    /// </summary>
+    private async Task<bool> ProposeChangeAsync(GroupRuntime group, RaftConfChange change)
+    {
+        using CancellationTokenSource deadline = _s.CreateDeadline();
+        return await group.ProposeConfChangeAsync(change, deadline.Token);
+    }
+
     private NodeId? PickPromotion(GroupRuntime group, RaftConfState conf, ControlState state)
     {
         ulong commit = group.CommitIndex;
         var caughtUp = new List<MemberRecord>();
         foreach (RaftPeerProgress progress in group.GetProgress())
         {
-            if (!progress.IsLearner || !progress.RecentActive || progress.Match + CatchUpLag < commit)
+            if (!IsCaughtUp(progress, commit))
                 continue;
             if (state.FindMember(progress.Peer) is { IsLive: true, Status: WireNodeStatus.Active, PendingAdmission: false } m)
                 caughtUp.Add(m);
@@ -220,7 +241,8 @@ internal sealed class MembershipManager
                 continue;
             _s.Info("membership", NodeServices.Inv(
                 $"Volume {volume.Name}: replacing voters [{string.Join(", ", bad.Select(_s.Control.NameOf))}] → [{string.Join(", ", voters.Select(_s.Control.NameOf))}]."));
-            ApplyOutcome outcome = await _s.Control.ProposeAsync(new SetVolumeVotersCommand(_s.Control.NewHeader(), volume.Id, voters, learners));
+            using CancellationTokenSource deadline = _s.CreateDeadline();
+            ApplyOutcome outcome = await _s.Control.ProposeAsync(new SetVolumeVotersCommand(_s.Control.NewHeader(), volume.Id, voters, learners), deadline.Token);
             if (!outcome.IsSuccess)
                 _s.Warn("membership", NodeServices.Inv($"Volume {volume.Name}: updating voters failed: {outcome.Code} {outcome.Message}"));
             return;

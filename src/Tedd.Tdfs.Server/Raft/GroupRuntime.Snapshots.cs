@@ -85,7 +85,7 @@ internal sealed partial class GroupRuntime
             Stats.SnapshotVerificationFailures++;
             Stats.SnapshotInstallsAborted++;
             _s.Warn("raft", NodeServices.Inv($"{Name}: rejected snapshot ({meta.Index}, {meta.Term}): {error}"));
-            await ResetFromDurableStateAsync("snapshot verification failure");
+            await ResetFromDurableStateAsync("snapshot verification failure", reopenLog: false);
             return false;
         }
 
@@ -116,7 +116,7 @@ internal sealed partial class GroupRuntime
         _postInstallCatchUp = true;
         foreach (PendingProposal p in _proposals.Values.Where(p => p.Index <= meta.Index).ToArray())
         {
-            _proposals.Remove(p.Index);
+            _proposals.Remove(p.Key);
             Exception unknown = OutcomeUnknown(p.Context, $"a snapshot through {meta.Index} replaced the local log");
             Defer(() => p.Completion.TrySetException(unknown));
         }

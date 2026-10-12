@@ -71,4 +71,17 @@ internal sealed class KeyHierarchy
 
     /// <summary>The fake salt answered for an unknown principal (existence is not disclosed).</summary>
     public byte[] FakeSalt(string principal) => HandshakeAuth.FakeSalt(FakeSaltKey, principal);
+
+    /// <summary>
+    /// The verifier used for an unknown principal: its fake salt and the default iteration count, with keys that no proof
+    /// can match (that would need a SHA-256 preimage), so the proof is checked with exactly the work of a wrong secret and
+    /// the reply timing does not disclose whether the principal exists.
+    /// </summary>
+    public PrincipalVerifier FakeVerifier(string principal)
+    {
+        ArgumentNullException.ThrowIfNull(principal);
+        byte[] stored = HMACSHA256.HashData(FakeSaltKey, Encoding.UTF8.GetBytes("tdfs/fake-stored-key/v1\0" + principal));
+        byte[] server = HMACSHA256.HashData(FakeSaltKey, Encoding.UTF8.GetBytes("tdfs/fake-server-key/v1\0" + principal));
+        return new PrincipalVerifier(FakeSalt(principal), HandshakeAuth.DefaultIterations, stored, server);
+    }
 }

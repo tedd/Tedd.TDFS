@@ -94,8 +94,8 @@ internal static class DataKeys
         if (escrow.Length < header + NonceSize + TagSize || BinaryPrimitives.ReadUInt32LittleEndian(escrow) != EscrowMagic || escrow[4] != EscrowVersion)
             throw new DfsRecoveryKeyMissingException("The recovery key escrow is malformed.");
         int iterations = BinaryPrimitives.ReadInt32LittleEndian(escrow[5..]);
-        if (iterations < 1)
-            throw new DfsRecoveryKeyMissingException("The recovery key escrow is malformed.");
+        if (iterations < 1 || iterations > Protocol.HandshakeAuth.MaxIterations)
+            throw new DfsRecoveryKeyMissingException("The recovery key escrow is malformed."); // bounded PBKDF2 work for hostile input
         byte[] key = Rfc2898DeriveBytes.Pbkdf2(Encoding.UTF8.GetBytes(passphrase), escrow.Slice(9, EscrowSaltSize).ToArray(), iterations, HashAlgorithmName.SHA256, 32);
         int length = escrow.Length - header - NonceSize - TagSize;
         byte[] kek = new byte[length];

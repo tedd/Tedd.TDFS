@@ -166,6 +166,7 @@ internal sealed class VolumeRegistry
                 return;
             VolumeRecord? record = state.FindVolume(host.Id);
             bool close;
+            bool deleteData = true;
             if (record is null)
             {
                 close = true;
@@ -177,7 +178,11 @@ internal sealed class VolumeRegistry
             }
             else
             {
-                // Keep participating until the group stopped counting this node (or a grace period passed).
+                // Keep participating until the group stopped counting this node. A node removed while it was cut off never
+                // learns of its removal, so it stops participating after a grace period, but it keeps its log then: a member
+                // the configuration may still count as a voter must never lose its log (re-listed later, it would rejoin
+                // with an empty log and could vote for a candidate lacking committed entries). The data is deleted only once
+                // the applied (committed) configuration no longer contains this node.
                 RaftConfState applied = host.Group.AppliedConf;
                 if (!_unlistedSince.TryGetValue(host.Id, out long since))
                 {
@@ -185,7 +190,9 @@ internal sealed class VolumeRegistry
                     _unlistedSince[host.Id] = since;
                 }
 
-                close = !applied.Contains(_s.NodeId) || _s.Time.GetElapsedTime(since, now) > grace;
+                bool counted = applied.Contains(_s.NodeId);
+                close = !counted || _s.Time.GetElapsedTime(since, now) > grace;
+                deleteData = !counted;
             }
 
             if (close)
@@ -193,7 +200,13 @@ internal sealed class VolumeRegistry
                 _unlistedSince.Remove(host.Id);
                 _hosts.Remove(host.Id);
                 host.NotifyClosing();
-                await _s.Raft.CloseAsync(host.Group.Name, deleteData: true);
+                if (!deleteData)
+                {
+                    _s.Warn("volume", NodeServices.Inv(
+                        $"Volume {host.Name}: no longer listed but still a member of the applied configuration; leaving the group and keeping its data."));
+                }
+
+                await _s.Raft.CloseAsync(host.Group.Name, deleteData);
             }
         }
     }

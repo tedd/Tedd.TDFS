@@ -63,8 +63,7 @@ internal sealed class ControlService
     private async ValueTask<IWireMessage> JoinClusterAsync(RpcContext context, IWireMessage request)
     {
         var message = (JoinClusterMessage)request;
-        if (context.PeerNode != message.Node)
-            throw new UnauthorizedAccessException("A node can only join as itself.");
+        RequireOwnIdentity(context, message.Node, message.Incarnation, message.BootId);
         if (!Control.IsLeader)
             throw Control.NotLeader();
         ControlState state = Control.State;
@@ -85,13 +84,26 @@ internal sealed class ControlService
     private async ValueTask<IWireMessage> RegisterIncarnationAsync(RpcContext context, IWireMessage request)
     {
         var message = (RegisterIncarnationMessage)request;
-        if (context.PeerNode != message.Node || context.Identity.Incarnation != message.Incarnation)
-            throw new UnauthorizedAccessException("A node can only register its own incarnation.");
+        RequireOwnIdentity(context, message.Node, message.Incarnation, message.BootId);
         if (!Control.IsLeader)
             throw Control.NotLeader();
         MemberRecord member = await RegisterAsync(message.Node, message.Incarnation, message.BootId, message.Labels, message.Endpoints, message.CapacityBytes,
             context.Cancellation);
         return new RegisterIncarnationResultMessage(true, member.Incarnation, member.Status, Control.State.AppliedIndex, Control.State.PlacementEpoch);
+    }
+
+    /// <summary>
+    /// A join or incarnation registration must describe the authenticated connection itself: its node id, the incarnation
+    /// it authenticated with and, on a connection the peer opened (whose Hello announced it), its boot id. Otherwise a
+    /// process could register an incarnation it does not run, fencing the real one (RSY-021) or reviving a stale one.
+    /// </summary>
+    private static void RequireOwnIdentity(RpcContext context, NodeId node, ulong incarnation, UInt128 bootId)
+    {
+        if (context.PeerNode != node || context.Identity.Incarnation != incarnation
+            || (!context.State.Outbound && context.State.BootId != bootId))
+        {
+            throw new UnauthorizedAccessException("A node can only register its own identity, incarnation and boot id.");
+        }
     }
 
     /// <summary>Proposes an incarnation registration (control leader) and returns the registered member.</summary>

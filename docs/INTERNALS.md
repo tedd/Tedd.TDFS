@@ -57,6 +57,7 @@ internal sealed class NodeServices
         DfsOperationId? operationId = null, string? path = null, ObjectId? obj = null, int occurrence = 0, string? detail = null,
         CancellationToken ct = default);
     string DataPath(string relative);                       // under Options.DataDirectory
+    CancellationTokenSource CreateDeadline(TimeSpan? timeout = null); // node-clock deadline (default: peer call timeout)
     void Info/Debug/Warn/Error(string category, string message);
 }
 
@@ -145,8 +146,18 @@ Proposal semantics: `ProposeAsync` completes with the `ApplyOutcome` after the e
 and nothing proposed. After proposing, a lost leadership keeps waiting for the entry's fate; a different term at the
 index means the proposal lost (retryable `NotLeader`); cancellation (deadline), shutdown, a local reset or an installed
 snapshot covering the index before the fate is known → `DfsCommitOutcomeUnknownException` (retry with the same
-operation id). `ReadIndexAsync` (leader only) confirms leadership with a heartbeat quorum and returns once the applied
-index reached the read index. Fault sites: F10 `RaftBeforePropose` and `RaftAfterLocalAppend`, F11
+operation id). Pending proposals are keyed by (index, term): a re-elected leader may append a new entry at the index of
+one of its own undecided proposals, and the entry committed there decides both. The fate of an entry appended just
+before leadership was lost is only decided when a later leader commits something at its index, which may never happen
+in an idle group: background proposals (membership, registration, audit) therefore always pass a deadline
+(`NodeServices.CreateDeadline`). `ReadIndexAsync` (leader only) confirms leadership with a heartbeat quorum and returns
+once the applied index reached the read index. A failed durable write resets the group: proposals become
+outcome-unknown, the journal files are flushed and the log store is reopened from the medium (a failed journal write
+faults the journal, and appended-but-unflushed entries must never be acknowledged), then the core is rebuilt; retried
+while the medium keeps failing. Opening a group raises a persisted term that is behind the last durable entry's term
+(crash between the entry flush and the hard-state write; no vote of that term was ever sent).
+
+Fault sites: F10 `RaftBeforePropose` and `RaftAfterLocalAppend`, F11
 `RaftAfterCommitBeforeApply` (per entry, also on followers; `ICommandDescriber` supplies the operation), F12
 `ApplyAfterBeforeReply`, F16 `RaftSnapshotInstall` (detail receive/verify/install/activate), F21 `Reconfiguration`;
 `RecoveryJournalReplay` is hit by the log store while the group opens. Checkpoints are written when
@@ -278,12 +289,18 @@ internal sealed partial class VolumeHost
   and every 40 ticks. It opens a group for each volume whose record lists this node (`VolumeRecord.Hosts`) in
   `groups/vol-{id:N}`, then calls `OnOpened`; record changes call `OnRecordChanged(previous)`; role/leader/term changes
   call `OnLeadershipChanged`; before closing (volume deleted, node no longer listed and removed from the applied
-  configuration, or node stop) it calls `OnClosing`. Deleted/unlisted volumes delete their group data; stop keeps it.
+  configuration, or node stop) it calls `OnClosing`. Deleted volumes, and unlisted ones whose applied configuration no
+  longer contains this node, delete their group data; stop keeps it. A node that is unlisted but still in the applied
+  configuration (it may have been removed while cut off and never learn it) leaves the group after a grace period but
+  keeps its log: a member the configuration may still count as a voter must never lose its log.
   Leader-only jobs (lease expiry, GC, repair, exporter) start in `OnLeadershipChanged` when `IsLeader` and must stop
   themselves when leadership is lost or `Group.IsClosed`.
 * **Membership** is owned by the runtime: the control leader's `MembershipManager` chooses volume voters/learners
   (eligible members of the volume's pool per the metadata policy, rendezvous hashing on the volume id) and writes them to the record; the volume
   leader's `VolumeHost.ReconcileMembershipAsync` moves the group one single-server change at a time towards the record.
+  A learner is promoted only when `MembershipManager.IsCaughtUp` (it acknowledged entries — replicate state, positive
+  match — and lags the commit index by at most `CatchUpLag`; a just-added member's progress starts "recently active" with
+  match 0 and does not qualify).
 * **Proposing**: `host.Group.ProposeAsync(command, new ProposalContext(kind, opId, path), ct)`; implement
   `ICommandDescriber` on the state machine so follower-side F11 contexts carry the operation.
 

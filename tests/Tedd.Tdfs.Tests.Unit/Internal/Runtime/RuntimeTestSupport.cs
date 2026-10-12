@@ -113,6 +113,23 @@ internal sealed class RecordingFaultInjector : IFaultInjector
     public void Clear() => _hits.Clear();
 }
 
+/// <summary>Isolates network identities: every message to or from an isolated name is dropped and no connection is opened.</summary>
+internal sealed class TestLinkPolicy : ILinkPolicy
+{
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> _isolated = new(StringComparer.Ordinal);
+
+    public void Isolate(string name) => _isolated[name] = true;
+
+    public void Heal(string name) => _isolated.TryRemove(name, out _);
+
+    public LinkDecision Decide(string fromName, string toName, LinkDirection direction, ReadOnlySpan<byte> payloadPrefix)
+        => IsCut(fromName, toName) ? LinkDecision.Drop : LinkDecision.Deliver;
+
+    public bool CanConnect(string fromName, string toName) => !IsCut(fromName, toName);
+
+    private bool IsCut(string from, string to) => _isolated.ContainsKey(from) || _isolated.ContainsKey(to);
+}
+
 /// <summary>One node of a <see cref="RuntimeCluster"/>.</summary>
 internal sealed class RuntimeNode
 {
@@ -159,7 +176,7 @@ internal sealed class RuntimeCluster : IAsyncDisposable
         var random = new SeededRandom(seed);
         ClusterId = random.NextGuid();
         Secret = random.NextBytes(32);
-        Network = new InMemoryNetwork(null, TimeProvider.System);
+        Network = new InMemoryNetwork(Links, TimeProvider.System);
         for (int i = 0; i < nodeCount; i++)
             _nodes.Add(CreateNode(i, zones is null ? "z" + (i + 1).ToString(CultureInfo.InvariantCulture) : zones[i], random));
         int voters = Math.Min(controlVoters, nodeCount);
@@ -183,6 +200,9 @@ internal sealed class RuntimeCluster : IAsyncDisposable
     public NodeTimings Timings { get; }
 
     public InMemoryNetwork Network { get; }
+
+    /// <summary>Link rules of <see cref="Network"/> (isolate and heal nodes).</summary>
+    public TestLinkPolicy Links { get; } = new();
 
     public CollectingNodeLog Log { get; } = new();
 

@@ -51,9 +51,17 @@ internal sealed partial class ControlStateMachine
                 return Fail(DfsErrorCode.AccessDenied, $"Node {c.Name} was removed from the cluster; re-admission requires an explicit administrative join.");
             if (!string.Equals(existing.Name, c.Name, StringComparison.Ordinal))
                 return Fail(DfsErrorCode.AlreadyExists, $"Node id {c.Id} is a member under the name '{existing.Name}'.");
-            MemberRecord updated = existing;
-            if (c.Incarnation > existing.Incarnation || (c.Incarnation == existing.Incarnation && (existing.BootId == UInt128.Zero || existing.BootId == c.BootId)))
-                updated = updated with { Incarnation = c.Incarnation, BootId = c.BootId };
+
+            // A re-join is also an incarnation registration: an older incarnation, or the registered one claimed by another
+            // process (cloned disk), must not rewrite the member's endpoints or identity (RSY-021).
+            if (c.Incarnation < existing.Incarnation
+                || (c.Incarnation == existing.Incarnation && existing.BootId != UInt128.Zero && existing.BootId != c.BootId))
+            {
+                return Fail(DfsErrorCode.StaleIncarnation,
+                    $"Incarnation {c.Incarnation} of {existing.Name} is stale (registered {existing.Incarnation}).");
+            }
+
+            MemberRecord updated = existing with { Incarnation = c.Incarnation, BootId = c.BootId };
             updated = updated with { Endpoints = c.Endpoints.ToArray(), CapacityBytes = c.CapacityBytes, ProtocolMax = c.ProtocolMax, Features = features, PendingAdmission = false };
             if (!Equals(existing.Labels, c.Labels))
             {

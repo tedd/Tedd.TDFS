@@ -190,7 +190,8 @@ internal sealed class ControlHost
                 AppendAuditCommand command = _pendingAudits.Dequeue();
                 try
                 {
-                    await ProposeAsync(command);
+                    using CancellationTokenSource deadline = _s.CreateDeadline();
+                    await ProposeAsync(command, deadline.Token);
                 }
                 catch (Exception ex) when (ex is DfsException or OperationCanceledException)
                 {

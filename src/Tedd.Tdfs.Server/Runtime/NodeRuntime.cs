@@ -103,10 +103,21 @@ internal sealed partial class NodeRuntime
         {
             if (!string.Equals(superblock.NodeName, options.Name, StringComparison.Ordinal))
                 throw new InvalidOperationException($"The data directory belongs to node '{superblock.NodeName}', not '{options.Name}'.");
-            if (options.Bootstrap is { } bootstrap && bootstrap.ClusterId != superblock.ClusterId)
+            if (options.Bootstrap is { } bootstrap)
             {
-                throw new DfsClusterIdentityException(
-                    $"The data directory belongs to cluster {superblock.ClusterId}; the bootstrap describes cluster {bootstrap.ClusterId}.");
+                if (bootstrap.ClusterId != superblock.ClusterId)
+                {
+                    throw new DfsClusterIdentityException(
+                        $"The data directory belongs to cluster {superblock.ClusterId}; the bootstrap describes cluster {bootstrap.ClusterId}.");
+                }
+
+                // A crash after the superblock was created but before the initial control log was written leaves an initial
+                // member with an empty control log (a single-node cluster could never elect a leader again). The group writes
+                // the identical bootstrap prefix only while its log is still empty, so offering it on every restart is safe.
+                BootstrapMember self = ControlBootstrap.Validate(bootstrap, options.Name);
+                if (self.Id != superblock.NodeId)
+                    throw new InvalidOperationException($"The data directory belongs to node id {superblock.NodeId}; the bootstrap lists {options.Name} as {self.Id}.");
+                controlBootstrap = ControlBootstrap.BuildEntries(bootstrap, s.Keys);
             }
         }
 
@@ -319,9 +330,13 @@ internal sealed partial class NodeRuntime
         if (control.IsSelfRegistered || !control.State.IsBootstrapped || control.Self is not { IsLive: true } self)
             return;
         await s.HitAsync(FaultStage.F21, FaultSites.Reconfiguration, operation: DfsOperationKind.MembershipChange, detail: "register-incarnation");
+
+        // Deadlines throughout: a registration appended by a leader that then lost leadership may stay undecided for as
+        // long as the control group is idle, and this job (RCV-02: no receipts before it succeeds) must keep retrying.
         if (control.IsLeader)
         {
-            await _controlService.RegisterAsync(s.NodeId, s.Incarnation, s.BootId, s.Options.Labels, [s.Endpoint], s.Options.CapacityBytes, CancellationToken.None);
+            using CancellationTokenSource deadline = s.CreateDeadline();
+            await _controlService.RegisterAsync(s.NodeId, s.Incarnation, s.BootId, s.Options.Labels, [s.Endpoint], s.Options.CapacityBytes, deadline.Token);
         }
         else if (control.Leader is { } leader && leader != s.NodeId)
         {
@@ -335,18 +350,22 @@ internal sealed partial class NodeRuntime
 
         if (control.Group is { } group && !control.IsSelfRegistered)
         {
-            Task applied = WaitRegisteredAsync(group);
-            await Task.WhenAny(applied, Task.Delay(s.Timings.Tick * s.Timings.ElectionTicksMax, s.Time));
+            // Wait (bounded) until the registration reaches the local applied view; one waiter per round, never a
+            // detached loop per round.
+            using CancellationTokenSource wait = s.CreateDeadline(s.Timings.Tick * s.Timings.ElectionTicksMax);
+            try
+            {
+                while (!control.IsSelfRegistered && !group.IsClosed)
+                    await group.WaitForAppliedAsync(group.AppliedIndex + 1, wait.Token);
+            }
+            catch (OperationCanceledException) when (wait.IsCancellationRequested)
+            {
+                // Not applied locally yet; the next round checks again.
+            }
         }
 
         if (control.IsSelfRegistered)
             s.Info("node", NodeServices.Inv($"Incarnation {s.Incarnation} of {s.NodeName} registered (was {self.Incarnation})."));
-    }
-
-    private async Task WaitRegisteredAsync(GroupRuntime group)
-    {
-        while (!Services.Control.IsSelfRegistered && !group.IsClosed)
-            await group.WaitForAppliedAsync(group.AppliedIndex + 1);
     }
 
     // ------------------------------------------------------------------ stop and crash
@@ -386,6 +405,10 @@ internal sealed partial class NodeRuntime
         Services.IsStopping = true;
         if (_transport is { } transport)
             _ = transport.DisposeAsync().AsTask();
+
+        // The process is gone: its meter must stop publishing the dead incarnation's counters (a restarted node registers a
+        // new one under the same node tag) and must not keep the abandoned node reachable from the global meter list.
+        Services.Metrics.Dispose();
     }
 
     private async Task AbortStartAsync()

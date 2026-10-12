@@ -160,10 +160,9 @@ internal sealed partial class VolumeHost
         }
 
         ulong commit = Group.CommitIndex;
-        ulong lag = _s.Membership.CatchUpLag;
         foreach (RaftPeerProgress progress in Group.GetProgress())
         {
-            if (progress.IsLearner && desiredVoters.Contains(progress.Peer) && progress.RecentActive && progress.Match + lag >= commit)
+            if (desiredVoters.Contains(progress.Peer) && _s.Membership.IsCaughtUp(progress, commit))
                 return await ChangeAsync(RaftConfChangeKind.PromoteLearner, progress.Peer, "caught-up desired voter");
         }
 
@@ -185,6 +184,10 @@ internal sealed partial class VolumeHost
     private async Task<bool> ChangeAsync(RaftConfChangeKind kind, NodeId node, string reason)
     {
         _s.Info("volume", NodeServices.Inv($"Volume {Name}: {kind} {_s.Control.NameOf(node)} ({reason})."));
-        return await Group.ProposeConfChangeAsync(new RaftConfChange(kind, node));
+
+        // A deadline: the fate of a change appended just before losing leadership may stay open in an idle group, and the
+        // node-wide reconciliation job awaiting it would stop serving every other volume.
+        using CancellationTokenSource deadline = _s.CreateDeadline();
+        return await Group.ProposeConfChangeAsync(new RaftConfChange(kind, node), deadline.Token);
     }
 }

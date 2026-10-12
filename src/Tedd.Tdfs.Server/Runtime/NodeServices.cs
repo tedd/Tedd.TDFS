@@ -113,6 +113,14 @@ internal sealed class NodeServices
     /// <summary>Path of <paramref name="relative"/> inside the node data directory.</summary>
     public string DataPath(string relative) => StoragePath.Combine(Options.DataDirectory, relative);
 
+    /// <summary>
+    /// A cancellation source firing after <paramref name="timeout"/> (default: the node-to-node call timeout) on the node
+    /// clock. Background proposals use it: the fate of an entry appended by a leader that lost leadership is decided only
+    /// when some later entry is committed at its index, which can take arbitrarily long in an idle group, and a periodic
+    /// job awaiting it would otherwise stop running.
+    /// </summary>
+    public CancellationTokenSource CreateDeadline(TimeSpan? timeout = null) => new(timeout ?? Peers.DefaultCallTimeout, Time);
+
     /// <summary>Writes a log entry (never payloads or secrets).</summary>
     public void LogMessage(NodeLogLevel level, string category, string message)
     {

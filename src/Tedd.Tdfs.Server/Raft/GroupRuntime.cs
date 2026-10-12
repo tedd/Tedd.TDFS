@@ -52,13 +52,17 @@ internal sealed partial class GroupRuntime
     private readonly NodeServices _s;
     private readonly RaftGroupHost _host;
     private readonly IReplicatedStateMachine _sm;
-    private readonly RaftStorageAdapter _view;
+    private readonly RaftLogStoreOptions _storeOptions;
     private readonly CheckpointStore _checkpoints;
     private readonly IRandomSource _random;
-    private readonly SortedDictionary<ulong, PendingProposal> _proposals = new();
+
+    // Keyed by (index, term): a leader re-elected after losing leadership can append a new entry at the index of one of
+    // its earlier, still undecided proposals; both wait for the entry committed there (at most one of them wins).
+    private readonly SortedDictionary<(ulong Index, ulong Term), PendingProposal> _proposals = new();
     private readonly Dictionary<ulong, PendingRead> _reads = new();
     private readonly List<AppliedWaiter> _appliedWaiters = [];
     private readonly List<SnapshotChunkCapture> _chunkCaptures = [];
+    private RaftStorageAdapter _view;
     private RaftNode _node = null!;
     private RaftConfState _appliedConf;
     private RaftSnapshot? _latestSnapshot;
@@ -68,19 +72,21 @@ internal sealed partial class GroupRuntime
     private bool _processing;
     private bool _kickPosted;
     private bool _closed;
+    private bool _resetting;
     private Exception? _failure;
     private RaftRole _lastRole;
     private NodeId? _lastLeader;
     private ulong _lastTerm;
     private TaskCompletionSource? _idle;
 
-    private GroupRuntime(NodeServices services, RaftGroupHost host, GroupOpenSpec spec, RaftStorageAdapter view, CheckpointStore checkpoints,
-        RaftSnapshot? latestSnapshot)
+    private GroupRuntime(NodeServices services, RaftGroupHost host, GroupOpenSpec spec, RaftStorageAdapter view, RaftLogStoreOptions storeOptions,
+        CheckpointStore checkpoints, RaftSnapshot? latestSnapshot)
     {
         _s = services;
         _host = host;
         _sm = spec.StateMachine;
         _view = view;
+        _storeOptions = storeOptions;
         _checkpoints = checkpoints;
         _random = services.Random.Fork("raft/" + spec.Group);
         Name = spec.Group;
@@ -122,7 +128,7 @@ internal sealed partial class GroupRuntime
 
     public NodeId? Leader => _node.Leader;
 
-    public bool IsLeader => _failure is null && !_closed && _node.Role == RaftRole.Leader;
+    public bool IsLeader => _failure is null && !_closed && !_resetting && _node.Role == RaftRole.Leader;
 
     public ulong CommitIndex => _node.CommitIndex;
 
@@ -171,13 +177,14 @@ internal sealed partial class GroupRuntime
             checkpointCipher = c;
         }
 
-        RaftLogStore store = await RaftLogStore.OpenAsync(medium, StoragePath.Combine(spec.Directory, "log"), new RaftLogStoreOptions
+        var storeOptions = new RaftLogStoreOptions
         {
             Cipher = journalCipher,
             Faults = services.Faults,
             NodeName = services.NodeName,
             GroupName = spec.VolumeName,
-        }, ct);
+        };
+        RaftLogStore store = await RaftLogStore.OpenAsync(medium, LogDirectoryOf(spec.Directory), storeOptions, ct);
         try
         {
             CheckpointStore checkpoints = await CheckpointStore.OpenAsync(medium, StoragePath.Combine(spec.Directory, "ckpt"), new CheckpointStoreOptions
@@ -212,10 +219,11 @@ internal sealed partial class GroupRuntime
                 spec.StateMachine.RestoreCheckpoint(new System.Buffers.ReadOnlySequence<byte>(state), latest.Meta.Index, latest.Meta.Term);
             }
 
+            await RepairHardStateAsync(store, ct);
             if (store.LastIndex == 0 && store.Snapshot.Index == 0 && spec.BootstrapEntries is { Count: > 0 } bootstrap)
                 await WriteBootstrapAsync(view, bootstrap, ct);
 
-            var group = new GroupRuntime(services, host, spec, view, checkpoints, latest);
+            var group = new GroupRuntime(services, host, spec, view, storeOptions, checkpoints, latest);
             group.CreateNode(view.Snapshot.Index);
             return group;
         }
@@ -231,7 +239,17 @@ internal sealed partial class GroupRuntime
     {
         if (!IsActive)
             return;
-        _node.Tick();
+        try
+        {
+            _node.Tick();
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            // One group's failure must never stop the node-wide tick loop.
+            Fail(ex);
+            return;
+        }
+
         Kick();
     }
 
@@ -247,6 +265,11 @@ internal sealed partial class GroupRuntime
         catch (ArgumentException ex)
         {
             _s.Debug("raft", NodeServices.Inv($"{Name}: dropped a malformed {message.GetType().Name} from {message.From}: {ex.Message}"));
+            return;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            Fail(ex);
             return;
         }
 
@@ -282,14 +305,16 @@ internal sealed partial class GroupRuntime
     public async Task<ApplyOutcome> ProposeAsync(ReadOnlyMemory<byte> command, ProposalContext context, CancellationToken ct = default)
     {
         ThrowIfUnavailable();
+        ThrowIfResetting();
         if (_node.Role != RaftRole.Leader)
             throw NotLeader();
         await _s.HitAsync(FaultStage.F10, FaultSites.RaftBeforePropose, VolumeName, context.Operation, context.OperationId, context.Path, ct: ct);
         ThrowIfUnavailable();
+        ThrowIfResetting();
         if (!_node.TryPropose(command, out ulong index))
             throw NotLeader();
         var pending = new PendingProposal(index, _node.Term, context);
-        _proposals[index] = pending;
+        _proposals[pending.Key] = pending;
         Kick();
 
         ApplyOutcome outcome;
@@ -299,7 +324,7 @@ internal sealed partial class GroupRuntime
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            _proposals.Remove(index);
+            RemoveProposal(pending);
             throw OutcomeUnknown(context, $"the deadline elapsed before entry {index} of group '{DisplayName}' was decided");
         }
 
@@ -312,13 +337,13 @@ internal sealed partial class GroupRuntime
     public async Task<bool> ProposeConfChangeAsync(RaftConfChange change, CancellationToken ct = default)
     {
         ThrowIfUnavailable();
-        if (_node.Role != RaftRole.Leader)
+        if (_resetting || _node.Role != RaftRole.Leader)
             return false;
         await _s.HitAsync(FaultStage.F21, FaultSites.Reconfiguration, VolumeName, DfsOperationKind.MembershipChange, detail: change.Kind + " " + change.Node, ct: ct);
         if (!IsActive || !_node.TryProposeConfChange(change, out ulong index))
             return false;
         var pending = new PendingProposal(index, _node.Term, new ProposalContext(DfsOperationKind.MembershipChange));
-        _proposals[index] = pending;
+        _proposals[pending.Key] = pending;
         Kick();
         try
         {
@@ -327,7 +352,7 @@ internal sealed partial class GroupRuntime
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            _proposals.Remove(index);
+            RemoveProposal(pending);
             return false;
         }
         catch (DfsException)
@@ -343,6 +368,7 @@ internal sealed partial class GroupRuntime
     public async Task<ulong> ReadIndexAsync(CancellationToken ct = default)
     {
         ThrowIfUnavailable();
+        ThrowIfResetting();
         if (_node.Role != RaftRole.Leader)
             throw NotLeader();
         ulong context = ++_nextReadContext;
@@ -405,7 +431,9 @@ internal sealed partial class GroupRuntime
         });
     }
 
-    private bool IsActive => !_closed && _failure is null;
+    private bool IsActive => !_closed && _failure is null && !_resetting;
+
+    private static string LogDirectoryOf(string groupDirectory) => StoragePath.Combine(groupDirectory, "log");
 
     private void CreateNode(ulong applied)
     {
@@ -424,6 +452,21 @@ internal sealed partial class GroupRuntime
         _lastTerm = _node.Term;
     }
 
+    /// <summary>
+    /// A crash after entries (or an installed snapshot) became durable but before the hard state was saved leaves the
+    /// persisted term behind the term of the last durable entry, which the Raft core refuses at start-up. No vote of that
+    /// newer term was ever sent (a vote is sent only after the hard state holding it is durable), so the term is raised to
+    /// the last log term without a vote.
+    /// </summary>
+    private static async Task RepairHardStateAsync(RaftLogStore store, CancellationToken ct)
+    {
+        RaftLogHardState hs = store.HardState;
+        ulong lastTerm = store.LastTerm;
+        if (hs.Term >= lastTerm)
+            return;
+        await store.SaveHardStateAsync(new RaftLogHardState(lastTerm, null, hs.Commit), ct);
+    }
+
     private static async Task WriteBootstrapAsync(RaftStorageAdapter view, IReadOnlyList<RaftEntry> entries, CancellationToken ct)
     {
         await view.AppendAsync(entries, ct);
@@ -438,6 +481,19 @@ internal sealed partial class GroupRuntime
             throw new DfsUnavailableException(DfsErrorCode.Unavailable, $"Group '{DisplayName}' is stopped on {_s.NodeName}: {_failure.Message}");
         if (_closed)
             throw new DfsUnavailableException(DfsErrorCode.NodeUnavailable, $"Group '{DisplayName}' is not hosted on {_s.NodeName}.");
+    }
+
+    private void ThrowIfResetting()
+    {
+        if (_resetting)
+            throw new DfsUnavailableException(DfsErrorCode.Unavailable, $"Group '{DisplayName}' on {_s.NodeName} is recovering from a storage failure.");
+    }
+
+    /// <summary>Forgets <paramref name="pending"/> (never another proposal registered under the same key).</summary>
+    private void RemoveProposal(PendingProposal pending)
+    {
+        if (_proposals.TryGetValue(pending.Key, out PendingProposal? current) && ReferenceEquals(current, pending))
+            _proposals.Remove(pending.Key);
     }
 
     /// <summary>A retryable NotLeader error carrying the leader's endpoint when known.</summary>
@@ -476,6 +532,8 @@ internal sealed partial class GroupRuntime
         public ulong Index { get; } = index;
 
         public ulong Term { get; } = term;
+
+        public (ulong Index, ulong Term) Key => (Index, Term);
 
         public ProposalContext Context { get; } = context;
 
