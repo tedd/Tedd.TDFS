@@ -7,7 +7,7 @@ namespace Tedd.Tdfs;
 /// File operations of a volume (thread-safe). Whole-file helpers are atomic and durable on return and preserve inode
 /// identity; when <see cref="IsTransactionBound"/> they stage into the transaction and return <see cref="CommitToken.None"/>.
 /// </summary>
-public sealed class DfsFileClient
+public sealed partial class DfsFileClient
 {
     internal DfsFileClient(DfsVolume volume, bool isReadOnly = false, DfsTransaction? transaction = null)
     {
@@ -248,7 +248,10 @@ public sealed class DfsFileClient
     public CommitToken SetStoragePolicy(string path, string policyName) =>
         SyncBridge.Run(() => SetStoragePolicyAsync(path, policyName, CancellationToken.None));
 
-    /// <summary>Changes the inode access flags (owner or administrators only).</summary>
+    /// <summary>
+    /// Changes the inode access flags (owner or administrators only); a shortcut for
+    /// <see cref="SetAccessControlAsync"/> with <see cref="DfsSecurityDescriptor.FromAccessFlags"/>.
+    /// </summary>
     public Task<CommitToken> SetAccessAsync(string path, DfsInodeAccess access, CancellationToken ct = default) =>
         throw new NotImplementedException("DfsFileClient.SetAccessAsync: implemented in a later phase");
 

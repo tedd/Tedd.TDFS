@@ -15,7 +15,9 @@ namespace Tedd.Tdfs;
 /// Every other code maps to <see cref="DfsException"/> or one of its typed subclasses. For <c>TransactionConflict</c>
 /// and <c>TransactionAborted</c> the supplied operation id (if any) also becomes the exception's transaction id;
 /// <see cref="Protocol.Messages.ErrorReplyMessage.ToException"/> overrides it with the transported transaction id.
-/// <c>None</c> and codes unknown to this version map to a plain <see cref="DfsException"/> carrying the exact code.
+/// <c>None</c> and codes unknown to this version map to a plain <see cref="DfsException"/> carrying the exact code, as do
+/// the Addendum A codes <c>PoolNotFound</c>, <c>PoolInUse</c>, <c>GroupNotFound</c> and <c>PrincipalNotFound</c> (not
+/// retryable).
 /// </remarks>
 public static class DfsErrors
 {
@@ -156,6 +158,8 @@ public static class DfsErrors
             DfsErrorCode.AdapterFailed => new DfsSnapshotAdapterException(message),
             DfsErrorCode.RetentionProtected => new DfsRetentionProtectedException(message),
             DfsErrorCode.BackupNotReached => new DfsBackupNotReachedException(message),
+            DfsErrorCode.PoolNotFound or DfsErrorCode.PoolInUse or DfsErrorCode.GroupNotFound or
+            DfsErrorCode.PrincipalNotFound => new DfsException(code, message),
             // None, Internal, NotADirectory, IsADirectory, SnapshotNotFound, BackupTargetNotFound, StaleIncarnation,
             // InvalidPolicy, InvalidHandle, VolumeNotFound and codes unknown to this version keep their exact code.
             _ => new DfsException(code, message),

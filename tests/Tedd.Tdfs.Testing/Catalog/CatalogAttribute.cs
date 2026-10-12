@@ -3,10 +3,10 @@ using Xunit.v3;
 namespace Tedd.Tdfs.Testing;
 
 /// <summary>
-/// Links a test method to its test-plan catalog row and emits xunit traits: <c>TestId</c>, <c>Suite</c> (the id prefix
-/// before '-'), <c>Level</c> and one <c>Invariant</c> trait per invariant.
+/// Links a test method to its catalog row (test plan, or FSD Addendum A suites ACL/POOL/ADS) and emits xunit traits:
+/// <c>TestId</c>, <c>Suite</c> (the id prefix before '-'), <c>Level</c> and one <c>Invariant</c> trait per invariant.
 /// </summary>
-/// <example><c>[Fact, Catalog("OPEN-001", "U", "INV-02", "INV-07")]</c></example>
+/// <example><c>[Fact, Catalog("OPEN-001", "U", "INV-02", "INV-07")]</c>, <c>[Fact, Catalog("ACL-004", "U", "INV-12")]</c></example>
 [AttributeUsage(AttributeTargets.Method)]
 public sealed class CatalogAttribute : Attribute, ITraitAttribute
 {

@@ -127,6 +127,7 @@ public static class DfsPath
 Rules: absolute; `/` separator only; root `/`; no empty components, no trailing slash except root, no `.`/`..`,
 no NUL, no backslash, no unpaired surrogates; NFC normalisation; component ≤ 255 UTF-8 bytes and full path ≤ 4096
 UTF-8 bytes **after** normalisation; ordinal, case-sensitive; percent sequences are literal characters.
+Since Addendum A, `:` is reserved for alternate-data-stream syntax in the final component (`name:stream`); see §H.1.
 
 ### A.4 Policies, topology, capabilities
 
@@ -1565,83 +1566,166 @@ public IReadOnlyList<string> AllPaths(); public int Count { get; } public long L
 ### H.1 Core (namespace `Tedd.Tdfs`)
 
 ```csharp
-[Flags] public enum DfsFileSystemRights   // NTFS values
+[Flags] public enum DfsFileSystemRights   // exactly System.Security.AccessControl.FileSystemRights (names and values)
 {
     ReadData = 0x1, ListDirectory = 0x1, WriteData = 0x2, CreateFiles = 0x2, AppendData = 0x4, CreateDirectories = 0x4,
     ReadExtendedAttributes = 0x8, WriteExtendedAttributes = 0x10, ExecuteFile = 0x20, Traverse = 0x20,
     DeleteSubdirectoriesAndFiles = 0x40, ReadAttributes = 0x80, WriteAttributes = 0x100, Delete = 0x10000,
     ReadPermissions = 0x20000, ChangePermissions = 0x40000, TakeOwnership = 0x80000, Synchronize = 0x100000,
-    Read = ReadData | ReadExtendedAttributes | ReadAttributes | ReadPermissions | Synchronize,           // 0x120089
-    Write = WriteData | AppendData | WriteExtendedAttributes | WriteAttributes | Synchronize,            // 0x100116
-    ReadAndExecute = Read | ExecuteFile,                                                                // 0x1200A9
-    Modify = ReadAndExecute | Write | Delete,                                                           // 0x1301BF
-    FullControl = 0x1F01FF
-}
-public enum DfsAccessControlType { Allow = 0, Deny = 1 }
-[Flags] public enum DfsInheritanceFlags { None = 0, ContainerInherit = 1, ObjectInherit = 2 }
-[Flags] public enum DfsPropagationFlags { None = 0, NoPropagateInherit = 1, InheritOnly = 2 }
+    Read = ReadData | ReadExtendedAttributes | ReadAttributes | ReadPermissions,                         // 0x20089
+    Write = WriteData | AppendData | WriteExtendedAttributes | WriteAttributes,                          // 0x116
+    ReadAndExecute = Read | ExecuteFile,                                                                // 0x200A9
+    Modify = ReadAndExecute | Write | Delete,                                                           // 0x301BF
+    FullControl = Modify | DeleteSubdirectoriesAndFiles | ChangePermissions | TakeOwnership | Synchronize // 0x1F01FF (every defined bit)
+}   // as in .NET, only FullControl includes Synchronize
+public enum DfsAccessControlType { Allow = 0, Deny = 1 }                                       // = AccessControlType
+[Flags] public enum DfsInheritanceFlags { None = 0, ContainerInherit = 1, ObjectInherit = 2 }  // = InheritanceFlags
+[Flags] public enum DfsPropagationFlags { None = 0, NoPropagateInherit = 1, InheritOnly = 2 }  // = PropagationFlags
 public enum DfsIdentityKind { User, Group, WellKnown }
-public readonly record struct DfsIdentity(DfsIdentityKind Kind, string Name)
+public readonly record struct DfsIdentity(DfsIdentityKind Kind, string Name)   // the constructor validates
 {
+    public const string UserPrefix = "user:", GroupPrefix = "group:";
+    public const int MaxNameBytes = 255;
+    public const string EveryoneName = "Everyone", AuthenticatedUsersName = "AuthenticatedUsers",
+        AdministratorsName = "Administrators", CreatorOwnerName = "CreatorOwner";
     public static DfsIdentity Everyone { get; } public static DfsIdentity AuthenticatedUsers { get; }
     public static DfsIdentity Administrators { get; } public static DfsIdentity CreatorOwner { get; }
-    public static DfsIdentity User(string name); public static DfsIdentity Group(string name);
-    public static DfsIdentity Parse(string s);  public static bool TryParse(string? s, out DfsIdentity id);
+    public static DfsIdentity User(string name); public static DfsIdentity Group(string name);   // ArgumentException for invalid names
+    public static DfsIdentity Parse(string s);  public static bool TryParse(string? s, out DfsIdentity id);   // Parse: FormatException
+    public static bool IsValidName(string? name);
+    public bool IsDefault { get; }              // default(DfsIdentity) is not a valid identity (Name == null)
+    public bool IsWellKnown { get; }
     public override string ToString();          // "user:alice", "group:eng", "Everyone", "AuthenticatedUsers", "Administrators", "CreatorOwner"
 }
 public sealed record DfsAccessRule(DfsIdentity Identity, DfsFileSystemRights Rights, DfsAccessControlType Type = DfsAccessControlType.Allow,
     DfsInheritanceFlags Inheritance = DfsInheritanceFlags.None, DfsPropagationFlags Propagation = DfsPropagationFlags.None)
 {
-    public bool IsInherited { get; init; }          // set only in returned descriptors
-    public string? InheritedFrom { get; init; }     // path of the ancestor the ACE was inherited from
+    public const DfsFileSystemRights AllRights = DfsFileSystemRights.FullControl;
+    public bool IsInherited { get; init; }          // set only in returned descriptors; ignored when storing
+    public string? InheritedFrom { get; init; }     // path of the ancestor the ACE was inherited from (when known)
+    public bool IsInheritable { get; }              // Inheritance != None
+    public bool AppliesToObject { get; }            // !InheritOnly
+    public void Validate(); public string? GetValidationError();   // explicit-entry rules (see below)
+    public static string FormatRights(DfsFileSystemRights rights); // "Read|Write", "WriteData" (Enum.ToString may print aliases)
 }
 public sealed record DfsSecurityDescriptor(DfsIdentity Owner, IReadOnlyList<DfsAccessRule> Rules, bool AreAccessRulesProtected = false)
 {
-    public static DfsSecurityDescriptor DefaultRoot(DfsIdentity owner);   // Everyone FullControl CI|OI
+    public static DfsSecurityDescriptor DefaultRoot(DfsIdentity owner);   // Everyone FullControl CI|OI, not protected
+    public static DfsSecurityDescriptor FromAccessFlags(DfsIdentity owner, bool ownerOnly, bool readOnlyForOthers); // DfsInodeAccess mapping (H.2)
+    public IReadOnlyList<DfsAccessRule> ExplicitRules { get; }
+    public DfsSecurityDescriptor WithoutInheritedRules();
     public void Validate();                                               // ArgumentException for invalid flags/identities
+    public string? GetValidationError();
+    // Equality: Owner, protection flag and Rules element-wise (order-sensitive). Rules are copied on construction/init.
 }
 public static class DfsAccessEvaluator   // the single production implementation of ACL-03/ACL-04 (pure, deterministic)
 {
-    // chain: descriptor of the target first, then each ancestor's descriptor up to the root (nearest first).
+    public const DfsFileSystemRights OwnerImplicitRights = ReadPermissions | ChangePermissions;
+    public const DfsFileSystemRights AdministratorImplicitRights = TakeOwnership | ChangePermissions;
+    // chain: descriptor of the target first, then each ancestor's descriptor towards the root (nearest first); it may stop
+    // early at a protected descriptor. Inherited entries inside the chain's descriptors are ignored.
     public static IReadOnlyList<DfsAccessRule> EffectiveRules(IReadOnlyList<DfsSecurityDescriptor> chainNearestFirst, bool targetIsDirectory, DfsIdentity targetOwner);
+    public static IReadOnlyList<DfsAccessRule> EffectiveRules(IReadOnlyList<DfsSecurityDescriptor> chainNearestFirst, bool targetIsDirectory, DfsIdentity targetOwner, string? targetPath); // + InheritedFrom
     public static DfsFileSystemRights GrantedRights(IReadOnlyList<DfsAccessRule> effectiveRules, DfsIdentity owner, IReadOnlySet<DfsIdentity> callerIdentities, bool callerIsAdministrator);
     public static bool IsGranted(IReadOnlyList<DfsAccessRule> effectiveRules, DfsIdentity owner, IReadOnlySet<DfsIdentity> callerIdentities, bool callerIsAdministrator, DfsFileSystemRights requested);
+    public static IReadOnlySet<DfsIdentity> CallerIdentities(string principal, IEnumerable<string> groups, bool isClusterAdmin); // user:p, groups, Everyone, AuthenticatedUsers, Administrators if admin
 }
 public static class DfsStreamPath
 {
     public const string DataType = "$DATA";
     public const int MaxStreamsPerInode = 1024;
-    // Normalized paths may end in ":stream". Splits "/a/f:s" -> ("/a/f", "s"); "/a/f" -> ("/a/f", null).
+    public const string DefaultStreamName = "";      // key of the default stream in stream maps
+    // Normalized paths may end in ":stream". Splits "/a/f:s" -> ("/a/f", "s"); "/a/f" -> ("/a/f", null). Inputs must be normalized.
     public static (string FilePath, string? StreamName) Split(string normalizedPath);
-    public static string Combine(string normalizedFilePath, string? streamName);
+    public static string Combine(string normalizedFilePath, string? streamName);   // null/"" -> the file path itself
     public static bool HasStream(string normalizedPath);
+    public static string GetFilePath(string normalizedPath); public static string? GetStreamName(string normalizedPath);
+    public static string NormalizeStreamName(string streamName);
+    public static bool TryNormalizeStreamName(string? streamName, out string normalized, out string? error);
 }
-// DfsPath.Normalize additionally implements ADS-01 (":$DATA" suffix normalisation, stream rules).
-// DfsErrorCode additions: PoolNotFound = 48, PoolInUse = 49, GroupNotFound = 50, PrincipalNotFound = 51.
 public sealed record DfsStreamInfo(string Name, long Length, ulong Revision);
+public static class DfsPoolNames
+{
+    public const string Default = "default"; public const int MaxLength = 64;
+    public static bool IsValid(string? name); public static void Validate(string name, string paramName = "pool"); public static string? GetError(string name);
+}
+// DfsPath gains: public const char StreamSeparator = ':';  (rules below)
+// DfsStoragePolicy gains: public string? Pool { get; init; }   (H.2; Validate also rejects an invalid pool name with InvalidPolicy)
+// DfsErrorCode additions: PoolNotFound = 48, PoolInUse = 49, GroupNotFound = 50, PrincipalNotFound = 51
+//   (DfsErrors maps each to a plain DfsException carrying the code, not retryable).
 ```
+
+**Identities.** User/group names: non-empty, at most 255 UTF-8 bytes, well-formed UTF-16, no control characters and no
+`:` (so the text form is unambiguous). Names are compared ordinally and are not Unicode-normalized. Prefixes and
+well-known names are case-sensitive (`everyone`, `User:x` are rejected).
+
+**Validation** (`DfsSecurityDescriptor.Validate`, applied to explicit entries only): owner not `default` and not
+`CreatorOwner`; rights non-zero and only defined bits (no generic rights); type defined; only defined flag bits;
+`InheritOnly`/`NoPropagateInherit` require an inheritance flag; `CreatorOwner` only in inheritable entries.
+
+**Inheritance** (`EffectiveRules`, ACL-03, dynamic but equal to a completed NTFS propagation). The ACL of each object is
+its explicit entries in canonical order (Deny before Allow, otherwise stored order) followed by what it inherits from its
+parent's ACL, in the parent's ACL order; a protected object (and the root) inherits nothing. From each parent entry a
+child directory inherits: `ContainerInherit` → the entry (with `NoPropagateInherit`: with no flags, applying to the child
+only; otherwise keeping its inheritance flags with `InheritOnly` cleared); `ObjectInherit` only and no
+`NoPropagateInherit` → `ObjectInherit|InheritOnly` (a template that reaches files at any depth). A child file inherits
+`ObjectInherit` entries with no flags. An applicable inherited `CreatorOwner` entry becomes an entry for the target's
+*current* owner, followed (if still inheritable) by an `InheritOnly` `CreatorOwner` template, as NTFS does; explicit
+`CreatorOwner` entries are never substituted. The result is the full ACL `GetAccessControl` returns (including
+`InheritOnly` entries, which evaluation skips).
+
+**Canonical order** (ACL-04): explicit Deny, explicit Allow, then the inherited entries **generation by generation** —
+all entries inherited from the parent (its Deny before its Allow), then all from the grandparent, and so on. This is the
+NTFS canonical order (an Allow inherited from the parent precedes a Deny inherited from the grandparent); it is how
+"inherited Deny (nearest ancestor first), inherited Allow (nearest first)" in ACL-04 and ACL-006 are implemented.
+
+**Evaluation.** Entries are evaluated in order, skipping `InheritOnly` entries and identities the caller does not hold;
+each right bit is decided by the first matching entry naming it; a request is granted only when every requested bit is
+allowed. Matching: `Everyone` matches every caller; `Administrators` matches when `callerIsAdministrator` or the set
+contains `Administrators`; `CreatorOwner` never matches; anything else must be in `callerIdentities`. The caller is the
+owner when the owner identity matches by the same rules (a group owner makes every member an owner). Implicit rights
+(owner: `ReadPermissions|ChangePermissions`; administrators: `TakeOwnership|ChangePermissions`) are granted before the
+ACL and cannot be denied. `Synchronize` is ignored in requests (`IsGranted(r)` ⇔ `(GrantedRights & r') == r'` with
+`r' = r & ~Synchronize`); `GrantedRights` reports it as the entries decide. `IsGranted` throws `ArgumentException` for a
+request with undefined bits or with no right other than `Synchronize`.
+
+**Stream paths** (`DfsPath.Normalize`, ADS-01). `:` is no longer an ordinary name character (intentional change). It
+may appear only in the final component: `name:stream`, `name:stream:$DATA` (→ `name:stream`), `name::$DATA` (→ `name`).
+Rejected as `InvalidPath`: `:` in any other component; empty file name (`/a/:s`); empty stream name (`/a/f:`); any type
+but `$DATA` (ordinal, case-sensitive: `:$data` is rejected); more separators; a stream on the root (`/:s`, `/::$DATA`);
+stream names starting with `$` (reserved for types, e.g. `f:$I30`); `.`/`..` as file or stream name. File name and stream
+name are each ≤ 255 UTF-8 bytes after NFC; the 4096-byte limit applies to the whole normalized path. Entry names
+(`ValidateComponent`, `NormalizeComponent`) never contain `:`. `Split("/a/f:s")` = `["a", "f:s"]`, `GetName` = `"f:s"`,
+`GetParent("/a/f:s")` = `"/a"`; `Combine(parent, name)` accepts a stream-qualified final name (normalizing `:$DATA`
+suffixes) and rejects a stream parent, so `Combine(GetParent(p), GetName(p)) == p`; `IsAncestorOrSelf("/a/f", "/a/f:s")`
+is true (a file contains its streams), the reverse is false.
+
+**Pool names**: 1..64 ASCII characters `[A-Za-z0-9._-]`, starting with a letter or digit; case-sensitive.
 
 ### H.2 Client
 
 ```csharp
-// DfsFileClient and DfsDirectoryClient (+ sync counterparts)
-public Task<DfsSecurityDescriptor> GetAccessControlAsync(string path, CancellationToken ct = default);           // includes inherited rules (IsInherited = true)
-public Task<CommitToken> SetAccessControlAsync(string path, DfsSecurityDescriptor descriptor, CancellationToken ct = default); // explicit rules only; inherited entries in the input are ignored
+// DfsFileClient and DfsDirectoryClient (now partial; + sync counterparts GetAccessControl, SetAccessControl, SetOwner, GetEffectiveRights)
+public Task<DfsSecurityDescriptor> GetAccessControlAsync(string path, CancellationToken ct = default);           // includes inherited rules (IsInherited = true, InheritedFrom), evaluation order
+public Task<CommitToken> SetAccessControlAsync(string path, DfsSecurityDescriptor descriptor, CancellationToken ct = default); // explicit rules + protection flag only; inherited entries and Owner in the input are ignored
 public Task<CommitToken> SetOwnerAsync(string path, DfsIdentity owner, CancellationToken ct = default);
-public Task<DfsFileSystemRights> GetEffectiveRightsAsync(string path, DfsIdentity? identity = null, CancellationToken ct = default); // null = caller
-// DfsFileClient only
-public Task<IReadOnlyList<DfsStreamInfo>> ListStreamsAsync(string path, CancellationToken ct = default);
-// DfsFileInfo gains: bool IsStream, string? StreamName, int StreamCount (positional record parameters appended at the end with defaults)
-// DfsVolumeSpec gains: string StoragePool = "default"; DfsSecurityDescriptor? RootSecurity; bool EnforceTraverseChecking = false
-// DfsStoragePolicy gains: string? Pool = null (null = the volume's pool)
-// DfsVolumeInfo gains (appended, defaults): string StoragePool, bool EnforceTraverseChecking
-// DfsInodeAccess / SetAccessAsync remain as shortcuts: OwnerOnly -> protected {Owner FullControl, Administrators FullControl};
+public Task<DfsFileSystemRights> GetEffectiveRightsAsync(string path, DfsIdentity? identity = null, CancellationToken ct = default); // null = caller; DfsAccessEvaluator.GrantedRights (volume grants not folded in)
+// DfsFileClient only (+ ListStreams)
+public Task<IReadOnlyList<DfsStreamInfo>> ListStreamsAsync(string path, CancellationToken ct = default);   // named streams of a file or directory, ordinal by name; a stream path is invalid
+// DfsFileInfo gains (appended, defaults): bool IsStream = false, string? StreamName = null, int StreamCount = 0
+//   (for a stream path, Length/Revision/IsInline/IsSparse/ExtentCount describe the addressed stream)
+// DfsVolumeSpec gains: string StoragePool = "default"; DfsSecurityDescriptor? RootSecurity (null = DefaultRoot(creator)); bool EnforceTraverseChecking = false
+// DfsStoragePolicy gains: string? Pool { get; init; } = null (null = the volume's pool)
+// DfsVolumeInfo gains (appended, defaults): string StoragePool = "default", bool EnforceTraverseChecking = false
+// DfsInodeAccess / SetAccessAsync remain as shortcuts (DfsSecurityDescriptor.FromAccessFlags; explicit entries are CI|OI):
+//   OwnerOnly -> protected {Owner FullControl, Administrators FullControl};
 //   ReadOnlyForOthers -> protected {Owner FullControl, Administrators FullControl, Everyone Read}; both false -> unprotected, no explicit rules.
+//   OwnerOnly wins when both are set.
 
 public sealed record DfsGroupInfo(string Name, IReadOnlyList<string> Members);
 public sealed record DfsPoolInfo(string Name, IReadOnlyList<string> Nodes, IReadOnlyList<string> Volumes, long CapacityBytes, long UsedBytes);
 public sealed record DfsPoolStatus(DfsPoolInfo Info, DfsReplicaHealth Replicas, IReadOnlyList<string> DrainingNodes);
-// DfsAdminClient additions
+// DfsAdminClient additions (async-only; ClusterAdmin)
 public Task CreateGroupAsync(string group, CancellationToken ct = default);
 public Task DeleteGroupAsync(string group, CancellationToken ct = default);
 public Task AddGroupMemberAsync(string group, string principal, CancellationToken ct = default);
@@ -1654,17 +1738,28 @@ public Task<IReadOnlyList<DfsPoolInfo>> ListPoolsAsync(CancellationToken ct = de
 public Task<DfsPoolStatus> GetPoolStatusAsync(string pool, CancellationToken ct = default);
 ```
 
-### H.3 Harness
+### H.3 Harness and server inspection
 
 ```csharp
-// TestNodeSpec gains: IReadOnlyList<string>? Pools = null (pools created at bootstrap; "default" always implied)
+// TestNodeSpec gains (appended): IReadOnlyList<string>? Pools = null (pools created at bootstrap from the nodes listing them;
+//   "default" is always implied and must not be listed); IReadOnlyList<string> EffectivePools; bool IsInPool(string pool)
 // TestVolumeSpec gains: string StoragePool = "default"; DfsSecurityDescriptor? RootSecurity; bool EnforceTraverseChecking = false
+//   (ToVolumeSpec maps all three)
+// TestClusterOptions gains: DfsStoragePolicy GetEffectiveDefaultPolicy(string pool) (derived from the pool's nodes);
+//   IReadOnlyList<string> GetPoolNames(); Validate() also checks pool names, that each volume's pool has a node, and RootSecurity
 // TestCluster gains:
 public Task CreateGroupAsync(string group, params string[] members);
 public Task<TestPrincipal> CreateUserAsync(string name, DfsPermissions volumeGrants = DfsPermissions.Read | DfsPermissions.Write, params string[] groups); // grants on every test volume
 // ClusterInspector gains:
 public Task<IReadOnlyList<string>> GetPoolNodesAsync(string pool);
 public Task<IReadOnlySet<ObjectId>> GetStoredObjectsOnNodeAsync(string node, string? volume = null);
-// TestCatalog gains: public static IReadOnlyList<CatalogEntry> Addendum { get; }  // 78 rows parsed from the addendum (embedded resource)
-// FileInspection gains (appended): IReadOnlyList<StreamInspection> Streams; record StreamInspection(string Name, long Length, ulong Revision, IReadOnlyList<ExtentInspection> Extents)
+// TestCatalog gains (embedded resource fsd-addendum-acl-pools-streams.md, section A5):
+public const int AddendumExpectedCount = 78;
+public static IReadOnlyList<CatalogEntry> Addendum { get; }        // 78 rows: ACL 34, POOL 18, ADS 26 (All stays the 586 plan cases)
+public static IReadOnlyList<string> AddendumSuites { get; }        // ["ACL", "POOL", "ADS"]
+public static CatalogEntry? FindAny(string id);                    // plan or addendum; Find(id) still searches the plan only
+public static IReadOnlyList<CatalogEntry> ParseAddendum(string markdown);
+// CatalogAttribute accepts addendum ids unchanged: [Catalog("ACL-004", "U", "INV-12")] -> Suite "ACL"
+// FileInspection gains (appended): IReadOnlyList<StreamInspection> Streams = null! (normalized to empty, never null)
+public sealed record StreamInspection(string Name, long Length, ulong Revision, IReadOnlyList<ExtentInspection> Extents);   // namespace Tedd.Tdfs.Server
 ```

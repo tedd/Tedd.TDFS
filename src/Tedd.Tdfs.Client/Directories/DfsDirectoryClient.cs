@@ -3,7 +3,7 @@ using Tedd.Tdfs.Client.Internal;
 namespace Tedd.Tdfs;
 
 /// <summary>Directory operations of a volume (thread-safe).</summary>
-public sealed class DfsDirectoryClient
+public sealed partial class DfsDirectoryClient
 {
     internal DfsDirectoryClient(DfsVolume volume, bool isReadOnly = false, DfsTransaction? transaction = null)
     {
