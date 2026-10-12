@@ -3,9 +3,9 @@ namespace Tedd.Tdfs.Consensus;
 /// <summary>Static configuration of one <see cref="RaftNode"/>.</summary>
 /// <param name="Self">This node's id.</param>
 /// <param name="ElectionTicksMin">Minimum randomized election timeout, in ticks.</param>
-/// <param name="ElectionTicksMax">Exclusive upper bound of the randomized election timeout, in ticks: the timeout is drawn from
-/// [ElectionTicksMin, ElectionTicksMax) (exactly ElectionTicksMin when both are equal). ElectionTicksMin is also the
-/// CheckQuorum interval and the leader-lease window during which followers ignore vote requests.</param>
+/// <param name="ElectionTicksMax">Maximum randomized election timeout, in ticks (inclusive upper bound of the range): the
+/// timeout is drawn uniformly from [ElectionTicksMin, ElectionTicksMax]. ElectionTicksMin is also the CheckQuorum interval
+/// and the leader-lease window during which followers ignore vote requests.</param>
 /// <param name="HeartbeatTicks">Leader heartbeat interval, in ticks.</param>
 /// <param name="PreVote">Run a PreVote round before incrementing the term.</param>
 /// <param name="CheckQuorum">A leader steps down when it has not heard from a quorum within an election timeout.</param>

@@ -10,14 +10,16 @@ namespace Tedd.Tdfs.Testing;
 /// <remarks>
 /// <para>Time advances in ticks. Each tick, every running node is ticked (in index order) and then messages due at the
 /// current tick are delivered in rounds until none are left. Ready processing follows the RaftNode host contract:
-/// install snapshot, persist hard state and entries, send messages, apply committed entries, advance.</para>
+/// install snapshot, persist hard state and entries, send messages, apply committed entries, advance. With
+/// <see cref="RaftSimulationOptions.DeferReadyProbability"/> hosts may keep a ready outstanding across several events,
+/// so the core is stepped while the host has not handled it yet.</para>
 /// <para>The network is seeded: drops, duplicates and (when enabled) reordering with random delays are drawn from the
 /// seed, so a run replays exactly. Partitions and directional cuts are checked at delivery time; messages to a crashed
 /// node are lost.</para>
 /// <para>Safety oracles run continuously: election safety (one leader per term ever observed), state-machine safety (no
 /// two applications of different entries at one index), leader completeness (a new leader's log holds every entry known
-/// committed before it was elected), commit monotonicity; <see cref="CheckSafety"/> adds pairwise log matching over
-/// the durable logs.</para>
+/// committed before it was elected), commit monotonicity, and agreement of each core's log with its durable log once
+/// the host has handled every ready; <see cref="CheckSafety"/> adds pairwise log matching over the durable logs.</para>
 /// </remarks>
 public sealed partial class RaftSimulation
 {
@@ -25,6 +27,7 @@ public sealed partial class RaftSimulation
     private readonly RaftConfState _bootstrap;
     private readonly IRandomSource _net;
     private readonly IRandomSource _idRandom;
+    private readonly IRandomSource _defer;
     private readonly List<SimHost> _hosts = [];
     private readonly List<Envelope> _inflight = [];
     private readonly HashSet<(int From, int To)> _cuts = [];
@@ -57,6 +60,7 @@ public sealed partial class RaftSimulation
         var root = new SeededRandom(options.Seed);
         _net = root.Fork("raft-sim/net");
         _idRandom = root.Fork("raft-sim/ids");
+        _defer = root.Fork("raft-sim/defer");
 
         int total = options.Voters + options.Learners;
         var ids = new NodeId[total];
@@ -134,6 +138,9 @@ public sealed partial class RaftSimulation
     /// <summary>Simulation events (replay artifact).</summary>
     public IReadOnlyList<string> Trace => _trace;
 
+    /// <summary>Every leader observed so far, by term (host index of the first leader seen in that term).</summary>
+    public IReadOnlyDictionary<ulong, int> LeadersByTerm => _leaderOfTerm;
+
     /// <summary>Messages handed to the network.</summary>
     public long MessagesSent { get; private set; }
 
@@ -145,6 +152,9 @@ public sealed partial class RaftSimulation
 
     /// <summary>Extra copies injected by random duplication.</summary>
     public long MessagesDuplicated { get; private set; }
+
+    /// <summary>Times a host left a taken ready outstanding at an event (see <see cref="RaftSimulationOptions.DeferReadyProbability"/>).</summary>
+    public long ReadiesDeferred { get; private set; }
 
     /// <summary>Highest index known to be committed (applied by any node).</summary>
     public ulong MaxCommittedIndex => _maxAppliedIndex;
@@ -231,6 +241,7 @@ public sealed partial class RaftSimulation
             return;
         h.Up = false;
         h.ArmedCrash = null;
+        h.Pending = null; // a ready the host had not handled yet is lost with the process
         AddTrace($"crash n{node} (term {h.Raft.Term}, role {h.Raft.Role}, durable last {h.Log.LastIndex})");
     }
 

@@ -13,8 +13,9 @@ namespace Tedd.Tdfs.Consensus;
 /// <item>Install <see cref="RaftReady.SnapshotToInstall"/> (restore the state machine from
 /// <see cref="RaftReady.SnapshotData"/> and make the durable log start after the snapshot), persist
 /// <see cref="RaftReady.HardState"/> and append <see cref="RaftReady.EntriesToPersist"/> — replacing every durable entry
-/// at or after the first one's index — all durably (flush barrier). The durable store is the <see cref="IRaftLogView"/>
-/// passed to the constructor, so it must reflect these writes when <see cref="Advance"/> is called.</item>
+/// at or after the first one's index (or, see <see cref="IRaftLogView"/>, keeping a durable suffix that matches them) —
+/// all durably (flush barrier). The durable store is the <see cref="IRaftLogView"/> passed to the constructor, so it
+/// must reflect these writes when <see cref="Advance"/> is called.</item>
 /// <item>Send <see cref="RaftReady.Messages"/> (votes and append acknowledgements depend on step 1).</item>
 /// <item>Apply <see cref="RaftReady.CommittedEntries"/> in order and serve <see cref="RaftReady.ReadStates"/> once the
 /// applied index reaches each read's index.</item>
@@ -219,7 +220,10 @@ public sealed partial class RaftNode
     /// <summary>Target of an in-progress leadership transfer (leader only).</summary>
     public NodeId? LeadTransferee => _leadTransferee;
 
-    /// <summary>True when this node is leader and a configuration change has not been committed yet.</summary>
+    /// <summary>
+    /// True when this node is leader and cannot accept a configuration change yet: a change has not been committed, or the
+    /// leader has not yet committed an entry of its own term (its election no-op).
+    /// </summary>
     public bool HasPendingConfChange => _state == NodeState.Leader && _pendingConfIndex > _log.Committed;
 
     /// <summary>Number of ReadIndex requests waiting for confirmation (leader only).</summary>
@@ -262,7 +266,8 @@ public sealed partial class RaftNode
 
     /// <summary>
     /// Proposes a membership change; false when not leader, a leadership transfer is in progress, another change is not
-    /// yet committed, or the change is not applicable to the current membership (see <see cref="RaftConfState.CanApply"/>).
+    /// yet committed, the leader has not yet committed an entry of its term, or the change is not applicable to the
+    /// current membership (see <see cref="RaftConfState.CanApply"/>).
     /// </summary>
     public bool TryProposeConfChange(RaftConfChange change, out ulong index)
     {
@@ -373,6 +378,7 @@ public sealed partial class RaftNode
         if (ready.HardState is { } hs)
             _prevHardState = hs;
 
+        ulong viewLast = _log.LastIndex;
         if (ready.SnapshotToInstall is { } meta)
         {
             if (_log.Stable.Snapshot.Index < meta.Index)
@@ -386,6 +392,16 @@ public sealed partial class RaftNode
             RaftEntry last = ready.EntriesToPersist[^1];
             VerifyPersisted(last);
             _log.StableTo(last.Index, last.Term);
+        }
+
+        if (_log.LastIndex > viewLast)
+        {
+            // The host kept durable entries beyond what this node had in view (after a snapshot whose last entry it holds
+            // with the same term, or a write whose entries all matched a longer durable suffix). They are part of the log
+            // again, so their configuration changes take effect again, exactly as a restart from this log replays them.
+            List<RaftEntry>? revealed = _log.Slice(viewLast + 1, _log.LastIndex + 1, 0);
+            if (revealed is { Count: > 0 })
+                OnEntriesAppended(viewLast + 1, revealed);
         }
 
         if (ready.CommittedEntries.Count > 0)

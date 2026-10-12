@@ -141,7 +141,8 @@ public sealed class RaftNodeContractTests
         Drain(node, log);
         Assert.Equal(0UL, log.LastIndex);
         Assert.Equal(RaftRole.Follower, node.Role);
-        Assert.True(node.Term <= 3);
+        Assert.Equal(2UL, node.Term); // malformed messages are dropped before their term is adopted
+        Assert.Null(node.Leader);
         Assert.Throws<ArgumentNullException>(() => node.Step(null!));
     }
 

@@ -224,16 +224,23 @@ internal sealed class RaftLog
     /// <summary>Unstable entries to hand to the host for persistence.</summary>
     public RaftEntry[] UnstableEntries() => [.. _unstable];
 
-    /// <summary>Marks entries up to (<paramref name="index"/>, <paramref name="term"/>) as persisted by the host.</summary>
+    /// <summary>
+    /// Marks entries up to (<paramref name="index"/>, <paramref name="term"/>) as persisted by the host. When the unstable
+    /// tail becomes empty, the view continues with whatever the durable log holds after <paramref name="index"/> (a host
+    /// may keep a durable suffix that matches what it was asked to write), so <see cref="LastIndex"/> and
+    /// <see cref="TryTerm"/> always describe the same log.
+    /// </summary>
     public void StableTo(ulong index, ulong term)
     {
+        if (_pendingSnapshot is not null)
+            return; // the snapshot is installed first and may discard durable entries: hand the tail over again after it
         if (index < _offset || _unstable.Count == 0)
             return;
         ulong pos = index - _offset;
         if (pos >= (ulong)_unstable.Count || _unstable[(int)pos].Term != term)
             return; // superseded by a later truncation
         _unstable.RemoveRange(0, (int)pos + 1);
-        _offset = index + 1;
+        _offset = _unstable.Count > 0 ? index + 1 : Math.Max(index, _stable.LastIndex) + 1;
     }
 
     /// <summary>Marks the pending snapshot at <paramref name="index"/> as installed by the host.</summary>

@@ -44,6 +44,61 @@ public sealed class RaftSafetyCampaignTests
         Assert.True(totalCommitted > Seeds * 5, $"the campaign committed too little to be meaningful ({totalCommitted})");
     }
 
+    /// <summary>
+    /// The same fault campaign with membership changes in place of most proposals, so configuration entries routinely
+    /// race leader changes, partitions, crashes and snapshot transfers. (The narrow single-server-change race of a new
+    /// leader appending a change before committing an entry of its term is pinned by a hand-scheduled test in
+    /// <see cref="RaftAdversarialTests"/>; random schedules rarely produce it.)
+    /// </summary>
+    [Theory]
+    [InlineData(3)]
+    [InlineData(4)]
+    public void MembershipChurn_SafetyHolds_AndClusterRecoversAfterHeal(int voters)
+    {
+        var failures = new List<string>();
+        for (ulong seed = FirstSeed; seed < FirstSeed + (ulong)Seeds; seed++)
+        {
+            string? failure = RunCampaign(voters, seed, SafetyMutations.None, requireLiveness: true, out _, membershipChurn: true);
+            if (failure is not null)
+            {
+                failures.Add(failure);
+                if (failures.Count >= 3)
+                    break;
+            }
+        }
+
+        Assert.True(failures.Count == 0, string.Join("\n\n", failures));
+    }
+
+    /// <summary>
+    /// The fault campaign with hosts that handle readies asynchronously: a taken ready is often left outstanding while the
+    /// core keeps stepping messages and ticks (appends, truncations, snapshots and elections land in the next ready).
+    /// Every other seed also churns membership.
+    /// </summary>
+    [Theory]
+    [InlineData(3)]
+    [InlineData(5)]
+    public void AsyncHostReadies_SafetyHolds_AndClusterRecoversAfterHeal(int voters)
+    {
+        var failures = new List<string>();
+        int totalCommitted = 0;
+        for (ulong seed = FirstSeed; seed < FirstSeed + (ulong)Seeds; seed++)
+        {
+            string? failure = RunCampaign(voters, seed, SafetyMutations.None, requireLiveness: true, out int committed,
+                membershipChurn: seed % 2 == 0, deferReadies: 0.35);
+            totalCommitted += committed;
+            if (failure is not null)
+            {
+                failures.Add(failure);
+                if (failures.Count >= 3)
+                    break;
+            }
+        }
+
+        Assert.True(failures.Count == 0, string.Join(Environment.NewLine + Environment.NewLine, failures));
+        Assert.True(totalCommitted > Seeds * 3, $"the campaign committed too little to be meaningful ({totalCommitted})");
+    }
+
     [Fact]
     public void NegativeControl_QuorumFromReachableNodes_ProducesSafetyViolation()
     {
@@ -122,7 +177,8 @@ public sealed class RaftSafetyCampaignTests
     }
 
     /// <summary>Runs one randomized campaign; returns a failure description or null.</summary>
-    private static string? RunCampaign(int voters, ulong seed, SafetyMutations mutations, bool requireLiveness, out int committed)
+    private static string? RunCampaign(int voters, ulong seed, SafetyMutations mutations, bool requireLiveness, out int committed,
+        bool membershipChurn = false, double deferReadies = 0)
     {
         var rnd = new SeededRandom(seed * 7919 + (ulong)voters);
         var options = new RaftSimulationOptions
@@ -138,6 +194,7 @@ public sealed class RaftSafetyCampaignTests
             MaxEntriesPerAppend = 1 + rnd.Next(16),
             MaxInflightAppends = 1 + rnd.Next(8),
             TraceMessages = Environment.GetEnvironmentVariable("TDFS_RAFT_TRACE_MESSAGES") == "1",
+            DeferReadyProbability = deferReadies,
         };
         var sim = new RaftSimulation(options);
         sim.DropProbability(rnd.Next(4) * 0.05);
@@ -153,7 +210,7 @@ public sealed class RaftSafetyCampaignTests
             if (!string.IsNullOrEmpty(dir))
             {
                 Directory.CreateDirectory(dir);
-                File.WriteAllLines(Path.Combine(dir, $"raft-v{voters}-s{seed}-m{(mutations.Any ? 1 : 0)}.log"), [what, .. sim.Trace]);
+                File.WriteAllLines(Path.Combine(dir, $"raft-v{voters}-s{seed}-m{(mutations.Any ? 1 : 0)}-c{(membershipChurn ? 1 : 0)}-d{deferReadies}.log"), [what, .. sim.Trace]);
             }
 
             return $"voters={voters} seed={seed} mutations={mutations.Any}: {what}\n{string.Join("\n", sim.Trace.Skip(Math.Max(0, sim.Trace.Count - 80)))}";
@@ -163,7 +220,10 @@ public sealed class RaftSafetyCampaignTests
         {
             for (int step = 0; step < 60; step++)
             {
-                switch (rnd.Next(16))
+                int action = rnd.Next(16);
+                if (membershipChurn && action is >= 10 and <= 13)
+                    action = 14; // most proposal slots become membership changes
+                switch (action)
                 {
                     case 14:
                     case 15:
@@ -241,12 +301,18 @@ public sealed class RaftSafetyCampaignTests
                     sim.Restart(i);
             }
 
-            // Only current members (per the current leader) must converge; removed nodes stop receiving the log.
+            // Only current members (per the current leader) must converge; removed nodes stop receiving the log. Without
+            // a leader the membership is unknown (a promoted voter may be missing from the bootstrap one): no members.
             int[] Members()
             {
-                RaftConfState conf = sim.LeaderIndex is int ml ? sim.Node(ml).ConfState : sim.BootstrapConf;
+                if (sim.LeaderIndex is not int ml)
+                    return [];
+                RaftConfState conf = sim.Node(ml).ConfState;
                 return [.. conf.Voters.Concat(conf.Learners).Select(sim.IndexOf).Where(i => i >= 0).Order()];
             }
+
+            string State() => string.Join(", ", Enumerable.Range(0, sim.NodeCount).Select(i =>
+                $"n{i}:{sim.Node(i).Role}/t{sim.Node(i).Term}/c{sim.Node(i).CommitIndex}/a{sim.AppliedIndex(i)}")) + $" members [{string.Join(",", Members())}]";
 
             // A proposal accepted by a leader that is deposed before committing it is legitimately lost: retry.
             bool converged = false;
@@ -255,25 +321,30 @@ public sealed class RaftSafetyCampaignTests
                 byte[] marker = Encoding.UTF8.GetBytes($"s{seed}-final{attempt}");
                 if (!sim.TryRunUntil(() => sim.LeaderIndex is int l && sim.Propose(l, marker), 3000))
                     return Fail("no leader accepted a proposal after healing");
-                converged = sim.TryRunUntil(() =>
-                    Members().All(i => sim.AppliedLog(i).Any(e => e.AsSpan().SequenceEqual(marker))), 500);
+                converged = sim.TryRunUntil(() => Members() is { Length: > 0 } m &&
+                    m.All(i => sim.AppliedLog(i).Any(e => e.AsSpan().SequenceEqual(marker))), 500);
             }
 
             if (!converged)
-            {
-                return Fail("nodes did not converge after healing: " +
-                    string.Join(", ", Enumerable.Range(0, sim.NodeCount).Select(i => $"n{i}:{sim.Node(i).Role}/t{sim.Node(i).Term}/c{sim.Node(i).CommitIndex}/a{sim.AppliedIndex(i)}")) +
-                    $" members [{string.Join(",", Members())}]");
-            }
+                return Fail("nodes did not converge after healing: " + State());
 
-            sim.RunTicks(20);
+            // Settle: a stable leader and every member applied exactly up to its commit index.
+            bool settled = sim.TryRunUntil(() => sim.LeaderIndex is int sl && Members() is { Length: > 0 } m &&
+                m.All(i => sim.AppliedIndex(i) == sim.Node(sl).CommitIndex), 1000);
+            if (!settled)
+                return Fail("members did not settle on the leader's commit index: " + State());
             int[] members = Members();
             IReadOnlyList<byte[]> reference = sim.AppliedLog(members[0]);
             foreach (int i in members)
             {
                 IReadOnlyList<byte[]> other = sim.AppliedLog(i);
                 if (other.Count != reference.Count || !other.Zip(reference).All(p => p.First.AsSpan().SequenceEqual(p.Second)))
-                    return Fail($"n{i} applied a different sequence than n{members[0]}");
+                {
+                    static string Show(IReadOnlyList<(ulong Index, byte[] Data)> applied)
+                        => string.Join(" ", applied.Select(e => $"{e.Index}:{Encoding.UTF8.GetString(e.Data)}"));
+                    return Fail($"n{i} applied a different sequence than n{members[0]}:\n  n{members[0]} (applied {sim.AppliedIndex(members[0])}): " +
+                        $"{Show(sim.AppliedEntries(members[0]))}\n  n{i} (applied {sim.AppliedIndex(i)}): {Show(sim.AppliedEntries(i))}");
+                }
             }
 
             committed = reference.Count;

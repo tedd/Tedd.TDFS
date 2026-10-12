@@ -14,6 +14,9 @@ public sealed partial class RaftSimulation
         h.Reads.Clear();
         h.ReadFloors.Clear();
         h.ArmedCrash = null;
+        h.Pending = null;
+        h.Processing = false;
+        h.CompletenessCheckedTerm = 0;
         RaftSnapshotMeta snap = h.Log.Snapshot;
         if (snap.Index > 0)
         {
@@ -64,20 +67,44 @@ public sealed partial class RaftSimulation
         }
     }
 
+    /// <summary>
+    /// Handles the node's readies. With <see cref="RaftSimulationOptions.DeferReadyProbability"/> a taken ready may be
+    /// left outstanding at each of the node's events (message, tick, proposal), so the core keeps stepping any number of
+    /// messages and ticks while the host has not persisted, sent or applied it yet, as an asynchronous host would.
+    /// </summary>
     private void Drive(SimHost h)
     {
-        while (h.Up && h.Raft.HasReady())
+        while (h.Up)
         {
-            RaftReady ready = h.Raft.GetReady();
+            if (h.Pending is null)
+            {
+                if (!h.Raft.HasReady())
+                    break;
+                h.Pending = h.Raft.GetReady();
+            }
+
+            if (_options.DeferReadyProbability > 0 && _defer.NextDouble() < _options.DeferReadyProbability)
+            {
+                ReadiesDeferred++;
+                break; // still outstanding; reconsidered at the node's next event
+            }
+
+            RaftReady ready = h.Pending;
+            h.Pending = null;
+            h.Processing = true;
             if (!ProcessReady(h, ready))
                 return; // crashed while processing
             h.Raft.Advance(ready);
+            h.Processing = false;
             Observe(h);
         }
 
         if (h.Up)
             Observe(h);
     }
+
+    /// <summary>True when the host has handled every ready, so its durable log covers the core's whole log.</summary>
+    private static bool Quiescent(SimHost h) => h.Up && h.Pending is null && !h.Processing && !h.Raft.HasReady();
 
     /// <summary>Handles one ready per the host contract; false when an armed crash interrupted it.</summary>
     private bool ProcessReady(SimHost h, RaftReady ready)
@@ -110,6 +137,10 @@ public sealed partial class RaftSimulation
 
         foreach (RaftMessage m in ready.Messages)
             Send(h, m);
+
+        // The ready's effects are now durable and visible to peers: run the oracles before a crash at the next point can
+        // hide them (a leader that sent its appends and then crashed was still a leader of its term).
+        Observe(h);
 
         if (TryCrashAt(h, RaftCrashPoint.AfterSendBeforeApply))
             return false;
@@ -276,19 +307,37 @@ public sealed partial class RaftSimulation
             h.LastTerm = r.Term;
         }
 
+        // Once the host has handled every ready, the core's log is the durable log: a restart would see exactly what
+        // the running core acts on (votes, acknowledgements and membership derive from it).
+        if (Quiescent(h) && (r.LastIndex != h.Log.LastIndex || r.LastTerm != h.Log.LastTerm) && h.ViewMismatchReported != h.Incarnation)
+        {
+            h.ViewMismatchReported = h.Incarnation;
+            Violation($"n{h.Index} core log ends at {r.LastIndex}/{r.LastTerm} but its durable log ends at {h.Log.LastIndex}/{h.Log.LastTerm}");
+        }
+
         if (r.Role != RaftRole.Leader)
             return;
         if (_leaderOfTerm.TryGetValue(r.Term, out int existing))
         {
             if (existing != h.Index && _splitBrainTerms.Add(r.Term))
                 Violation($"election safety: n{existing} and n{h.Index} are both leader of term {r.Term}");
-            return;
+            if (existing != h.Index)
+                return;
+        }
+        else
+        {
+            _leaderOfTerm[r.Term] = h.Index;
         }
 
-        _leaderOfTerm[r.Term] = h.Index;
+        // Leader completeness is checked against the durable log, so only once the host has persisted everything the
+        // core holds (with deferred readies a new leader's log may still be partly unpersisted). A leader never truncates
+        // its log, so checking later in the term is as strong as checking at election.
+        if (h.CompletenessCheckedTerm == r.Term || !Quiescent(h))
+            return;
+        h.CompletenessCheckedTerm = r.Term;
         string? missing = FindMissingCommitted(h, r.Term);
         if (missing is not null)
-            Violation($"leader completeness: new leader n{h.Index} of term {r.Term} {missing}");
+            Violation($"leader completeness: leader n{h.Index} of term {r.Term} {missing}");
     }
 
     /// <summary>Returns a description of a committed entry missing from the node's log, or null.</summary>
@@ -334,7 +383,8 @@ public sealed partial class RaftSimulation
 
         foreach (SimHost h in _hosts)
         {
-            if (!h.Up || h.Raft.Role != RaftRole.Leader)
+            // A leader whose host still holds a deferred ready may not have persisted its whole log yet.
+            if (!Quiescent(h) || h.Raft.Role != RaftRole.Leader)
                 continue;
             string? missing = FindMissingCommitted(h, h.Raft.Term);
             if (missing is not null)
@@ -469,5 +519,17 @@ public sealed partial class RaftSimulation
         public ulong LastCommit { get; set; }
         public RaftRole LastRole { get; set; }
         public ulong LastTerm { get; set; }
+
+        /// <summary>A ready taken from the core but not handled yet (deferred-ready mode).</summary>
+        public RaftReady? Pending { get; set; }
+
+        /// <summary>True between taking a ready for processing and advancing it.</summary>
+        public bool Processing { get; set; }
+
+        /// <summary>Term whose leadership of this node already passed the leader-completeness check.</summary>
+        public ulong CompletenessCheckedTerm { get; set; }
+
+        /// <summary>Incarnation for which a core/durable log mismatch was already reported (one report per run).</summary>
+        public int ViewMismatchReported { get; set; }
     }
 }

@@ -58,7 +58,7 @@ public sealed class RaftElectionTests
                 Assert.True(ticks < 100);
             }
 
-            Assert.InRange(ticks, 10, 19);
+            Assert.InRange(ticks, 10, 20); // ElectionTicksMax is inclusive
             Drain(node, log);
         }
     }

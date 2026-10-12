@@ -3,16 +3,19 @@ namespace Tedd.Tdfs.Consensus;
 public sealed partial class RaftNode
 {
     /// <summary>
-    /// Processes an inbound message. Malformed messages and messages not addressed to this node are ignored. Messages from
-    /// nodes outside the latest membership are ignored too, except leader-originated replication messages (a lagging node
-    /// must accept the log from a leader it does not know yet) and vote requests while no leader is known.
+    /// Processes an inbound message. Malformed messages and messages not addressed to this node are ignored (before any
+    /// state change, so they cannot raise the term). Messages from nodes outside the latest membership are ignored too,
+    /// except leader-originated replication messages (a lagging node must accept the log from a leader it does not know
+    /// yet), <see cref="TimeoutNow"/> from the leader this node follows (the hand-over of a leader that committed its own
+    /// removal) and vote requests while no leader has been heard from within the minimum election timeout.
     /// </summary>
     /// <remarks>
-    /// Vote requests from non-members are processed when no leader is known because this node's membership may lag
-    /// behind the candidate's (Raft dissertation §4.1: servers vote for candidates outside their configuration); without
-    /// that, a newly promoted voter can be the only electable node yet be ignored by peers that have not seen its
-    /// promotion. While a leader is known they are ignored, so removed servers cannot disrupt a healthy group. Either way
-    /// safety is unaffected: ignoring a message is equivalent to losing it.
+    /// Vote requests from non-members are processed unless a leader was heard from recently because this node's
+    /// membership may lag behind the candidate's (Raft dissertation §4.1: servers vote for candidates outside their
+    /// configuration); without that, a newly promoted voter can be the only electable node yet be ignored by peers that
+    /// have not seen its promotion, and a lagging node that still remembers a departed leader would ignore every candidate
+    /// it does not know. While the leader is live they are ignored, so removed servers cannot disrupt a healthy group
+    /// (§4.2.3). Either way safety is unaffected: ignoring a message is equivalent to losing it.
     /// </remarks>
     public void Step(RaftMessage message)
     {
@@ -20,10 +23,16 @@ public sealed partial class RaftNode
         RaftMessage m = message;
         if (m.To != _self || m.From == _self || m.From.IsEmpty || m.Term == 0)
             return;
+        if (!IsWellFormedMessage(m))
+            return; // validated before any state change: a malformed message must not even raise the term
 
         bool leaderMessage = m is AppendEntries or Heartbeat or InstallSnapshot;
-        if (!leaderMessage && !_conf.Contains(m.From) && !(m is VoteRequest && _lead is null))
-            return; // removed or unknown peers cannot influence a group with a leader or its bookkeeping
+
+        // A leader that committed its own removal hands over with TimeoutNow; by then the target's membership no longer
+        // lists it, so accept TimeoutNow from the leader this node follows even when it is not a member any more.
+        bool fromOwnLeader = m is TimeoutNow && _lead is { } lead && m.From == lead;
+        if (!leaderMessage && !fromOwnLeader && !_conf.Contains(m.From) && !(m is VoteRequest && !HeardFromLeaderRecently))
+            return; // removed or unknown peers cannot influence a group with a live leader or its bookkeeping
 
         if (_reachableQuorum)
             _lastHeard[m.From] = _tickCount;
@@ -81,6 +90,25 @@ public sealed partial class RaftNode
                 break;
         }
     }
+
+    /// <summary>
+    /// True when a leader is known and was heard from within the minimum election timeout (a leader counts itself). Vote
+    /// requests from nodes outside this node's membership are ignored only then (Raft dissertation §4.2.3): a lagging
+    /// node may know neither its new voters nor that its old leader is gone, and if it ignored candidates for as long as
+    /// it remembered a leader, a group that needs its vote could stay leaderless forever (a learner never campaigns, so
+    /// nothing would ever clear that memory).
+    /// </summary>
+    private bool HeardFromLeaderRecently
+        => _lead is not null && (_state == NodeState.Leader || _electionElapsed < _cfg.ElectionTicksMin);
+
+    /// <summary>Structural validation of fields whose violation no correct peer can produce.</summary>
+    private static bool IsWellFormedMessage(RaftMessage m) => m switch
+    {
+        AppendEntries ae => IsWellFormed(ae, ae.Entries ?? []),
+        InstallSnapshot snap => snap.Meta is { ConfState: not null } meta && meta.Term <= snap.Term,
+        VoteRequest vr => vr.LastLogTerm <= vr.Term,
+        _ => true,
+    };
 
     private void HandleVoteRequest(VoteRequest m)
     {
@@ -211,7 +239,11 @@ public sealed partial class RaftNode
         if (_heartbeatElapsed >= _cfg.HeartbeatTicks)
         {
             _heartbeatElapsed = 0;
-            BroadcastHeartbeat(0);
+
+            // Carry the newest pending read round so that a lost confirmation round (heartbeat or response) is retried:
+            // a response to it confirms every request registered before it. Otherwise pending reads would wait forever
+            // for a new ReadIndex call.
+            BroadcastHeartbeat(_readQueue.Count > 0 ? _readQueue[^1].Seq : 0);
         }
     }
 
@@ -308,8 +340,9 @@ public sealed partial class RaftNode
         _pendingConfIndex = 0;
     }
 
+    /// <summary>Draws the election timeout uniformly from [ElectionTicksMin, ElectionTicksMax] (both inclusive).</summary>
     private void ResetRandomizedElectionTimeout()
-        => _randomizedElectionTimeout = _cfg.ElectionTicksMin + _random.Next(_cfg.ElectionTicksMax - _cfg.ElectionTicksMin);
+        => _randomizedElectionTimeout = _cfg.ElectionTicksMin + _random.Next(_cfg.ElectionTicksMax - _cfg.ElectionTicksMin + 1);
 
     private void BecomeFollower(ulong term, NodeId? lead)
     {
@@ -351,9 +384,13 @@ public sealed partial class RaftNode
                 _progress[id] = new RaftProgress(id, next, _cfg.MaxInflightAppends, recentActive: false);
         }
 
-        // Conservatively treat any configuration entry in the uncommitted tail as pending: no new change until all
-        // entries up to here are committed.
-        _pendingConfIndex = _log.LastIndex;
+        // A configuration takes effect when appended, so this leader may append a change only after an entry of its own
+        // term has been committed under the configuration it inherited (the fix for the single-server membership change
+        // bug, Ongaro, raft-dev 2015). Otherwise a leader that inherits a fully committed log could append and commit a
+        // change with a quorum of the new configuration while an older leader's uncommitted change elects a rival leader
+        // with a quorum of its configuration, and both commit different entries at the same index. Treating the no-op as
+        // the pending change also covers any configuration entry in the uncommitted tail.
+        _pendingConfIndex = _log.LastIndex + 1;
         AppendLeaderEntry(RaftEntryKind.Noop, ReadOnlyMemory<byte>.Empty);
     }
 

@@ -4,9 +4,8 @@ public sealed partial class RaftNode
 {
     private void HandleAppendEntries(AppendEntries m)
     {
-        IReadOnlyList<RaftEntry> entries = m.Entries ?? [];
-        if (!IsWellFormed(m, entries))
-            return;
+        IReadOnlyList<RaftEntry> entries = m.Entries ?? []; // structure already validated by Step (IsWellFormedMessage)
+        DropStaleIncomingSnapshot();
 
         if (m.PrevLogIndex < _log.Committed)
         {
@@ -92,7 +91,9 @@ public sealed partial class RaftNode
 
         if (meta.Index <= _log.Committed)
         {
-            _incoming = null;
+            // Stale (or duplicate) chunk of a snapshot we already cover. Only drop the assembly buffer when it is stale
+            // too: a delayed chunk of an older snapshot must not abort the transfer of a newer one.
+            DropStaleIncomingSnapshot();
             Send(new AppendResponse(_self, m.From, _term, Reject: false, MatchIndex: _log.Committed, RejectHint: 0));
             return;
         }
@@ -141,6 +142,13 @@ public sealed partial class RaftNode
             Send(new AppendResponse(_self, m.From, _term, Reject: false, MatchIndex: _log.LastIndex, RejectHint: 0));
         else
             Send(new AppendResponse(_self, m.From, _term, Reject: false, MatchIndex: _log.Committed, RejectHint: 0));
+    }
+
+    /// <summary>Releases a partially received snapshot that the commit index has overtaken (it can never be installed).</summary>
+    private void DropStaleIncomingSnapshot()
+    {
+        if (_incoming is not null && _incoming.Meta.Index <= _log.Committed)
+            _incoming = null;
     }
 
     private void RejectSnapshot(InstallSnapshot m, long nextOffset)

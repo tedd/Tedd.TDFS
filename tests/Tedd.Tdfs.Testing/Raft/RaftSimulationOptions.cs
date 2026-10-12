@@ -20,7 +20,7 @@ public sealed record RaftSimulationOptions
     /// <summary>Lower bound of the randomized election timeout (ticks).</summary>
     public int ElectionTicksMin { get; init; } = 10;
 
-    /// <summary>Exclusive upper bound of the randomized election timeout (ticks).</summary>
+    /// <summary>Upper bound (inclusive) of the randomized election timeout (ticks).</summary>
     public int ElectionTicksMax { get; init; } = 20;
 
     /// <summary>Leader heartbeat interval (ticks).</summary>
@@ -49,6 +49,13 @@ public sealed record RaftSimulationOptions
     /// <summary>Maximum extra delivery delay (ticks) applied to messages while reordering is enabled.</summary>
     public int MaxReorderDelayTicks { get; init; } = 3;
 
+    /// <summary>
+    /// Probability, at each of a node's events (message, tick, proposal), that its host leaves the ready it has taken
+    /// unhandled until a later event, so the core keeps stepping messages and ticks while that ready is outstanding (as an
+    /// asynchronous host does). 0 handles every ready immediately.
+    /// </summary>
+    public double DeferReadyProbability { get; init; }
+
     /// <summary>Record every dropped, duplicated or delivered message in <see cref="RaftSimulation.Trace"/>.</summary>
     public bool TraceMessages { get; init; }
 
@@ -64,6 +71,8 @@ public sealed record RaftSimulationOptions
             throw new ArgumentOutOfRangeException(nameof(Voters), Voters + Learners, "At most 64 nodes are supported.");
         if (SnapshotThreshold < 0)
             throw new ArgumentOutOfRangeException(nameof(SnapshotThreshold), SnapshotThreshold, "Must not be negative.");
+        if (DeferReadyProbability is < 0 or >= 1 || double.IsNaN(DeferReadyProbability))
+            throw new ArgumentOutOfRangeException(nameof(DeferReadyProbability), DeferReadyProbability, "Must be within [0, 1).");
         if (MaxReorderDelayTicks < 0)
             throw new ArgumentOutOfRangeException(nameof(MaxReorderDelayTicks), MaxReorderDelayTicks, "Must not be negative.");
         if (Mutations is null)

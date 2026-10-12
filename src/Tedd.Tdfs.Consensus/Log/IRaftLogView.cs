@@ -11,7 +11,10 @@ namespace Tedd.Tdfs.Consensus;
 /// <item>When handling a <see cref="RaftReady"/>, append <see cref="RaftReady.EntriesToPersist"/> by discarding every
 /// entry at or after the first one's index, and install <see cref="RaftReady.SnapshotToInstall"/> by dropping the
 /// entries it covers (all of them when the snapshot's last entry is not held with the same term); both must be visible
-/// through this view before <see cref="RaftNode.Advance"/> is called.</item>
+/// through this view before <see cref="RaftNode.Advance"/> is called. A store that instead follows the paper's rule
+/// (skip entries already held with the same term, truncate only at the first conflict, as <see cref="InMemoryRaftLog"/>
+/// does) is supported too: when such a write leaves a longer durable suffix, the node adopts it on
+/// <see cref="RaftNode.Advance"/>, exactly as a restart from that log would.</item>
 /// <item>The host may compact on its own (replace a prefix with a snapshot) only up to the node's applied index, with
 /// the membership in effect at that index (the host tracks it by applying committed configuration entries), and must
 /// be able to serve that snapshot's payload through <see cref="IRaftSnapshotSource"/>.</item>
