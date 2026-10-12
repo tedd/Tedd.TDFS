@@ -36,3 +36,10 @@ Distributed filesystem with a .NET client SDK. Requirements: `docs/spec/distribu
   `DfsBackupCheckpoint`) live in Core (namespace `Tedd.Tdfs`).
 - `MessageCodec` registrations go in `src/Tedd.Tdfs.Core/Protocol/MessageCodec.Registrations.cs`; message records
   implement `IWireMessage<TSelf>`.
+- Simulation (`Tedd.Tdfs.Testing.Simulation`): the runtime only inlines `ConfigureAwait(false)` continuations when the
+  completing thread has **no custom `SynchronizationContext`**; completing a TCS (or cancelling a CTS) inside a node-loop
+  or client-context work item queues SDK-style continuations to the thread pool, which `SimScheduler` reports as a
+  violation. Complete such tasks via `SimScheduler.CompleteWithoutContext(...)` (the sim's own loops/network already do).
+  Inside the sim never block on simulated work (`.Result`, `Wait()`, SDK sync wrappers): the single sim thread deadlocks.
+- `TimeProvider` subclasses: `System.X` resolves to the inherited `TimeProvider.System` property — add `using` directives
+  instead of fully qualified `System.` names.
