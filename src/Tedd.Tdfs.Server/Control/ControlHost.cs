@@ -17,10 +17,13 @@ internal sealed class ControlHost
     public const string Directory = "control";
 
     private const int MaxPendingAudits = 64;
+    private const int AuditBurst = 20;
 
     private readonly NodeServices _s;
     private readonly Queue<AppendAuditCommand> _pendingAudits = new();
     private bool _auditing;
+    private double _auditTokens = AuditBurst;
+    private long _auditRefilled;
 
     public ControlHost(NodeServices services)
     {
@@ -157,11 +160,24 @@ internal sealed class ControlHost
     /// </summary>
     public void ReportSecurityEvent(string operation, string outcome, string scope, string principal = "-")
     {
-        if (!IsLeader || _pendingAudits.Count >= MaxPendingAudits)
+        if (!IsLeader || _pendingAudits.Count >= MaxPendingAudits || !TakeAuditToken())
             return;
         _pendingAudits.Enqueue(new AppendAuditCommand(NewHeader(default, string.IsNullOrEmpty(principal) ? "-" : principal), operation, outcome, scope));
         if (!_auditing)
             _ = DrainAuditsAsync();
+    }
+
+    /// <summary>Token bucket (20 events burst, 10 per second) so floods of failed handshakes cannot flood the log.</summary>
+    private bool TakeAuditToken()
+    {
+        long now = _s.Time.GetTimestamp();
+        if (_auditRefilled != 0)
+            _auditTokens = Math.Min(AuditBurst, _auditTokens + (_s.Time.GetElapsedTime(_auditRefilled, now).TotalSeconds * 10));
+        _auditRefilled = now;
+        if (_auditTokens < 1)
+            return false;
+        _auditTokens--;
+        return true;
     }
 
     private async Task DrainAuditsAsync()

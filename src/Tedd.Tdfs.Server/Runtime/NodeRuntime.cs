@@ -16,7 +16,7 @@ namespace Tedd.Tdfs.Server.Runtime;
 /// Loop-side composition of a live node: start-up (superblock, incarnation bump before serving, keys, object store,
 /// control group, transport), seed join, incarnation registration, background jobs, graceful stop and crash.
 /// </summary>
-internal sealed class NodeRuntime
+internal sealed partial class NodeRuntime
 {
     private const string SuperblockFile = Superblock.DefaultFileName;
 
@@ -143,6 +143,7 @@ internal sealed class NodeRuntime
         s.Metrics.SetStored(s.ObjectStore.ObjectCount, s.ObjectStore.LiveBytes);
         s.Objects = new ObjectService(s, new Capabilities(s.Keys, () => s.ClusterId, s.Time));
         s.Objects.Register(s.Rpc);
+        RegisterFeatureHandlers();
 
         await s.Control.OpenAsync(controlBootstrap, ct);
         s.Volumes.Start();
@@ -193,6 +194,7 @@ internal sealed class NodeRuntime
             return Task.CompletedTask;
         });
         s.Jobs.StartPeriodic("rejoin", tick * 40, RejoinIfNeededAsync, tick * 20);
+        StartFeatureJobs();
     }
 
     // ------------------------------------------------------------------ seed join

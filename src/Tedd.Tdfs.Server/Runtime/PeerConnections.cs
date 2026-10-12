@@ -161,11 +161,11 @@ internal sealed class PeerConnections
             _byNode[peer] = slot;
         }
 
-        if (slot.Connection is not { IsOpen: true } && slot.Connecting is null && ResolveEndpoint(peer) is null
-            && _s.Rpc.FindInbound(peer) is { } inbound)
+        if (slot.Connection is not { IsOpen: true } && slot.Connecting is null && _s.Rpc.FindInbound(peer) is { } inbound
+            && (slot.RetryAfter > _s.Time.GetTimestamp() || ResolveEndpoint(peer) is null))
         {
-            // No endpoint is known locally (for example a learner whose control view is still empty): answer over the
-            // authenticated connection the peer opened to this node.
+            // No endpoint is known locally (a learner whose control view is still empty), or connecting to the known one
+            // keeps failing (a stale endpoint of a restarted peer): use the authenticated connection the peer opened.
             return Task.FromResult(inbound);
         }
 
