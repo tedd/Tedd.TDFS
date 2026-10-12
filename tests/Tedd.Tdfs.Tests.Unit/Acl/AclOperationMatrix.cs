@@ -19,7 +19,7 @@ public enum MatrixOp
     SetAccessControl, DirectorySetAccessControl,
     SetOwnerSelf, DirectorySetOwnerSelf, SetOwnerOther,
     CopyFile,
-    StreamReadAll, StreamOpenRead, StreamWriteAll, StreamOpenWrite, StreamAppend, StreamGetInfo, StreamExists,
+    StreamReadAll, StreamOpenRead, StreamWriteAll, StreamOpenWrite, StreamSetLength, StreamAppend, StreamGetInfo, StreamExists, StreamDelete,
 }
 
 /// <summary>Nodes of a matrix case tree (relative to its case root R).</summary>
@@ -47,12 +47,20 @@ internal enum MNode
 /// <summary>An explicit, non-inheritable Allow entry for the case principal on one node.</summary>
 internal readonly record struct MGrant(MNode Node, DfsFileSystemRights Rights);
 
+/// <summary>An additional explicit entry installed on one node of every tree of a case (exact and lacking alike).</summary>
+internal readonly record struct MExtra(MNode Node, DfsAccessRule Rule);
+
 /// <summary>
 /// One ACL-015 row: the operation, the ACL-05 table rows it needs (all must be allowed), the grant sets that hold
 /// exactly the required rights (alternatives of an OR are separate sets), and grant sets lacking the required right
-/// while holding every other right.
+/// while holding every other right. <paramref name="Extra"/> entries are installed on every tree of the case.
 /// </summary>
-internal sealed record MatrixCase(MatrixOp Op, AclTableRow[] Rows, MGrant[][] Exact, MGrant[][] Lacking, bool ExactIsAdministrator = false);
+internal sealed record MatrixCase(MatrixOp Op, AclTableRow[] Rows, MGrant[][] Exact, MGrant[][] Lacking, bool ExactIsAdministrator = false,
+    MExtra[]? Extra = null)
+{
+    /// <summary>The extra entries (never null).</summary>
+    public MExtra[] Extras => Extra ?? [];
+}
 
 /// <summary>Definitions, execution and effect checks of the ACL-015 operation matrix.</summary>
 internal static class AclOperationMatrix
@@ -153,7 +161,10 @@ internal static class AclOperationMatrix
         Single(MatrixOp.DirectorySetAccessControl, AclTableRow.SetAccessControl, MNode.D, CP),
         Single(MatrixOp.SetOwnerSelf, AclTableRow.SetOwnerSelf, MNode.F, TO),
         Single(MatrixOp.DirectorySetOwnerSelf, AclTableRow.SetOwnerSelf, MNode.D, TO),
-        new(MatrixOp.SetOwnerOther, [AclTableRow.SetOwnerOther], [On()], [On((MNode.F, FC), (MNode.Src, FC))], ExactIsAdministrator: true),
+        // The administrator gets nothing from the file's own entries here: an explicit Deny of TakeOwnership to
+        // Administrators on the file shows that the success comes from the Administrators rule (any owner), not the ACL.
+        new(MatrixOp.SetOwnerOther, [AclTableRow.SetOwnerOther], [On()], [On((MNode.F, FC), (MNode.Src, FC))], ExactIsAdministrator: true,
+            Extra: [new MExtra(MNode.F, Deny(DfsIdentity.Administrators, TO))]),
         new(MatrixOp.CopyFile, [AclTableRow.Copy],
             [On((MNode.F, RD), (MNode.Dst, CF))],
             [On((MNode.F, All(RD)), (MNode.Src, FC), (MNode.Dst, FC)), On((MNode.F, FC), (MNode.Src, FC), (MNode.Dst, All(CF)))]),
@@ -161,9 +172,11 @@ internal static class AclOperationMatrix
         ReadCase(MatrixOp.StreamOpenRead, MNode.F),
         WriteCase(MatrixOp.StreamWriteAll, MNode.F),
         WriteCase(MatrixOp.StreamOpenWrite, MNode.F),
+        WriteCase(MatrixOp.StreamSetLength, MNode.F),
         AppendCase(MatrixOp.StreamAppend, MNode.F),
         InfoCase(MatrixOp.StreamGetInfo, MNode.F),
         InfoCase(MatrixOp.StreamExists, MNode.F),
+        DeleteCase(MatrixOp.StreamDelete, MNode.F),
     ];
 
     public static MatrixCase Get(MatrixOp op) => Cases.Single(c => c.Op == op);
@@ -189,7 +202,10 @@ internal static class AclOperationMatrix
         ["SetOwner"] = [MatrixOp.SetOwnerSelf, MatrixOp.DirectorySetOwnerSelf, MatrixOp.SetOwnerOther],
         ["Copy"] = [MatrixOp.CopyFile],
         ["Named stream operations"] =
-            [MatrixOp.StreamReadAll, MatrixOp.StreamOpenRead, MatrixOp.StreamWriteAll, MatrixOp.StreamOpenWrite, MatrixOp.StreamAppend, MatrixOp.StreamGetInfo, MatrixOp.StreamExists],
+            [
+                MatrixOp.StreamReadAll, MatrixOp.StreamOpenRead, MatrixOp.StreamWriteAll, MatrixOp.StreamOpenWrite, MatrixOp.StreamSetLength,
+                MatrixOp.StreamAppend, MatrixOp.StreamGetInfo, MatrixOp.StreamExists, MatrixOp.StreamDelete,
+            ],
     };
 
     /// <summary>The operation cells of the ACL-05 table, parsed from the embedded addendum.</summary>
@@ -231,8 +247,8 @@ internal static class AclOperationMatrix
         MatrixOp.DeleteDirectory or MatrixOp.MoveDirectory or MatrixOp.DirectoryGetInfo or MatrixOp.DirectoryExists
             or MatrixOp.DirectoryGetAccessControl or MatrixOp.DirectorySetAccessControl or MatrixOp.DirectorySetOwnerSelf => PathOf(root, MNode.D),
         MatrixOp.Enumerate or MatrixOp.ListPage => PathOf(root, MNode.Src),
-        MatrixOp.StreamReadAll or MatrixOp.StreamOpenRead or MatrixOp.StreamWriteAll or MatrixOp.StreamOpenWrite or MatrixOp.StreamAppend
-            or MatrixOp.StreamGetInfo or MatrixOp.StreamExists => PathOf(root, MNode.F) + ":s",
+        MatrixOp.StreamReadAll or MatrixOp.StreamOpenRead or MatrixOp.StreamWriteAll or MatrixOp.StreamOpenWrite or MatrixOp.StreamSetLength
+            or MatrixOp.StreamAppend or MatrixOp.StreamGetInfo or MatrixOp.StreamExists or MatrixOp.StreamDelete => PathOf(root, MNode.F) + ":s",
         _ => PathOf(root, MNode.F),
     };
 
@@ -247,8 +263,11 @@ internal static class AclOperationMatrix
         _ => null,
     };
 
-    /// <summary>Builds the case tree under <paramref name="root"/> (protected: Administrators only) and grants the principal.</summary>
-    public static async Task BuildAsync(AclWorld w, string root, string principal, MGrant[] grants)
+    /// <summary>
+    /// Builds the case tree under <paramref name="root"/> (protected: Administrators only), grants the principal and
+    /// installs the case's extra entries.
+    /// </summary>
+    public static async Task BuildAsync(AclWorld w, string root, string principal, MGrant[] grants, MExtra[] extras)
     {
         await w.MkdirAsync(root);
         await w.ProtectAsync(root);
@@ -259,10 +278,21 @@ internal static class AclOperationMatrix
         await w.MkdirAsync(PathOf(root, MNode.D));
         await w.MkdirAsync(PathOf(root, MNode.Dst));
         await w.MkfileAsync(PathOf(root, MNode.G), ContentB);
-        foreach (IGrouping<MNode, MGrant> byNode in grants.GroupBy(g => g.Node))
+        foreach ((MNode node, DfsAccessRule[] rules) in RulesByNode(principal, grants, extras))
+            await w.SetAclAsync(PathOf(root, node), false, rules);
+    }
+
+    /// <summary>The explicit entries of each granted node: one Allow for the principal (union of its grants) plus extras.</summary>
+    public static IEnumerable<(MNode Node, DfsAccessRule[] Rules)> RulesByNode(string principal, MGrant[] grants, MExtra[] extras)
+    {
+        foreach (MNode node in grants.Select(g => g.Node).Concat(extras.Select(e => e.Node)).Distinct().Order())
         {
-            DfsFileSystemRights rights = byNode.Aggregate((DfsFileSystemRights)0, (acc, g) => acc | g.Rights);
-            await w.SetAclAsync(PathOf(root, byNode.Key), false, Allow(U(principal), rights));
+            var rules = new List<DfsAccessRule>();
+            MGrant[] mine = grants.Where(g => g.Node == node).ToArray();
+            if (mine.Length > 0)
+                rules.Add(Allow(U(principal), mine.Aggregate((DfsFileSystemRights)0, (acc, g) => acc | g.Rights)));
+            rules.AddRange(extras.Where(e => e.Node == node).Select(e => e.Rule));
+            yield return (node, rules.ToArray());
         }
     }
 
@@ -270,10 +300,14 @@ internal static class AclOperationMatrix
     // Execution
     // ------------------------------------------------------------------------------------------------------------
 
-    private static async Task<byte[]> ReadToEndAsync(Stream s)
+    /// <summary>Reads a handle to its end with plain reads (no Length/Position queries, which Stream.CopyToAsync makes).</summary>
+    public static async Task<byte[]> ReadToEndAsync(Stream s)
     {
         using var ms = new MemoryStream();
-        await s.CopyToAsync(ms, Ct);
+        byte[] buffer = new byte[16 * 1024];
+        int n;
+        while ((n = await s.ReadAsync(buffer, Ct)) > 0)
+            ms.Write(buffer, 0, n);
         return ms.ToArray();
     }
 
@@ -352,6 +386,7 @@ internal static class AclOperationMatrix
             case MatrixOp.WriteAllTextExisting:
                 return await v.Files.WriteAllTextAsync(target, "omega\n", null, Ct);
             case MatrixOp.SetLength:
+            case MatrixOp.StreamSetLength:
             {
                 await using (DfsStream s = await v.Files.OpenAsync(target, FileMode.Open, FileAccess.Write, FileShare.Read, Ct))
                     await s.SetLengthAsync(1234, Ct);
@@ -380,6 +415,7 @@ internal static class AclOperationMatrix
             case MatrixOp.CreateDirectory:
                 return await v.Directories.CreateDirectoryAsync(target, Ct);
             case MatrixOp.DeleteFile:
+            case MatrixOp.StreamDelete:
                 return await v.Files.DeleteAsync(target, Ct);
             case MatrixOp.DeleteDirectory:
                 return await v.Directories.DeleteAsync(target, false, Ct);
@@ -499,6 +535,10 @@ internal static class AclOperationMatrix
             case MatrixOp.SetLength:
                 await AssertBytesAsync(ContentA[..1234], admin.Files.ReadAllBytesAsync(target, Ct), because);
                 break;
+            case MatrixOp.StreamSetLength:
+                await AssertBytesAsync(StreamS[..1234], admin.Files.ReadAllBytesAsync(target, Ct), because);
+                await AssertBytesAsync(ContentA, admin.Files.ReadAllBytesAsync(fPath, Ct), "default stream unchanged");
+                break;
             case MatrixOp.AppendOpen:
             case MatrixOp.AppendAllBytes:
                 await AssertBytesAsync([.. ContentA, .. Suffix], admin.Files.ReadAllBytesAsync(target, Ct), because);
@@ -528,6 +568,16 @@ internal static class AclOperationMatrix
                 Assert.False(await admin.Directories.ExistsAsync(target, Ct), because);
                 w.Ref.Remove(target);
                 break;
+            case MatrixOp.StreamDelete:
+            {
+                // Only the stream goes; the file (same inode, same default stream) stays, so the reference is unchanged.
+                Assert.False(await admin.Files.ExistsAsync(target, Ct), because + ": stream still present");
+                Assert.Equal(before[fPath], (await admin.Files.GetInfoAsync(fPath, Ct)).InodeId);
+                await AssertBytesAsync(ContentA, admin.Files.ReadAllBytesAsync(fPath, Ct), "default stream unchanged");
+                Assert.Empty(await admin.Files.ListStreamsAsync(fPath, Ct));
+                break;
+            }
+
             case MatrixOp.MoveFile:
             case MatrixOp.RenameFile:
             case MatrixOp.MoveFileOverwrite:

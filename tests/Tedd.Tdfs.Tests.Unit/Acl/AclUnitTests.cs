@@ -96,11 +96,17 @@ public sealed class AclUnitTests
             DfsSecurityDescriptor opsRoot = await ops.Client.GetVolume("opsvol").Directories.GetAccessControlAsync("/", Ct);
             Assert.Equal(DfsSecurityDescriptor.DefaultRoot(U("ops")), opsRoot);
 
-            // A volume spec that supplies a root descriptor gets exactly that descriptor.
+            // A volume spec that supplies a root descriptor gets exactly that descriptor (reported in canonical order:
+            // the explicit Deny first, then the Allows in stored order).
             DfsSecurityDescriptor custom = await w.AdminClient.GetVolume("custom").Directories.GetAccessControlAsync("/", Ct);
             Assert.Equal(CustomRoot.Owner, custom.Owner);
             Assert.True(custom.AreAccessRulesProtected);
-            Assert.Equal(NtfsAclReference.Describe(CustomRoot), NtfsAclReference.Describe(custom));
+            Assert.Equal(
+            [
+                "explicit Deny user:mallory FullControl [CIOI]",
+                "explicit Allow Administrators FullControl [CIOI]",
+                "explicit Allow Everyone Read [CIOI]",
+            ], NtfsAclReference.Describe(custom));
         });
 
     // =============================================================================================================
@@ -496,9 +502,8 @@ public sealed class AclUnitTests
                 HandleInspection handle = Assert.Single(await HandlesOfAsync(cluster, Vol, "alice", inode));
                 Assert.Equal(FileAccess.Read, handle.Access);
                 Assert.False(handle.IsWriter);
-                using var ms = new MemoryStream();
-                await reader.CopyToAsync(ms, Ct);
-                AssertEx.BytesEqual(content, ms.ToArray(), "the read-only open");
+                byte[] read = await ReadToEndAsync(reader);
+                AssertEx.BytesEqual(content, read, "the read-only open");
             }
         });
 
@@ -843,7 +848,7 @@ public sealed class AclUnitTests
                     await w.AddAdminUserAsync(user);
                 else
                     await w.AddUserAsync(user);
-                await BuildAsync(w, root, user, c.Exact[i]);
+                await BuildAsync(w, root, user, c.Exact[i], c.Extras);
                 exact.Add((user, root));
             }
 
@@ -851,7 +856,7 @@ public sealed class AclUnitTests
             {
                 string user = "l" + j, root = "/m/l" + j;
                 await w.AddUserAsync(user);
-                await BuildAsync(w, root, user, c.Lacking[j]);
+                await BuildAsync(w, root, user, c.Lacking[j], c.Extras);
                 lacking.Add((user, root));
             }
 
@@ -910,6 +915,7 @@ public sealed class AclUnitTests
         Assert.Equal(rows.Order(StringComparer.Ordinal), TableCoverage.Keys.Order(StringComparer.Ordinal));
         Assert.Equal(Enum.GetValues<MatrixOp>().Order(), Cases.Select(c => c.Op).Order());
         Assert.All(TableCoverage.Values.SelectMany(v => v), op => Assert.Contains(Cases, c => c.Op == op));
+        Assert.All(Enum.GetValues<MatrixOp>(), op => Assert.Contains(TableCoverage.Values, ops => ops.Contains(op)));
 
         foreach (MatrixCase c in Cases)
         {
@@ -931,8 +937,8 @@ public sealed class AclUnitTests
                 reference.AddFile(PathOf(root, MNode.T), AdminId);
                 reference.AddDirectory(PathOf(root, MNode.D), AdminId);
                 reference.AddFile(PathOf(root, MNode.G), AdminId);
-                foreach (IGrouping<MNode, MGrant> g in grants.GroupBy(x => x.Node))
-                    reference.SetExplicit(PathOf(root, g.Key), [Allow(U(user), g.Aggregate((DfsFileSystemRights)0, (a, x) => a | x.Rights))], false);
+                foreach ((MNode node, DfsAccessRule[] rules) in RulesByNode(user, grants, c.Extras))
+                    reference.SetExplicit(PathOf(root, node), rules, false);
             }
 
             for (int i = 0; i < c.Exact.Length; i++)
@@ -1189,6 +1195,7 @@ public sealed class AclUnitTests
             byte[] f = await w.MkfileAsync("/t/allow/f", TestData.Bytes(1901, 5000));
             await w.SetAclAsync("/t/allow/f", false, Allow(carol.Identity, Read));
             await w.MkdirAsync("/t/allow/sub");
+            await w.SetAclAsync("/t/allow/sub", false, Allow(carol.Identity, Read, CIOI));
             byte[] g = await w.MkfileAsync("/t/allow/sub/g", TestData.Bytes(1902, 300));
             InodeId inode = (await w.Admin.Files.GetInfoAsync("/t/allow/f", Ct)).InodeId;
             string[] users = [AdminName, "alice", "carol"];
@@ -1209,9 +1216,14 @@ public sealed class AclUnitTests
 
             await w.Admin.Directories.MoveAsync("/t/allow/sub", "/t/deny/sub", Ct);
             w.Ref.Move("/t/allow/sub", "/t/deny/sub");
+            Assert.False(w.Ref.Can("/t/deny/sub", "alice", DfsFileSystemRights.ListDirectory));
+            Assert.False(w.Ref.Can("/t/deny/sub/g", "alice", DfsFileSystemRights.ReadData));
             await w.AssertReadDecisionAsync("alice", "/t/deny/sub", null);
             await w.AssertReadDecisionAsync("alice", "/t/deny/sub/g", g);
-            Assert.False(w.Ref.Can("/t/deny/sub/g", "alice", DfsFileSystemRights.ReadData));
+            // The directory's explicit entry travels with it and keeps reaching its subtree from the new place.
+            await AssertBytesAsync(g, carol.Volume.Files.ReadAllBytesAsync("/t/deny/sub/g", Ct), "a moved directory's explicit inheritable entry");
+            Assert.Contains((await w.Admin.Directories.GetAccessControlAsync("/t/deny/sub", Ct)).ExplicitRules, r => r.Identity == carol.Identity);
+            await w.CrossCheckAsync(["/t/deny/sub", "/t/deny/sub/g"], users);
 
             await w.Admin.Files.MoveAsync("/t/deny/f", "/t/allow/f2", false, Ct);
             w.Ref.Move("/t/deny/f", "/t/allow/f2");

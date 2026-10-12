@@ -1,5 +1,3 @@
-using System.Security.Cryptography;
-using Tedd.Tdfs.Server;
 using Tedd.Tdfs.Testing;
 
 namespace Tedd.Tdfs.Tests.Simulation.Acl;
@@ -134,23 +132,10 @@ internal static class AclHelpers
         return list;
     }
 
-    public static string Hash(ReadOnlySpan<byte> data) => Convert.ToHexString(SHA256.HashData(data));
-
     /// <summary>Awaits <paramref name="actual"/> and asserts byte equality.</summary>
     public static async Task AssertBytesAsync(byte[] expected, Task<byte[]> actual, string because)
     {
         byte[] got = await actual;
         AssertEx.BytesEqual(expected, got, because);
-    }
-
-    /// <summary>Revision and content hash of a file as the leader's applied state and the admin see it.</summary>
-    public static async Task<string> FileStateAsync(TestCluster cluster, DfsVolume admin, string path)
-    {
-        FileInspection? f = await cluster.Inspect.GetFileAsync(Vol, path);
-        if (f is null)
-            return "<absent>";
-        byte[] bytes = await admin.Files.ReadAllBytesAsync(path, Ct);
-        DfsSecurityDescriptor acl = await admin.Files.GetAccessControlAsync(path, Ct);
-        return $"inode={f.Inode.Value} rev={f.Revision} len={f.Length} sha={Hash(bytes)} {Fingerprint(acl.WithoutInheritedRules())}";
     }
 }

@@ -44,7 +44,7 @@ Used by: ACL-031 (`ACL_031_DirectObjectReadStillNeedsAcl`).
 * `tests/Tedd.Tdfs.Tests.Unit/Acl/AclHelpers.cs` — `AclWorld` keeps a cluster volume and the reference in lockstep and
   cross-checks `GetAccessControl` (owner, protection, every entry in order with flags and `InheritedFrom`) and
   `GetEffectiveRights(path, user:x)` against the reference.
-* `tests/Tedd.Tdfs.Tests.Unit/Acl/AclOperationMatrix.cs` — ACL-015: 46 SDK operations covering every row of the ACL-05
+* `tests/Tedd.Tdfs.Tests.Unit/Acl/AclOperationMatrix.cs` — ACL-015: 48 SDK operations covering every row of the ACL-05
   table (verified against the embedded addendum by `ACL_015_OperationRightMatrix_CoversEveryTableRow`), each with grant
   sets holding exactly the required right (every OR alternative separately) and grant sets holding every right except it.
 
@@ -72,6 +72,12 @@ Where the addendum or API.md leaves room, the tests assume the following:
   CreateDirectories on the destination parent, a file CreateFiles; a rename within one directory needs the create right
   on that directory too. Copy copies all named streams; the copy has no explicit entries, is not protected and is owned
   by the caller. ACL-015, 017, 018.
+* **Named streams** ("the same rights on the owning inode"): reading, writing, `SetLength`, appending, info and existence
+  of `/f:s` need the file's rights for that operation; **deleting `/f:s` needs the delete rights of the file** (Delete on
+  `/f` or DeleteSubdirectoriesAndFiles on its parent, as NTFS checks DELETE on a stream open) — WriteData alone does not
+  delete a stream. ACL-015 (`StreamDelete`, `StreamSetLength`), 032.
+* **Administrators and SetOwner.** An administrator sets any owner even when the file's ACL explicitly denies
+  TakeOwnership to Administrators (the administrator rule, not an ACE, grants it). ACL-014, ACL-015 (`SetOwnerOther`).
 * **Exists/GetInfo** without ReadAttributes on the entry and without ListDirectory on the parent throw
   `UnauthorizedAccessException` (never `false`, never not-found) — also for stream paths and directories. ACL-023.
 * **Enumeration** needs only ListDirectory on the directory; entries (names, kinds, inode ids, lengths) are listed as the
@@ -89,6 +95,12 @@ Where the addendum or API.md leaves room, the tests assume the following:
 * **Fault contexts.** At `rpc.request.accepted` and `raft.before-propose`, opens report `DfsOperationKind.Open`, WriteAll
   `WriteAll`, Append `Append`, transaction commits `TxCommit`, with `Volume` and (for path operations) the normalized
   `Path`. At `rpc.reply.send`, a SetAccessControl reply carries `Volume`, `Path` and its `OperationId`. ACL-026, 027.
+* **Lost replies** (ACL-027): the reply of a SetAccessControl is held at `rpc.reply.send`, another client's change
+  commits, then `TestNetwork.ResetConnections("client:a")` closes the caller's connections before the reply is released,
+  so the reply is lost and the SDK must retry (or resolve through `QueryOperation`) with the same operation id. The test
+  checks this through `TestFaults.Coverage.Hits`: at least two `rpc.request.accepted` hits carry that `OperationId`, so
+  the server fills `FaultContext.OperationId` at that site for every request that has one (a `QueryOperation` carries the
+  queried id).
 * **Idempotent ACL changes.** The SDK retries a SetAccessControl whose reply was lost with the same operation id and
   receives the stored outcome; `QueryOperationAsync(id)` reports `Committed` with the same token; no second application
   (a later change by another client is not overwritten). ACL-027.
@@ -99,7 +111,8 @@ Where the addendum or API.md leaves room, the tests assume the following:
   snapshot's ancestors) and evaluate them with the current group database. Snapshot restore and backup restore
   reproduce the root descriptor, owners, explicit entries (order and flags), protection and named streams; users need a
   fresh volume grant on the restored volume (granted by the test). ACL-029, 030.
-* **Group changes** take effect once applied by the deciding volume leader's control-group replica; ACL-033 waits for that
+* **Group changes** take effect once applied by the deciding volume leader's control-group replica; ACL-029 and ACL-030
+  call `WaitForStableAsync` after membership changes before relying on them; ACL-033 waits for that
   (via `NodeInspector.GetGroupAsync("control")`) before treating a membership as definite. ACL-021 (single node) expects
   the first operation after `AddGroupMemberAsync`/`RemoveGroupMemberAsync` returns to see the change.
 * **Volume creator.** `DfsAdminClient.CreateVolumeAsync` without `RootSecurity` gives the root `DefaultRoot(user:<caller>)`;

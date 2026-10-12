@@ -321,9 +321,10 @@ public sealed class AclSimulationTests
     // =============================================================================================================
 
     /// <summary>
-    /// SetAccessControl's reply is lost after apply; the SDK retries with the same operation id and receives the stored
-    /// outcome without a second effect (a later change by another client is not overwritten); the result survives leader
-    /// failover and a cold restart of every node.
+    /// SetAccessControl's reply is lost after apply (held at reply-send, then the client's connections are reset); the SDK
+    /// retries with the same operation id and receives the stored outcome without a second effect (a later change by
+    /// another client, committed before the retry, is not overwritten); the result survives leader failover and a cold
+    /// restart of every node.
     /// </summary>
     [Fact]
     [Catalog("ACL-027", "S", "INV-06", "INV-08", "INV-12")]
@@ -342,16 +343,22 @@ public sealed class AclSimulationTests
             DfsAccessRule[] d1 = [Allow(alice.Identity, Read)];
             DfsAccessRule[] d2 = [Allow(bob.Identity, Read), Deny(alice.Identity, FC)];
 
+            // a's change is applied; its reply is held at the server while b's later change commits.
             FaultArm arm = cluster.Faults.Arm(new FaultMatch(FaultSites.RpcReplySend, Volume: Vol, PathPrefix: "/t/f"), FaultAction.Block());
             Task<CommitToken> first = va.Files.SetAccessControlAsync("/t/f", new DfsSecurityDescriptor(AdminId, d1), Ct);
             await arm.WaitTriggeredAsync(Wait);
             DfsOperationId opId = arm.Contexts[0].OperationId ?? throw new InvalidOperationException("the reply-send fault context carries no operation id");
             CommitToken t2 = await vb.Files.SetAccessControlAsync("/t/f", new DfsSecurityDescriptor(AdminId, d2), Ct);
-            MessageRule drop = cluster.Network.DropReplies(new MessageFilter(To: "client:a"), 1);
+
+            // Lose the held reply: a's connections are closed while the server still holds it, so it can never arrive and
+            // the SDK has to retry with the same operation id — after b's change, so a re-application would overwrite it.
+            // (A DropReplies rule cannot be used here: it matches requests, and this request was delivered already.)
+            cluster.Network.ResetConnections("client:a");
             arm.Release();
             CommitToken t1 = await first;
-            drop.Cancel();
             cluster.Faults.AssertReached(arm);
+            int sameIdRequests = cluster.Faults.Coverage.Hits.Count(h => h.Site == FaultSites.RpcRequestAccepted && h.OperationId == opId);
+            Assert.True(sameIdRequests >= 2, $"the lost reply must be retried with operation id {opId} (requests seen with it: {sameIdRequests})");
 
             DfsOperationOutcome outcome = await va.QueryOperationAsync(opId, false, Ct);
             Assert.Equal(DfsOutcomeStatus.Committed, outcome.Status);
@@ -477,7 +484,7 @@ public sealed class AclSimulationTests
             int successes = 0;
             async Task ObserveAsync()
             {
-                for (int i = 0; i < 400 && !(committed && successes > 2); i++)
+                for (int i = 0; i < 5000 && !(committed && successes > 2); i++)
                 {
                     try
                     {
@@ -544,6 +551,10 @@ public sealed class AclSimulationTests
             await admin.Files.MoveAsync("/t/d/g", "/t/g2", false, Ct);
             await cluster.Admin.RemoveGroupMemberAsync("eng", "carol", Ct);
             await cluster.Admin.AddGroupMemberAsync("eng", "dave", Ct);
+
+            // Group changes bind decisions once the deciding volume leader has applied them (ACL-08): let every replica
+            // catch up so the snapshot decisions below see the current identity database wherever they are made.
+            await cluster.WaitForStableAsync(Wait, Ct);
 
             await AssertDeniedAsync(() => alice.Volume.Files.ReadAllBytesAsync("/t/d/f", Ct), "live: alice denied after the change");
             await AssertBytesAsync(f, bob.Volume.Files.ReadAllBytesAsync("/t/d/f", Ct), "live: bob allowed after the change");
@@ -625,6 +636,7 @@ public sealed class AclSimulationTests
             await SetAclAsync(admin, "/t/p", true, true, AdminsFull, Allow(dave.Identity, FC, OI, IO), Deny(bob.Identity, DfsFileSystemRights.ListDirectory));
             await admin.Files.SetOwnerAsync("/t/p/x", bob.Identity, Ct);
 
+            await cluster.WaitForStableAsync(Wait, Ct);   // bob's eng membership is applied by every replica before deciding
             var descriptors = new Dictionary<string, string>(StringComparer.Ordinal);
             var decisions = new Dictionary<(string User, string Path), bool>();
             async Task<bool> DecideAsync(SimUser u, DfsVolume v, string path, bool dir) =>
