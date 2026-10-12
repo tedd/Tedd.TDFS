@@ -72,6 +72,10 @@ public static class MessageTypes
         MessageType.CreateDirectory or MessageType.CreateDirectoryResult => DfsOperationKind.CreateDirectory,
         MessageType.SetPolicy or MessageType.SetPolicyResult => DfsOperationKind.PolicyChange,
         MessageType.SetAccess or MessageType.SetAccessResult => DfsOperationKind.Admin,
+        MessageType.GetAccessControl or MessageType.GetAccessControlResult or MessageType.GetEffectiveRights or MessageType.GetEffectiveRightsResult
+            or MessageType.ListStreams or MessageType.ListStreamsResult => DfsOperationKind.GetInfo,
+        MessageType.SetAccessControl or MessageType.SetAccessControlResult or MessageType.SetOwner or MessageType.SetOwnerResult
+            => DfsOperationKind.Admin,
 
         MessageType.TxBegin or MessageType.TxBeginResult => DfsOperationKind.TxBegin,
         MessageType.TxOp or MessageType.TxOpResult => DfsOperationKind.TxOp,

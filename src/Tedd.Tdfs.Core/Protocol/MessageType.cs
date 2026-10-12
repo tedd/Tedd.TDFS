@@ -119,6 +119,29 @@ public enum MessageType : ushort
     /// <summary>Set inode access reply.</summary>
     SetAccessResult = 69,
 
+    // Addendum A: security descriptors and named streams
+
+    /// <summary>Get access control (security descriptor) request.</summary>
+    GetAccessControl = 70,
+    /// <summary>Get access control reply.</summary>
+    GetAccessControlResult = 71,
+    /// <summary>Set access control (explicit entries and protection) request.</summary>
+    SetAccessControl = 72,
+    /// <summary>Set access control reply.</summary>
+    SetAccessControlResult = 73,
+    /// <summary>Set owner request.</summary>
+    SetOwner = 74,
+    /// <summary>Set owner reply.</summary>
+    SetOwnerResult = 75,
+    /// <summary>Get effective rights request.</summary>
+    GetEffectiveRights = 76,
+    /// <summary>Get effective rights reply.</summary>
+    GetEffectiveRightsResult = 77,
+    /// <summary>List named streams request.</summary>
+    ListStreams = 78,
+    /// <summary>List named streams reply.</summary>
+    ListStreamsResult = 79,
+
     // transactions
 
     /// <summary>Transaction begin request.</summary>

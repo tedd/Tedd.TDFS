@@ -118,10 +118,26 @@ internal sealed class ControlHost
         return new ClusterMapData(state.ClusterId, state.ClusterName, state.AppliedIndex, state.PlacementEpoch, nodes, volumes, Leader, BuildCapabilities());
     }
 
-    /// <summary>Map entry of a member as seen from this node.</summary>
+    /// <summary>Map entry of a member as seen from this node (including the named pools it belongs to, Addendum A).</summary>
     public NodeEntry ToNodeEntry(MemberRecord m, RaftConfState conf)
         => new(m.Id, m.Name, m.Labels, m.Endpoints.ToArray(), m.Status, m.Incarnation, false, conf.IsVoter(m.Id), IsReachable(m.Id),
-            m.IsPlacementEligible && m.CapacityBytes - m.UsedBytes > 0, m.CapacityBytes, m.UsedBytes);
+            m.IsPlacementEligible && m.CapacityBytes - m.UsedBytes > 0, m.CapacityBytes, m.UsedBytes)
+        {
+            Pools = PoolsOf(m.Id),
+        };
+
+    /// <summary>Named pools (ordinal) whose member list contains <paramref name="node"/>; <c>default</c> is implicit.</summary>
+    private System.Collections.Immutable.ImmutableSortedSet<string> PoolsOf(NodeId node)
+    {
+        var pools = System.Collections.Immutable.ImmutableSortedSet.CreateBuilder<string>(StringComparer.Ordinal);
+        foreach (PoolRecord pool in State.Pools.Values)
+        {
+            if (pool.Nodes.Contains(node))
+                pools.Add(pool.Name);
+        }
+
+        return pools.ToImmutable();
+    }
 
     /// <summary>Map entry of a volume (leader hint from this node's view when it hosts the group).</summary>
     public VolumeEntry ToVolumeEntry(VolumeRecord v)

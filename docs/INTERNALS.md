@@ -340,16 +340,25 @@ installed/aborted/rejected, verification failures, checkpoints written) for suit
 ## 2. Client (`src/Tedd.Tdfs.Client`)
 
 ```
-Internal/Runtime/   ClientRuntime (options, transport, time, random, faults, mutations), ConnectionPool,
-                    ClientConnection (handshake, reconnect), ClusterMapCache
-Internal/Rpc/       RpcInvoker (leader routing, NotLeader reroute, retries with same op id, deadline, unknown-outcome
-                    classification), RequestFactory
-Internal/Sessions/  VolumeSession (session id, sequence allocator, ack watermark, keepalive timer, handle registry)
-Internal/Data/      DataPlane (object upload to placement targets with fallback and receipts; verified range reads with
-                    replica failover; read capability handling), ChunkPlanner
-Internal/Overlay/   StagedOverlay (sorted ranges of buffered bytes / staged object ranges, truncation watermark)
-Files/              DfsFileClient (+ partials per helper family), Directories/, Streams/DfsStream (+ partials: .Read.cs,
-                    .Write.cs, .Publish.cs, .Lifecycle.cs), Transactions/, Snapshots/, Backups/, Admin/
+Internal/Runtime/   ClientRuntime (options, transport, time, random, faults, mutations, lifecycle: in-flight tracking,
+                    shutdown, Abandon), OperationScope (deadline, caller/kill tokens, F00/F01 hits, classification of
+                    never-transmitted failures), ConnectionPool, ClientConnection (handshake, cluster identity, protocol
+                    version, poisoning of stale connections), ClusterMapCache (map, pools, discovery order), Waits
+                    (TimeProvider delays/waits without sync context), LockedRandom
+Internal/Rpc/       RpcInvoker (routing, NotLeader redirects, retries with the same op id, per-attempt and per-operation
+                    deadlines, unknown-outcome resolution via QueryOperation(resolve)), RpcRequest, Routers (control
+                    leader, any node)
+Internal/Sessions/  VolumeContext (volume binding id/epoch, leader routing via GetVolumeRoute, session open, sequence
+                    blocks, Read/Mutate helpers, keep-alive timer, weak handle/pin registries, helper staging session),
+                    VolumeSession (session id, reserved sequence blocks, ack watermark)
+Internal/Data/      DataPlane (HRW upload with fallback, receipts until the ack policy is met, grace for extra copies;
+                    verified range reads with replica failover and LocateObject; never zero-fill), ContentLayout (chunking
+                    at ChunkSize boundaries, inline-permission from the voters' failure domains), StagingLease
+Internal/Overlay/   StagedOverlay (sorted buffered / uploaded ranges, staged length, truncation point, snapshot/restore)
+Internal/Text/      TextCodec (UTF-8 without BOM by default, BOM detection, incremental line splitting)
+Internal/Facades/   WireConvert (wire records <-> SDK records), SnapshotAdapters (prepare/abort/resume bounded by timeouts)
+Internal/           Validation (paths and options, before any request), AsyncGate, AsyncLock, SyncBridge, ContextFree
+Files/              DfsFileClient (+ .Security.cs), Directories/, Streams/DfsStream, Transactions/, Snapshots/, Backups/, Admin/
 ```
 
 ## 3. Harness (`tests/Tedd.Tdfs.Testing`)

@@ -1,4 +1,6 @@
 using Tedd.Tdfs.Client.Internal;
+using Tedd.Tdfs.Client.Internal.Runtime;
+using Tedd.Tdfs.Protocol.Messages;
 
 namespace Tedd.Tdfs;
 
@@ -6,62 +8,136 @@ namespace Tedd.Tdfs;
 public sealed partial class DfsFileClient
 {
     /// <summary>
-    /// Reads the file's security descriptor: owner, protection flag, explicit entries and the inherited entries
-    /// (<see cref="DfsAccessRule.IsInherited"/> = true, with <see cref="DfsAccessRule.InheritedFrom"/>) in evaluation
-    /// order. Requires ReadPermissions. A stream path reads its file's descriptor.
+    /// Reads the security descriptor of a file (owner, protection, explicit entries, then inherited entries in evaluation
+    /// order). A stream path reads its file's descriptor.
     /// </summary>
     public Task<DfsSecurityDescriptor> GetAccessControlAsync(string path, CancellationToken ct = default) =>
-        throw new NotImplementedException("DfsFileClient.GetAccessControlAsync: implemented in a later phase");
+        SecurityOperations.GetAccessControlAsync(Volume, Begin, Validation.Path, path, Pin, TxId, ct, EnterTransaction);
 
     /// <summary>Synchronous counterpart of <see cref="GetAccessControlAsync"/>.</summary>
     public DfsSecurityDescriptor GetAccessControl(string path) =>
         SyncBridge.Run(() => GetAccessControlAsync(path, CancellationToken.None));
 
     /// <summary>
-    /// Atomically replaces the explicit entries and the protection flag. Inherited entries in
-    /// <paramref name="descriptor"/> are ignored, and so is <see cref="DfsSecurityDescriptor.Owner"/> (use
-    /// <see cref="SetOwnerAsync"/> to change the owner). Requires ChangePermissions. Bumps the inode revision (ACL-07).
+    /// Atomically replaces the explicit entries and protection flag of a file (inherited entries and the owner in
+    /// <paramref name="descriptor"/> are ignored; change the owner with <see cref="SetOwnerAsync"/>).
     /// </summary>
-    /// <exception cref="ArgumentException">The descriptor is invalid (<see cref="DfsSecurityDescriptor.Validate"/>).</exception>
     public Task<CommitToken> SetAccessControlAsync(string path, DfsSecurityDescriptor descriptor, CancellationToken ct = default) =>
-        throw new NotImplementedException("DfsFileClient.SetAccessControlAsync: implemented in a later phase");
+        SecurityOperations.SetAccessControlAsync(Volume, Begin, Validation.Path, path, descriptor, TxId, ct, EnsureWritable, EnterTransaction);
 
     /// <summary>Synchronous counterpart of <see cref="SetAccessControlAsync"/>.</summary>
     public CommitToken SetAccessControl(string path, DfsSecurityDescriptor descriptor) =>
         SyncBridge.Run(() => SetAccessControlAsync(path, descriptor, CancellationToken.None));
 
-    /// <summary>
-    /// Changes the owner: with TakeOwnership the caller may make itself the owner; Administrators may set any owner
-    /// (ACL-05, ACL-014). <see cref="DfsIdentity.CreatorOwner"/> is rejected.
-    /// </summary>
+    /// <summary>Changes the owner of a file (TakeOwnership for oneself, Administrators for any owner).</summary>
     public Task<CommitToken> SetOwnerAsync(string path, DfsIdentity owner, CancellationToken ct = default) =>
-        throw new NotImplementedException("DfsFileClient.SetOwnerAsync: implemented in a later phase");
+        SecurityOperations.SetOwnerAsync(Volume, Begin, Validation.Path, path, owner, TxId, ct, EnsureWritable, EnterTransaction);
 
     /// <summary>Synchronous counterpart of <see cref="SetOwnerAsync"/>.</summary>
     public CommitToken SetOwner(string path, DfsIdentity owner) =>
         SyncBridge.Run(() => SetOwnerAsync(path, owner, CancellationToken.None));
 
-    /// <summary>
-    /// The rights <paramref name="identity"/> (null = the caller) would be granted on the file by
-    /// <see cref="DfsAccessEvaluator"/>, including inherited and group-derived bits (ACL-034). Volume grants are not
-    /// folded in.
-    /// </summary>
+    /// <summary>The rights <paramref name="identity"/> (null = the caller) would be granted on a file.</summary>
     public Task<DfsFileSystemRights> GetEffectiveRightsAsync(string path, DfsIdentity? identity = null, CancellationToken ct = default) =>
-        throw new NotImplementedException("DfsFileClient.GetEffectiveRightsAsync: implemented in a later phase");
+        SecurityOperations.GetEffectiveRightsAsync(Volume, Begin, Validation.Path, path, identity, Pin, TxId, ct, EnterTransaction);
 
     /// <summary>Synchronous counterpart of <see cref="GetEffectiveRightsAsync"/>.</summary>
     public DfsFileSystemRights GetEffectiveRights(string path, DfsIdentity? identity = null) =>
         SyncBridge.Run(() => GetEffectiveRightsAsync(path, identity, CancellationToken.None));
 
-    /// <summary>
-    /// Lists the named streams of a file or directory (not the default stream) with lengths and revisions,
-    /// ordinal-sorted by name (ADS-03, ADS-025). <see cref="FileNotFoundException"/> when the path is absent; a stream
-    /// path is rejected as an invalid path.
-    /// </summary>
-    public Task<IReadOnlyList<DfsStreamInfo>> ListStreamsAsync(string path, CancellationToken ct = default) =>
-        throw new NotImplementedException("DfsFileClient.ListStreamsAsync: implemented in a later phase");
+    /// <summary>Lists the named streams of a file or directory (ordinal by name; the default stream is not listed).</summary>
+    public async Task<IReadOnlyList<DfsStreamInfo>> ListStreamsAsync(string path, CancellationToken ct = default)
+    {
+        using OperationScope scope = Begin(DfsOperationKind.GetInfo, ct);
+        await scope.StartedAsync().ConfigureAwait(false);
+        string p = Validation.Path(path);
+        if (DfsStreamPath.HasStream(p))
+            throw DfsPath.InvalidPath($"'{Validation.Printable(p)}' addresses a stream; list the streams of its file instead.", nameof(path));
+        using DfsTransaction.TransactionOperation? txOperation = EnterTransaction();
+        scope.Path = p;
+        await scope.ValidatedAsync().ConfigureAwait(false);
+        ListStreamsResultMessage result = await Volume.Context.ReadAsync<ListStreamsResultMessage>(scope, "ListStreams",
+            header => new ListStreamsMessage(header, p, Pin), p, TxId, requireSession: Pin != 0 || TxId is not null).ConfigureAwait(false);
+        return result.Streams.Select(s => new DfsStreamInfo(s.Name, s.Length, s.Revision)).ToArray();
+    }
 
     /// <summary>Synchronous counterpart of <see cref="ListStreamsAsync"/>.</summary>
     public IReadOnlyList<DfsStreamInfo> ListStreams(string path) =>
         SyncBridge.Run(() => ListStreamsAsync(path, CancellationToken.None));
+}
+
+/// <summary>Security-descriptor operations shared by the file and directory facades (Addendum A, ACL-02..07).</summary>
+internal static class SecurityOperations
+{
+    public static async Task<DfsSecurityDescriptor> GetAccessControlAsync(DfsVolume volume, Func<DfsOperationKind, CancellationToken, OperationScope> begin,
+        Func<string?, string, string> validate, string path, ulong pin, DfsTransactionId? transaction, CancellationToken ct, Func<IDisposable?> enterTransaction)
+    {
+        using OperationScope scope = begin(DfsOperationKind.GetInfo, ct);
+        await scope.StartedAsync().ConfigureAwait(false);
+        string p = validate(path, nameof(path));
+        using IDisposable? txOperation = enterTransaction();
+        scope.Path = p;
+        await scope.ValidatedAsync().ConfigureAwait(false);
+        GetAccessControlResultMessage result = await volume.Context.ReadAsync<GetAccessControlResultMessage>(scope, "GetAccessControl",
+            header => new GetAccessControlMessage(header, p, pin), p, transaction, requireSession: pin != 0 || transaction is not null).ConfigureAwait(false);
+        return result.Descriptor;
+    }
+
+    public static async Task<CommitToken> SetAccessControlAsync(DfsVolume volume, Func<DfsOperationKind, CancellationToken, OperationScope> begin,
+        Func<string?, string, string> validate, string path, DfsSecurityDescriptor descriptor, DfsTransactionId? transaction, CancellationToken ct,
+        Action ensureWritable, Func<IDisposable?> enterTransaction)
+    {
+        using OperationScope scope = begin(DfsOperationKind.Admin, ct);
+        await scope.StartedAsync().ConfigureAwait(false);
+        string p = validate(path, nameof(path));
+        ArgumentNullException.ThrowIfNull(descriptor);
+        foreach (DfsAccessRule rule in descriptor.ExplicitRules)
+        {
+            if (rule.GetValidationError() is { } invalid)
+                throw new ArgumentException($"Invalid security descriptor entry: {invalid}", nameof(descriptor));
+        }
+        ensureWritable();
+        using IDisposable? txOperation = enterTransaction();
+        scope.Path = p;
+        await scope.ValidatedAsync().ConfigureAwait(false);
+        SetAccessControlResultMessage result = await volume.Context.MutateAsync<SetAccessControlResultMessage>(scope, "SetAccessControl", null,
+            header => new SetAccessControlMessage(header, p, descriptor), p, transaction).ConfigureAwait(false);
+        return result.Token;
+    }
+
+    public static async Task<CommitToken> SetOwnerAsync(DfsVolume volume, Func<DfsOperationKind, CancellationToken, OperationScope> begin,
+        Func<string?, string, string> validate, string path, DfsIdentity owner, DfsTransactionId? transaction, CancellationToken ct, Action ensureWritable,
+        Func<IDisposable?> enterTransaction)
+    {
+        using OperationScope scope = begin(DfsOperationKind.Admin, ct);
+        await scope.StartedAsync().ConfigureAwait(false);
+        string p = validate(path, nameof(path));
+        if (owner.IsDefault)
+            throw new ArgumentException("The owner identity must not be empty.", nameof(owner));
+        if (owner == DfsIdentity.CreatorOwner)
+            throw new ArgumentException("CreatorOwner is a placeholder for inheritable entries and cannot own an inode.", nameof(owner));
+        ensureWritable();
+        using IDisposable? txOperation = enterTransaction();
+        scope.Path = p;
+        await scope.ValidatedAsync().ConfigureAwait(false);
+        SetOwnerResultMessage result = await volume.Context.MutateAsync<SetOwnerResultMessage>(scope, "SetOwner", null,
+            header => new SetOwnerMessage(header, p, owner), p, transaction).ConfigureAwait(false);
+        return result.Token;
+    }
+
+    public static async Task<DfsFileSystemRights> GetEffectiveRightsAsync(DfsVolume volume, Func<DfsOperationKind, CancellationToken, OperationScope> begin,
+        Func<string?, string, string> validate, string path, DfsIdentity? identity, ulong pin, DfsTransactionId? transaction, CancellationToken ct,
+        Func<IDisposable?> enterTransaction)
+    {
+        using OperationScope scope = begin(DfsOperationKind.GetInfo, ct);
+        await scope.StartedAsync().ConfigureAwait(false);
+        string p = validate(path, nameof(path));
+        using IDisposable? txOperation = enterTransaction();
+        scope.Path = p;
+        await scope.ValidatedAsync().ConfigureAwait(false);
+        GetEffectiveRightsResultMessage result = await volume.Context.ReadAsync<GetEffectiveRightsResultMessage>(scope, "GetEffectiveRights",
+            header => new GetEffectiveRightsMessage(header, p, identity, pin), p, transaction, requireSession: pin != 0 || transaction is not null)
+            .ConfigureAwait(false);
+        return result.Rights;
+    }
 }

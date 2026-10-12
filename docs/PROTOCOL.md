@@ -196,7 +196,7 @@ peer                                         server (live node or backup node)
 
 ### 4.1 `RequestHeader`
 
-Every volume-scoped request (34 types, all implementing `IVolumeRequest`) starts with:
+Every volume-scoped request (39 types, all implementing `IVolumeRequest`) starts with:
 
 | Field | Wire type | Semantics |
 |---|---|---|
@@ -227,6 +227,16 @@ Every volume-scoped request (34 types, all implementing `IVolumeRequest`) starts
 * A client that cannot tell whether a transmitted mutation committed reports `DfsCommitOutcomeUnknownException` with
   the id (and transaction id) and resolves it with `QueryOperation`; `QueryOperationResult.ResultFrame` returns the
   original success reply when retained (for example the `HandleId` of a create-open whose reply was lost).
+* **Sequence allocation contract.** The leader reserves strictly increasing, non-overlapping blocks per session with
+  `ReserveOperationIds`. The SDK uses **only** sequences the leader handed out: it reserves blocks for its own internal
+  operations (64 at a time) and single sequences for application-visible ids, so an application id can never collide
+  with a sequence the SDK allocated concurrently. A sequence that was allocated but never transmitted is reused by the
+  next allocation (so blocks are used up and their reservations retire). An SDK-allocated id whose **only** transmission
+  is rejected with `OperationExpired` (or, for requests that refer to no handle, pin or staging session, `LeaseLost` for
+  an expired session, or `EpochMismatch` for a re-created volume) did not execute; the SDK opens a new session and
+  continues under a fresh id. After more than one transmission such a rejection makes the outcome unknown
+  (`DfsCommitOutcomeUnknownException`), because an earlier transmission may have committed before its outcome was
+  retired.
 * `Header.AckWatermark` retires outcomes, so the SDK advances it only past sequences whose outcome it has observed and
   will never ask about again. Ids handed to or supplied by the application (`NewOperationIdAsync`,
   `DfsMutationOptions.OperationId`, transaction ids) may be retried or queried by another process after this one is
@@ -302,6 +312,14 @@ carry an operation id; **opt** = may carry one (then retries are deduplicated); 
 * Live-read handles report `HandlePinUpdate(handle, pinIndex)` after each read so GC can reclaim objects of older
   revisions; version-pinned handles keep their pin for their lifetime.
 * Backup nodes keep sessions and pins locally (no Raft) for snapshot readers (BAK-013, BAK-027).
+* Requests that create nothing owned by a session (`GetInfo` by path, `GetVolumeRoute`, `ListSnapshots`,
+  `QueryOperation`, `BackupStatus`, `BackupAwait`, `GetAccessControl`, `GetEffectiveRights`, `ListStreams`) may carry
+  `Session = 0`; the SDK attaches its session when one is open (for the acknowledgement watermark) but never opens one
+  just to read. Requests through handles, pins, staging sessions or transactions carry the owning session.
+* Whole-file helpers (`WriteAll`, `Append`) share one unbound staging session per client session (`CreateStaging`
+  with an empty `Handle`); it stays open across publications (only the leader's own materialization staging closes
+  with its publication) and is replaced when the client session expires. Stream writers use a staging session bound
+  to their handle; transactions use the staging session returned by `TxBegin`.
 
 ## 7. Data plane
 
@@ -383,6 +401,20 @@ zeroes; missing objects never do (STR, DSK-016).
   with `LeaseLost` (LOCK-04).
 * `WriteAll` replaces the whole content (`[0, Length)` described by changes) while preserving the inode;
   `Append` interprets offsets relative to the end of file at apply time and is applied exactly once per id.
+* **Representation chosen by the client**: a publication carries `Inline` changes exactly when the resulting stream is
+  stored inline — its new length is at most the volume's `InlineThreshold` **and** every majority of the volume's voters
+  spans at least `DurableCopiesBeforeAck` distinct hosts and `DurableZonesBeforeAck` distinct zones of the file's
+  policy (LAY-002) — and `Data` changes (objects uploaded with receipts meeting the policy) otherwise. Content is split
+  into objects at `ChunkSize` boundaries of the file (helpers) or of the dirty range (streams), so retries of the same
+  operation carry the same payload identity. `Append` offsets are relative to the end of file; the SDK appends inline
+  only when the file's current length plus the appended bytes fit the threshold, and otherwise (or when the leader
+  rejects an inline append because the file grew meanwhile, with a new operation id) as objects.
+* **Extents → inline**: when a publication whose result is stored inline leaves bytes of objects inside the result —
+  base bytes of an extent-based file (for example a truncation to below the threshold followed by small writes), or
+  `Data` changes of objects a write-only stream uploaded early and then truncated below the threshold — the leader
+  materializes those bytes from the objects into the inline image before proposing; the client never reads the base
+  (or its own staged objects) to rewrite it. Staging capabilities never authorize `GetObject`, so the SDK uploads
+  staged data early (bounded memory) only for write-only streams; readable writers keep their staged bytes in memory.
 * **Inline → extents**: when a publication turns an inline file into an extent-based one, bytes of the new content not
   covered by the change set are taken from the old inline bytes; the leader materializes them as an object written
   under the request's staging session with receipts meeting the file's policy, before proposing. (The client never
@@ -1205,6 +1237,116 @@ Reply to `SetAccessMessage`.
 | 2 | `Revision` | `varuint` | New revision (0 when transaction-bound). |
 | 3 | `Token` | `CommitToken` | Commit token of the decision (`CommitToken.None` when transaction-bound: nothing is committed before `TxCommit`). |
 | 4 | — | `extensions` | Terminal extension block. |
+
+#### `GetAccessControl` = 70 (`GetAccessControlMessage`)
+
+Reads the security descriptor of a file, directory or stream path (client → volume leader or backup node; ReadIndex read; Addendum A, ACL-02/03). The reply carries the owner, the protection flag, the explicit entries in canonical order and the inherited entries generation by generation (`IsInherited = true`, with `InheritedFrom`), exactly as `DfsAccessEvaluator.EffectiveRules` computes them. A stream path reads its file's descriptor. Requires the volume Read grant and ReadPermissions. Errors: FileNotFound, DirectoryNotFound, AccessDenied, InvalidPath, PinExpired (snapshot view).
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Header` | `RequestHeader` | Request header. |
+| 2 | `Path` | `string` | Path whose descriptor is read (re-validated and NFC-normalized by the server). |
+| 3 | `SnapshotPin` | `varuint` | Read the descriptor inside the snapshot held by this reader pin; 0 = live (or transaction) view. |
+| 4 | — | `extensions` | Terminal extension block. |
+
+#### `GetAccessControlResult` = 71 (`GetAccessControlResultMessage`)
+
+Reply to `GetAccessControlMessage`.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Descriptor` | `SecurityDescriptor` | The full descriptor: owner, protection flag, explicit then inherited entries in evaluation order. |
+| 2 | `Inode` | `InodeId` | Inode the descriptor belongs to. |
+| 3 | `Revision` | `varuint` | Revision of the inode at the observed position. |
+| 4 | `ObservedAt` | `CommitToken` | Commit position the answer is based on. |
+| 5 | — | `extensions` | Terminal extension block. |
+
+#### `SetAccessControl` = 72 (`SetAccessControlMessage`)
+
+Atomically replaces the explicit entries and the protection flag of an inode (client → volume leader; committed `SetAcl` entry; Addendum A, ACL-07). Inherited entries and the owner in `Descriptor` are ignored (the owner changes only through `SetOwner`). Requires the volume Write grant and ChangePermissions; the change bumps the inode revision. A stream path changes its file's descriptor. Retries reuse the operation id and receive the stored outcome. Errors: FileNotFound, DirectoryNotFound, AccessDenied, InvalidArgument (invalid explicit entries), InvalidPath.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Header` | `RequestHeader` | Request header; `RequestHeader.Operation` identifies the mutation (retries reuse it). |
+| 2 | `Path` | `string` | File, directory or stream path. |
+| 3 | `Descriptor` | `SecurityDescriptor` | New explicit entries and protection flag (validated by the server). |
+| 4 | — | `extensions` | Terminal extension block. |
+
+#### `SetAccessControlResult` = 73 (`SetAccessControlResultMessage`)
+
+Reply to `SetAccessControlMessage`.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Inode` | `InodeId` | Inode changed. |
+| 2 | `Revision` | `varuint` | New revision of the inode (0 when transaction-bound). |
+| 3 | `Token` | `CommitToken` | Commit token of the decision (`CommitToken.None` when transaction-bound). |
+| 4 | — | `extensions` | Terminal extension block. |
+
+#### `SetOwner` = 74 (`SetOwnerMessage`)
+
+Changes the owner of an inode (client → volume leader; committed `SetOwner` entry; Addendum A, ACL-05/014): a caller holding TakeOwnership may make itself the owner; members of Administrators may set any owner. CreatorOwner is rejected (InvalidArgument). Requires the volume Write grant; the change bumps the inode revision. A stream path changes its file's owner. Errors: FileNotFound, DirectoryNotFound, AccessDenied, InvalidArgument, InvalidPath.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Header` | `RequestHeader` | Request header; `RequestHeader.Operation` identifies the mutation (retries reuse it). |
+| 2 | `Path` | `string` | File, directory or stream path. |
+| 3 | `Owner` | `Identity` | New owner identity. |
+| 4 | — | `extensions` | Terminal extension block. |
+
+#### `SetOwnerResult` = 75 (`SetOwnerResultMessage`)
+
+Reply to `SetOwnerMessage`.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Inode` | `InodeId` | Inode changed. |
+| 2 | `Revision` | `varuint` | New revision of the inode (0 when transaction-bound). |
+| 3 | `Token` | `CommitToken` | Commit token of the decision (`CommitToken.None` when transaction-bound). |
+| 4 | — | `extensions` | Terminal extension block. |
+
+#### `GetEffectiveRights` = 76 (`GetEffectiveRightsMessage`)
+
+The rights an identity would be granted on a path (client → volume leader or backup node; ReadIndex read; Addendum A, ACL-034): `DfsAccessEvaluator.GrantedRights` over the effective entries, with the identity's groups and administrator flag resolved from the identity database (volume grants not folded in). Querying another identity requires ReadPermissions on the path; querying oneself (`Identity` null) only the volume Read grant. Errors: FileNotFound, DirectoryNotFound, AccessDenied, InvalidPath.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Header` | `RequestHeader` | Request header. |
+| 2 | `Path` | `string` | File, directory or stream path (a stream path evaluates its file). |
+| 3 | `Identity` | `Identity?` | Identity to evaluate (`bool` presence, then the identity); null = the caller. |
+| 4 | `SnapshotPin` | `varuint` | Evaluate inside the snapshot held by this reader pin; 0 = live view. |
+| 5 | — | `extensions` | Terminal extension block. |
+
+#### `GetEffectiveRightsResult` = 77 (`GetEffectiveRightsResultMessage`)
+
+Reply to `GetEffectiveRightsMessage`.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Rights` | `varuint` | Granted rights (raw `DfsFileSystemRights` bits; values above 32 bits are malformed). |
+| 2 | `ObservedAt` | `CommitToken` | Commit position the answer is based on. |
+| 3 | — | `extensions` | Terminal extension block. |
+
+#### `ListStreams` = 78 (`ListStreamsMessage`)
+
+Lists the named streams of a file or directory (client → volume leader or backup node; ReadIndex read; Addendum A, ADS-03/005): name, length and revision of every named stream (not the default stream), ordinal by name. Requires the volume Read grant and ReadAttributes on the inode (or ListDirectory on its parent). Errors: FileNotFound (absent path), InvalidPath (a stream path), AccessDenied.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Header` | `RequestHeader` | Request header. |
+| 2 | `Path` | `string` | File or directory path (a stream path is rejected). |
+| 3 | `SnapshotPin` | `varuint` | List inside the snapshot held by this reader pin; 0 = live view. |
+| 4 | — | `extensions` | Terminal extension block. |
+
+#### `ListStreamsResult` = 79 (`ListStreamsResultMessage`)
+
+Reply to `ListStreamsMessage`.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Streams` | `list<StreamInfoData>` | Named streams, ordinal by name. |
+| 2 | `ObservedAt` | `CommitToken` | Commit position the answer is based on. |
+| 3 | — | `extensions` | Terminal extension block. |
 
 ### 9.5 Transactions
 
@@ -2497,7 +2639,10 @@ Metadata of a file or directory (FSD NS-04), used by open, get-info and create-d
 | 14 | `ExtentCount` | `varint32` | Number of extents (0 for inline files and directories). |
 | 15 | `EntryCount` | `varint32` | Number of children (directories only). |
 | 16 | `WriterGeneration` | `varuint` | Current writer fencing generation of the inode (files only). |
-| 17 | — | `extensions` | Terminal extension block. |
+| 17 | `IsStream` | `bool` | True when `Path` addresses a named stream (Addendum A, ADS-024): `Length`, `Revision`, `IsInline`, `IsSparse` and `ExtentCount` then describe that stream (trailing field). |
+| 18 | `StreamName` | `string?` | Name of the addressed named stream, or null (trailing field). |
+| 19 | `StreamCount` | `varint32` | Number of named streams of the inode, the default stream excluded (trailing field). |
+| 20 | — | `extensions` | Terminal extension block. |
 
 #### `GroupInfoData`
 
@@ -2566,7 +2711,8 @@ One member of the cluster map (live node or registered backup node).
 | 10 | `PlacementEligible` | `bool` | True when new object placements may target the node (active, not draining, not full). |
 | 11 | `CapacityBytes` | `varint` | Configured capacity. |
 | 12 | `UsedBytes` | `varint` | Last reported used bytes (advisory; free = capacity − used). |
-| 13 | — | `extensions` | Terminal extension block. |
+| 13 | `Pools` | `set<string>` | Named storage pools the node belongs to (Addendum A, POOL-02; the implicit `default` pool holds every member and is not listed). Clients place objects of a policy with `DfsStoragePolicy.Pool` (or the volume's `StoragePool`) on the members of that pool only (trailing field). |
+| 14 | — | `extensions` | Terminal extension block. |
 
 #### `ObjectCopy`
 
@@ -2757,6 +2903,17 @@ Description of a snapshot (live volume or published backup snapshot).
 | 7 | `CreatedUtc` | `timestamp` | Creation time (leader wall clock carried in the log entry). |
 | 8 | `Retention` | `Retention` | Retention (expiry and hold). |
 | 9 | — | `extensions` | Terminal extension block. |
+
+#### `StreamInfoData`
+
+One named stream of a file or directory (mirrors the SDK's `DfsStreamInfo`; Addendum A, ADS-03).
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Name` | `string` | Stream name (NFC). |
+| 2 | `Length` | `varint` | Stream length. |
+| 3 | `Revision` | `varuint` | Revision (log index) of the stream's last modification. |
+| 4 | — | `extensions` | Terminal extension block. |
 
 #### `VolumeEntry`
 

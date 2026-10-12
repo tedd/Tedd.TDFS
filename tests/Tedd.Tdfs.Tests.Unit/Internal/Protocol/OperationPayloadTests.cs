@@ -35,7 +35,7 @@ public sealed class OperationPayloadTests
             WireDeepEquality.AssertEqual(request, changed.WithHeader(request.Header));
         }
 
-        Assert.Equal(34, count);
+        Assert.Equal(39, count);
     }
 
     [Fact]
