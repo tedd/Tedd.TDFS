@@ -168,10 +168,12 @@ public sealed class PoolUnitTests
     public static TheoryData<string> CrossVolumeArtifacts => new() { "Handle", "ContinuationToken", "OperationId", "TransactionId", "SnapshotName" };
 
     /// <summary>
-    /// Identifiers issued by volume <c>vb</c> — handle numbers (presented raw, after driving both volumes' handle counters
-    /// into a numeric collision when per-volume numbering allows one), directory continuation tokens, operation ids,
-    /// transaction ids and snapshot names — are rejected (or resolve to nothing) in volume <c>va</c>, never address one
-    /// of <c>va</c>'s own objects, and keep working in <c>vb</c>.
+    /// Identifiers issued by volume <c>vb</c> — handle numbers (presented raw), directory continuation tokens, operation
+    /// ids, transaction ids and snapshot names — are rejected (or resolve to nothing) in volume <c>va</c>, never expose or
+    /// address anything of <c>vb</c> there, and keep working in <c>vb</c>. Handle numbers and operation-id sessions are
+    /// allocated per volume (ARCHITECTURE §2.2), so a foreign number can coincide with one the target volume issued itself;
+    /// the tests drive such collisions where numbering allows them, accept that a coinciding number addresses only the
+    /// target volume's own state, and require rejection of every foreign identifier the target volume never issued.
     /// </summary>
     [Theory]
     [MemberData(nameof(CrossVolumeArtifacts))]
@@ -193,10 +195,10 @@ public sealed class PoolUnitTests
                     await CrossVolumeContinuationTokensAsync(va, vb);
                     break;
                 case "OperationId":
-                    await CrossVolumeOperationIdsAsync(va, vb);
+                    await CrossVolumeOperationIdsAsync(cluster, va, vb);
                     break;
                 case "TransactionId":
-                    await CrossVolumeTransactionIdsAsync(va, vb);
+                    await CrossVolumeTransactionIdsAsync(cluster, va);
                     break;
                 case "SnapshotName":
                     await CrossVolumeSnapshotNamesAsync(cluster, va, vb);
@@ -229,29 +231,53 @@ public sealed class PoolUnitTests
                 await OpenRawAsync(VolA, handlesA);
         }
 
+        // Then vb runs ahead: with per-volume numbering these numbers were never issued by va, so va must reject them.
+        for (int i = 0; i < 3; i++)
+            await OpenRawAsync(VolB, handlesB);
+
         Log($"POOL-002: {handlesA.Count} raw handles in va, {handlesB.Count} in vb; numeric collision: {Collides()}");
-        foreach ((string volume, List<HandleId> handles, byte[] bytes) in new[] { (VolA, handlesA, bytesA), (VolB, handlesB, bytesB) })
+        var bytesOf = new Dictionary<string, byte[]>(StringComparer.Ordinal) { [VolA] = bytesA, [VolB] = bytesB };
+        foreach ((string volume, List<HandleId> handles) in new[] { (VolA, handlesA), (VolB, handlesB) })
         {
             foreach (HandleId own in handles)
             {
-                (DfsErrorCode code, byte[] data) = await raw.ReadThroughHandleAsync(volume, own, 0, bytes.Length);
+                (DfsErrorCode code, byte[] data) = await raw.ReadThroughHandleAsync(volume, own, 0, bytesOf[volume].Length);
                 Assert.Equal(DfsErrorCode.None, code);
-                Same(bytes, data, $"own handle {own.Value} in {volume}");
+                Same(bytesOf[volume], data, $"own handle {own.Value} in {volume}");
             }
         }
 
+        // Handle ids are allocated by each volume's state machine (ARCHITECTURE §2.2), so a number issued by the other
+        // volume may coincide with one this volume issued itself; such a number can only ever address this volume's own
+        // handle. Every other foreign number must be rejected, and no foreign number may ever yield the other volume's bytes.
+        IReadOnlySet<ulong> issuedA = await HandleNumbersAsync(VolA);
         int activeA = (await cluster.Inspect.GetVolumeStateAsync(VolA)).Handles.Count(h => !h.Expired);
         foreach ((string volume, List<HandleId> foreignHandles) in new[] { (VolA, handlesB), (VolB, handlesA) })
         {
+            IReadOnlySet<ulong> issued = await HandleNumbersAsync(volume);
+            int unissued = 0;
             foreach (HandleId foreign in foreignHandles)
             {
                 (DfsErrorCode code, byte[] data) = await raw.ReadThroughHandleAsync(volume, foreign, 0, 32);
-                Assert.True(code != DfsErrorCode.None, $"handle {foreign.Value} of the other volume was accepted by {volume}");
+                if (issued.Contains(foreign.Value))
+                {
+                    if (code == DfsErrorCode.None)
+                        Same(bytesOf[volume], data, $"number {foreign.Value} (also issued by {volume}) may only address {volume}'s own handle");
+                    else
+                        Assert.Empty(data);
+                    continue;
+                }
+
+                unissued++;
+                Assert.True(code != DfsErrorCode.None, $"handle {foreign.Value} of the other volume was accepted by {volume}, which never issued it");
                 Assert.Empty(data);
             }
+
+            if (volume == VolA)
+                Assert.True(unissued > 0, "vb's handle numbers include numbers va never issued (rejection is exercised)");
         }
 
-        foreach (HandleId foreign in handlesB)
+        foreach (HandleId foreign in handlesB.Where(h => !issuedA.Contains(h.Value)))
             Assert.NotEqual(DfsErrorCode.None, await raw.CloseHandleInVolumeAsync(VolA, foreign));
 
         // No local handle was closed or touched by foreign numbers.
@@ -268,6 +294,9 @@ public sealed class PoolUnitTests
         Same(bytesA, buffer, "SDK handle");
 
         bool Collides() => handlesA.Any(a => handlesB.Any(b => a.Value == b.Value));
+
+        async Task<IReadOnlySet<ulong>> HandleNumbersAsync(string volume) =>
+            (await cluster.Inspect.GetVolumeStateAsync(volume)).Handles.Select(h => h.Id.Value).ToHashSet();
 
         async Task OpenRawAsync(string volume, List<HandleId> into)
         {
@@ -314,15 +343,21 @@ public sealed class PoolUnitTests
         Assert.Equal(namesB.Count, namesB.Distinct(StringComparer.Ordinal).Count());
     }
 
-    private static async Task CrossVolumeOperationIdsAsync(DfsVolume va, DfsVolume vb)
+    private static async Task CrossVolumeOperationIdsAsync(TestCluster cluster, DfsVolume va, DfsVolume vb)
     {
-        // The client holds a session in both volumes and va has issued several ids, so per-volume numbering would overlap.
-        var ownA = new List<DfsOperationId>();
-        for (int i = 0; i < 4; i++)
-            ownA.Add(await va.NewOperationIdAsync(Ct));
-        await va.Files.WriteAllBytesAsync("/own", new byte[] { 9 }, new DfsMutationOptions { OperationId = ownA[0] }, Ct);
-        DfsOperationId opB = await vb.NewOperationIdAsync(Ct);
-        CommitToken tokenB = await vb.Files.AppendAllBytesAsync("/log", new byte[] { 1 }, new DfsMutationOptions { OperationId = opB }, Ct);
+        // The main client holds a session in both volumes before any foreign session is chosen (so neither volume issues
+        // a new session to it later), and va has issued and used an id of its own.
+        DfsOperationId usedA = await va.NewOperationIdAsync(Ct);
+        await vb.NewOperationIdAsync(Ct);
+        await va.Files.WriteAllBytesAsync("/own", new byte[] { 9 }, new DfsMutationOptions { OperationId = usedA }, Ct);
+
+        // Operation-id sessions are issued per volume (ARCHITECTURE §2.2), so vb's id is taken from a session number va has
+        // never issued: only then is it recognisably foreign to va (a coinciding number would name one of va's own sessions).
+        await using DfsClient clientB = await ClientWithSessionUnknownToAsync(cluster, VolB, VolA, "opb");
+        DfsVolume fb = clientB.GetVolume(VolB);
+        DfsOperationId opB = await fb.NewOperationIdAsync(Ct);
+        CommitToken tokenB = await fb.Files.AppendAllBytesAsync("/log", new byte[] { 1 }, new DfsMutationOptions { OperationId = opB }, Ct);
+        Assert.False(await IsSessionOfAsync(cluster, VolA, opB.Session), $"{opB} must name a session va never issued");
 
         Exception? reuse = await Record.ExceptionAsync(() => va.Files.AppendAllBytesAsync("/log", new byte[] { 2 }, new DfsMutationOptions { OperationId = opB }, Ct));
         Assert.True(IsOperationIdRejection(reuse), $"vb's operation id used for a va mutation: {Describe(reuse)}");
@@ -339,27 +374,36 @@ public sealed class PoolUnitTests
             }
 
             Assert.NotNull(outcome);
-            Assert.True(outcome.Status != DfsOutcomeStatus.Committed && outcome.Token != tokenB,
-                $"va reported vb's operation as {outcome.Status} at {outcome.Token} (resolve={resolve})");
+            Assert.True(outcome.Status != DfsOutcomeStatus.Committed, $"va reported vb's operation as {outcome.Status} at {outcome.Token} (resolve={resolve})");
+            Assert.NotEqual(tokenB, outcome.Token);
         }
 
         // In vb the id still has exactly its one committed effect, and a retry is answered from the outcome record.
-        DfsOperationOutcome own = await vb.QueryOperationAsync(opB, false, Ct);
+        DfsOperationOutcome own = await fb.QueryOperationAsync(opB, false, Ct);
         Assert.Equal(DfsOutcomeStatus.Committed, own.Status);
         Assert.Equal(tokenB, own.Token);
-        Assert.Equal(tokenB, await vb.Files.AppendAllBytesAsync("/log", new byte[] { 1 }, new DfsMutationOptions { OperationId = opB }, Ct));
+        Assert.Equal(tokenB, await fb.Files.AppendAllBytesAsync("/log", new byte[] { 1 }, new DfsMutationOptions { OperationId = opB }, Ct));
         Same(new byte[] { 1 }, await vb.Files.ReadAllBytesAsync("/log", Ct), "vb:/log has one append");
 
-        // Symmetric: an unused id reserved in va is rejected by vb and stays usable in va.
-        Exception? reverse = await Record.ExceptionAsync(() => vb.Files.WriteAllBytesAsync("/other", new byte[] { 3 }, new DfsMutationOptions { OperationId = ownA[1] }, Ct));
+        // Symmetric: an unused id reserved in va (from a session vb never issued) is rejected by vb and stays usable in va.
+        await using DfsClient clientA = await ClientWithSessionUnknownToAsync(cluster, VolA, VolB, "opa");
+        DfsVolume fa = clientA.GetVolume(VolA);
+        DfsOperationId unusedA = await fa.NewOperationIdAsync(Ct);
+        Assert.False(await IsSessionOfAsync(cluster, VolB, unusedA.Session), $"{unusedA} must name a session vb never issued");
+        Exception? reverse = await Record.ExceptionAsync(() => vb.Files.WriteAllBytesAsync("/other", new byte[] { 3 }, new DfsMutationOptions { OperationId = unusedA }, Ct));
         Assert.True(IsOperationIdRejection(reverse), $"va's operation id used for a vb mutation: {Describe(reverse)}");
         Assert.False(await vb.Files.ExistsAsync("/other", Ct));
-        await va.Files.WriteAllBytesAsync("/other", new byte[] { 4 }, new DfsMutationOptions { OperationId = ownA[1] }, Ct);
+        await fa.Files.WriteAllBytesAsync("/other", new byte[] { 4 }, new DfsMutationOptions { OperationId = unusedA }, Ct);
         Same(new byte[] { 4 }, await va.Files.ReadAllBytesAsync("/other", Ct), "va:/other");
     }
 
-    private static async Task CrossVolumeTransactionIdsAsync(DfsVolume va, DfsVolume vb)
+    private static async Task CrossVolumeTransactionIdsAsync(TestCluster cluster, DfsVolume va)
     {
+        // As for operation ids: the main client's va session exists first, and vb's transaction runs in a vb session whose
+        // number va never issued.
+        await va.NewOperationIdAsync(Ct);
+        await using DfsClient clientB = await ClientWithSessionUnknownToAsync(cluster, VolB, VolA, "txb");
+        DfsVolume vb = clientB.GetVolume(VolB);
         DfsTransactionId txB;
         await using (DfsTransaction tx = await vb.Transactions.BeginAsync(null, Ct))
         {
@@ -368,6 +412,7 @@ public sealed class PoolUnitTests
             txB = tx.Id;
         }
 
+        Assert.False(await IsSessionOfAsync(cluster, VolA, txB.Operation.Session), $"{txB} must belong to a session va never issued");
         await using (DfsTransaction txA = await va.Transactions.BeginAsync(null, Ct))
         {
             await txA.Files.WriteAllBytesAsync("/tx.bin", new byte[] { 8 }, Ct);
@@ -392,6 +437,29 @@ public sealed class PoolUnitTests
         Same(new byte[] { 7 }, await vb.Files.ReadAllBytesAsync("/tx.bin", Ct), "vb:/tx.bin");
         Same(new byte[] { 8 }, await va.Files.ReadAllBytesAsync("/tx.bin", Ct), "va:/tx.bin");
     }
+
+    /// <summary>
+    /// A fresh client whose session in <paramref name="from"/> has a number <paramref name="other"/> never issued. Session
+    /// numbers are allocated per volume, so the first sessions of two volumes usually coincide; each fresh client opens a
+    /// new, higher-numbered session in <paramref name="from"/> only, until one falls outside <paramref name="other"/>'s.
+    /// </summary>
+    private static async Task<DfsClient> ClientWithSessionUnknownToAsync(TestCluster cluster, string from, string other, string namePrefix)
+    {
+        for (int attempt = 0; attempt < 64; attempt++)
+        {
+            DfsClient candidate = await cluster.ConnectAsync(new TestClientOptions { Name = $"{namePrefix}{attempt}" }, Ct);
+            DfsOperationId probe = await candidate.GetVolume(from).NewOperationIdAsync(Ct);
+            if (!await IsSessionOfAsync(cluster, other, probe.Session))
+                return candidate;
+            await candidate.DisposeAsync();
+        }
+
+        Assert.Fail($"64 fresh clients found no session of {from} outside the session numbers of {other}");
+        return null!;
+    }
+
+    private static async Task<bool> IsSessionOfAsync(TestCluster cluster, string volume, ulong session) =>
+        (await cluster.Inspect.GetVolumeStateAsync(volume)).Sessions.Any(s => s.Id == session);
 
     private static async Task CrossVolumeSnapshotNamesAsync(TestCluster cluster, DfsVolume va, DfsVolume vb)
     {
@@ -464,13 +532,15 @@ public sealed class PoolUnitTests
         {
             DfsAdminClient admin = cluster.Admin;
             IReadOnlyList<DfsPoolInfo> pools = await admin.ListPoolsAsync(Ct);
-            Assert.Equal(new[] { DfsPoolNames.Default, "fast" }, pools.Select(p => p.Name));
-            Assert.Equal(all, pools[0].Nodes);
-            Assert.Equal(new[] { "n3" }, pools[1].Nodes);
-            Assert.Equal(all, await cluster.Inspect.GetPoolNodesAsync(DfsPoolNames.Default));
-            Assert.Contains("vol", pools[0].Volumes);
-            Assert.DoesNotContain("vol", pools[1].Volumes);
-            Assert.Equal((await admin.ListNodesAsync(Ct)).Sum(n => n.CapacityBytes), pools[0].CapacityBytes);
+            Assert.Equal(new[] { DfsPoolNames.Default, "fast" }, Sorted(pools.Select(p => p.Name)));
+            DfsPoolInfo defaultPool = pools.Single(p => p.Name == DfsPoolNames.Default);
+            DfsPoolInfo fastPool = pools.Single(p => p.Name == "fast");
+            Assert.Equal(all, Sorted(defaultPool.Nodes));
+            Assert.Equal(new[] { "n3" }, fastPool.Nodes);
+            Assert.Equal(all, Sorted(await cluster.Inspect.GetPoolNodesAsync(DfsPoolNames.Default)));
+            Assert.Contains("vol", defaultPool.Volumes);
+            Assert.DoesNotContain("vol", fastPool.Volumes);
+            Assert.Equal((await admin.ListNodesAsync(Ct)).Sum(n => n.CapacityBytes), defaultPool.CapacityBytes);
 
             await using DfsClient client = await cluster.ConnectAsync(null, Ct);
             DfsVolume vol = client.GetVolume("vol");
@@ -495,7 +565,7 @@ public sealed class PoolUnitTests
             await cluster.AddNodeAsync(new TestNodeSpec("n4", "z2"), true, Ct);
             await cluster.WaitUntilAsync(async () => (await PoolAsync(cluster, DfsPoolNames.Default)).Nodes.Contains("n4"), Converge,
                 "a joined node is a member of the default pool", Ct);
-            Assert.Equal(new[] { "n0", "n1", "n2", "n3", "n4" }, (await PoolAsync(cluster, DfsPoolNames.Default)).Nodes);
+            Assert.Equal(new[] { "n0", "n1", "n2", "n3", "n4" }, Sorted((await PoolAsync(cluster, DfsPoolNames.Default)).Nodes));
             Assert.Equal(new[] { "n3" }, (await PoolAsync(cluster, "fast")).Nodes);
 
             // ...and a removed node leaves it.
@@ -505,8 +575,8 @@ public sealed class PoolUnitTests
             await admin.RemoveNodeAsync("n4", false, Ct);
             await cluster.WaitUntilAsync(async () => !(await PoolAsync(cluster, DfsPoolNames.Default)).Nodes.Contains("n4"), Converge,
                 "a removed node leaves the default pool", Ct);
-            Assert.Equal(all, (await PoolAsync(cluster, DfsPoolNames.Default)).Nodes);
-            Assert.Equal(all, await cluster.Inspect.GetPoolNodesAsync(DfsPoolNames.Default));
+            Assert.Equal(all, Sorted((await PoolAsync(cluster, DfsPoolNames.Default)).Nodes));
+            Assert.Equal(all, Sorted(await cluster.Inspect.GetPoolNodesAsync(DfsPoolNames.Default)));
         }, Ct);
     }
 
@@ -557,13 +627,15 @@ public sealed class PoolUnitTests
                     await admin.CreatePoolAsync("p2", ["n0", "n1", "n2"], Ct);
                     await admin.CreateVolumeAsync(new DfsVolumeSpec { Name = "v2", DefaultPolicy = ThreeZones }, Ct);
                     await admin.DefinePolicyAsync("v2", "tier", ThreeZones with { Pool = "p2" }, Ct);
-                    Assert.Contains("v2", (await PoolAsync(cluster, "p2")).Volumes);
+                    // v2 is bound to default; p2 is referenced only through the named policy.
+                    Assert.Equal("p2", (await admin.GetVolumeStatusAsync("v2", Ct)).Info.NamedPolicies["tier"].Pool);
+                    Assert.Equal(DfsPoolNames.Default, (await admin.GetVolumeStatusAsync("v2", Ct)).Info.StoragePool);
                     break;
             }
 
             string poolsBefore = DescribePools(await admin.ListPoolsAsync(Ct));
             ulong epochBefore = await PlacementEpochAsync(cluster);
-            string[] volumesBefore = [.. await admin.ListVolumesAsync(Ct)];
+            string[] volumesBefore = Sorted(await admin.ListVolumesAsync(Ct));
 
             Exception? ex = await Record.ExceptionAsync(Act);
             bool expected = scenario switch
@@ -583,8 +655,8 @@ public sealed class PoolUnitTests
             // Nothing changed.
             Assert.Equal(poolsBefore, DescribePools(await admin.ListPoolsAsync(Ct)));
             Assert.Equal(epochBefore, await PlacementEpochAsync(cluster));
-            Assert.Equal(volumesBefore, await admin.ListVolumesAsync(Ct));
-            Assert.Equal(new[] { "n0", "n1", "n2" }, await cluster.Inspect.GetPoolNodesAsync("p1"));
+            Assert.Equal(volumesBefore, Sorted(await admin.ListVolumesAsync(Ct)));
+            Assert.Equal(new[] { "n0", "n1", "n2" }, Sorted(await cluster.Inspect.GetPoolNodesAsync("p1")));
             if (scenario == "PolicyOnAbsentPool")
                 Assert.False((await admin.GetVolumeStatusAsync("vol", Ct)).Info.NamedPolicies.ContainsKey("tier2"));
 
@@ -727,12 +799,14 @@ public sealed class PoolUnitTests
     // ------------------------------------------------------------------------------------------------------------
 
     /// <summary>
-    /// Pool listing and status report each pool's members, bound volumes (including a volume that only names the pool in a
-    /// policy), total member capacity and no draining nodes. Usage grows by at least the replicated bytes written through a
-    /// pool and stays within encoding overhead of the members' object inventories, while the other pools' usage is
-    /// unchanged. Replica deficits match the inventories: with one member crashed and one object deleted from the other
-    /// two, the pool reports every object under-replicated and zone-deficient and that object missing, the other pools
-    /// report nothing, and everything returns to zero after recovery and repair.
+    /// Pool listing and status report each pool's members, bound volumes (a volume that only names the pool in a policy may
+    /// be listed as well), total member capacity and no draining nodes. Usage grows by at least the replicated bytes written
+    /// through a pool and stays within encoding overhead of the members' object inventories, while the other pools' usage
+    /// is unchanged (usage attribution per pool.md). Replica deficits match the inventories: with one member of pool a
+    /// crashed and one object deleted from the other two, pool a (and the volume's own health) reports every object
+    /// under-replicated and zone-deficient and that object missing, pool b reports nothing, the default pool (which also
+    /// contains the crashed node) reports exactly what its inventories show, and everything returns to zero after recovery
+    /// and repair.
     /// </summary>
     [Fact]
     [Catalog("POOL-013", "U", "INV-11", "INV-16")]
@@ -749,16 +823,21 @@ public sealed class PoolUnitTests
         {
             DfsAdminClient admin = cluster.Admin;
             IReadOnlyList<DfsPoolInfo> pools = await admin.ListPoolsAsync(Ct);
-            Assert.Equal(new[] { PoolA, PoolB, DfsPoolNames.Default }, pools.Select(p => p.Name));
+            Assert.Equal(new[] { PoolA, PoolB, DfsPoolNames.Default }, Sorted(pools.Select(p => p.Name)));
             IReadOnlyDictionary<string, long> capacity = (await admin.ListNodesAsync(Ct)).ToDictionary(n => n.Name, n => n.CapacityBytes, StringComparer.Ordinal);
-            foreach ((string name, string[] members, string[] volumes) in new[]
+            // Volumes: the bound volumes are listed; a volume that names the pool only through a policy (vd for pool b) may
+            // be listed too (the addendum leaves this open), never a volume without any reference to the pool.
+            foreach ((string name, string[] members, string[] bound, string[] referencing) in new[]
                      {
-                         (PoolA, poolA, new[] { VolA }), (PoolB, poolB, new[] { VolB, "vd" }), (DfsPoolNames.Default, all, new[] { "vd" }),
+                         (PoolA, poolA, new[] { VolA }, Array.Empty<string>()), (PoolB, poolB, new[] { VolB }, new[] { "vd" }),
+                         (DfsPoolNames.Default, all, new[] { "vd" }, Array.Empty<string>()),
                      })
             {
                 DfsPoolInfo info = pools.Single(p => p.Name == name);
-                Assert.Equal(members, info.Nodes);
-                Assert.Equal(volumes, info.Volumes);
+                Assert.Equal(members, Sorted(info.Nodes));
+                Assert.Equal(info.Volumes.Count, info.Volumes.Distinct(StringComparer.Ordinal).Count());
+                Assert.True(bound.All(info.Volumes.Contains) && info.Volumes.All(v => bound.Contains(v) || referencing.Contains(v)),
+                    $"pool {name} lists volumes {Show(info.Volumes)}; expected {Show(bound)} (plus possibly {Show(referencing)})");
                 Assert.Equal(members.Sum(m => capacity[m]), info.CapacityBytes);
                 DfsPoolStatus status = await admin.GetPoolStatusAsync(name, Ct);
                 Assert.Equal(DescribePools([info]), DescribePools([status.Info]));
@@ -824,16 +903,29 @@ public sealed class PoolUnitTests
                 return (reported.Objects, reported.UnderReplicatedObjects, reported.ZoneDeficitObjects, reported.MissingObjects) == expectedA;
             }, Converge, "pool a's reported replica deficits match the inventories", Ct);
             Assert.Equal(((long)reachableA.Count, (long)reachableA.Count, (long)reachableA.Count, 1L), expectedA);
-            DfsReplicaHealth volumeHealth = await admin.GetReplicaHealthAsync(VolA, Ct);
-            Assert.Equal(expectedA, (volumeHealth.Objects, volumeHealth.UnderReplicatedObjects, volumeHealth.ZoneDeficitObjects, volumeHealth.MissingObjects));
+            await cluster.WaitUntilAsync(async () =>
+            {
+                DfsReplicaHealth v = await admin.GetReplicaHealthAsync(VolA, Ct);
+                return (v.Objects, v.UnderReplicatedObjects, v.ZoneDeficitObjects, v.MissingObjects) == expectedA;
+            }, Converge, "va's volume replica health agrees with its pool's", Ct);
 
+            // Pool b (no member down) reports nothing.
             IReadOnlySet<ObjectId> reachableB = await ReachableAsync(cluster, VolB);
             DfsReplicaHealth healthB = (await admin.GetPoolStatusAsync(PoolB, Ct)).Replicas;
             Assert.Equal((long)(reachableB.Count + hotObjects.Count), healthB.Objects);
             Assert.Equal((0L, 0L, 0L, 0L), (healthB.UnderReplicatedObjects, healthB.ZoneDeficitObjects, healthB.MissingObjects, healthB.PlacementViolations));
-            DfsReplicaHealth healthDefault = (await admin.GetPoolStatusAsync(DfsPoolNames.Default, Ct)).Replicas;
-            Assert.Equal((long)coldObjects.Count, healthDefault.Objects);
-            Assert.Equal((0L, 0L, 0L), (healthDefault.UnderReplicatedObjects, healthDefault.ZoneDeficitObjects, healthDefault.MissingObjects));
+
+            // n0 is also a member of default: vd's /cold objects with a copy on n0 are short there until repair re-creates
+            // the copy on n3 (the other z1 node), so default's report is judged against its own inventories, not as zero.
+            (long Objects, long Under, long ZoneDeficit, long Missing) expectedDefault = default;
+            await cluster.WaitUntilAsync(async () =>
+            {
+                expectedDefault = await ExpectedHealthAsync(coldObjects.ToHashSet(), all, policy);
+                DfsReplicaHealth reported = (await admin.GetPoolStatusAsync(DfsPoolNames.Default, Ct)).Replicas;
+                return (reported.Objects, reported.UnderReplicatedObjects, reported.ZoneDeficitObjects, reported.MissingObjects) == expectedDefault;
+            }, Converge, "default's reported replica deficits match the inventories", Ct);
+            Assert.Equal((long)coldObjects.Count, expectedDefault.Objects);
+            Assert.Equal(0L, expectedDefault.Missing);
 
             // Recovery: n0 still holds the victim; repair restores every copy and the deficits return to zero.
             await cluster.Node("n0").RestartAsync();
@@ -845,8 +937,14 @@ public sealed class PoolUnitTests
                 return r.UnderReplicatedObjects == 0 && r.ZoneDeficitObjects == 0 && r.MissingObjects == 0;
             }, Converge, "pool a reports no deficit after repair", Ct);
             Assert.Equal(((long)reachableA.Count, 0L, 0L, 0L), await ExpectedHealthAsync(reachableA, poolA, policy));
-            Assert.Equal(poolA, (await HoldersAsync(cluster, victim)).Order(StringComparer.Ordinal));
+            Assert.Equal(poolA, Sorted(await HoldersAsync(cluster, victim)));
             Assert.Empty((await admin.GetPoolStatusAsync(PoolA, Ct)).DrainingNodes);
+            await cluster.WaitForRepairAsync("vd", Converge, Ct);
+            await cluster.WaitUntilAsync(async () =>
+            {
+                DfsReplicaHealth r = (await admin.GetPoolStatusAsync(DfsPoolNames.Default, Ct)).Replicas;
+                return (r.Objects, r.UnderReplicatedObjects, r.ZoneDeficitObjects, r.MissingObjects) == ((long)coldObjects.Count, 0L, 0L, 0L);
+            }, Converge, "the default pool reports no deficit after repair", Ct);
 
             async Task<Dictionary<string, long>> UsedAsync() =>
                 (await admin.ListPoolsAsync(Ct)).ToDictionary(p => p.Name, p => p.UsedBytes, StringComparer.Ordinal);
@@ -889,6 +987,8 @@ public sealed class PoolUnitTests
     // POOL-017 PoolAdminRequiresClusterAdmin
     // ------------------------------------------------------------------------------------------------------------
 
+    private static readonly string[] DeniedWords = ["denied", "unauthorized", "refused", "rejected", "forbidden", "fail"];
+
     public static TheoryData<string> AdminOperations => new()
     {
         "CreatePool", "SetPoolMembers", "DeletePool", "ListPools", "GetPoolStatus",
@@ -898,8 +998,9 @@ public sealed class PoolUnitTests
     /// <summary>
     /// A principal holding every volume right except ClusterAdmin is denied each pool and group administration call
     /// (<see cref="UnauthorizedAccessException"/>, <c>AccessDenied</c>, no data returned); pools, groups and the placement
-    /// epoch are unchanged; the audit log records the denial with the principal, the target and the outcome, never the
-    /// principal's secret. A second ClusterAdmin principal performs the same call successfully, and it is audited too.
+    /// epoch are unchanged; the audit log records the denial with the principal, the object kind, the target and the
+    /// outcome, never the principal's secret. A second ClusterAdmin principal performs the same call successfully, and
+    /// successful changes are audited too.
     /// </summary>
     [Theory]
     [MemberData(nameof(AdminOperations))]
@@ -915,6 +1016,8 @@ public sealed class PoolUnitTests
             "DeleteGroup" or "AddGroupMember" or "RemoveGroupMember" => "g1",
             _ => null,
         };
+        string kind = operation.Contains("Group", StringComparison.Ordinal) ? "group" : "pool";
+        bool mutates = operation is not ("ListPools" or "GetPoolStatus" or "ListGroups");
         await ClusterTest.RunAsync(Realtime(nodes, 3, new TestVolumeSpec("vol")), async cluster =>
         {
             DfsAdminClient admin = cluster.Admin;
@@ -941,10 +1044,14 @@ public sealed class PoolUnitTests
             Assert.Equal(groupsBefore, DescribeGroups(await admin.ListGroupsAsync(Ct)));
             Assert.Equal(epochBefore, await PlacementEpochAsync(cluster));
 
+            // The denial is audited with the principal, the kind of object (pool/group), the target and a denial outcome
+            // (same outcome vocabulary as the SEC suite's audit checks).
             IReadOnlyList<string> audit = await admin.GetAuditLogAsync(10_000, Ct);
-            Assert.Contains(audit, line => line.Contains("bob", StringComparison.Ordinal)
-                                           && (target is null || line.Contains(target, StringComparison.Ordinal))
-                                           && line.Contains("denied", StringComparison.OrdinalIgnoreCase));
+            Assert.True(audit.Any(line => line.Contains("bob", StringComparison.Ordinal)
+                                          && line.Contains(kind, StringComparison.OrdinalIgnoreCase)
+                                          && (target is null || line.Contains(target, StringComparison.Ordinal))
+                                          && DeniedWords.Any(w => line.Contains(w, StringComparison.OrdinalIgnoreCase))),
+                $"no audit entry records {operation} denied to bob (target {target ?? "-"}); last entries:{Environment.NewLine}{string.Join(Environment.NewLine, audit.TakeLast(20))}");
             Assert.DoesNotContain(audit, line => line.Contains(bob.Credentials.Secret, StringComparison.Ordinal));
 
             // Control: a ClusterAdmin principal may perform the same call.
@@ -956,7 +1063,7 @@ public sealed class PoolUnitTests
                     Assert.Equal(new[] { "n3" }, (await PoolAsync(cluster, "p-new")).Nodes);
                     break;
                 case "SetPoolMembers":
-                    Assert.Equal(new[] { "n0", "n1", "n2", "n3" }, (await PoolAsync(cluster, "p1")).Nodes);
+                    Assert.Equal(new[] { "n0", "n1", "n2", "n3" }, Sorted((await PoolAsync(cluster, "p1")).Nodes));
                     break;
                 case "DeletePool":
                     Assert.DoesNotContain("p1", (await admin.ListPoolsAsync(Ct)).Select(p => p.Name));
@@ -965,7 +1072,7 @@ public sealed class PoolUnitTests
                     Assert.Contains(Assert.IsAssignableFrom<IReadOnlyList<DfsPoolInfo>>(result), p => p.Name == "p1");
                     break;
                 case "GetPoolStatus":
-                    Assert.Equal(new[] { "n0", "n1", "n2" }, Assert.IsType<DfsPoolStatus>(result).Info.Nodes);
+                    Assert.Equal(new[] { "n0", "n1", "n2" }, Sorted(Assert.IsType<DfsPoolStatus>(result).Info.Nodes));
                     break;
                 case "CreateGroup":
                     Assert.Contains(await admin.ListGroupsAsync(Ct), g => g.Name == "g-new");
@@ -984,10 +1091,14 @@ public sealed class PoolUnitTests
                     break;
             }
 
-            if (target is not null)
+            // Successful administration changes are audited too (successful reads need not be).
+            if (mutates)
             {
                 IReadOnlyList<string> audit2 = await admin.GetAuditLogAsync(10_000, Ct);
-                Assert.Contains(audit2, line => line.Contains("root2", StringComparison.Ordinal) && line.Contains(target, StringComparison.Ordinal));
+                Assert.True(audit2.Any(line => line.Contains("root2", StringComparison.Ordinal)
+                                               && line.Contains(kind, StringComparison.OrdinalIgnoreCase)
+                                               && line.Contains(target!, StringComparison.Ordinal)),
+                    $"no audit entry records root2's {operation} of {target}; last entries:{Environment.NewLine}{string.Join(Environment.NewLine, audit2.TakeLast(20))}");
             }
 
             async Task RunAsync(DfsAdminClient a)

@@ -25,9 +25,12 @@ Behaviour:
   identity); all three methods route to the named volume's current leader regardless of the node the raw client
   connected to, following `NotLeader` hints like the SDK.
 
-Needed by: POOL-002 `HandlesAndTokensDoNotCrossVolumes` (`_Handle` case): handle numbers issued by one volume must be
-rejected by another volume and must never read or close the other volume's handle that happens to carry the same number,
-even after both volumes' counters were driven into a numeric collision.
+Needed by: POOL-002 `HandlesAndTokensDoNotCrossVolumes` (`Handle` case): handle numbers issued by one volume and presented
+to another must never read the other volume's bytes. Handle ids are allocated per volume (ARCHITECTURE §2.2), so a
+foreign number may coincide with a handle the target volume issued itself; the test accepts that such a number addresses
+only the target volume's own handle, and requires every foreign number the target volume never issued (read through
+`VolumeStateInspection.Handles`) to be rejected for reads and closes. The test drives a numeric collision when per-volume
+numbering allows one and then lets `vb` run ahead, so rejection of never-issued numbers is always exercised.
 
 Overlap note: branch `tests/sdk-path` adds `RawProtocolClient.OpenHandleAsync` / `SendHandleOperationAsync` for
 PATH-014 with similar routing. The POOL members use distinct names so both branches merge without conflicts; an
@@ -57,6 +60,14 @@ Needed by: POOL-016 `SnapshotRestoreKeepsPool` (all five cases).
 
 ## Conventions the tests rely on (no new members)
 
+- Operation-id sessions are issued per volume (ARCHITECTURE §2.2), so `DfsOperationId.Session` values of two volumes
+  usually coincide. POOL-002 (`OperationId`, `TransactionId`) therefore takes the foreign id from a fresh client whose
+  session number the target volume never issued (checked through `VolumeStateInspection.Sessions`), and requires such an
+  id to be rejected (`ArgumentException`, `OperationIdMismatch`, `CrossVolume`, `OperationExpired`) or, for queries, to
+  resolve to anything but the other volume's committed outcome.
+- `DfsPoolInfo.Nodes`, `DfsPoolInfo.Volumes`, `ListPoolsAsync` and `ClusterInspector.GetPoolNodesAsync` have no specified
+  order; the tests compare them as sets. `DfsPoolInfo.Volumes` lists the volumes bound to the pool and MAY also list
+  volumes that reference the pool only through a named policy (POOL-013 accepts both).
 - `ClusterInspector.GetStoredObjectsOnNodeAsync(node, volume)` reports staged as well as committed records (it reads the
   node's object store), so POOL-005/006/012 can assert that not even staged uploads leave a pool. With `volume == null`
   it reports every record id on the node (POOL-016 compares whole-node inventories because a restore may or may not
@@ -77,5 +88,10 @@ Needed by: POOL-016 `SnapshotRestoreKeepsPool` (all five cases).
 - `DfsPoolStatus.Replicas` counts the objects placed through the pool (`Objects`) and their deficits against the target
   policy, counting only verified copies on the pool's members (POOL-013).
 - Placement is stable for pools whose membership did not change: a membership change of one pool never migrates another
-  pool's objects (POOL-014), and converged holders equal `Placement.SelectTargets(object, currentPlacementEpoch, policy,
-  poolMembers)` (POOL-010, POOL-011).
+  pool's objects (POOL-014), and converged holders equal `Placement.SelectTargets(object, epoch, policy, poolMembers)`
+  where `epoch` is the placement epoch created by the pool's last membership change (POOL-010, POOL-011). POOL-011 also
+  accepts the cluster's current placement epoch, which is the same value unless something else advanced it.
+- Pool and group administration is audited like other security-relevant actions (SEC suite vocabulary): a denial entry
+  names the principal, the object kind (`pool`/`group`), the target name when there is one, and a denial outcome
+  (`denied`, `unauthorized`, `refused`, `rejected`, `forbidden` or `fail…`); successful changes name the acting principal,
+  the kind and the target. Successful reads (`ListPools`, `GetPoolStatus`, `ListGroups`) need not be audited (POOL-017).

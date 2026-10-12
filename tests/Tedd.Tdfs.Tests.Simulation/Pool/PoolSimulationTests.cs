@@ -40,7 +40,14 @@ public sealed class PoolSimulationTests
             for (int round = 0; round < 4; round++)
             {
                 if (variant == "CrashAndRepair" && round == 1)
+                {
+                    // Round 0's objects first reach their full target (an object acknowledged on n0+n1 alone would
+                    // otherwise legitimately drop below the acknowledgement policy when n1 crashes).
+                    await cluster.WaitForRepairAsync(VolA, Converge, Ct);
+                    await cluster.WaitForRepairAsync(VolB, Converge, Ct);
                     await cluster.Node("n1").CrashAsync();
+                }
+
                 if (variant == "CrashAndRepair" && round == 3)
                 {
                     await cluster.Node("n1").RestartAsync();
@@ -157,8 +164,15 @@ public sealed class PoolSimulationTests
             await AssertNoPlacementAsync(() => va.Files.WriteAllBytesAsync("/new", attempt, Ct), maxAchieved, silent, $"{outage}: WriteAll");
             await AssertNoPlacementAsync(() => va.Files.AppendAllBytesAsync("/base", attempt, Ct), maxAchieved, silent, $"{outage}: Append");
             await AssertNoPlacementAsync(() => WriteStreamAsync(va, "/base", attempt, FileMode.Open), maxAchieved, silent, $"{outage}: stream flush");
-            foreach (FaultArm arm in arms)
-                cluster.Faults.AssertReached(arm);
+            if (arms.Count > 0)
+            {
+                // Two copies are needed and any two members could have provided them, so the failed writes must have asked at
+                // least two different members (an uploader may stop once the remaining members cannot reach the ack count).
+                FaultArm[] reached = arms.Where(a => a.Triggered).ToArray();
+                Assert.True(reached.Length >= 2, $"{outage}: only {reached.Length} pool member(s) were asked to store an object");
+                foreach (FaultArm arm in reached)
+                    cluster.Faults.AssertReached(arm);
+            }
 
             Assert.False(await va.Files.ExistsAsync("/new", Ct), $"{outage}: a failed WriteAll must not publish");
             DfsFileInfo afterInfo = await va.Files.GetInfoAsync("/base", Ct);
@@ -488,8 +502,8 @@ public sealed class PoolSimulationTests
             await cluster.Admin.SetPoolMembersAsync(PoolA, remaining, Ct);
             changeCommitted.TrySetResult();
             Assert.True(await PlacementEpochAsync(cluster) > epoch0, "a pool membership change advances the placement epoch");
-            Assert.Equal(remaining, await cluster.Inspect.GetPoolNodesAsync(PoolA));
-            Assert.Equal(remaining, (await PoolAsync(cluster, PoolA)).Nodes);
+            Assert.Equal(remaining, Sorted(await cluster.Inspect.GetPoolNodesAsync(PoolA)));
+            Assert.Equal(remaining, Sorted((await PoolAsync(cluster, PoolA)).Nodes));
             DfsNodeInfo n2Info = (await cluster.Admin.ListNodesAsync(Ct)).Single(n => n.Name == "n2");
             Assert.Equal(DfsNodeStatus.Active, n2Info.Status);
 
@@ -639,16 +653,20 @@ public sealed class PoolSimulationTests
             await cluster.Admin.SetPoolMembersAsync(PoolA, grown, Ct);
             ulong epoch1 = await PlacementEpochAsync(cluster);
             Assert.True(epoch1 > epoch0, $"adding {added} must advance the placement epoch ({epoch0} -> {epoch1})");
-            Assert.Equal(grown, await cluster.Inspect.GetPoolNodesAsync(PoolA));
+            Assert.Equal(grown, Sorted(await cluster.Inspect.GetPoolNodesAsync(PoolA)));
 
             DfsStoragePolicy policy = (await va.GetInfoAsync(Ct)).DefaultPolicy;
             IReadOnlyDictionary<string, DfsTopologyLabels> labels = await LabelsAsync(cluster);
             IReadOnlyList<PlacementNode> map = await PlacementNodesAsync(cluster, grown);
+            // The targets are those of the epoch the membership change created (epoch1). Nothing else changes placement in
+            // this scenario, so the current epoch normally equals it; should the cluster have advanced it further, convergence
+            // to the current epoch's targets is accepted as well (pool.md, "Placement is stable ...").
             int sample = 0;
+            ulong convergedEpoch = 0;
             await cluster.WaitUntilAsync(async () =>
             {
                 ulong epochNow = await PlacementEpochAsync(cluster);
-                bool converged = true;
+                bool atChange = true, atNow = true;
                 foreach (ObjectId o in await ReachableAsync(cluster, VolA))
                 {
                     HashSet<string> holders = await HoldersAsync(cluster, o);
@@ -657,19 +675,21 @@ public sealed class PoolSimulationTests
                     (int c, int z) = Domains(holders, labels);
                     Assert.True(c >= policy.DurableCopiesBeforeAck && z >= policy.DurableZonesBeforeAck,
                         $"object {o} dropped to {c} copies in {z} zones on {Show(holders)} while rebalancing");
-                    converged &= Targets(o, epochNow, policy, map).SetEquals(holders);
+                    atChange &= Targets(o, epoch1, policy, map).SetEquals(holders);
+                    atNow &= Targets(o, epochNow, policy, map).SetEquals(holders);
                 }
 
                 Assert.Equal(0, (await cluster.Admin.GetReplicaHealthAsync(VolA, Ct)).MissingObjects);
                 (string path, byte[] data) = model[sample++ % model.Count];
                 Same(data, await va.Files.ReadAllBytesAsync(path, Ct), $"{path} while rebalancing");
-                return converged;
+                convergedEpoch = atChange ? epoch1 : epochNow;
+                return atChange || atNow;
             }, Converge, "repair converges to the deterministic targets of the grown pool", Ct);
 
             IReadOnlySet<ObjectId> reachable = await ReachableAsync(cluster, VolA);
-            ulong epochEnd = await PlacementEpochAsync(cluster);
-            Assert.True(epochEnd >= epoch1);
-            int expectedOnAdded = reachable.Count(o => Targets(o, epochEnd, policy, map).Contains(added));
+            Assert.True(await PlacementEpochAsync(cluster) >= epoch1);
+            Log($"POOL-011 ({variant}): converged to the targets of placement epoch {convergedEpoch} (change at {epoch1})");
+            int expectedOnAdded = reachable.Count(o => Targets(o, convergedEpoch, policy, map).Contains(added));
             Assert.True(expectedOnAdded > 0, $"the oracle assigns objects to {added} (otherwise the rebalance is not exercised)");
             HashSet<ObjectId> onAdded = await InventoryAsync(cluster, added, VolA);
             Assert.Equal(expectedOnAdded, reachable.Count(onAdded.Contains));
@@ -679,7 +699,7 @@ public sealed class PoolSimulationTests
             Assert.Equal(0, health.MissingObjects);
             Assert.Equal(0, health.PlacementViolations);
             DfsPoolStatus status = await cluster.Admin.GetPoolStatusAsync(PoolA, Ct);
-            Assert.Equal(grown, status.Info.Nodes);
+            Assert.Equal(grown, Sorted(status.Info.Nodes));
             Assert.Empty(status.DrainingNodes);
             await AssertVolumeConfinedAsync(cluster, VolA, grown, "after rebalancing");
             foreach ((string path, byte[] data) in model)
@@ -853,7 +873,7 @@ public sealed class PoolSimulationTests
             IReadOnlyDictionary<string, DfsTopologyLabels> labels = await LabelsAsync(cluster);
 
             await cluster.Admin.SetPoolMembersAsync(removeFrom, remaining, Ct);
-            Assert.Equal(remaining, await cluster.Inspect.GetPoolNodesAsync(removeFrom));
+            Assert.Equal(remaining, Sorted(await cluster.Inspect.GetPoolNodesAsync(removeFrom)));
             Assert.Contains(Shared, await cluster.Inspect.GetPoolNodesAsync(keep));
 
             await cluster.WaitUntilAsync(async () =>
@@ -953,7 +973,7 @@ public sealed class PoolSimulationTests
             ulong epochBefore = await PlacementEpochAsync(cluster);
             await cluster.Admin.SetPoolMembersAsync(PoolA, shrunk, Ct);
             Assert.True(await PlacementEpochAsync(cluster) > epochBefore, "removing n3 advances the placement epoch");
-            Assert.Equal(shrunk, await cluster.Inspect.GetPoolNodesAsync(PoolA));
+            Assert.Equal(shrunk, Sorted(await cluster.Inspect.GetPoolNodesAsync(PoolA)));
 
             if (variant == "TargetsBack")
                 cluster.Network.Heal();
@@ -1153,5 +1173,4 @@ public sealed class PoolSimulationTests
         }, Ct);
     }
 
-    private static string[] Sorted(IEnumerable<string> names) => names.Order(StringComparer.Ordinal).ToArray();
 }

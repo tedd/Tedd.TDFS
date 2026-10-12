@@ -106,6 +106,12 @@ internal static class PoolHelpers
     public static string Show(IEnumerable<string> names) => "[" + string.Join(",", names.Order(StringComparer.Ordinal)) + "]";
 
     /// <summary>
+    /// Ordinal-sorted copy of a name list. Pool members and voter lists have no specified order (the control state keeps
+    /// pool members sorted by node id, not by name), so every comparison goes through this.
+    /// </summary>
+    public static string[] Sorted(IEnumerable<string> names) => names.Order(StringComparer.Ordinal).ToArray();
+
+    /// <summary>
     /// Every object is durably held only by nodes of <paramref name="pool"/>, on at least <paramref name="copies"/> distinct
     /// hosts in at least <paramref name="zones"/> distinct zones of that pool.
     /// </summary>

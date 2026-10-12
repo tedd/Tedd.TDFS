@@ -88,6 +88,12 @@ internal static class PoolHelpers
 
     public static string Show(IEnumerable<string> names) => "[" + string.Join(",", names.Order(StringComparer.Ordinal)) + "]";
 
+    /// <summary>
+    /// Ordinal-sorted copy of a name list. Pool members, pool volumes and pool listings have no specified order (the
+    /// control state keeps members sorted by node id, not by name), so every comparison goes through this.
+    /// </summary>
+    public static string[] Sorted(IEnumerable<string> names) => names.Order(StringComparer.Ordinal).ToArray();
+
     /// <summary>Every object is held only inside <paramref name="pool"/>, on at least the given distinct hosts/zones.</summary>
     public static async Task AssertPlacedWithinAsync(TestCluster cluster, IEnumerable<ObjectId> objects, IReadOnlyCollection<string> pool,
         int copies, int zones, string because)
@@ -117,11 +123,11 @@ internal static class PoolHelpers
 
     /// <summary>A canonical text fingerprint of the pool table (names, members, volumes) for "nothing changed" checks.</summary>
     public static string DescribePools(IReadOnlyList<DfsPoolInfo> pools) =>
-        string.Join(";", pools.Select(p => $"{p.Name}:{Show(p.Nodes)}:{Show(p.Volumes)}"));
+        string.Join(";", pools.OrderBy(p => p.Name, StringComparer.Ordinal).Select(p => $"{p.Name}:{Show(p.Nodes)}:{Show(p.Volumes)}"));
 
     /// <summary>A canonical text fingerprint of the group table.</summary>
     public static string DescribeGroups(IReadOnlyList<DfsGroupInfo> groups) =>
-        string.Join(";", groups.Select(g => $"{g.Name}:{Show(g.Members)}"));
+        string.Join(";", groups.OrderBy(g => g.Name, StringComparer.Ordinal).Select(g => $"{g.Name}:{Show(g.Members)}"));
 
     public static string Describe(Exception? ex) =>
         ex is null

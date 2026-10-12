@@ -71,7 +71,7 @@ public sealed class PoolIntegrationTests
             await WriteRoundAsync(100, 4);
             await AssertDisjointAsync($"while {crashed} is down", fullTarget: false);
             foreach ((string volume, string path, byte[] data) in model)
-                {
+            {
                 byte[] actual = await client.GetVolume(volume).Files.ReadAllBytesAsync(path, Ct);
                 AssertEx.BytesEqual(data, actual, $"{volume}:{path} while {crashed} is down");
             }
@@ -87,7 +87,7 @@ public sealed class PoolIntegrationTests
             Assert.Empty(await cluster.Inspect.GetStoredObjectsOnNodeAsync(crashed, otherVolume));
             await AssertDisjointAsync("after restart and repair", fullTarget: true);
             foreach ((string volume, string path, byte[] data) in model)
-                {
+            {
                 byte[] actual = await client.GetVolume(volume).Files.ReadAllBytesAsync(path, Ct);
                 AssertEx.BytesEqual(data, actual, $"{volume}:{path} after recovery");
             }
