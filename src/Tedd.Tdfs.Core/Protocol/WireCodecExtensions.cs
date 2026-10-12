@@ -504,7 +504,10 @@ public static class WireCodecExtensions
         return new DfsTopologyLabels(region, zone, rack, host, device);
     }
 
-    /// <summary>Writes a storage policy as four zigzag varints (values are not validated; receivers do that).</summary>
+    /// <summary>
+    /// Writes a storage policy as four zigzag varints followed by the optional pool name (presence flag + string)
+    /// (values are not validated; receivers do that).
+    /// </summary>
     public static void WriteStoragePolicy(this ref WireWriter writer, DfsStoragePolicy value)
     {
         ArgumentNullException.ThrowIfNull(value);
@@ -512,6 +515,9 @@ public static class WireCodecExtensions
         writer.WriteVarInt32(value.TargetDistinctZones);
         writer.WriteVarInt32(value.DurableCopiesBeforeAck);
         writer.WriteVarInt32(value.DurableZonesBeforeAck);
+        writer.WriteBool(value.Pool is not null);
+        if (value.Pool is not null)
+            writer.WriteString(value.Pool);
     }
 
     /// <summary>Reads a storage policy (not validated: an inconsistent policy is a semantic error for the receiver).</summary>
@@ -521,12 +527,14 @@ public static class WireCodecExtensions
         int zones = reader.ReadVarInt32();
         int ackCopies = reader.ReadVarInt32();
         int ackZones = reader.ReadVarInt32();
+        string? pool = reader.ReadBool() ? reader.ReadString() : null;
         return new DfsStoragePolicy
         {
             TargetCopies = copies,
             TargetDistinctZones = zones,
             DurableCopiesBeforeAck = ackCopies,
             DurableZonesBeforeAck = ackZones,
+            Pool = pool,
         };
     }
 
