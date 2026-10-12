@@ -359,6 +359,9 @@ public sealed class LockUnitTests
             DfsFileInfo before = await hv.Files.GetInfoAsync(path, ct);
 
             DfsStream holder = await hv.Files.OpenAsync(path, LockHelpers.Options(FileMode.Open, new HandleSpec(holderAccess, FileShare.None)), ct);
+            // Metadata reads take no handle, so they work next to a FileShare.None holder. Taken after the holder's open
+            // because a writable open may legitimately touch the inode record (writer generation).
+            DfsFileInfo held = await ov.Files.GetInfoAsync(path, ct);
 
             int index = 0;
             foreach (HandleSpec request in LockHelpers.AllRequests().Where(LockHelpers.IsValidCoreRequest))
@@ -400,6 +403,8 @@ public sealed class LockUnitTests
             DfsFileInfo during = await ov.Files.GetInfoAsync(path, ct);
             Assert.Equal(before.InodeId, during.InodeId);
             Assert.Equal(content.Length, during.Length);
+            Assert.True(held.Revision == during.Revision,
+                $"no refused open/helper may publish anything: revision moved from {held.Revision} to {during.Revision} while the FileShare.None holder was active");
             Assert.True(await ov.Files.ExistsAsync(src, ct), "the failed move must not consume its source");
             HandleInspection[] active = await LockHelpers.ActiveHandlesAsync(cluster, before.InodeId);
             Assert.True(active.Length == 1, $"only the FileShare.None holder may be active, found {active.Length}");
@@ -458,6 +463,7 @@ public sealed class LockUnitTests
                 await opened.DisposeAsync();
             }
 
+            LockHelpers.BytesEqual(content, await LockHelpers.ReadCommittedAsync(ov, path, ct), "every conflicting open/helper left the bytes untouched");
             await ov.Files.WriteAllBytesAsync(path, replacement, ct);
             LockHelpers.BytesEqual(replacement, await LockHelpers.ReadCommittedAsync(ov, path, ct), "a writer can publish once the exclusive holder is gone");
             Assert.Equal(before.InodeId, (await ov.Files.GetInfoAsync(path, ct)).InodeId);
@@ -539,7 +545,7 @@ public sealed class LockUnitTests
                 Assert.Equal(readerCount + 1, active.Length);
                 HandleInspection writerHandle = Assert.Single(active, h => h.IsWriter);
                 Assert.Equal(writer.WriterGeneration, writerHandle.Generation);
-                Assert.All(active.Where(h => !h.IsWriter), h => Assert.Equal(0UL, h.Generation));
+                Assert.All(active.Where(h => !h.IsWriter), h => Assert.Equal(FileAccess.Read, h.Access));
 
                 // Staged writes are private to the writer.
                 writer.Seek(0, SeekOrigin.Begin);
@@ -717,10 +723,14 @@ public sealed class LockUnitTests
                 LockHelpers.AssertExplicitOptionRejection(txError, $"transaction-bound open {access}/{share}");
             }
 
-            // The file stays fully available to a valid writer afterwards (nothing was reserved).
+            // Nothing changed and nothing was reserved: the bytes are intact and the file is fully available to a valid
+            // writer afterwards. (Read first: the valid writer may grant no Read share, e.g. Share.None or Share.Delete.)
+            LockHelpers.BytesEqual(txContent, await LockHelpers.ReadCommittedAsync(v, txPath, ct), "transaction-bound rejection changed nothing");
+            InodeId txInode = (await v.Files.GetInfoAsync(txPath, ct)).InodeId;
+            Assert.Empty(await LockHelpers.ActiveHandlesAsync(cluster, txInode));
             await using DfsStream valid = await c1.GetVolume(Vol).Files.OpenAsync(txPath, FileMode.Open, access, share & ~FileShare.Write, ct);
             Assert.True(valid.WriterGeneration > 0);
-            LockHelpers.BytesEqual(txContent, await LockHelpers.ReadCommittedAsync(v, txPath, ct), "transaction-bound rejection changed nothing");
+            Assert.Equal(share & ~FileShare.Write, valid.Share);
         }, ct);
     }
 
@@ -956,6 +966,14 @@ public sealed class LockUnitTests
                         Assert.False(await v1.Files.ExistsAsync(path, ct), $"{what}: writing through the old handle must not recreate the path");
                     else
                         LockHelpers.BytesEqual(srcBytes, await LockHelpers.ReadCommittedAsync(v1, path, ct), $"{what}: writes through the old handle stay on the detached inode");
+
+                    if ((holderAccess & FileAccess.Read) != 0)
+                    {
+                        byte[] detachedExpected = [.. written, .. fileBytes.AsSpan(written.Length)];
+                        holder.Seek(0, SeekOrigin.Begin);
+                        LockHelpers.BytesEqual(detachedExpected, await LockHelpers.ReadToEndAsync(holder, ct),
+                            $"{what}: the publication through the old handle changed the detached inode itself");
+                    }
                 }
             }
             else
@@ -1188,10 +1206,14 @@ public sealed class LockUnitTests
     };
 
     /// <summary>
-    /// LOCK-019: transactions acquiring writer reservations in opposing orders never wait for each other: every
-    /// acquisition that closes the cycle fails promptly (well inside the operation timeout) with a typed sharing
-    /// conflict, aborting one participant releases its reservations, and the survivor (or, if the policy aborted it
-    /// too, its explicit retry) commits. Aborted transactions' writes never become visible.
+    /// LOCK-019: transactions acquiring writer reservations in opposing orders never wait for each other. Every
+    /// acquisition that closes the cycle completes promptly (well inside the operation timeout): when its target is
+    /// still reserved by an ACTIVE transaction it fails with a typed sharing conflict (ARCHITECTURE §5.6: conflict →
+    /// immediate SharingViolation, never waiting). The conflict policy may additionally abort the failing requester
+    /// (FSD §8.3: conflicts abort with a typed exception), which releases its reservations — then a later closing
+    /// acquisition on a released inode may legitimately be granted, but only if the previous holder can no longer
+    /// commit. Either way the cycle resolves: the survivors (or their explicit retries) commit, and nothing written by
+    /// an aborted transaction ever becomes visible.
     /// </summary>
     [Theory]
     [MemberData(nameof(LockCycles))]
@@ -1239,6 +1261,18 @@ public sealed class LockUnitTests
                 openStreams.Clear();
             }
 
+            Task<Exception?> CloseCycleAsync(DfsTransaction tx, string path, byte[] data, string because) =>
+                LockHelpers.CatchWithinAsync(cluster, () => AcquireAsync(tx, path, data), bound, because, ct);
+
+            async Task AssertNothingVisibleAsync(int count)
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    DfsFileInfo info = await v2.Files.GetInfoAsync(paths[i], ct);
+                    Assert.True(info.Length == baseline[i].Length, $"{paths[i]}: an uncommitted transaction's write became visible (length {info.Length})");
+                }
+            }
+
             byte[] a1 = TestData.Bytes(19_101, 333), b1 = TestData.Bytes(19_102, 333);
             byte[] b2 = TestData.Bytes(19_201, 444), c2Data = TestData.Bytes(19_202, 444), a2 = TestData.Bytes(19_203, 444);
             byte[] c3 = TestData.Bytes(19_301, 555), a3 = TestData.Bytes(19_302, 555);
@@ -1255,33 +1289,55 @@ public sealed class LockUnitTests
                 Exception? e2;
                 if (scenario == LockCycleScenario.TwoCycleSimultaneous)
                 {
-                    Task<Exception?> first = LockHelpers.CatchWithinAsync(cluster, () => AcquireAsync(t1, paths[1], b1), bound, "T1 acquiring b (held by T2)", ct);
-                    Task<Exception?> second = LockHelpers.CatchWithinAsync(cluster, () => AcquireAsync(t2, paths[0], a2), bound, "T2 acquiring a (held by T1)", ct);
+                    Task<Exception?> first = CloseCycleAsync(t1, paths[1], b1, "T1 acquiring b (held by T2)");
+                    Task<Exception?> second = CloseCycleAsync(t2, paths[0], a2, "T2 acquiring a (held by T1)");
                     Exception?[] both = await Task.WhenAll(first, second);
                     e1 = both[0];
                     e2 = both[1];
+                    AssertConflictOrGranted(e1, "T1 closing the lock cycle");
+                    AssertConflictOrGranted(e2, "T2 closing the lock cycle");
                 }
                 else
                 {
-                    e1 = await LockHelpers.CatchWithinAsync(cluster, () => AcquireAsync(t1, paths[1], b1), bound, "T1 acquiring b (held by T2)", ct);
-                    e2 = await LockHelpers.CatchWithinAsync(cluster, () => AcquireAsync(t2, paths[0], a2), bound, "T2 acquiring a (held by T1)", ct);
+                    e1 = await CloseCycleAsync(t1, paths[1], b1, "T1 acquiring b (held by T2)");
+                    LockHelpers.AssertSharingConflict(e1, "T1 closing the lock cycle: b is reserved by the active T2");
+                    e2 = await CloseCycleAsync(t2, paths[0], a2, "T2 acquiring a (held by T1 unless the policy aborted T1)");
+                    AssertConflictOrGranted(e2, "T2 closing the lock cycle");
                 }
 
-                LockHelpers.AssertSharingConflict(e1, "T1 closing the lock cycle");
-                LockHelpers.AssertSharingConflict(e2, "T2 closing the lock cycle");
+                Assert.False(e1 is null && e2 is null, "both closing acquisitions were granted: a and b would each have two writers");
+                await AssertNothingVisibleAsync(2);
 
-                // Nothing is visible yet.
-                for (int i = 0; i < 2; i++)
-                    Assert.Equal(baseline[i].Length, (await v2.Files.GetInfoAsync(paths[i], ct)).Length);
+                byte[] expectA;
+                byte[] expectB;
+                if (e1 is not null && e2 is not null)
+                {
+                    // Neither got through. Resolution: T2 aborts (releasing b); T1 — or, if the policy already aborted
+                    // it, its explicit retry — completes.
+                    if (t2.State == DfsTransactionState.Active)
+                        await t2.AbortAsync(ct);
+                    Assert.Equal(DfsTransactionState.Aborted, t2.State);
+                    CommitToken committed = await ContinueOrRetryAsync(v0, t1, ReleaseStreamsAsync, [(paths[1], b1)], [(paths[0], a1), (paths[1], b1)], ct);
+                    Assert.False(committed.IsNone);
+                    (expectA, expectB) = (a1, b1);
+                }
+                else
+                {
+                    // One closing acquisition was granted: the inode it took must have been released by an abort of
+                    // its previous holder, which therefore can never commit.
+                    bool t1Won = e1 is null;
+                    DfsTransaction winner = t1Won ? t1 : t2;
+                    DfsTransaction loser = t1Won ? t2 : t1;
+                    await ReleaseStreamsAsync();
+                    await AssertCannotCommitAsync(loser, $"{(t1Won ? "T2" : "T1")} lost its reservation to the other transaction");
+                    CommitToken committed = await winner.CommitAsync(ct);
+                    Assert.False(committed.IsNone);
+                    Assert.Equal(DfsTransactionState.Committed, winner.State);
+                    (expectA, expectB) = t1Won ? (a1, b1) : (a2, b2);
+                }
 
-                // Resolution: T2 aborts; its reservation on b is released and T1 (or its explicit retry) completes.
-                await t2.AbortAsync(ct);
-                Assert.Equal(DfsTransactionState.Aborted, t2.State);
-                CommitToken committed = await ContinueOrRetryAsync(v0, t1, ReleaseStreamsAsync, [(paths[1], b1)], [(paths[0], a1), (paths[1], b1)], ct);
-                Assert.False(committed.IsNone);
-
-                LockHelpers.BytesEqual(a1, await LockHelpers.ReadCommittedAsync(v2, paths[0], ct), "the surviving transaction's write to a");
-                LockHelpers.BytesEqual(b1, await LockHelpers.ReadCommittedAsync(v2, paths[1], ct), "the surviving transaction's write to b (T2's write never published)");
+                LockHelpers.BytesEqual(expectA, await LockHelpers.ReadCommittedAsync(v2, paths[0], ct), "a holds exactly the committed transaction's write");
+                LockHelpers.BytesEqual(expectB, await LockHelpers.ReadCommittedAsync(v2, paths[1], ct), "b holds exactly the committed transaction's write (the aborted one's never published)");
             }
             else
             {
@@ -1291,30 +1347,74 @@ public sealed class LockUnitTests
                 await AcquireAsync(t3, paths[2], c3);
 
                 LockHelpers.AssertSharingConflict(
-                    await LockHelpers.CatchWithinAsync(cluster, () => AcquireAsync(t1, paths[1], b1), bound, "T1 acquiring b (held by T2)", ct), "T1 in the 3-cycle");
+                    await CloseCycleAsync(t1, paths[1], b1, "T1 acquiring b (held by T2)"), "T1 in the 3-cycle: b is reserved by the active T2");
                 LockHelpers.AssertSharingConflict(
-                    await LockHelpers.CatchWithinAsync(cluster, () => AcquireAsync(t2, paths[2], c2Data), bound, "T2 acquiring c (held by T3)", ct), "T2 in the 3-cycle");
-                LockHelpers.AssertSharingConflict(
-                    await LockHelpers.CatchWithinAsync(cluster, () => AcquireAsync(t3, paths[0], a3), bound, "T3 acquiring a (held by T1)", ct), "T3 in the 3-cycle");
+                    await CloseCycleAsync(t2, paths[2], c2Data, "T2 acquiring c (held by T3)"), "T2 in the 3-cycle: c is reserved by the active T3");
+                Exception? e3 = await CloseCycleAsync(t3, paths[0], a3, "T3 acquiring a (held by T1 unless the policy aborted T1)");
+                AssertConflictOrGranted(e3, "T3 closing the 3-cycle");
+                await AssertNothingVisibleAsync(3);
 
-                await t3.AbortAsync(ct);
-                Assert.Equal(DfsTransactionState.Aborted, t3.State);
+                if (e3 is null)
+                {
+                    // T3 got a: T1 must have been aborted when its own acquisition failed.
+                    await AssertCannotCommitAsync(t1, "T1 lost a to T3");
+                    await t3.CommitAsync(ct);
+                    Assert.Equal(DfsTransactionState.Committed, t3.State);
+                    LockHelpers.BytesEqual(a3, await LockHelpers.ReadCommittedAsync(v2, paths[0], ct), "a = T3 after T3 committed");
+                    LockHelpers.BytesEqual(c3, await LockHelpers.ReadCommittedAsync(v2, paths[2], ct), "c = T3 after T3 committed");
+                }
+                else
+                {
+                    if (t3.State == DfsTransactionState.Active)
+                        await t3.AbortAsync(ct);
+                    Assert.Equal(DfsTransactionState.Aborted, t3.State);
+                }
+
+                // c is free now (T3 aborted or committed): T2 completes, which frees b for T1.
                 await ContinueOrRetryAsync(v1, t2, ReleaseStreamsAsync, [(paths[2], c2Data)], [(paths[1], b2), (paths[2], c2Data)], ct);
                 await ContinueOrRetryAsync(v0, t1, ReleaseStreamsAsync, [(paths[1], b1)], [(paths[0], a1), (paths[1], b1)], ct);
 
-                LockHelpers.BytesEqual(a1, await LockHelpers.ReadCommittedAsync(v2, paths[0], ct), "a = T1 (T3's write discarded)");
+                LockHelpers.BytesEqual(a1, await LockHelpers.ReadCommittedAsync(v2, paths[0], ct), "a = T1, the last committed writer of a");
                 LockHelpers.BytesEqual(b1, await LockHelpers.ReadCommittedAsync(v2, paths[1], ct), "b = T1, which committed after T2 released b");
-                LockHelpers.BytesEqual(c2Data, await LockHelpers.ReadCommittedAsync(v2, paths[2], ct), "c = T2 (T3's write discarded)");
+                LockHelpers.BytesEqual(c2Data, await LockHelpers.ReadCommittedAsync(v2, paths[2], ct), "c = T2, the last committed writer of c");
             }
 
             await ReleaseStreamsAsync();
+
+            // No reservation of the resolved cycle survives: a fresh exclusive writer takes every file.
+            foreach (string path in paths)
+            {
+                await using DfsStream exclusive = await v2.Files.OpenAsync(path, FileMode.Open, FileAccess.Write, FileShare.None, ct);
+                Assert.True(exclusive.WriterGeneration > 0);
+            }
         }, ct);
+    }
+
+    /// <summary>A closing acquisition either was granted (null) or failed with a typed, retryable sharing conflict.</summary>
+    private static void AssertConflictOrGranted(Exception? error, string because)
+    {
+        if (error is not null)
+            LockHelpers.AssertSharingConflict(error, because);
+    }
+
+    /// <summary>
+    /// A transaction whose reservation was handed to another transaction must not be able to commit: the attempt fails
+    /// with a typed transaction failure (or, if the SDK already knows it was aborted, as an invalid operation) and the
+    /// transaction never reaches <see cref="DfsTransactionState.Committed"/>.
+    /// </summary>
+    private static async Task AssertCannotCommitAsync(DfsTransaction tx, string because)
+    {
+        Exception? error = await LockHelpers.CatchAsync(() => tx.CommitAsync(TestContext.Current.CancellationToken));
+        Assert.True(error is DfsTransactionConflictException or InvalidOperationException,
+            $"{because}: its commit must fail with a typed transaction failure, got {LockHelpers.Describe(error)}");
+        Assert.NotEqual(DfsTransactionState.Committed, tx.State);
     }
 
     /// <summary>
     /// Continues <paramref name="tx"/> with <paramref name="remaining"/> writes and commits it. If the conflict policy
-    /// aborted the transaction when its acquisition failed (a legal resolution), the abort must be reported as a typed
-    /// transaction failure and an explicit retry with <paramref name="all"/> writes must commit.
+    /// aborted the transaction when its acquisition failed (a legal resolution), the abort must surface as a typed
+    /// transaction failure (or an invalid operation on the already-aborted transaction), and an explicit retry with
+    /// <paramref name="all"/> writes must commit.
     /// </summary>
     private static async Task<CommitToken> ContinueOrRetryAsync(DfsVolume volume, DfsTransaction tx, Func<Task> releaseStreams,
         IReadOnlyList<(string Path, byte[] Data)> remaining, IReadOnlyList<(string Path, byte[] Data)> all, CancellationToken ct)
@@ -1333,13 +1433,15 @@ public sealed class LockUnitTests
             return token;
         }
 
-        Assert.True(error is DfsTransactionConflictException,
+        Assert.True(error is DfsTransactionConflictException or InvalidOperationException,
             $"a transaction that cannot continue after a lock-cycle conflict must report a typed transaction failure, got {LockHelpers.Describe(error)}");
         Assert.Equal(DfsTransactionState.Aborted, tx.State);
         await releaseStreams();
         await using DfsTransaction retry = await volume.Transactions.BeginAsync(null, ct);
         foreach ((string path, byte[] data) in all)
             await retry.Files.WriteAllBytesAsync(path, data, ct);
-        return await retry.CommitAsync(ct);
+        CommitToken retried = await retry.CommitAsync(ct);
+        Assert.Equal(DfsTransactionState.Committed, retry.State);
+        return retried;
     }
 }

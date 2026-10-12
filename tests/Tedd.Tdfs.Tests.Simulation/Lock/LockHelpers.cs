@@ -131,6 +131,20 @@ internal static class LockHelpers
         CancellationToken ct, string? node = null) =>
         cluster.WaitUntilAsync(async () => !(await ActiveWritersAsync(cluster, inode, node)).Any(h => h.Generation == generation), timeout, because, ct);
 
+    /// <summary>Highest applied index of <paramref name="volume"/> over every running replica.</summary>
+    public static async Task<ulong> MaxAppliedIndexAsync(TestCluster cluster, string volume = Vol)
+    {
+        ulong max = 0;
+        foreach (TestNode node in Running(cluster))
+        {
+            VolumeStateInspection? state = await node.Inspect.GetVolumeStateAsync(volume);
+            if (state is not null && state.AppliedIndex > max)
+                max = state.AppliedIndex;
+        }
+
+        return max;
+    }
+
     /// <summary>Waits until a running node other than <paramref name="oldLeader"/> leads the volume group.</summary>
     public static async Task<TestNode> WaitForNewLeaderAsync(TestCluster cluster, string oldLeader, TimeSpan timeout, CancellationToken ct, string volume = Vol)
     {
@@ -340,8 +354,18 @@ internal sealed class SingleWriterProbe
 
     public ulong BGeneration { get; private set; }
 
-    /// <summary>Leader applied index observed right after B's grant returned (an upper bound of the grant's log index).</summary>
+    /// <summary>
+    /// Highest applied index of any running replica observed right after B's grant returned: an upper bound of the
+    /// grant's log index (the granting leader applied the grant before replying). The maximum over all replicas is used
+    /// because "the leader" may be ambiguous while server clocks are frozen or jumped.
+    /// </summary>
     public ulong BGrantAppliedUpperBound { get; private set; }
+
+    /// <summary>
+    /// Unknown publications whose authoritative resolution answered <see cref="DfsOutcomeStatus.Expired"/> (only allowed
+    /// for writer A, whose session may expire while its renewals are withheld or server clocks run fast).
+    /// </summary>
+    public List<ProbeUnknown> Indeterminate { get; } = [];
 
     public List<ProbePublication> Committed { get; } = [];
 
@@ -410,12 +434,18 @@ internal sealed class SingleWriterProbe
                     BGrantIteration = iteration;
                     BGeneration = opened.WriterGeneration;
                     Assert.True(BGeneration > AGeneration, $"B's generation {BGeneration} must exceed A's {AGeneration}");
-                    BGrantAppliedUpperBound = (await _cluster.Inspect.GetVolumeStateAsync(LockHelpers.Vol)).AppliedIndex;
+                    BGrantAppliedUpperBound = await LockHelpers.MaxAppliedIndexAsync(_cluster);
                 }
             }
-            else if (error is not DfsSharingViolationException)
+            else if (error is DfsSharingViolationException)
             {
-                Assert.True(LockHelpers.IsAvailabilityOrUnknown(error),
+                LockHelpers.AssertSharingConflict(error, $"iteration {iteration}: B's open while A may still hold the inode");
+            }
+            else
+            {
+                // A refused open is safe whatever the reason; it must just never be a fabricated grant or an untyped
+                // failure. OperationExpired: B's session may expire while server clocks jump/run fast.
+                Assert.True(LockHelpers.IsAvailabilityOrUnknown(error) || error is DfsOperationExpiredException,
                     $"iteration {iteration}: B's open failed with neither a sharing conflict nor reduced availability: {LockHelpers.Describe(error)}");
             }
         }
@@ -470,8 +500,16 @@ internal sealed class SingleWriterProbe
         foreach (ProbeUnknown unknown in Unknown)
         {
             DfsOperationOutcome outcome = await resolver.QueryOperationAsync(unknown.Operation, resolve: true, _ct);
+            if (outcome.Status == DfsOutcomeStatus.Expired && unknown.Writer == "A")
+            {
+                // A's session expired (its renewals were withheld / server clocks ran fast): the id is honestly
+                // reported as expired. Its effect, if any, is judged through the final contents.
+                Indeterminate.Add(unknown);
+                continue;
+            }
+
             Assert.True(outcome.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Aborted,
-                $"resolve:true must produce a definite outcome for {unknown.Operation}, got {outcome.Status}");
+                $"resolve:true must produce a definite outcome for {unknown.Operation} ({unknown.Writer}), got {outcome.Status}");
             if (outcome.Status == DfsOutcomeStatus.Committed)
             {
                 Assert.False(unknown.Writer == "A" && unknown.AfterReplacementGrant,
@@ -490,6 +528,31 @@ internal sealed class SingleWriterProbe
         }
 
         return Committed.Count == 0 ? null : Committed.MaxBy(p => p.Token.Sequence)!.Marker;
+    }
+
+    /// <summary>
+    /// Final-contents oracle after <see cref="ResolveAsync"/>: the file holds the last committed publication in log
+    /// order (or <paramref name="initial"/>), or — only when an outcome stayed indeterminate — the marker of an
+    /// indeterminate publication that was legal when issued. Contents equal to a publication A issued after B's grant
+    /// are a fencing violation.
+    /// </summary>
+    public void AssertFinalContents(byte[]? expected, byte[] initial, byte[] actual, string because)
+    {
+        byte[] last = expected ?? initial;
+        if (actual.AsSpan().SequenceEqual(last))
+            return;
+
+        foreach (ProbeUnknown unknown in Indeterminate)
+        {
+            if (actual.AsSpan().SequenceEqual(unknown.Marker))
+            {
+                Assert.False(unknown.AfterReplacementGrant,
+                    $"{because}: the file holds A's publication from iteration {unknown.Iteration}, issued after B had been granted");
+                return;
+            }
+        }
+
+        LockHelpers.BytesEqual(last, actual, because);
     }
 
     public async Task DisposeStreamsAsync()

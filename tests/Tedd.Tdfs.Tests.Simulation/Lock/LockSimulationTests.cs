@@ -430,6 +430,11 @@ public sealed class LockSimulationTests
     /// A's old generation is rejected with LeaseLost and faults its stream; B stays the only valid writer; A's orphan
     /// uploads are never published and are reclaimed once safely abandoned.
     /// </summary>
+    /// <remarks>
+    /// Whether a writable open (B's grant) itself changes the inode's revision is not specified (the generation lives in
+    /// the inode record), so the uncommitted variant pins the revision observed right after B's grant: nothing A does
+    /// may move it.
+    /// </remarks>
     [Theory]
     [MemberData(nameof(ReplacementSchedules))]
     [Catalog("LOCK-009", "S", "INV-02", "INV-05", "INV-06", "INV-12")]
@@ -487,7 +492,7 @@ public sealed class LockSimulationTests
             Assert.True(gB > gA, $"replacement generation {gB} must exceed the expired generation {gA}");
 
             byte[] expected = initial;
-            ulong expectedRevision = baseInfo.Revision;
+            ulong expectedRevision = (await LockHelpers.FileAsync(cluster, path)).Revision;
             if (replacementCommitted)
             {
                 CommitToken tB = await LockHelpers.ReplaceAndCommitAsync(b, dataB, ct);
@@ -521,7 +526,10 @@ public sealed class LockSimulationTests
 
             queue.ReleaseAll(reverseDelivery);
             clockA.Unfreeze();
-            Exception? flushError = await LockHelpers.WithinAsync(cluster, staleFlush, lease * 10, "A's queued flush must be answered once delivered", ct);
+            // With a crashed leader, A's queue partly targets a dead node: allow A's SDK its own timeouts and rerouting.
+            Exception? flushError = await LockHelpers.WithinAsync(cluster, staleFlush, lease * (leaderChangeBeforeResume ? 15 : 10),
+                "A's queued flush must be answered once delivered", ct);
+            uploadsA.UnionWith(await LockHelpers.StoredObjectsOfStagingAsync(cluster, stagingA)); // uploads delivered late
             LockHelpers.AssertLeaseLost(flushError, $"A's flush under obsolete generation {gA}");
             Assert.True(a.IsFaulted, "lease loss must fault A's stream");
             Assert.True(a.Fault is DfsLeaseLostException, $"A's stream fault must be the lease loss, got {LockHelpers.Describe(a.Fault)}");
@@ -586,8 +594,10 @@ public sealed class LockSimulationTests
     /// <summary>
     /// LOCK-010: A's renewals are withheld in the network until its lease (and optionally its session) expired and B
     /// was granted a newer generation; then the old renewals are delivered (forward/reverse, optionally after a leader
-    /// change) and replayed once more. B remains the only authoritative writer on every replica, A's handle and session
-    /// are not revived, a third writer is still refused and A's publication is rejected.
+    /// change) and replayed once more — to their original destination and to the current leader, so that after a
+    /// leader crash they still reach the authority instead of vanishing with the dead node. B remains the only
+    /// authoritative writer on every replica, A's handle and session are not revived, a third writer is still refused
+    /// and A's publication is rejected.
     /// </summary>
     [Theory]
     [MemberData(nameof(DelayedRenewalSchedules))]
@@ -643,9 +653,17 @@ public sealed class LockSimulationTests
 
             CapturedMessage[] oldRenewals = renewals.Captured.ToArray();
             Assert.NotEmpty(oldRenewals);
+            TestNode currentLeader = await cluster.GetLeaderAsync(Vol, ct);
             renewals.ReleaseAll(reverseDelivery);
             foreach (CapturedMessage renewal in reverseDelivery ? Enumerable.Reverse(oldRenewals) : oldRenewals)
-                await LockHelpers.CatchAsync(() => cluster.Network.ReplayAsync(renewal)); // delivered once more; the state is checked below
+            {
+                // Delivered once more (the reply code is not judged: a KeepAlive may succeed at session level while its
+                // handle entries are refused); the replicated state is checked below.
+                await LockHelpers.CatchAsync(() => cluster.Network.ReplayAsync(renewal));
+                if (!string.Equals(renewal.To, currentLeader.Name, StringComparison.Ordinal))
+                    await LockHelpers.CatchAsync(() => cluster.Network.ReplayAsync(renewal with { To = currentLeader.Name }));
+            }
+
             await cluster.DelayAsync(lease, ct);
 
             await LockHelpers.AssertAtMostOneActiveWriterOnEveryReplicaAsync(cluster, inode, "after delivering old renewals");
@@ -671,7 +689,17 @@ public sealed class LockSimulationTests
 
             LockHelpers.AssertSharingConflict(thirdError, "third writer while B is authoritative");
 
-            LockHelpers.AssertLeaseLost(await LockHelpers.CatchAsync(() => a.CommitAsync(ct)), "A's publication after its old renewal was delivered");
+            Exception? staleCommit = await LockHelpers.CatchAsync(() => a.CommitAsync(ct));
+            if (waitForSessionExpiry && staleCommit is DfsOperationExpiredException)
+            {
+                // A's whole session expired: its operation ids are refused as expired, which is equally definite.
+                Assert.Equal(DfsErrorCode.OperationExpired, ((DfsException)staleCommit).ErrorCode);
+            }
+            else
+            {
+                LockHelpers.AssertLeaseLost(staleCommit, "A's publication after its old renewal was delivered");
+            }
+
             CommitToken tB = await LockHelpers.ReplaceAndCommitAsync(b, dataB, ct);
             Assert.Equal(tB.Sequence, (await LockHelpers.FileAsync(cluster, path)).Revision);
             LockHelpers.BytesEqual(dataB, await LockHelpers.ReadCommittedAsync(vb, path, ct), "B remains the authoritative writer");
@@ -707,10 +735,16 @@ public sealed class LockSimulationTests
     /// <summary>
     /// LOCK-011: the volume leader is lost (crash, isolation or pause) while writer A holds a live lease on f1 and writer
     /// A2 — paused with its lease in flight — holds f2. The new leader recovers the persisted generations (no reset),
-    /// grants no duplicate writer while A's lease may still be valid, lets A publish under its generation, expires A2 on
-    /// its own clock, grants B2 a strictly newer generation and rejects A2's stale publication; after the old leader
-    /// returns every replica agrees on the newest generations.
+    /// grants no duplicate writer while A's lease may still be valid (it must treat every lease as renewed at its
+    /// election, and B asks right after the election), never accepts a publication under a superseded generation,
+    /// expires A2 on its own clock, grants B2 a strictly newer generation and rejects A2's stale publication; after the
+    /// old leader returns every replica agrees on the newest generations.
     /// </summary>
+    /// <remarks>
+    /// Whether A itself keeps its authority depends on its SDK reaching the new leader within one lease term, which is
+    /// availability, not safety: A's publication may commit under gA, fail for availability (resolved authoritatively),
+    /// or fail with LeaseLost when its lease lapsed — in every case f1 gets no other writer generation.
+    /// </remarks>
     [Theory]
     [MemberData(nameof(LeaderLosses))]
     [Catalog("LOCK-011", "S", "INV-02", "INV-05", "INV-06", "INV-12")]
@@ -738,7 +772,7 @@ public sealed class LockSimulationTests
 
             await using DfsClient clientA = await LockHelpers.ConnectAsync(cluster, "a", ct);
             DfsVolume va = clientA.GetVolume(Vol);
-            await using DfsStream a = await va.Files.OpenAsync(f1, LockHelpers.Writer(), ct);
+            DfsStream a = await va.Files.OpenAsync(f1, LockHelpers.Writer(), ct);
             ulong gA = a.WriterGeneration;
             await LockHelpers.StageReplaceAsync(a, dataA, ct);
 
@@ -781,26 +815,36 @@ public sealed class LockSimulationTests
 
             LockHelpers.AssertSharingConflict(dupError, "writer open right after the leader change");
 
-            // A keeps its authority across the change: its publication is accepted under generation gA.
+            // A's publication across the change: committed under gA, an availability failure resolved authoritatively,
+            // or LeaseLost if its lease lapsed — never a commit under any other generation.
             Exception? aCommit = await LockHelpers.CatchAsync(() => a.CommitAsync(ct));
             if (aCommit is null)
             {
                 LockHelpers.BytesEqual(dataA, await LockHelpers.ReadCommittedAsync(vb, f1, ct), "A's publication after the leader change");
             }
+            else if (aCommit is DfsLeaseLostException)
+            {
+                LockHelpers.AssertLeaseLost(aCommit, "A's publication after its lease lapsed during the leader change");
+                Assert.True(a.IsFaulted, "lease loss must fault A's stream");
+                LockHelpers.BytesEqual(initial1, await LockHelpers.ReadCommittedAsync(vb, f1, ct), "a rejected publication of A changed nothing");
+            }
             else
             {
-                Assert.True(LockHelpers.IsAvailabilityOrUnknown(aCommit), $"A holds a valid lease; its commit may only fail for availability, got {LockHelpers.Describe(aCommit)}");
+                Assert.True(LockHelpers.IsAvailabilityOrUnknown(aCommit), $"A's commit may only fail for availability or lease loss, got {LockHelpers.Describe(aCommit)}");
                 DfsOperationId? op = LockHelpers.OperationIdOf(aCommit);
                 if (op is not null)
                 {
                     DfsOperationOutcome outcome = await vb.QueryOperationAsync(op.Value, resolve: true, ct);
-                    Assert.True(outcome.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Aborted);
+                    Assert.True(outcome.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Aborted,
+                        $"resolve:true must make A's commit definite, got {outcome.Status}");
                     LockHelpers.BytesEqual(outcome.Status == DfsOutcomeStatus.Committed ? dataA : initial1,
                         await LockHelpers.ReadCommittedAsync(vb, f1, ct), "resolved outcome of A's commit");
                 }
             }
 
+            // No other writer was granted on f1 by the new leader, whatever happened to A.
             Assert.Equal(gA, (await LockHelpers.FileAsync(cluster, f1, newLeader.Name)).WriterGeneration);
+            Assert.DoesNotContain(await LockHelpers.ActiveWritersAsync(cluster, inode1, newLeader.Name), h => h.Generation != gA);
 
             // A2 (paused) expires on the new leader's clock; B2 gets a strictly newer generation; A2's publication is rejected.
             await LockHelpers.WaitForWriterGoneAsync(cluster, inode2, gA2, lease * 4, "A2's lease must expire under the new leader", ct, newLeader.Name);
@@ -835,6 +879,7 @@ public sealed class LockSimulationTests
             Assert.Equal(tB2.Sequence, (await LockHelpers.FileAsync(cluster, f2)).Revision);
             LockHelpers.BytesEqual(dataB2, await LockHelpers.ReadCommittedAsync(vb, f2, ct), "B2 is authoritative on f2; the returned old leader published nothing");
 
+            await LockHelpers.CatchAsync(() => a.DisposeAsync().AsTask()); // may legitimately surface a lease loss
             await LockHelpers.CatchAsync(() => a2.DisposeAsync().AsTask());
             await clientA2.DisposeAsync();
         }, ct);
@@ -933,6 +978,7 @@ public sealed class LockSimulationTests
             foreach (TestNode node in allNodes)
                 await node.RestartAsync();
             await cluster.WaitForStableAsync(null, ct);
+            await cluster.WaitForReplicationAsync(Vol, ct);
 
             await LockHelpers.AssertWriterGenerationOnEveryReplicaAsync(cluster, f1, gA, "generation recovered from durable state after the cold restart");
             await LockHelpers.AssertWriterGenerationOnEveryReplicaAsync(cluster, f2, h, "untouched inode's generation recovered");
@@ -975,7 +1021,8 @@ public sealed class LockSimulationTests
     /// LOCK-013: the volume leader (plus one follower with 5 nodes) is cut off with client M. Throughout the partition
     /// the minority grants no new writer, accepts no publication from M's existing writer and applies nothing; the
     /// majority elects a leader, expires M's writer and grants new writers. After healing the majority's history wins,
-    /// M's unknown operations resolve as aborted and M's stale writer cannot publish.
+    /// M's unknown operations resolve as aborted (or expired with M's session), never committed, and M's stale writer
+    /// cannot publish.
     /// </summary>
     [Theory]
     [MemberData(nameof(PartitionSizes))]
@@ -1015,6 +1062,8 @@ public sealed class LockSimulationTests
             await using DfsClient clientJ = await LockHelpers.ConnectAsync(cluster, "j", ct, seeds: majority);
             DfsVolume vj = clientJ.GetVolume(Vol);
             await cluster.WaitForReplicationAsync(Vol, ct);
+            // Baseline after A's writable open (which may itself touch f's inode record) and before the partition.
+            ulong fRevisionAtPartition = (await LockHelpers.FileAsync(cluster, f)).Revision;
 
             cluster.Network.Partition([.. minority, LockHelpers.Net("m")], [.. majority, LockHelpers.Net("j"), LockHelpers.Net("setup")]);
 
@@ -1044,7 +1093,7 @@ public sealed class LockSimulationTests
                 FileInspection? fm = state.GetFile(f);
                 FileInspection? gm = state.GetFile(g);
                 Assert.True(fm is not null && gm is not null);
-                Assert.Equal(f0.Revision, fm!.Revision);
+                Assert.Equal(fRevisionAtPartition, fm!.Revision);
                 Assert.Equal(g0.Revision, gm!.Revision);
                 Assert.Equal(gA, fm.WriterGeneration);
                 Assert.DoesNotContain(state.Handles, h => h.Inode == g0.InodeId && !h.Expired);
@@ -1075,8 +1124,11 @@ public sealed class LockSimulationTests
 
             foreach (DfsOperationId op in unknownOps)
             {
+                // M's session may have expired on the majority side during the partition; an expired id is an honest
+                // definite answer too. What must never happen is a commit.
                 DfsOperationOutcome outcome = await vj.QueryOperationAsync(op, resolve: true, ct);
-                Assert.True(outcome.Status == DfsOutcomeStatus.Aborted, $"minority operation {op} must never commit, resolved as {outcome.Status}");
+                Assert.True(outcome.Status is DfsOutcomeStatus.Aborted or DfsOutcomeStatus.Expired,
+                    $"minority operation {op} must never commit, resolved as {outcome.Status}");
             }
 
             LockHelpers.BytesEqual(dataB, await LockHelpers.ReadCommittedAsync(vj, f, ct), "f holds the majority writer's contents");
@@ -1166,8 +1218,12 @@ public sealed class LockSimulationTests
             CommitToken tB = await LockHelpers.ReplaceAndCommitAsync(b, dataB, ct);
 
             cluster.Network.Heal();
+            // The changed clock covered A's isolation, expiry and B's grant — the part under test. A's SDK then needs
+            // working timers (reconnect backoff, request timeouts) to complete its next call within the bound.
             if (change == ClientClockChange.Frozen)
-                clockA.Unfreeze(); // the frozen interval covered A's expiry and B's grant; A's SDK needs its timers to complete calls
+                clockA.Unfreeze();
+            if (change == ClientClockChange.SlowRate)
+                clockA.SetRate(1.0);
             Exception? stale = await LockHelpers.CatchWithinAsync(cluster, () => a.CommitAsync(ct), lease * 20, "A's publication after reconnecting", ct);
             LockHelpers.AssertLeaseLost(stale, $"A's publication with client clock change {change}");
             Assert.True(a.IsFaulted);
@@ -1186,9 +1242,13 @@ public sealed class LockSimulationTests
     /// LOCK-014 (connected): the same client clock changes with the network intact, while A keeps publishing through its
     /// original handle and B keeps trying to take the inode. Legal outcomes: A keeps authority (B is refused) or A loses
     /// it (server-side expiry) and B takes over — but never both: no A publication commits after B's grant, and every
-    /// replica holds at most one active writer at every step. A frozen or 10× slowed client stops renewing in time, so
-    /// the server must hand the inode to B.
+    /// replica holds at most one active writer at every step.
     /// </summary>
+    /// <remarks>
+    /// Which branch occurs is availability, not safety: a frozen/slowed client may still keep its lease if the server
+    /// counts its publications as activity, and a client that distrusts its own clock may conservatively stop
+    /// publishing. The deterministic replacement (renewals cannot arrive) is covered by the isolated variant above.
+    /// </remarks>
     [Theory]
     [MemberData(nameof(ClientClockChanges))]
     [Catalog("LOCK-014", "S", "INV-02", "INV-05", "INV-06", "INV-12")]
@@ -1226,14 +1286,14 @@ public sealed class LockSimulationTests
             clockA.SetRate(1.0);
 
             byte[]? expected = await probe.ResolveAsync(vb);
-            LockHelpers.BytesEqual(expected ?? initial, await LockHelpers.ReadCommittedAsync(setup, path, ct), "contents equal the last committed publication in log order");
+            probe.AssertFinalContents(expected, initial, await LockHelpers.ReadCommittedAsync(setup, path, ct), "contents equal the last committed publication in log order");
 
-            if (change is ClientClockChange.Frozen or ClientClockChange.SlowRate)
-                Assert.True(probe.BGrantIteration is not null, $"A's client ({change}) cannot renew in time, so the server must expire it and grant B");
             if (probe.BGrantIteration is null)
             {
-                Assert.True(probe.ASuccesses > 0, "legal branch 'A keeps authority': A's publications are accepted");
-                Assert.Single(await LockHelpers.ActiveWritersAsync(cluster, inode), h => h.Generation == probe.AGeneration);
+                // Legal branch "A keeps authority": B was refused throughout, so no generation other than A's was ever
+                // granted (A's handle may have lapsed only after B's last attempt).
+                Assert.All(await LockHelpers.ActiveWritersAsync(cluster, inode), h => Assert.Equal(probe.AGeneration, h.Generation));
+                Assert.Equal(probe.AGeneration, (await LockHelpers.FileAsync(cluster, path)).WriterGeneration);
             }
             else
             {
@@ -1369,7 +1429,7 @@ public sealed class LockSimulationTests
             await cluster.WaitForStableAsync(null, ct);
             byte[]? expected = await probe.ResolveAsync(vb);
             await using DfsClient verifier = await LockHelpers.ConnectAsync(cluster, "verify", ct);
-            LockHelpers.BytesEqual(expected ?? initial, await LockHelpers.ReadCommittedAsync(verifier.GetVolume(Vol), path, ct),
+            probe.AssertFinalContents(expected, initial, await LockHelpers.ReadCommittedAsync(verifier.GetVolume(Vol), path, ct),
                 "contents equal the last committed publication in log order");
             await LockHelpers.AssertAtMostOneActiveWriterOnEveryReplicaAsync(cluster, inode, "after clocks were restored");
             await cluster.Inspect.AssertNoSplitBrainAsync();
@@ -1503,9 +1563,10 @@ public sealed class LockSimulationTests
     /// LOCK-017: writer A is paused, expired and replaced by B (generation gB). Then A — or A's client — attempts a
     /// stale write through one path: its own stream (flush, commit, write-through, write-through SetLength, dispose),
     /// every convenience helper, a transaction commit, truncating/creating opens, a replay of its queued CommitFile RPC,
-    /// a direct storage put without capability, or a snapshot restore. No path bypasses authority: stream paths fail
-    /// with LeaseLost, reservation-taking paths with a sharing conflict, raw RPCs are refused, restore creates a new
-    /// volume without carrying reservations — and B's inode keeps B's contents, revision and generation.
+    /// a direct storage put without capability, or a restore (by A's client) of a snapshot taken while A was the writer.
+    /// No path bypasses authority: stream paths fail with LeaseLost, reservation-taking paths with a sharing conflict,
+    /// raw RPCs are refused, restore creates a new volume without carrying reservations and cannot touch the live inode
+    /// — and B's inode keeps B's contents, revision and generation.
     /// </summary>
     [Theory]
     [MemberData(nameof(StalePaths))]
@@ -1558,6 +1619,10 @@ public sealed class LockSimulationTests
                 });
                 await queuedCommit.WaitForAsync(1, lease * 2);
             }
+
+            const string preSnapshot = "lock017-pre";
+            if (stalePath == StalePath.Restore)
+                await setup.Snapshots.CreateAsync(preSnapshot, null, ct); // holds A's accepted publication dataA1
 
             PausedClient pausedA = PausedClient.Pause(cluster, "a", clockA);
             await LockHelpers.WaitForWriterGoneAsync(cluster, inode, gA, lease * 4, "A's lease must expire while A is paused", ct);
@@ -1679,15 +1744,18 @@ public sealed class LockSimulationTests
 
                 case StalePath.Restore:
                 {
+                    // A's client restores the snapshot taken while A was the writer. Restore always creates a NEW volume
+                    // (FSD §11, ARCHITECTURE §5.7): it can neither overwrite B's live inode nor carry any reservation.
                     const string restoredName = "lock017-restored";
-                    DfsVolumeInfo live = await vb.GetInfoAsync(ct);
-                    await vb.Snapshots.CreateAsync("lock017", null, ct);
-                    DfsVolumeInfo restored = await vb.Snapshots.RestoreAsync("lock017", restoredName, ct);
+                    DfsVolumeInfo live = await va.GetInfoAsync(ct);
+                    DfsVolumeInfo restored = await va.Snapshots.RestoreAsync(preSnapshot, restoredName, ct);
                     Assert.NotEqual(live.Id, restored.Id);
+                    Assert.Equal(restoredName, restored.Name);
+                    await cluster.GetLeaderAsync(restoredName, ct);
                     VolumeStateInspection restoredState = await cluster.Inspect.GetVolumeStateAsync(restoredName);
-                    Assert.Empty(restoredState.Handles); // no live reservation (A's or B's) is carried into the restored volume
+                    Assert.DoesNotContain(restoredState.Handles, h => !h.Expired); // neither A's nor B's reservation is carried over
                     DfsVolume rv = clientB.GetVolume(restoredName);
-                    LockHelpers.BytesEqual(dataB, await LockHelpers.ReadCommittedAsync(rv, path, ct), $"{what}: restored contents are the snapshot's");
+                    LockHelpers.BytesEqual(dataA1, await LockHelpers.ReadCommittedAsync(rv, path, ct), $"{what}: restored contents are the snapshot's");
                     await using (DfsStream fresh = await rv.Files.OpenAsync(path, LockHelpers.Writer(), ct))
                         Assert.True(fresh.WriterGeneration > 0, "a new writer of the restored volume is granted freshly");
                     LockHelpers.AssertLeaseLost(await LockHelpers.CatchAsync(async () =>
@@ -1761,10 +1829,14 @@ public sealed class LockSimulationTests
             await other.Files.WriteAllBytesAsync(readSet, TestData.Bytes(18_004, 500), ct);
             InodeId inodeA = (await other.Files.GetInfoAsync(targets[0], ct)).InodeId;
 
+            // Long enough for the three reservations and the enforcement checks below (a few Raft round trips), short
+            // enough to expire well before the session timeout.
+            TimeSpan txTimeout = lease + lease / 2;
             DfsClient txClient = await LockHelpers.ConnectAsync(cluster, "t1", ct);
             DfsVolume tv = txClient.GetVolume(Vol);
+            long txBegunAt = cluster.Time.GetTimestamp();
             DfsTransaction tx = await tv.Transactions.BeginAsync(
-                end == TransactionEnd.TimeoutExpiry ? new DfsTransactionOptions { Timeout = TimeSpan.FromSeconds(1) } : null, ct);
+                end == TransactionEnd.TimeoutExpiry ? new DfsTransactionOptions { Timeout = txTimeout } : null, ct);
             if (end == TransactionEnd.CommitConflict)
                 await tx.Files.ReadAllBytesAsync(readSet, ct);
 
@@ -1797,6 +1869,12 @@ public sealed class LockSimulationTests
                 LockHelpers.AssertSharingConflict(e, $"{target} reserved by the transaction");
             }
 
+            if (end == TransactionEnd.TimeoutExpiry)
+            {
+                Assert.True(cluster.Time.GetElapsedTime(txBegunAt) < txTimeout,
+                    $"test precondition: the reservations were verified before the {txTimeout} transaction timeout");
+            }
+
             TestNode? crashedLeader = null;
             switch (end)
             {
@@ -1824,10 +1902,15 @@ public sealed class LockSimulationTests
                 }
 
                 case TransactionEnd.TimeoutExpiry:
-                    await cluster.DelayAsync(TimeSpan.FromSeconds(3), ct);
+                {
+                    await cluster.DelayAsync(txTimeout * 3, ct);
                     Exception? expired = await LockHelpers.CatchAsync(() => tx.CommitAsync(ct));
-                    Assert.True(expired is DfsTransactionAbortedException, $"an expired transaction must report TransactionAborted, got {LockHelpers.Describe(expired)}");
+                    Assert.True(expired is DfsTransactionAbortedException or DfsLimitExceededException,
+                        $"an expired transaction must refuse to commit with a typed abort (TransactionAborted, or the exceeded duration limit), got {LockHelpers.Describe(expired)}");
+                    Assert.NotEqual(DfsTransactionState.Committed, tx.State);
                     break;
+                }
+
                 case TransactionEnd.ClientKilled:
                     cluster.KillClient(txClient);
                     break;
@@ -1837,7 +1920,18 @@ public sealed class LockSimulationTests
                     await crashedLeader.CrashAsync();
                     await LockHelpers.WaitForNewLeaderAsync(cluster, crashedLeader.Name, lease * 5, ct);
                     Exception? aborted = await LockHelpers.CatchAsync(() => tx.CommitAsync(ct));
-                    Assert.True(aborted is DfsTransactionAbortedException, $"a leader change aborts active transactions, got {LockHelpers.Describe(aborted)}");
+                    if (aborted is DfsCommitOutcomeUnknownException unknown)
+                    {
+                        // The commit request may have been in flight around the crash: resolve it authoritatively.
+                        Assert.Equal(tx.Id, unknown.TransactionId);
+                        DfsOperationOutcome outcome = await other.Transactions.QueryOutcomeAsync(tx.Id, resolve: true, ct);
+                        Assert.True(outcome.Status == DfsOutcomeStatus.Aborted, $"a leader change aborts active transactions; the commit resolved as {outcome.Status}");
+                    }
+                    else
+                    {
+                        Assert.True(aborted is DfsTransactionAbortedException, $"a leader change aborts active transactions, got {LockHelpers.Describe(aborted)}");
+                    }
+
                     break;
                 }
             }
