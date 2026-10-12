@@ -3,7 +3,7 @@ using System.Text;
 using Tedd.Tdfs.Testing;
 using Tedd.Tdfs.Tests.Unit.Sdk;
 
-namespace Tedd.Tdfs.Tests.Unit.Path;
+namespace Tedd.Tdfs.Tests.Unit.Paths;
 
 /// <summary>Shared helpers for the PATH unit suite: path builders and the "rejected locally, no request" sweep.</summary>
 internal static class PathHelpers
@@ -121,8 +121,16 @@ internal static class PathHelpers
     }
 
     /// <summary>
+    /// True when an <see cref="ArgumentException"/> identifies the path as the invalid argument: it is classified
+    /// <see cref="DfsErrorCode.InvalidPath"/> (canonical mapping, ParamName "path"), or it names the method's path
+    /// parameter ("sourcePath"/"destinationPath" of two-path operations — the ordinary .NET convention).
+    /// </summary>
+    public static bool IdentifiesPathArgument(ArgumentException ex) =>
+        DfsErrors.ToCode(ex) == DfsErrorCode.InvalidPath || ex.ParamName is "path" or "sourcePath" or "destinationPath";
+
+    /// <summary>
     /// For every bad path and every path-taking entry point: the call fails with an <see cref="ArgumentException"/>
-    /// classified <see cref="DfsErrorCode.InvalidPath"/> (any <see cref="ArgumentNullException"/> for a null path),
+    /// that identifies the path (<see cref="IdentifiesPathArgument"/>; any <see cref="ArgumentNullException"/> for a null path),
     /// no request leaves the client (the message log is unchanged, also after a settle delay) and the namespace is
     /// unchanged (same inode count, valid companions intact).
     /// </summary>
@@ -154,8 +162,8 @@ internal static class PathHelpers
                     failures.Add($"{call} completed instead of rejecting the path");
                 else if (ex is not ArgumentException)
                     failures.Add($"{call} threw {ex.GetType().Name} ({DfsErrors.ToCode(ex)}) instead of ArgumentException: {ex.Message}");
-                else if (bad is not null && DfsErrors.ToCode(ex) != DfsErrorCode.InvalidPath)
-                    failures.Add($"{call} threw ArgumentException classified {DfsErrors.ToCode(ex)} instead of InvalidPath: {ex.Message}");
+                else if (bad is not null && !IdentifiesPathArgument((ArgumentException)ex))
+                    failures.Add($"{call} threw ArgumentException classified {DfsErrors.ToCode(ex)} (ParamName '{((ArgumentException)ex).ParamName}') that does not identify the path: {ex.Message}");
                 else if (bad is null && ex is not ArgumentNullException)
                     failures.Add($"{call} threw {ex.GetType().Name} instead of ArgumentNullException for a null path");
 

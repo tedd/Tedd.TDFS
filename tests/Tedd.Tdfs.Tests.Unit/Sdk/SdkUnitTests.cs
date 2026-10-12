@@ -175,10 +175,11 @@ public sealed class SdkUnitTests
         ],
         ["MutationOptions"] =
         [
+            // Only empty names are rejected here: the FSD/API define no character rules for policy or snapshot names,
+            // so a whitespace or '/'-containing name is not an invalid *option* (an unknown policy is a server error).
             Case("EmptyStoragePolicy", c => c.Files.WriteAllBytesAsync(NewPath, new byte[] { 1 }, new DfsMutationOptions { StoragePolicy = "" }, Ct)),
-            Case("WhitespaceStoragePolicy", c => c.Files.WriteAllBytesAsync(NewPath, new byte[] { 1 }, new DfsMutationOptions { StoragePolicy = "  " }, Ct)),
             Case("EmptyCommitSnapshotName", c => c.Files.WriteAllBytesAsync(NewPath, new byte[] { 1 }, new DfsMutationOptions { CommitSnapshotName = "" }, Ct)),
-            Case("SlashInCommitSnapshotName", c => c.Files.AppendAllBytesAsync(ExistingPath, new byte[] { 1 }, new DfsMutationOptions { CommitSnapshotName = "a/b" }, Ct)),
+            Case("EmptyCommitSnapshotNameOnAppend", c => c.Files.AppendAllBytesAsync(ExistingPath, new byte[] { 1 }, new DfsMutationOptions { CommitSnapshotName = "" }, Ct)),
             Case("EmptyOperationIdOnWrite", c => c.Files.WriteAllBytesAsync(NewPath, new byte[] { 1 }, new DfsMutationOptions { OperationId = default(DfsOperationId) }, Ct)),
             Case("EmptyOperationIdOnMove", c => c.Files.MoveAsync(ExistingPath, NewPath, false, new DfsMutationOptions { OperationId = default(DfsOperationId) }, Ct)),
             Case("EmptyOperationIdOnCreateDirectory", c => c.Volume.Directories.CreateDirectoryAsync("/sdk001/newdir", new DfsMutationOptions { OperationId = default(DfsOperationId) }, Ct)),
@@ -208,13 +209,14 @@ public sealed class SdkUnitTests
             Case("NegativeAdapterTimeout", c => c.Volume.Snapshots.CreateAsync("sdk001-snap", new DfsSnapshotOptions { AdapterTimeout = TimeSpan.FromSeconds(-1) }, Ct)),
             Case("NullAdapterList", c => c.Volume.Snapshots.CreateAsync("sdk001-snap", new DfsSnapshotOptions { Adapters = null! }, Ct)),
             Case("EmptySnapshotName", c => c.Volume.Snapshots.CreateAsync("", null, Ct)),
-            Case("NoneMinimumCommit", c => c.Volume.Snapshots.CreateAsync("sdk001-snap", new DfsSnapshotOptions { MinimumCommit = CommitToken.None }, Ct)),
+            // (CommitToken.None as MinimumCommit / await token is not listed: the API does not say whether None means
+            // "no minimum" or is invalid, so either behaviour is legal.)
             Case("EmptyCommitWithSnapshotName", c => c.Transaction.CommitWithSnapshotAsync("", Ct)),
         ],
         ["BackupOptions"] =
         [
             Case("NegativeAwaitTimeout", c => c.Volume.Backups.AwaitBackupAsync("b0", c.Token, TimeSpan.FromSeconds(-1), Ct)),
-            Case("NoneAwaitToken", c => c.Volume.Backups.AwaitBackupAsync("b0", CommitToken.None, TimeSpan.FromSeconds(5), Ct)),
+            Case("ZeroAwaitTimeout", c => c.Volume.Backups.AwaitBackupAsync("b0", c.Token, TimeSpan.Zero, Ct)),
             Case("NegativePinnedBytesBudget", c => c.Volume.Backups.ConfigureAsync("b0", new DfsBackupSchedule(), new DfsBackupBudgets(TimeSpan.FromHours(1), -1), Ct)),
             Case("ZeroPinAgeBudget", c => c.Volume.Backups.ConfigureAsync("b0", new DfsBackupSchedule(), new DfsBackupBudgets(TimeSpan.Zero, 1L << 30), Ct)),
             Case("ZeroConcurrentObjects", c => c.Volume.Backups.ConfigureAsync("b0", new DfsBackupSchedule(), new DfsBackupBudgets(TimeSpan.FromHours(1), 1L << 30, long.MaxValue, 0), Ct)),
@@ -288,8 +290,10 @@ public sealed class SdkUnitTests
     [Catalog("SDK-003", "U", "INV-12", "INV-08")]
     public async Task SDK_003_MultipleClientsAreIsolated()
     {
-        TestClusterOptions optionsA = TestClusterOptions.ThreeZones with { Volumes = [new TestVolumeSpec("va"), new TestVolumeSpec("shared")] };
-        TestClusterOptions optionsB = TestClusterOptions.ThreeZones with { Volumes = [new TestVolumeSpec("vb"), new TestVolumeSpec("shared")] };
+        // Explicit, different seeds: with Seed = 0 both clusters would derive the same seed from the test name, and every
+        // seeded identity (cluster id, secrets, node ids) would be identical, hiding any cross-cluster mix-up.
+        TestClusterOptions optionsA = TestClusterOptions.ThreeZones with { Seed = 0x5D_0003_0A, Volumes = [new TestVolumeSpec("va"), new TestVolumeSpec("shared")] };
+        TestClusterOptions optionsB = TestClusterOptions.ThreeZones with { Seed = 0x5D_0003_0B, Volumes = [new TestVolumeSpec("vb"), new TestVolumeSpec("shared")] };
         await ClusterTest.RunAsync(optionsA, async clusterA =>
         {
             await ClusterTest.RunAsync(optionsB, async clusterB =>
@@ -425,9 +429,10 @@ public sealed class SdkUnitTests
             Assert.All(shared, o => Assert.Equal(OpOutcome.Ok, o.Outcome));
             LinearizabilityChecker.Check(shared, new RegisterModel()).AssertValid();
 
-            // Pooled connections are reused, not opened per call.
+            // Pooled connections are reused, not opened per call: every worker issued well over a dozen calls, yet the
+            // client holds at most one connection per concurrent caller per node (and at least one: it is still live).
             int open = cluster.Network.CountOpenConnections(SdkHelpers.NetworkName());
-            Assert.InRange(open, 1, cluster.Nodes.Count * 4);
+            Assert.InRange(open, 1, cluster.Nodes.Count * Workers);
         }, Ct);
     }
 
@@ -478,9 +483,13 @@ public sealed class SdkUnitTests
             Assert.False(await volume.Files.ExistsAsync(file, Ct));
             result.Tokens.Add(await volume.Files.DeleteAsync(streamed, Ct));
 
+            // 16 threads hit one file: WriteAll's implicit writer reservation may legally conflict with another WriteAll
+            // or a ReadAll pin (typed sharing violation, no effect, no automatic waiting — LOCK-03). Such rejections are
+            // retried inside the recorded operation; they are not evidence about the facades' thread safety.
             byte[] value = Encoding.UTF8.GetBytes($"w{worker}-r{round}");
-            await cluster.History.RecordAsync($"w{worker}", "write", SharedKey, value, () => volume.Files.WriteAllBytesAsync(SharedKey, value, Ct));
-            await cluster.History.RecordAsync<byte[]?>($"w{worker}", "read", SharedKey, null, async () =>
+            await cluster.History.RecordAsync($"w{worker}", "write", SharedKey, value,
+                () => SdkHelpers.RetryOnSharingViolationAsync(cluster, () => volume.Files.WriteAllBytesAsync(SharedKey, value, Ct)));
+            await cluster.History.RecordAsync<byte[]?>($"w{worker}", "read", SharedKey, null, () => SdkHelpers.RetryOnSharingViolationAsync<byte[]?>(cluster, async () =>
             {
                 try
                 {
@@ -490,7 +499,7 @@ public sealed class SdkUnitTests
                 {
                     return null;
                 }
-            });
+            }));
         }
 
         string[] names = (await SdkHelpers.ListNamesAsync(volume.Directories, dir)).Order(StringComparer.Ordinal).ToArray();
@@ -553,10 +562,12 @@ public sealed class SdkUnitTests
             async c => !await c.Observer.Files.ExistsAsync("/sdk009/delete.bin", Ct)),
         ["Directories.CreateDirectoryAsync"] = new(true, (c, ct) => c.Volume.Directories.CreateDirectoryAsync("/sdk009/newdir", ct),
             c => c.Observer.Directories.ExistsAsync("/sdk009/newdir", Ct)),
+        // The probed files have an open writer (Share.Read), so the observer reads them with a compatible
+        // Share.ReadWrite stream instead of ReadAllBytes (whose internal handle may legally conflict with the writer).
         ["Stream.WriteAsync(WriteThrough)"] = new(true, (c, ct) => c.WriteThroughStream.WriteAsync(new byte[] { 9, 9, 9 }, ct).AsTask(),
-            async c => !(await c.Observer.Files.ReadAllBytesAsync("/sdk009/wt.bin", Ct)).AsSpan().SequenceEqual(c.WriteThroughOriginal)),
+            async c => !(await SdkHelpers.ReadSharedAsync(c.Observer.Files, "/sdk009/wt.bin", Ct)).AsSpan().SequenceEqual(c.WriteThroughOriginal)),
         ["Stream.FlushAsync(OnFlush)"] = new(true, (c, ct) => c.OnFlushStream.FlushAsync(ct),
-            async c => (await c.Observer.Files.ReadAllBytesAsync("/sdk009/of.bin", Ct)).AsSpan().SequenceEqual(c.Staged)),
+            async c => (await SdkHelpers.ReadSharedAsync(c.Observer.Files, "/sdk009/of.bin", Ct)).AsSpan().SequenceEqual(c.Staged)),
         ["Transaction.CommitAsync"] = new(true, (c, ct) => c.Transaction.CommitAsync(ct),
             c => c.Observer.Files.ExistsAsync("/sdk009/tx.bin", Ct)),
         ["Snapshots.CreateAsync"] = new(true, (c, ct) => c.Volume.Snapshots.CreateAsync("sdk009-snap", null, ct),
@@ -610,6 +621,8 @@ public sealed class SdkUnitTests
             if (!call.Mutates)
             {
                 Assert.True(error is OperationCanceledException, $"{callName}: expected OperationCanceledException but got {error}");
+                if (callName == "Stream.ReadAsync")
+                    Assert.Equal(0, context.ReadStream.Position); // FSD §6.2: a failed read leaves Position unchanged
             }
             else if (error is OperationCanceledException)
             {
@@ -757,9 +770,19 @@ public sealed class SdkUnitTests
 
             Assert.True(client.IsDisposed);
 
-            // New work is rejected locally on every facade, async and sync.
-            Assert.Throws<ObjectDisposedException>(() => client.GetVolume(Volume));
-            Assert.Throws<ObjectDisposedException>(() => client.GetVolume("another"));
+            // New work is rejected locally on every facade, async and sync. GetVolume does no I/O, so it may either throw
+            // ObjectDisposedException itself or hand out a facade whose operations do (the FSD only requires that new
+            // work is rejected).
+            foreach (string name in new[] { Volume, "another" })
+            {
+                DfsVolume? late = null;
+                Exception? getVolume = Record.Exception(() => late = client.GetVolume(name));
+                if (getVolume is not null)
+                    Assert.IsAssignableFrom<ObjectDisposedException>(getVolume);
+                else
+                    await Assert.ThrowsAsync<ObjectDisposedException>(() => late!.Files.ExistsAsync("/sdk011.bin", Ct));
+            }
+
             await Assert.ThrowsAsync<ObjectDisposedException>(() => volume.Files.ReadAllBytesAsync("/sdk011.bin", Ct));
             await Assert.ThrowsAsync<ObjectDisposedException>(() => volume.Files.WriteAllBytesAsync("/sdk011-new.bin", bytes, Ct));
             await Assert.ThrowsAsync<ObjectDisposedException>(() => volume.Files.OpenReadAsync("/sdk011.bin", Ct));
@@ -930,12 +953,30 @@ public sealed class SdkUnitTests
             };
             if (stage == "F02_ConnectionAcquisition")
                 cluster.Network.ResetConnections(me);
+            if (stage == "F03_RequestSend")
+                replacement = TestData.Bytes(1333, 1000); // inline: no uploads, so the first send of the operation is (close to) the commit
 
-            FaultArm arm = cluster.Faults.Arm(new FaultMatch(site, Operation: DfsOperationKind.WriteAll, Occurrence: occurrence), FaultAction.CancelCaller());
             long commitsBefore = SdkHelpers.RequestsOfKind(cluster, me, DfsOperationKind.WriteAll);
             using var cts = new CancellationTokenSource();
+            bool cancelledAfterCommitReply = false;
+            FaultArm arm = stage == "F14_ReplyReceived"
+                // A large WriteAll receives upload (PutObject/staging) replies before the commit reply, so cancel at the
+                // first reply received after the WriteAll commit request itself was sent: only then is the outcome known.
+                ? cluster.Faults.Arm(new FaultMatch(site, Operation: DfsOperationKind.WriteAll, Count: 100_000), FaultAction.Custom(_ =>
+                {
+                    if (!cancelledAfterCommitReply && SdkHelpers.RequestsOfKind(cluster, me, DfsOperationKind.WriteAll) > commitsBefore)
+                    {
+                        cancelledAfterCommitReply = true;
+                        cts.Cancel();
+                    }
+
+                    return Task.CompletedTask;
+                }))
+                : cluster.Faults.Arm(new FaultMatch(site, Operation: DfsOperationKind.WriteAll, Occurrence: occurrence), FaultAction.CancelCaller());
             Exception? error = await Record.ExceptionAsync(() => volume.Files.WriteAllBytesAsync(Target, replacement, cts.Token));
             cluster.Faults.AssertReached(arm);
+            if (stage == "F14_ReplyReceived")
+                Assert.True(cancelledAfterCommitReply, "F14: no reply was received for the WriteAll after its commit request was sent");
             await cluster.DelayAsync(TimeSpan.FromMilliseconds(500), Ct);
             error = error is null ? null : SdkHelpers.Unwrap(error);
             byte[] current = await volume.Files.ReadAllBytesAsync(Target, Ct);
@@ -1357,9 +1398,13 @@ public sealed class SdkUnitTests
                     await v.Files.WriteAllBytesAsync($"/tx/f{i}", Encoding.UTF8.GetBytes($"before-{i}"), Ct);
             }
 
+            // Within the limit under any counting of "touched" inodes (2 written files; with the root and /tx read for
+            // path resolution still 4). The limit-sized commit is not used as the accepted boundary because the FSD does
+            // not say whether path-resolution reads count as touched.
+            const int WithinLimit = 2;
             await using (DfsTransaction ok = await strictVolume.Transactions.BeginAsync(null, Ct))
             {
-                for (int i = 0; i < 4; i++)
+                for (int i = 0; i < WithinLimit; i++)
                     await ok.Files.WriteAllBytesAsync($"/tx/f{i}", Encoding.UTF8.GetBytes($"after-{i}"), Ct);
                 Assert.False((await ok.CommitAsync(Ct)).IsNone);
             }
@@ -1382,7 +1427,7 @@ public sealed class SdkUnitTests
             }
 
             for (int i = 0; i < 5; i++)
-                Assert.Equal(i < 4 ? $"after-{i}" : "before-4", await strictVolume.Files.ReadAllTextAsync($"/tx/f{i}", null, Ct));
+                Assert.Equal(i < WithinLimit ? $"after-{i}" : $"before-{i}", await strictVolume.Files.ReadAllTextAsync($"/tx/f{i}", null, Ct));
 
             await using (DfsTransaction wide = await vol.Transactions.BeginAsync(null, Ct))
             {

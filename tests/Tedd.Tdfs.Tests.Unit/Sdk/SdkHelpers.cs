@@ -114,6 +114,41 @@ internal static class SdkHelpers
 
     /// <summary>Writes a line to the test output.</summary>
     public static void Log(string message) => TestContext.Current.TestOutputHelper?.WriteLine(message);
+
+    /// <summary>
+    /// Reads a whole file through a live read stream opened with <see cref="FileShare.ReadWrite"/> |
+    /// <see cref="FileShare.Delete"/>, so the read coexists with writers and transaction reservations that are still
+    /// active on the file (test plan §5: visibility checks use compatible sharing options; a setup-level sharing
+    /// conflict is not evidence about publication).
+    /// </summary>
+    public static async Task<byte[]> ReadSharedAsync(DfsFileClient files, string path, CancellationToken ct = default)
+    {
+        await using DfsStream stream = await files.OpenAsync(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, ct);
+        var copy = new MemoryStream();
+        await stream.CopyToAsync(copy, ct);
+        return copy.ToArray();
+    }
+
+    /// <summary>
+    /// Runs <paramref name="action"/> and retries it (bounded, with a short backoff on the cluster clock) while it fails
+    /// with a <see cref="DfsSharingViolationException"/>. A sharing/writer conflict is a definite rejection without
+    /// effect (LOCK-03: no automatic waiting), so wrapping the retries inside one recorded history operation keeps the
+    /// history legal: the effect still lies within the operation's invocation/completion window.
+    /// </summary>
+    public static async Task<T> RetryOnSharingViolationAsync<T>(TestCluster cluster, Func<Task<T>> action, int maxAttempts = 200)
+    {
+        for (int attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await action();
+            }
+            catch (DfsSharingViolationException) when (attempt < maxAttempts)
+            {
+                await cluster.DelayAsync(TimeSpan.FromMilliseconds(5 + (attempt % 8) * 5));
+            }
+        }
+    }
 }
 
 /// <summary>Records every SDK diagnostic event (thread-safe).</summary>

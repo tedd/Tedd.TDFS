@@ -74,8 +74,12 @@ public sealed class SdkSimulationTests
             Assert.NotNull(file);
             Assert.Equal(bytes.Length, file.Length);
 
-            if (failure is "Cut" or "BlackHole" or "Crashed" or "Stopped")
+            // The first seed did not serve the client. (Requests *to* it may legitimately have been attempted and logged
+            // for a cut or black-holed link — seeds are tried in order — so only its replies are checked there.)
+            if (failure is "Crashed" or "Stopped")
                 Assert.Equal(0, cluster.Network.Log.CountMessages(new MessageFilter(From: me, To: first.Name)));
+            if (failure is "Cut" or "Crashed" or "Stopped")
+                Assert.Equal(0, cluster.Network.Log.CountMessages(new MessageFilter(From: first.Name, To: me, Direction: LinkDirection.Reply)));
             long viaOthers = seeds.Skip(1).Sum(n => cluster.Network.Log.CountMessages(new MessageFilter(From: me, To: n)));
             Assert.True(viaOthers > 0, "the client must have been served by another seed");
 
@@ -136,9 +140,12 @@ public sealed class SdkSimulationTests
                 }
             }
 
+            // Every node is named as a seed explicitly (the harness default must not drop crashed/paused nodes and hand
+            // the SDK an empty seed list, which would be an argument error instead of an availability failure).
+            string[] allSeeds = cluster.Nodes.Select(n => n.Name).ToArray();
             long started = cluster.Time.GetTimestamp();
             Exception error = await SdkHelpers.CaptureAsync(
-                () => cluster.ConnectAsync(new TestClientOptions { Name = ClientName, ConnectTimeout = connectTimeout }), "every seed is offline");
+                () => cluster.ConnectAsync(new TestClientOptions { Name = ClientName, SeedNodes = allSeeds, ConnectTimeout = connectTimeout }), "every seed is offline");
             TimeSpan elapsed = cluster.Time.GetElapsedTime(started);
             Exception inner = SdkHelpers.Unwrap(error);
             SdkHelpers.Log($"SDK-005 {failure}: {inner.GetType().Name} after {elapsed}");
@@ -216,11 +223,12 @@ public sealed class SdkSimulationTests
     [Catalog("SDK-006", "S", "INV-12", "INV-08")]
     public async Task SDK_006_ClusterIdentityMismatch_ForeignClusterEndpoint(string layout)
     {
-        // Two real clusters on QUIC so an endpoint of the other cluster is genuinely reachable from the client.
+        // Two real clusters on QUIC so an endpoint of the other cluster is genuinely reachable from the client. Explicit,
+        // different seeds: with Seed = 0 both would derive the same seed from the test name and get identical cluster ids.
         TestClusterOptions quic = TestClusterOptions.ThreeZones with { Transport = TransportKind.Quic };
-        await ClusterTest.RunAsync(quic, async clusterA =>
+        await ClusterTest.RunAsync(quic with { Seed = 0x5D_0006_0A }, async clusterA =>
         {
-            await ClusterTest.RunAsync(quic, async clusterB =>
+            await ClusterTest.RunAsync(quic with { Seed = 0x5D_0006_0B }, async clusterB =>
             {
                 Assert.NotEqual(clusterA.ClusterId, clusterB.ClusterId);
                 DfsClientOptions own = clusterA.CreateClientOptions();
@@ -265,12 +273,31 @@ public sealed class SdkSimulationTests
     // SDK-007 RoutingChangesDuringCall
     // =====================================================================================================
 
-    public static TheoryData<string> LeadershipMoves => new(
-        "StaleRouteAfterHeal", "LeaderIsolatedDuringCall", "LeaderCrashBeforePropose", "LeaderCrashAfterLocalAppend", "LeaderCrashAfterCommitBeforeReply");
+    private static readonly string[] LeadershipMoveNames =
+        ["StaleRouteAfterHeal", "LeaderIsolatedDuringCall", "LeaderCrashBeforePropose", "LeaderCrashAfterLocalAppend", "LeaderCrashAfterCommitBeforeReply"];
+
+    /// <summary>
+    /// Every leadership move with an application-supplied operation id (outcome queryable and retryable by id) and with
+    /// the SDK's own id (the SDK must reuse it across the reroute; a fresh id would append the suffix twice).
+    /// </summary>
+    public static TheoryData<string, bool> LeadershipMoves
+    {
+        get
+        {
+            var data = new TheoryData<string, bool>();
+            foreach (string move in LeadershipMoveNames)
+            {
+                data.Add(move, true);
+                data.Add(move, false);
+            }
+
+            return data;
+        }
+    }
 
     [Theory, MemberData(nameof(LeadershipMoves))]
     [Catalog("SDK-007", "S", "INV-06", "INV-17")]
-    public async Task SDK_007_RoutingChangesDuringCall(string move)
+    public async Task SDK_007_RoutingChangesDuringCall(string move, bool explicitOperationId)
     {
         await ClusterTest.RunAsync(SdkHelpers.Deterministic, async cluster =>
         {
@@ -283,7 +310,8 @@ public sealed class SdkSimulationTests
             CommitToken first = await volume.Files.WriteAllBytesAsync(LogPath, prefix); // discovery and routing to the current leader
             TestNode oldLeader = await cluster.GetLeaderAsync(Volume);
             ulong termBefore = (await cluster.Inspect.GetVolumeGroupAsync(Volume)).Term;
-            DfsOperationId opId = await volume.NewOperationIdAsync();
+            DfsOperationId? opId = explicitOperationId ? await volume.NewOperationIdAsync() : null;
+            var mutation = new DfsMutationOptions { OperationId = opId };
 
             FaultArm? arm = null;
             switch (move)
@@ -315,7 +343,7 @@ public sealed class SdkSimulationTests
             }
 
             long started = cluster.Time.GetTimestamp();
-            CommitToken token = await volume.Files.AppendAllBytesAsync(LogPath, suffix, new DfsMutationOptions { OperationId = opId });
+            CommitToken token = await volume.Files.AppendAllBytesAsync(LogPath, suffix, mutation);
             TimeSpan elapsed = cluster.Time.GetElapsedTime(started);
             if (arm is not null)
                 cluster.Faults.AssertReached(arm);
@@ -327,16 +355,21 @@ public sealed class SdkSimulationTests
             Assert.Equal(cluster.ClusterId, token.ClusterId);
             Assert.True(token.IsComparableWith(first) && token.IsAtOrAfter(first));
             byte[] content = await SdkHelpers.ReadAsync(volume, LogPath);
-            AssertEx.BytesEqual([.. prefix, .. suffix], content, "the suffix is appended exactly once");
-            DfsOperationOutcome outcome = await volume.QueryOperationAsync(opId);
-            Assert.Equal(DfsOutcomeStatus.Committed, outcome.Status);
-            Assert.Equal(token, outcome.Token);
+            AssertEx.BytesEqual([.. prefix, .. suffix], content, "the suffix is appended exactly once (the reroute reused the operation id)");
+            Assert.Equal(prefix.Length + suffix.Length, (await cluster.Inspect.GetFileAsync(Volume, LogPath))!.Length);
 
-            // A retry under the same id reports the original outcome without a second effect.
-            CommitToken retried = await volume.Files.AppendAllBytesAsync(LogPath, suffix, new DfsMutationOptions { OperationId = opId });
-            Assert.Equal(token, retried);
-            content = await SdkHelpers.ReadAsync(volume, LogPath);
-            AssertEx.BytesEqual([.. prefix, .. suffix], content, "a retry must not append again");
+            if (opId is { } id)
+            {
+                DfsOperationOutcome outcome = await volume.QueryOperationAsync(id);
+                Assert.Equal(DfsOutcomeStatus.Committed, outcome.Status);
+                Assert.Equal(token, outcome.Token);
+
+                // A retry under the same id reports the original outcome without a second effect.
+                CommitToken retried = await volume.Files.AppendAllBytesAsync(LogPath, suffix, mutation);
+                Assert.Equal(token, retried);
+                content = await SdkHelpers.ReadAsync(volume, LogPath);
+                AssertEx.BytesEqual([.. prefix, .. suffix], content, "a retry must not append again");
+            }
 
             // Safety after recovery: the old leader returns, there is one leader per term and replicas converge.
             cluster.Network.Heal();
@@ -417,7 +450,10 @@ public sealed class SdkSimulationTests
             await readHold.WaitForAsync(1, TimeSpan.FromSeconds(5));
             await appendHold.WaitForAsync(1, TimeSpan.FromSeconds(5));
             await writeReplyHold.WaitForAsync(1, TimeSpan.FromSeconds(5));
-            byte[] writeVisible = await SdkHelpers.ReadAsync(observer, "/write.bin");
+            // Observer reads below use a Share.ReadWrite|Delete stream: the disposed client's writer handle on
+            // /stream.bin and its transaction reservation on /tx.bin may still be active until their leases/sessions
+            // expire, and a ReadAll's own handle could legally conflict with them (test plan §5).
+            byte[] writeVisible = await SdkHelpers.ReadSharedAsync(observer, "/write.bin");
             AssertEx.BytesEqual(newWrite, writeVisible, "the WriteAll committed; only its reply is held");
             Assert.False(readTask.IsCompleted || appendTask.IsCompleted || writeTask.IsCompleted);
 
@@ -469,7 +505,7 @@ public sealed class SdkSimulationTests
 
             DfsOperationOutcome writeOutcome = await observer.QueryOperationAsync(writeId, resolve: true);
             Assert.Equal(DfsOutcomeStatus.Committed, writeOutcome.Status);
-            byte[] writeNow = await SdkHelpers.ReadAsync(observer, "/write.bin");
+            byte[] writeNow = await SdkHelpers.ReadSharedAsync(observer, "/write.bin");
             AssertEx.BytesEqual(newWrite, writeNow);
 
             // Append: success, uncertainty (with its id), or a definite cancellation that must then be a real abort.
@@ -490,7 +526,7 @@ public sealed class SdkSimulationTests
                     Assert.Fail($"append failed with unexpected {e.GetType().Name}: {e.Message}");
             }
 
-            byte[] appended = await SdkHelpers.ReadAsync(observer, "/append.bin");
+            byte[] appended = await SdkHelpers.ReadSharedAsync(observer, "/append.bin");
             byte[] expectedAppend = appendOutcome.Status == DfsOutcomeStatus.Committed ? [.. prefix, .. suffix] : prefix;
             AssertEx.BytesEqual(expectedAppend, appended, "append effect matches its resolved outcome");
 
@@ -498,14 +534,27 @@ public sealed class SdkSimulationTests
             Assert.NotEqual(DfsTransactionState.Committed, tx.State);
             DfsOperationOutcome txOutcome = await observer.Transactions.QueryOutcomeAsync(tx.Id, resolve: true);
             Assert.NotEqual(DfsOutcomeStatus.Committed, txOutcome.Status);
-            byte[] txNow = await SdkHelpers.ReadAsync(observer, "/tx.bin");
+            byte[] txNow = await SdkHelpers.ReadSharedAsync(observer, "/tx.bin");
             AssertEx.BytesEqual(txOriginal, txNow, "an uncommitted transaction is not committed by client disposal");
-            byte[] streamNow = await SdkHelpers.ReadAsync(observer, "/stream.bin");
+            byte[] streamNow = await SdkHelpers.ReadSharedAsync(observer, "/stream.bin");
             AssertEx.BytesEqual(streamOriginal, streamNow, "unflushed stream bytes are not published by client disposal");
 
-            // Nothing remains: no connections, new work rejected.
+            // Even after the abandoned handle/transaction expire, nothing is published later.
+            await cluster.DelayAsync(TimeSpan.FromSeconds(12)); // > session timeout (Fast: 10 s) and lease (2 s)
+            txNow = await SdkHelpers.ReadSharedAsync(observer, "/tx.bin");
+            AssertEx.BytesEqual(txOriginal, txNow, "expiry of the abandoned transaction does not commit it");
+            streamNow = await SdkHelpers.ReadSharedAsync(observer, "/stream.bin");
+            AssertEx.BytesEqual(streamOriginal, streamNow, "expiry of the abandoned handle does not publish it");
+
+            // Nothing remains: no connections, new work rejected (GetVolume does no I/O, so it may instead return a
+            // facade whose operations throw ObjectDisposedException).
             Assert.Equal(0, cluster.Network.CountOpenConnections(me));
-            Assert.Throws<ObjectDisposedException>(() => client.GetVolume(Volume));
+            DfsVolume? late = null;
+            Exception? getVolume = Record.Exception(() => late = client.GetVolume(Volume));
+            if (getVolume is not null)
+                Assert.IsAssignableFrom<ObjectDisposedException>(getVolume);
+            else
+                await Assert.ThrowsAsync<ObjectDisposedException>(() => late!.Files.ExistsAsync("/read.bin"));
             await Assert.ThrowsAsync<ObjectDisposedException>(() => volume.Files.ReadAllBytesAsync("/read.bin"));
         }, Ct);
     }

@@ -4,7 +4,7 @@ using Tedd.Tdfs.Server;
 using Tedd.Tdfs.Testing;
 using Tedd.Tdfs.Tests.Unit.Sdk;
 
-namespace Tedd.Tdfs.Tests.Unit.Path;
+namespace Tedd.Tdfs.Tests.Unit.Paths;
 
 /// <summary>
 /// PATH suite (test plan §7.3, FSD §4 NS-01..NS-04): path parsing and name identity. Pure rules are checked against
@@ -1073,7 +1073,9 @@ public sealed class PathUnitTests
     [Catalog("PATH-010", "U", "INV-07", "INV-12")]
     public async Task PATH_010_RootProtection()
     {
-        await ClusterTest.RunAsync(TestClusterOptions.ThreeZones, async cluster =>
+        // "bare" keeps an empty root: there, a DirectoryNotEmpty refusal cannot stand in for root protection.
+        TestClusterOptions options = TestClusterOptions.ThreeZones with { Volumes = [new TestVolumeSpec(Volume), new TestVolumeSpec("bare")] };
+        await ClusterTest.RunAsync(options, async cluster =>
         {
             await using DfsClient client = await cluster.ConnectAsync(null, Ct);
             DfsVolume volume = client.GetVolume(Volume);
@@ -1090,40 +1092,68 @@ public sealed class PathUnitTests
             InodeId fileInode = (await files.GetInfoAsync("/keep/file.bin", Ct)).InodeId;
 
             var write = new DfsOpenOptions { Access = FileAccess.Write, Share = FileShare.None };
-            var attempts = new (string Name, Func<Task> Action, bool AllowNotEmpty)[]
+            // AllowNotEmpty: a non-recursive delete of this (non-empty) root may be refused as DirectoryNotEmpty; the empty
+            // root of "bare" below proves the refusal does not depend on that. AllowFileNotFound: a *file* operation that
+            // requires an existing file at "/" (copy/move source, Truncate) may report that no file exists there — the
+            // root is a directory — but a directory operation must never report the root as missing.
+            var attempts = new (string Name, Func<Task> Action, bool AllowNotEmpty, bool AllowFileNotFound)[]
             {
-                ("Directories.Delete(/, nonrecursive)", () => dirs.DeleteAsync("/", false, Ct), true),
-                ("Directories.Delete(/, recursive)", () => dirs.DeleteAsync("/", true, Ct), false),
-                ("Directories.Move(/ -> /moved-root)", () => dirs.MoveAsync("/", "/moved-root", Ct), false),
-                ("Directories.Move(/ -> /keep2/inside)", () => dirs.MoveAsync("/", "/keep2/inside", Ct), false),
-                ("Directories.Move(/keep2 -> /)", () => dirs.MoveAsync("/keep2", "/", Ct), false),
-                ("Files.Delete(/)", () => files.DeleteAsync("/", Ct), false),
-                ("Files.Move(/ -> /x)", () => files.MoveAsync("/", "/x", false, Ct), false),
-                ("Files.Move(/f.bin -> /, overwrite)", () => files.MoveAsync("/f.bin", "/", true, Ct), false),
-                ("Files.Move(/f.bin -> /)", () => files.MoveAsync("/f.bin", "/", false, Ct), false),
-                ("Files.Copy(/f.bin -> /, overwrite)", () => files.CopyAsync("/f.bin", "/", true, Ct), false),
-                ("Files.Copy(/ -> /x)", () => files.CopyAsync("/", "/x", false, Ct), false),
-                ("Files.WriteAllBytes(/)", () => files.WriteAllBytesAsync("/", keep, Ct), false),
-                ("Files.WriteAllText(/)", () => files.WriteAllTextAsync("/", "x", null, Ct), false),
-                ("Files.AppendAllBytes(/)", () => files.AppendAllBytesAsync("/", keep, Ct), false),
-                ("Files.Create(/)", async () => { await using DfsStream s = await files.CreateAsync("/", Ct); }, false),
-                ("Files.OpenWrite(/)", async () => { await using DfsStream s = await files.OpenWriteAsync("/", Ct); }, false),
-                ("Files.Open(/, CreateNew)", async () => { await using DfsStream s = await files.OpenAsync("/", write with { Mode = FileMode.CreateNew }, Ct); }, false),
-                ("Files.Open(/, Create)", async () => { await using DfsStream s = await files.OpenAsync("/", write with { Mode = FileMode.Create }, Ct); }, false),
-                ("Files.Open(/, OpenOrCreate)", async () => { await using DfsStream s = await files.OpenAsync("/", write with { Mode = FileMode.OpenOrCreate }, Ct); }, false),
-                ("Files.Open(/, Truncate)", async () => { await using DfsStream s = await files.OpenAsync("/", write with { Mode = FileMode.Truncate }, Ct); }, false),
-                ("Files.Open(/, Append)", async () => { await using DfsStream s = await files.OpenAsync("/", write with { Mode = FileMode.Append }, Ct); }, false),
-                ("Files.Delete(/) sync", () => { files.Delete("/"); return Task.CompletedTask; }, false),
+                ("Directories.Delete(/, nonrecursive)", () => dirs.DeleteAsync("/", false, Ct), true, false),
+                ("Directories.Delete(/, recursive)", () => dirs.DeleteAsync("/", true, Ct), false, false),
+                ("Directories.Move(/ -> /moved-root)", () => dirs.MoveAsync("/", "/moved-root", Ct), false, false),
+                ("Directories.Move(/ -> /keep2/inside)", () => dirs.MoveAsync("/", "/keep2/inside", Ct), false, false),
+                ("Directories.Move(/keep2 -> /)", () => dirs.MoveAsync("/keep2", "/", Ct), false, false),
+                ("Files.Delete(/)", () => files.DeleteAsync("/", Ct), false, false),
+                ("Files.Move(/ -> /x)", () => files.MoveAsync("/", "/x", false, Ct), false, true),
+                ("Files.Move(/f.bin -> /, overwrite)", () => files.MoveAsync("/f.bin", "/", true, Ct), false, false),
+                ("Files.Move(/f.bin -> /)", () => files.MoveAsync("/f.bin", "/", false, Ct), false, false),
+                ("Files.Copy(/f.bin -> /, overwrite)", () => files.CopyAsync("/f.bin", "/", true, Ct), false, false),
+                ("Files.Copy(/ -> /x)", () => files.CopyAsync("/", "/x", false, Ct), false, true),
+                ("Files.WriteAllBytes(/)", () => files.WriteAllBytesAsync("/", keep, Ct), false, false),
+                ("Files.WriteAllText(/)", () => files.WriteAllTextAsync("/", "x", null, Ct), false, false),
+                ("Files.AppendAllBytes(/)", () => files.AppendAllBytesAsync("/", keep, Ct), false, false),
+                ("Files.Create(/)", async () => { await using DfsStream s = await files.CreateAsync("/", Ct); }, false, false),
+                ("Files.OpenWrite(/)", async () => { await using DfsStream s = await files.OpenWriteAsync("/", Ct); }, false, false),
+                ("Files.Open(/, CreateNew)", async () => { await using DfsStream s = await files.OpenAsync("/", write with { Mode = FileMode.CreateNew }, Ct); }, false, false),
+                ("Files.Open(/, Create)", async () => { await using DfsStream s = await files.OpenAsync("/", write with { Mode = FileMode.Create }, Ct); }, false, false),
+                ("Files.Open(/, OpenOrCreate)", async () => { await using DfsStream s = await files.OpenAsync("/", write with { Mode = FileMode.OpenOrCreate }, Ct); }, false, false),
+                ("Files.Open(/, Truncate)", async () => { await using DfsStream s = await files.OpenAsync("/", write with { Mode = FileMode.Truncate }, Ct); }, false, true),
+                ("Files.Open(/, Append)", async () => { await using DfsStream s = await files.OpenAsync("/", write with { Mode = FileMode.Append }, Ct); }, false, false),
+                ("Files.Delete(/) sync", () => { files.Delete("/"); return Task.CompletedTask; }, false, false),
             };
 
             var failures = new List<string>();
-            foreach ((string name, Func<Task> action, bool allowNotEmpty) in attempts)
+            foreach ((string name, Func<Task> action, bool allowNotEmpty, bool allowFileNotFound) in attempts)
             {
                 Exception? ex = await Record.ExceptionAsync(action);
-                string? problem = DescribeRootRejectionProblem(ex, allowNotEmpty);
+                string? problem = DescribeRootRejectionProblem(ex, allowNotEmpty, allowFileNotFound);
                 if (problem is not null)
                     failures.Add($"{name}: {problem}");
             }
+
+            // An empty root is protected just the same: no DirectoryNotEmpty excuse is accepted there.
+            DfsVolume bare = client.GetVolume("bare");
+            Assert.Empty(await SdkHelpers.ListNamesAsync(bare.Directories, "/"));
+            foreach ((string name, Func<Task> action) in new (string, Func<Task>)[]
+            {
+                ("bare: Directories.Delete(/, nonrecursive)", () => bare.Directories.DeleteAsync("/", false, Ct)),
+                ("bare: Directories.Delete(/, recursive)", () => bare.Directories.DeleteAsync("/", true, Ct)),
+                ("bare: Directories.Move(/ -> /moved-root)", () => bare.Directories.MoveAsync("/", "/moved-root", Ct)),
+                ("bare: Files.Delete(/)", () => bare.Files.DeleteAsync("/", Ct)),
+                ("bare: Files.WriteAllBytes(/)", () => bare.Files.WriteAllBytesAsync("/", keep, Ct)),
+            })
+            {
+                Exception? ex = await Record.ExceptionAsync(action);
+                string? problem = DescribeRootRejectionProblem(ex, allowNotEmpty: false, allowFileNotFound: false);
+                if (problem is not null)
+                    failures.Add($"{name}: {problem}");
+            }
+
+            Assert.True(await bare.Directories.ExistsAsync("/", Ct));
+            Assert.Equal(InodeId.Root, (await bare.Directories.GetInfoAsync("/", Ct)).InodeId);
+            Assert.False(await bare.Directories.ExistsAsync("/moved-root", Ct));
+            await bare.Directories.CreateDirectoryAsync("/after", Ct); // the root still works as a parent
+            Assert.Equal(new[] { "after" }, await SdkHelpers.ListNamesAsync(bare.Directories, "/"));
 
             // Transaction-bound attempts: rejected, and committing the transaction afterwards changes nothing.
             DfsTransaction tx = await volume.Transactions.BeginAsync(null, Ct);
@@ -1136,7 +1166,7 @@ public sealed class PathUnitTests
             })
             {
                 Exception? ex = await Record.ExceptionAsync(action);
-                string? problem = DescribeRootRejectionProblem(ex, allowNotEmpty: false);
+                string? problem = DescribeRootRejectionProblem(ex, allowNotEmpty: false, allowFileNotFound: false);
                 if (problem is not null)
                     failures.Add($"{name}: {problem}");
             }
@@ -1185,11 +1215,13 @@ public sealed class PathUnitTests
     }
 
     /// <summary>Null when <paramref name="ex"/> is an acceptable rejection of an operation on/over the root; otherwise the problem.</summary>
-    private static string? DescribeRootRejectionProblem(Exception? ex, bool allowNotEmpty)
+    private static string? DescribeRootRejectionProblem(Exception? ex, bool allowNotEmpty, bool allowFileNotFound)
     {
         if (ex is null)
             return "completed instead of being rejected";
         ex = SdkHelpers.Unwrap(ex);
+        if (ex is FileNotFoundException && allowFileNotFound)
+            return null;
         if (ex is FileNotFoundException or DirectoryNotFoundException)
             return $"reported the root as missing: {ex.GetType().Name}";
         bool ok = ex switch
@@ -1451,8 +1483,12 @@ public sealed class PathUnitTests
                             AssertLimitRejection(write);
                             if (!s.IsFaulted)
                             {
-                                s.Position = long.MaxValue;
-                                AssertLimitRejection(Assert.ThrowsAny<Exception>(() => s.WriteByte(5)));
+                                // Positioning at long.MaxValue may itself be refused (also legal); writing there never is accepted.
+                                Exception? position = Record.Exception(() => s.Position = long.MaxValue);
+                                if (position is not null)
+                                    AssertLimitRejection(position);
+                                else
+                                    AssertLimitRejection(Assert.ThrowsAny<Exception>(() => s.WriteByte(5)));
                             }
                         }
 
@@ -1707,39 +1743,85 @@ public sealed class PathUnitTests
                 failures.Add($"operation id of the other volume queried here: {opProblem}");
             await SdkHelpers.AssertBytesEqualAsync(new byte[] { 1 }, other.Files.ReadAllBytesAsync("/log", Ct));
 
-            // Handles: a handle issued by the other volume, presented to this volume with SDK checks bypassed.
+            // Handles. One raw client (one principal, one session per volume, SDK checks bypassed) holds handles in BOTH
+            // volumes, so a handle number of 'other' presented to 'vol' is only rejected if handle ids are bound to their
+            // volume: if 'vol' had issued the same number to this very client, an unbound design would resolve the
+            // foreign handle to the client's own local handle — the "matching local numeric id" the row forbids. The
+            // loop opens handles in whichever volume is numerically behind, which drives per-volume counters into a
+            // collision; volume-bound ids never collide and the loop simply ends.
             byte[] hBytes = TestData.Bytes(1460, 32);
             await vol.Files.WriteAllBytesAsync("/h.bin", hBytes, Ct);
             await other.Files.WriteAllBytesAsync("/h.bin", TestData.Bytes(1461, 32), Ct);
             await using DfsStream volHandle1 = await vol.Files.OpenAsync("/h.bin", FileMode.Open, FileAccess.Read, FileShare.ReadWrite, Ct);
             await using DfsStream volHandle2 = await vol.Files.OpenAsync("/h.bin", FileMode.Open, FileAccess.Read, FileShare.ReadWrite, Ct);
-            TestNode otherLeader = await cluster.GetLeaderAsync("other", Ct);
             TestNode volLeader = await cluster.GetLeaderAsync(Volume, Ct);
-            await using RawProtocolClient rawOther = await cluster.ConnectRawAsync(otherLeader.Name, Ct);
-            await using RawProtocolClient rawVol = await cluster.ConnectRawAsync(volLeader.Name, Ct);
-            Assert.Equal(DfsErrorCode.None, await rawOther.AuthenticateAsync(cluster.AdminCredentials));
-            Assert.Equal(DfsErrorCode.None, await rawVol.AuthenticateAsync(cluster.AdminCredentials));
-            (DfsErrorCode openCode, HandleId foreignHandle) = await rawOther.OpenHandleAsync("other", "/h.bin", FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            Assert.Equal(DfsErrorCode.None, openCode);
-            Assert.Equal(DfsErrorCode.None, await rawOther.SendHandleOperationAsync("other", DfsOperationKind.Read, foreignHandle)); // control
-            VolumeStateInspection volState = await cluster.Inspect.GetVolumeStateAsync(Volume);
-            bool numericCollision = volState.Handles.Any(h => h.Id == foreignHandle);
-            SdkHelpers.Log($"PATH-014: foreign handle {foreignHandle.Value}; numerically equal handle exists in '{Volume}': {numericCollision}");
-            foreach (DfsOperationKind kind in new[] { DfsOperationKind.Read, DfsOperationKind.KeepAlive, DfsOperationKind.CommitFile, DfsOperationKind.CloseHandle })
+            await using RawProtocolClient raw = await cluster.ConnectRawAsync(volLeader.Name, Ct);
+            Assert.Equal(DfsErrorCode.None, await raw.AuthenticateAsync(cluster.AdminCredentials));
+
+            var otherHandles = new List<HandleId>();
+            var volHandles = new List<HandleId>();
+            async Task OpenRawAsync(string volume, List<HandleId> into)
             {
-                DfsErrorCode code = await rawVol.SendHandleOperationAsync(Volume, kind, foreignHandle);
-                if (code == DfsErrorCode.None)
-                    failures.Add($"handle {foreignHandle.Value} of 'other' was accepted by '{Volume}' for {kind}");
+                (DfsErrorCode code, HandleId handle) = await raw.OpenHandleAsync(volume, "/h.bin", FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                Assert.Equal(DfsErrorCode.None, code);
+                into.Add(handle);
             }
 
-            // This volume's own handles were not addressed by the foreign handle number.
+            await OpenRawAsync("other", otherHandles);
+            await OpenRawAsync(Volume, volHandles);
+            bool Collides() => otherHandles.Any(o => volHandles.Any(v => v.Value == o.Value));
+            for (int i = 0; i < 256 && !Collides(); i++)
+            {
+                if (otherHandles[^1].Value < volHandles[^1].Value)
+                    await OpenRawAsync("other", otherHandles);
+                else
+                    await OpenRawAsync(Volume, volHandles);
+            }
+
+            SdkHelpers.Log($"PATH-014: raw client holds {otherHandles.Count} handles in 'other' and {volHandles.Count} in '{Volume}'; numeric collision: {Collides()}");
+            Assert.Equal(DfsErrorCode.None, await raw.SendHandleOperationAsync("other", DfsOperationKind.Read, otherHandles[0])); // control
+            Assert.Equal(DfsErrorCode.None, await raw.SendHandleOperationAsync(Volume, DfsOperationKind.Read, volHandles[0]));   // control
+            VolumeStateInspection volState = await cluster.Inspect.GetVolumeStateAsync(Volume);
+
+            // Every handle of 'other' is rejected by 'vol' (and vice versa) for a read.
+            foreach (HandleId foreign in otherHandles)
+            {
+                if (await raw.SendHandleOperationAsync(Volume, DfsOperationKind.Read, foreign) == DfsErrorCode.None)
+                    failures.Add($"handle {foreign.Value} of 'other' was accepted by '{Volume}' for Read");
+            }
+
+            foreach (HandleId foreign in volHandles)
+            {
+                if (await raw.SendHandleOperationAsync("other", DfsOperationKind.Read, foreign) == DfsErrorCode.None)
+                    failures.Add($"handle {foreign.Value} of '{Volume}' was accepted by 'other' for Read");
+            }
+
+            // The other handle-addressed requests as well (CloseHandle last: an accepted close would end a local handle).
+            HandleId probe = otherHandles.FirstOrDefault(o => volHandles.Any(v => v.Value == o.Value), otherHandles[0]);
+            foreach (DfsOperationKind kind in new[] { DfsOperationKind.KeepAlive, DfsOperationKind.CommitFile, DfsOperationKind.CloseHandle })
+            {
+                DfsErrorCode code = await raw.SendHandleOperationAsync(Volume, kind, probe);
+                if (code == DfsErrorCode.None)
+                    failures.Add($"handle {probe.Value} of 'other' was accepted by '{Volume}' for {kind}");
+            }
+
+            // No local handle was addressed, closed or renewed by the foreign numbers: all are still open and readable.
+            VolumeStateInspection volAfter = await cluster.Inspect.GetVolumeStateAsync(Volume);
+            if (volState.Handles.Count(h => !h.Expired) != volAfter.Handles.Count(h => !h.Expired))
+                failures.Add($"'{Volume}' active handles changed from {volState.Handles.Count(h => !h.Expired)} to {volAfter.Handles.Count(h => !h.Expired)} while foreign handles were presented");
+            foreach (HandleId own in volHandles)
+            {
+                DfsErrorCode code = await raw.SendHandleOperationAsync(Volume, DfsOperationKind.Read, own);
+                if (code != DfsErrorCode.None)
+                    failures.Add($"own handle {own.Value} of '{Volume}' no longer readable ({code}) after foreign handles were presented");
+            }
+
             byte[] buffer = new byte[hBytes.Length];
             await volHandle1.ReadExactlyAsync(buffer, Ct);
             AssertEx.BytesEqual(hBytes, buffer);
             volHandle2.Position = 0;
             await volHandle2.ReadExactlyAsync(buffer, Ct);
             AssertEx.BytesEqual(hBytes, buffer);
-            Assert.Equal(volState.Handles.Count, (await cluster.Inspect.GetVolumeStateAsync(Volume)).Handles.Count);
 
             Assert.True(failures.Count == 0, string.Join(Environment.NewLine, failures));
         }, Ct);

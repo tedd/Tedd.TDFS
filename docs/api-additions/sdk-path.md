@@ -64,9 +64,12 @@ Behaviour:
   that handle), `CloseHandle`, `CommitFile` (an empty commit carrying the handle's writer generation as last reported
   by the server, or 0). The handle number is sent verbatim, never translated through the raw client's own handle
   table. Other kinds throw `ArgumentOutOfRangeException`.
+- One raw client may hold handles in several volumes at once (one session per volume, same principal and connection
+  identity): both methods route to the named volume's current leader regardless of the node the raw client was
+  connected to (following `NotLeader` hints like the SDK).
 
 Needed by: PATH-014 `TokenIdentityCannotCrossVolumes` (a handle issued by one volume must be rejected by another
-volume, e.g. `InvalidHandle`, even when that volume has a handle with the same number).
+volume, e.g. `InvalidHandle`, even when the same raw client holds a handle with the same number in that volume).
 
 ## Test-side helpers (not harness additions)
 
@@ -79,10 +82,11 @@ volume, e.g. `InvalidHandle`, even when that volume has a handle with the same n
 
 ## Notes for the implementation
 
-- PATH and SDK tests in namespaces `Tedd.Tdfs.Tests.Unit.Path` / `Tedd.Tdfs.Tests.Simulation.Path` follow the
-  API.md §G naming convention. A namespace named `Path` directly under `Tedd.Tdfs.Tests.<Level>` shadows
-  `System.IO.Path` for code in sibling namespaces of the same project (`Path.Combine` would resolve to the namespace);
-  code in those projects must use `System.IO.Path` explicitly once these suites are merged.
+- PATH tests use the namespaces `Tedd.Tdfs.Tests.Unit.Paths` / `Tedd.Tdfs.Tests.Simulation.Paths` (folder `Path/` and
+  class `Path<Level>Tests` as in API.md §G). This is a deliberate deviation from the §G namespace
+  `Tedd.Tdfs.Tests.<Level>.Path`: a namespace named `Path` directly under `Tedd.Tdfs.Tests.<Level>` would shadow
+  `System.IO.Path` for every other suite in the same project (an unqualified `Path.Combine` there would bind to the
+  namespace and stop compiling after merge).
 - PATH-014 (operation ids, transaction ids and handle ids) and FSD §13 require that ids issued by one volume can never
   be accepted or resolved by another volume, even when per-volume counters produce equal numbers: session/handle ids
   must be volume-bound (for example allocated from a volume-derived space) or carried with their volume on the wire.

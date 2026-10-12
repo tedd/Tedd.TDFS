@@ -10,7 +10,11 @@ public sealed partial class RawProtocolClient
     /// wire (<c>default</c> on failure). The handle is renewed by the raw client's session keep-alive until
     /// <see cref="SendHandleOperationAsync"/> closes it or the connection is disposed.
     /// </summary>
-    /// <remarks>Used by PATH-014 to obtain a genuine handle id of one volume and present it to another.</remarks>
+    /// <remarks>
+    /// One raw client may hold handles in several volumes (one session per volume, same principal); the request is
+    /// routed to <paramref name="volume"/>'s current leader whichever node the client connected to. Used by PATH-014 to
+    /// obtain genuine handle ids of two volumes from one client and present each to the other volume.
+    /// </remarks>
     public Task<(DfsErrorCode Code, HandleId Handle)> OpenHandleAsync(string volume, string rawPath, FileMode mode, FileAccess access, FileShare share) =>
         throw Stub.NotYet("RawProtocolClient.OpenHandleAsync");
 
@@ -24,8 +28,9 @@ public sealed partial class RawProtocolClient
     /// verbatim; it is never translated through the raw client's own handle table. Other kinds throw
     /// <see cref="ArgumentOutOfRangeException"/>.
     /// </summary>
-    /// <remarks>Used by PATH-014: a handle issued by another volume must be rejected (for example
-    /// <see cref="DfsErrorCode.InvalidHandle"/>) even when the target volume has a handle with the same number.</remarks>
+    /// <remarks>Routed to <paramref name="volume"/>'s current leader. Used by PATH-014: a handle issued by another volume
+    /// must be rejected (for example <see cref="DfsErrorCode.InvalidHandle"/>) even when this same client holds a handle
+    /// with the same number in the target volume.</remarks>
     public Task<DfsErrorCode> SendHandleOperationAsync(string volume, DfsOperationKind kind, HandleId handle) =>
         throw Stub.NotYet("RawProtocolClient.SendHandleOperationAsync");
 }

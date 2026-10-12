@@ -3,7 +3,7 @@ using Tedd.Tdfs.Server;
 using Tedd.Tdfs.Testing;
 using Tedd.Tdfs.Tests.Simulation.Sdk;
 
-namespace Tedd.Tdfs.Tests.Simulation.Path;
+namespace Tedd.Tdfs.Tests.Simulation.Paths;
 
 /// <summary>PATH suite, level S (test plan §7.3, FSD §4 NS-01/NS-02): canonical-name races under deterministic simulation.</summary>
 public sealed class PathSimulationTests
@@ -87,6 +87,9 @@ public sealed class PathSimulationTests
                     Assert.Equal(new[] { $"d{n}-{nfc}" }, await ListNamesAsync(volumes[0].Directories, "/race", $"d{n}-"));
 
                     // 3. Concurrent create-or-replace through different spellings: one register, linearizable history.
+                    // Concurrent WriteAll/ReadAll on one inode may legally be refused with a typed sharing/writer
+                    // conflict (no effect, no automatic waiting — LOCK-03); such refusals are retried inside the
+                    // recorded operation and are not evidence about canonical-name identity.
                     string key = $"/race/w{n}-{nfc}";
                     InodeId? registerInode = null;
                     for (int round = 0; round < 3; round++)
@@ -98,10 +101,11 @@ public sealed class PathSimulationTests
                             if ((i + round) % 2 == 0)
                             {
                                 byte[] value = Encoding.UTF8.GetBytes($"s{seed}-n{n}-r{round}-c{i}");
-                                return (Task)cluster.History.RecordAsync("c" + i, "write", key, value, () => v.Files.WriteAllBytesAsync(spelling, value));
+                                return (Task)cluster.History.RecordAsync("c" + i, "write", key, value,
+                                    () => SdkHelpers.RetryOnSharingViolationAsync(cluster, () => v.Files.WriteAllBytesAsync(spelling, value)));
                             }
 
-                            return cluster.History.RecordAsync<byte[]?>("c" + i, "read", key, null, async () =>
+                            return cluster.History.RecordAsync<byte[]?>("c" + i, "read", key, null, () => SdkHelpers.RetryOnSharingViolationAsync<byte[]?>(cluster, async () =>
                             {
                                 try
                                 {
@@ -111,7 +115,7 @@ public sealed class PathSimulationTests
                                 {
                                     return null;
                                 }
-                            });
+                            }));
                         }).ToArray();
                         await Task.WhenAll(ops);
                         InodeId inode = (await volumes[0].Files.GetInfoAsync(key)).InodeId;
@@ -139,8 +143,13 @@ public sealed class PathSimulationTests
                         Assert.NotNull(file);
                         expected ??= file.Inode;
                         Assert.Equal(expected, file.Inode);
+                        // No second entry is stored under a non-NFC spelling. (Whether the inspector normalizes its
+                        // argument is unspecified, so a lookup may also resolve to the one canonical entry.)
                         foreach (string spelling in CanonicalNames[n].Spellings.Where(s => s != CanonicalNames[n].Nfc))
-                            Assert.Null(state.GetFile($"/race/n{n}-{spelling}"));
+                        {
+                            FileInspection? alias = state.GetFile($"/race/n{n}-{spelling}");
+                            Assert.True(alias is null || alias.Inode == file.Inode, $"{node.Name}: a separate entry exists for spelling {spelling} of name {n}");
+                        }
                     }
                 }
             }
