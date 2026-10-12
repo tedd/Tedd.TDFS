@@ -51,6 +51,8 @@ bld/
 !src/**/[Ll]ogs/
 !tests/**/[Ll]og/
 !tests/**/[Ll]ogs/
+# ...and the OUT suite's test folders (tests/Tedd.Tdfs.Tests.<Level>/Out) are code.
+!tests/**/[Oo]ut/
 
 # Build results on 'Bin' directories
 **/[Bb]in/*
