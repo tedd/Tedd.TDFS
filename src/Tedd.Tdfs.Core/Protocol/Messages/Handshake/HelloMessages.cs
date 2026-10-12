@@ -15,6 +15,10 @@ namespace Tedd.Tdfs.Protocol.Messages;
 /// <param name="Incarnation">Node incarnation (nodes only; 0 for clients).</param>
 /// <param name="Principal">Principal to authenticate (clients only).</param>
 /// <param name="Nonce">Fresh random nonce of exactly <see cref="ProtocolInfo.NonceSize"/> bytes.</param>
+/// <param name="BootId">Process boot id of a node peer (0 for clients): a random value chosen at every process start and
+/// registered with the incarnation (<see cref="RegisterIncarnationMessage"/>). Two processes started from a cloned disk
+/// share node id and incarnation but not the boot id, so the one that is not registered is told apart and fenced
+/// (<see cref="DfsErrorCode.StaleIncarnation"/>, RSY-021).</param>
 public sealed record HelloMessage(
     Guid ExpectedClusterId,
     ushort ProtocolMin,
@@ -25,7 +29,8 @@ public sealed record HelloMessage(
     NodeId? NodeId,
     ulong Incarnation,
     string? Principal,
-    ReadOnlyMemory<byte> Nonce) : IWireMessage<HelloMessage>
+    ReadOnlyMemory<byte> Nonce,
+    UInt128 BootId = default) : IWireMessage<HelloMessage>
 {
     /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
@@ -51,6 +56,7 @@ public sealed record HelloMessage(
         writer.WriteVarUInt(Incarnation);
         writer.WriteOptionalString(Principal);
         writer.WriteBytes(Nonce.Span);
+        writer.WriteUInt128(BootId);
         writer.WriteExtensionBlock(Extensions);
     }
 
@@ -67,8 +73,9 @@ public sealed record HelloMessage(
         ulong incarnation = reader.ReadVarUInt();
         string? principal = reader.ReadOptionalString();
         ReadOnlyMemory<byte> nonce = reader.ReadFixedBytes(ProtocolInfo.NonceSize, nameof(Nonce));
+        UInt128 bootId = reader.ReadUInt128();
         IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
-        return new HelloMessage(cluster, min, max, features, role, name, nodeId, incarnation, principal, nonce) { Extensions = extensions };
+        return new HelloMessage(cluster, min, max, features, role, name, nodeId, incarnation, principal, nonce, bootId) { Extensions = extensions };
     }
 }
 

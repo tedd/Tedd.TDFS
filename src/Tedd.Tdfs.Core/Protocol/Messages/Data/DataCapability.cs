@@ -106,14 +106,10 @@ public sealed record DataCapability(
     }
 
     /// <summary>Decodes a token produced by <see cref="Encode"/>.</summary>
-    /// <exception cref="DfsProtocolException">The token is malformed.</exception>
+    /// <exception cref="DfsProtocolException">The token is malformed (every decoding failure surfaces as this type, so
+    /// <see cref="TryDecode"/> never lets another exception escape from a hostile token).</exception>
     public static DataCapability Decode(ReadOnlySpan<byte> token, WireLimits? limits = null)
-    {
-        var reader = new WireReader(token, limits ?? WireLimits.Default);
-        DataCapability capability = Read(ref reader);
-        reader.EnsureEnd();
-        return capability;
-    }
+        => WireRecordCodec.Decode<DataCapability>(token, limits);
 
     /// <summary>Tries to decode a token; false when it is malformed or requires unsupported extensions.</summary>
     public static bool TryDecode(ReadOnlySpan<byte> token, out DataCapability? capability, WireLimits? limits = null)

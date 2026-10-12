@@ -151,10 +151,15 @@ peer                                         server (live node or backup node)
 * **Nodes** (role `Node`, cluster secret): `NodeAuthKey = HKDF-SHA256(clusterSecret, info "tdfs/v1/node-auth")`
   (`KeyDerivation`); `Proof = HMAC(NodeAuthKey, "tdfs/node-proof/v1\0" ‖ T)`,
   `ServerMac = HMAC(NodeAuthKey, "tdfs/node-server/v1\0" ‖ T)` (distinct labels, so neither can be reflected). The
-  `Hello` must carry the node's `NodeId`, name and incarnation. Unknown node ids, removed nodes (CON-016) and wrong
-  secrets are rejected (`AuthenticationFailed`/`AccessDenied`); an incarnation older than the registered one is
-  rejected with `StaleIncarnation` (RSY-021). A higher, not yet registered incarnation is accepted for transport but
-  its receipts and Raft messages are not trusted until `RegisterIncarnation` committed it (RCV-02).
+  `Hello` must carry the node's `NodeId`, name, incarnation and `BootId` (a random value chosen at every process
+  start). Wrong secrets are rejected with `AuthenticationFailed` and removed node ids (CON-016) with `AccessDenied`. A
+  node id that is not (yet) a member but proves the cluster secret is accepted only for the seed-join flow
+  (`GetClusterMap`, `GetVolumeRoute`, `JoinCluster`); every other request on such a connection is answered
+  `AccessDenied`. An incarnation older than the registered one, or equal to it with a different boot id (a second
+  process started from a cloned disk), is rejected with `StaleIncarnation` (RSY-021). A newer, not yet registered
+  incarnation is accepted, **including its Raft traffic**: committing the registration needs a control quorum, and
+  after a full-cluster restart every voter is in that state. Its receipts are not trusted, and the node issues none,
+  until `RegisterIncarnation` committed the (incarnation, boot id) pair (RCV-02).
 * **Result**: on success the connection identity (`RpcPeerIdentity`: principal or node id/name/incarnation, role) is
   fixed and every later request is authorized against it, on every request (SEC-003). On rejection
   `HelloResult.Accepted = false` carries the error code and the server closes the connection.
@@ -214,14 +219,30 @@ Every volume-scoped request (34 types, all implementing `IVolumeRequest`) starts
 * A client that cannot tell whether a transmitted mutation committed reports `DfsCommitOutcomeUnknownException` with
   the id (and transaction id) and resolves it with `QueryOperation`; `QueryOperationResult.ResultFrame` returns the
   original success reply when retained (for example the `HandleId` of a create-open whose reply was lost).
+* `Header.AckWatermark` retires outcomes, so the SDK advances it only past sequences whose outcome it has observed and
+  will never ask about again. Ids handed to or supplied by the application (`NewOperationIdAsync`,
+  `DfsMutationOptions.OperationId`, transaction ids) may be retried or queried by another process after this one is
+  gone, so the SDK never advances the watermark past them; their outcomes retire only through the per-session
+  retention bounds (OUT-010).
 
 ### 5.2 Payload identity
 
-`OperationPayload.ComputeHash(request)` = first 16 bytes of SHA-256 over the request frame re-encoded with its header
-normalized (`Session = 0`, `AckWatermark = 0`, `ExpectedVolumeId = empty`, `ExpectedVolumeEpoch = 0`, header
-extensions removed). The volume name, operation id, transaction id, every request field and the request's own
-extensions are covered. A retry from another process (different session, advanced watermark) therefore has the same
-identity, while any change of arguments, bytes, path, options or request kind yields a different one
+`OperationPayload.ComputeHash(request)` = first 16 bytes of SHA-256 over the request frame re-encoded in identity form
+(`OperationPayload.NormalizeRequest`):
+
+* the header is normalized (`Session = 0`, `AckWatermark = 0`, `ExpectedVolumeId = empty`, `ExpectedVolumeEpoch = 0`,
+  header extensions removed);
+* publications (`CommitFile`, `WriteAll`, `Append`) also drop their **per-attempt upload artifacts**: `Receipts`,
+  `Staging` and the uploader-chosen random `Object` id of every `RangeChange`. A client that lost its process (or its
+  staged uploads) must upload the content again before retrying with a persisted id — new staging session, new object
+  ids, new receipts — and still has to get the stored outcome rather than `OperationIdMismatch` (OUT-002, OUT-006).
+  The content stays covered (every change's offset, length, kind, object offset/length, checksum, encoding and inline
+  bytes), so SDKs split content into objects deterministically (at `ChunkSize` boundaries, inline when the file fits
+  `InlineThreshold`).
+
+The volume name, operation id, transaction id, every other request field and the request's own extensions are
+covered. A retry from another process (different session, advanced watermark, re-uploaded content) therefore has the
+same identity, while any change of arguments, bytes, path, options or request kind yields a different one
 (`OperationIdMismatch`, OUT-003). The server stores this value in the outcome record (`PayloadHash`).
 
 ### 5.3 Per-request summary
@@ -251,9 +272,9 @@ carry an operation id; **opt** = may carry one (then retries are deduplicated); 
 | `OpenSnapshot` / `CloseSnapshot` | `AcquirePin` / `ReleasePin` | opt / — | With an id: stored outcome (same pin). Close is idempotent. |
 | `BackupRegister` (mutating actions), `BackupRequestSync` | volume/control entries | req | Stored outcome. |
 | `BackupStatus`, `BackupAwait` | — | — | Reads (await is a bounded wait). |
-| `PutObject`, `ReplicateObject` | durable local write | — (object id) | Idempotent per (object id, content); different content under the same id → `Integrity`. |
+| `PutObject`, `ReplicateObject` | durable local write | — (object id) | Idempotent per (object id, content); the receipt is bound to the request's staging session (a re-upload under another session durably re-binds the copy first); different content under the same id → `Integrity`. |
 | `GetObject`, `LocateObject` | — | — | Reads. |
-| `DeleteObjects` | local delete | — | Idempotent. |
+| `DeleteObjects` | local delete | — | Idempotent; deletes a copy only while its record still carries the decided staging session (`ObjectStagingRef`). |
 | `InventoryReport` | — | — (report id, page) | Idempotent per page; the GC answer is only given on the last page. |
 | `CopyObjects` | durable local writes | — (from, to) | Idempotent per pair. |
 | `RaftBatch`, `RaftSnapshotChunk` | Raft | — | Raft tolerates duplicates/reordering. |
@@ -291,7 +312,8 @@ carry an operation id; **opt** = may carry one (then retries are deduplicated); 
    object length, encoding; plus volume and staging session); node incarnation equals the registered one; placement
    epoch valid; distinct hosts ≥ `DurableCopiesBeforeAck` and distinct (region, zone) ≥ `DurableZonesBeforeAck` per
    referenced object (copies of the same host count once, REP-005; backups never count). Insufficient receipts →
-   `PlacementUnavailable` (carrying required/achieved copies and zones); nothing is proposed.
+   `PlacementUnavailable` (the error reply's `Detail` carries the required/achieved copies and zones, surfaced as
+   `DfsPlacementUnavailableException.RequiredCopies` etc.); nothing is proposed.
 
 ### 7.2 `ObjectReceipt` MAC
 
@@ -427,7 +449,9 @@ filters and fault injection inspect Raft traffic, and leaves the Consensus core 
 `"control"` and `"vol:{VolumeId}"` (`ProtocolInfo.VolumeGroup`), keyed by volume id so a re-created volume name never
 receives stale traffic. Large snapshots may use `RaftSnapshotChunk` (request/response, flow-controlled) instead of an
 `InstallSnapshot` inside a batch. Receivers drop batches whose `From`/`Incarnation` do not match the authenticated
-peer and its registered incarnation.
+connection, batches of an incarnation older than the registered one, and batches of a cloned process (registered
+incarnation, different boot id). A newer, not yet registered incarnation is accepted (§3): a node must take part in the
+elections and commits that register its new incarnation.
 
 ### 8.8 Administration
 
@@ -483,7 +507,8 @@ Error reply to any request (`MessageType.ErrorReply`). Preserves the error code,
 | 4 | `Retryable` | `bool` | True when retrying the same operation may succeed. |
 | 5 | `LeaderHint` | `string?` | Endpoint of the current leader, for `DfsErrorCode.NotLeader`. |
 | 6 | `TransactionId` | `OperationId? (transaction)` | Transaction id, for transaction failures and unknown transaction outcomes. |
-| 7 | — | `extensions` | Terminal extension block. |
+| 7 | `Detail` | `ErrorDetailData?` | Structured details (placement shortfall, exceeded limit, integrity object, adapter phase) recreated on the typed exception; null when the error has none. |
+| 8 | — | `extensions` | Terminal extension block. |
 
 ### 9.2 Handshake and discovery
 
@@ -503,7 +528,8 @@ First message on every connection (client → server, node → node). Declares t
 | 8 | `Incarnation` | `varuint` | Node incarnation (nodes only; 0 for clients). |
 | 9 | `Principal` | `string?` | Principal to authenticate (clients only). |
 | 10 | `Nonce` | `bytes[32]` | Fresh random nonce of exactly `ProtocolInfo.NonceSize` bytes. |
-| 11 | — | `extensions` | Terminal extension block. |
+| 11 | `BootId` | `u128` | Process boot id of a node peer (0 for clients): random per process start, registered with the incarnation; a process with the registered incarnation but another boot id is a cloned disk and is fenced (`StaleIncarnation`, RSY-021). |
+| 12 | — | `extensions` | Terminal extension block. |
 
 #### `HelloChallenge` = 11 (`HelloChallengeMessage`)
 
@@ -554,7 +580,7 @@ Requests the cluster map (any authenticated peer → any live or backup node).
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
-| 1 | `KnownConfigIndex` | `varuint` | Config index of the map the caller already has; when it equals the server's current /// index the reply omits the map. 0 always returns the map. |
+| 1 | `KnownConfigIndex` | `varuint` | Config index of the map the caller already has; when it equals the server's current index the reply omits the map. 0 always returns the map. |
 | 2 | — | `extensions` | Terminal extension block. |
 
 #### `ClusterMapResult` = 15 (`ClusterMapResultMessage`)
@@ -574,7 +600,7 @@ Requests the route of one volume (any authenticated peer → any live node).
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
 | 1 | `Volume` | `string` | Volume name. |
-| 2 | `RequireLeader` | `bool` | When true the request must be served by the volume leader after a ReadIndex barrier, and /// the reply carries the volume's last applied commit (used by `DfsVolume.GetInfoAsync`). A non-leader answers /// `DfsErrorCode.NotLeader` with a leader hint. |
+| 2 | `RequireLeader` | `bool` | When true the request must be served by the volume leader after a ReadIndex barrier, and the reply carries the volume's last applied commit (used by `DfsVolume.GetInfoAsync`). A non-leader answers `DfsErrorCode.NotLeader` with a leader hint. |
 | 3 | — | `extensions` | Terminal extension block. |
 
 #### `VolumeRouteResult` = 17 (`VolumeRouteResultMessage`)
@@ -604,7 +630,8 @@ Seed-join request (joining node → any live node; non-leaders answer `DfsErrorC
 | 6 | `CapacityBytes` | `varint` | Configured capacity. |
 | 7 | `ProtocolMax` | `varuint16` | Newest protocol version the node speaks (for feature eligibility, FMT-009). |
 | 8 | `Features` | `set<string>` | Features the node supports. |
-| 9 | — | `extensions` | Terminal extension block. |
+| 9 | `BootId` | `u128` | Process boot id of the joining node (see `HelloMessage.BootId`); registered with the incarnation. |
+| 10 | — | `extensions` | Terminal extension block. |
 
 #### `JoinClusterResult` = 19 (`JoinClusterResultMessage`)
 
@@ -620,17 +647,18 @@ Reply to `JoinClusterMessage`.
 
 #### `RegisterIncarnation` = 20 (`RegisterIncarnationMessage`)
 
-Registers a restarted node's new incarnation with the control group (node → control leader) before the node issues receipts or Raft messages (RCV-02). Also updates the node's endpoints (a restarted node may listen on a new port) and reported capacity. Rejected with `DfsErrorCode.StaleIncarnation` when the incarnation is not greater than the registered one (cloned disk, RSY-021), and with `DfsErrorCode.AccessDenied` for a removed node. Idempotent for the same (node, incarnation).
+Registers a restarted node's new incarnation with the control group (node → control leader) before the node issues receipts (RCV-02). Also updates the node's endpoints (a restarted node may listen on a new port) and reported capacity. Rejected with `DfsErrorCode.StaleIncarnation` when the incarnation is lower than the registered one, or equal to it with a different `BootId` (two processes started from a cloned disk pick the same incarnation; the one registered second is fenced and must stop serving, RSY-021), and with `DfsErrorCode.AccessDenied` for a removed node. Idempotent for the same (node, incarnation, boot id). Raft traffic of a newer, not yet registered incarnation is accepted: committing the registration needs a control quorum, which after a full-cluster restart consists only of not yet registered incarnations.
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
 | 1 | `Node` | `NodeId` | Node identity. |
-| 2 | `Incarnation` | `varuint` | New incarnation (strictly greater than the registered one). |
+| 2 | `Incarnation` | `varuint` | New incarnation (greater than the registered one; equal only for a retry with the same boot id). |
 | 3 | `Name` | `string` | Node name (must match the membership). |
 | 4 | `Labels` | `Labels` | Current labels from the node configuration. |
 | 5 | `Endpoints` | `list<string>` | Current listen endpoints. |
 | 6 | `CapacityBytes` | `varint` | Configured capacity. |
-| 7 | — | `extensions` | Terminal extension block. |
+| 7 | `BootId` | `u128` | Process boot id (see `HelloMessage.BootId`). |
+| 8 | — | `extensions` | Terminal extension block. |
 
 #### `RegisterIncarnationResult` = 21 (`RegisterIncarnationResultMessage`)
 
@@ -708,7 +736,7 @@ Queries the durable outcome of an operation id or transaction (client → volume
 | 1 | `Header` | `RequestHeader` | Request header (`RequestHeader.Operation` empty). |
 | 2 | `Target` | `OperationId` | Operation id to query; for a transaction, the operation id wrapped by its `DfsTransactionId`. |
 | 3 | `IsTransaction` | `bool` | True to query the final state of the transaction `Target` began. |
-| 4 | `Resolve` | `bool` | True to make the answer definite: an id with no outcome is fenced (recorded as aborted) so a /// delayed copy can never commit later (OUT-013). Never returns `WireOutcomeStatus.NotFound` or `WireOutcomeStatus.Pending`. |
+| 4 | `Resolve` | `bool` | True to make the answer definite: an id with no outcome is fenced (recorded as aborted) so a delayed copy can never commit later (OUT-013). Never returns `WireOutcomeStatus.NotFound` or `WireOutcomeStatus.Pending`. |
 | 5 | — | `extensions` | Terminal extension block. |
 
 #### `QueryOperationResult` = 35 (`QueryOperationResultMessage`)
@@ -723,7 +751,7 @@ Reply to `QueryOperationMessage`.
 | 4 | `Error` | `enum DfsErrorCode (raw)` | For a completed-with-failure or aborted operation, its error code (`DfsErrorCode.None` for success). |
 | 5 | `Detail` | `string?` | Human-readable detail. |
 | 6 | `Operation` | `enum DfsOperationKind (raw)` | Kind of the original operation, when known. |
-| 7 | `ResultFrame` | `bytes` | Encoded success reply frame of the original request (for example an `OpenHandleResult`), /// when the outcome record retains it; empty otherwise. |
+| 7 | `ResultFrame` | `bytes` | Encoded success reply frame of the original request (for example an `OpenHandleResult`), when the outcome record retains it; empty otherwise. |
 | 8 | — | `extensions` | Terminal extension block. |
 
 #### `ReserveOperationIds` = 36 (`ReserveOperationIdsMessage`)
@@ -860,7 +888,7 @@ Reply to `GetInfoMessage`.
 
 #### `ListDirectory` = 48 (`ListDirectoryMessage`)
 
-Lists one page of a directory at a pinned namespace version (client → volume leader or backup node). The first page pins the directory version (an enumeration pin, renewed by `KeepAlive` and by subsequent pages); the opaque continuation binds volume, epoch, pin and position, and an expired or foreign continuation fails with <see cref="DfsErrorCode.ContinuationExpired"/> instead of restarting against a newer version (NS-07). Transaction-bound listings record the enumeration predicate. Errors: DirectoryNotFound, NotADirectory, ContinuationExpired, InvalidArgument (page size outside 1..10000, empty kinds, malformed pattern).
+Lists one page of a directory at a pinned namespace version (client → volume leader or backup node). The first page pins the directory version (an enumeration pin, renewed by `KeepAlive` and by subsequent pages); the opaque continuation binds volume, epoch, pin and position, and an expired or foreign continuation fails with `DfsErrorCode.ContinuationExpired` instead of restarting against a newer version (NS-07). Transaction-bound listings record the enumeration predicate. Errors: DirectoryNotFound, NotADirectory, ContinuationExpired, InvalidArgument (page size outside 1..10000, empty kinds, malformed pattern).
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
@@ -1187,7 +1215,7 @@ Reply to `TxBeginMessage`.
 
 #### `TxOp` = 82 (`TxOpMessage`)
 
-Optional batching envelope: executes several transaction-bound requests in order against the transaction's working root (client → volume leader). Each element is a complete request frame whose header carries the same transaction; execution stops at the first failing request, whose error reply is the last element of the result. Ordinary transaction-bound requests do not need this envelope; a server that does not implement it answers <see cref="DfsErrorCode.Unsupported"/>.
+Optional batching envelope: executes several transaction-bound requests in order against the transaction's working root (client → volume leader). Each element is a complete request frame whose header carries the same transaction; execution stops at the first failing request, whose error reply is the last element of the result. Elements are decoded one level deep only: an element that is itself a `TxOp`, `TxBegin`, `TxCommit` or `TxAbort`, or whose header names another transaction or volume, is answered with `DfsErrorCode.InvalidArgument` (no nesting, so a hostile frame cannot force recursive decoding). Ordinary transaction-bound requests do not need this envelope; a server that does not implement it answers `DfsErrorCode.Unsupported`.
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
@@ -1206,7 +1234,7 @@ Reply to `TxOpMessage`.
 
 #### `TxCommit` = 84 (`TxCommitMessage`)
 
-Commits a transaction (client → volume leader; committed `TxCommit` entry with the read set and ordered writes). Apply validates every read item against the current state; any change → <see cref="DfsErrorCode.TransactionConflict"/> with no effect, otherwise all writes apply atomically at the commit index (strict serializability). Retries reuse the header operation id; an unknown outcome is resolved with `QueryOperation(IsTransaction: true)`.
+Commits a transaction (client → volume leader; committed `TxCommit` entry with the read set and ordered writes). Apply validates every read item against the current state; any change → `DfsErrorCode.TransactionConflict` with no effect, otherwise all writes apply atomically at the commit index (strict serializability). Retries reuse the header operation id; an unknown outcome is resolved with `QueryOperation(IsTransaction: true)`.
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
@@ -1394,7 +1422,7 @@ Reply to `RestoreSnapshotMessage`.
 
 #### `PutObject` = 110 (`PutObjectMessage`)
 
-Stores one immutable object (client or node → storage node). The node verifies the staging capability (MAC, cluster, volume, epoch, staging session, principal, expiry), the declared length and checksum against the payload, and capacity admission (CapacityExhausted before touching reserves), writes the record and flushes, and only then returns a signed receipt. Idempotent: re-uploading identical content returns a receipt; the same id with different content is rejected with `DfsErrorCode.Integrity`. Objects are at most `MaxObjectSize` bytes.
+Stores one immutable object (client or node → storage node). The node verifies the staging capability (MAC, cluster, volume, epoch, staging session, principal, expiry), the declared length and checksum against the payload, and capacity admission (CapacityExhausted before touching reserves), writes the record and flushes, and only then returns a signed receipt. A receipt is always bound to the request's staging session. Idempotent: re-uploading identical content under the same staging session returns a receipt; under another staging session the node first durably re-binds its copy to the new session (a new record), so a garbage decision taken for the old (object, staging) pair can no longer remove it (see `ObjectStagingRef`). The same id with different content is rejected with `DfsErrorCode.Integrity`. Objects are at most `MaxObjectSize` bytes.
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
@@ -1421,7 +1449,7 @@ Reply to `PutObjectMessage`.
 
 #### `GetObject` = 112 (`GetObjectMessage`)
 
-Reads a byte range of an object (client or node → storage node). Requires a read capability listing the object (nodes may omit it); object ids alone grant nothing (SEC-004). The node verifies the stored record before replying (corruption → `DfsErrorCode.Integrity`, the client tries another replica); a missing object is <see cref="DfsErrorCode.Integrity"/> with detail "missing", never zeroes.
+Reads a byte range of an object (client or node → storage node). Requires a read capability listing the object (nodes may omit it); object ids alone grant nothing (SEC-004). The node verifies the stored record before replying (corruption → `DfsErrorCode.Integrity`, the client tries another replica); a missing object is `DfsErrorCode.Integrity` with detail "missing", never zeroes.
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
@@ -1494,14 +1522,14 @@ Reply to `ReplicateObjectMessage`.
 
 #### `DeleteObjects` = 118 (`DeleteObjectsMessage`)
 
-Deletes objects (volume leader → storage node): garbage the leader proved unreachable at a committed index with a closed staging session (GC), or excess replicas after repair verified the targets (REP-016). Rejected for an older volume epoch. Idempotent.
+Deletes stored copies (volume leader → storage node): garbage the leader proved unreachable at a committed index with a closed staging session (GC), or excess replicas after repair verified the targets (REP-016). Copies are identified by (object, staging session), the unit of GC decisions (ARCHITECTURE §8): a node deletes a copy only while its stored record still carries that staging session, and keeps a copy that a later upload re-bound to another session. Rejected for an older volume epoch. Idempotent.
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
 | 1 | `Volume` | `VolumeId` | Owning volume. |
 | 2 | `VolumeEpoch` | `varuint` | Volume epoch of the decision. |
 | 3 | `DecisionIndex` | `varuint` | Applied index at which deletability was decided. |
-| 4 | `Objects` | `list<ObjectId>` | Objects to delete. |
+| 4 | `Objects` | `list<ObjectStagingRef>` | Copies to delete. |
 | 5 | `ExcessReplicas` | `bool` | True for excess-replica cleanup rather than garbage collection. |
 | 6 | — | `extensions` | Terminal extension block. |
 
@@ -1536,10 +1564,11 @@ Reply to `InventoryReportMessage`.
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
-| 1 | `Delete` | `list<ObjectId>` | Reported objects that are garbage at `DecisionIndex` (only on the last page). |
+| 1 | `Delete` | `list<ObjectStagingRef>` | Reported copies (object, staging session) that are garbage at `DecisionIndex` (only on the last page); deleted with the same rule as `DeleteObjectsMessage`. |
 | 2 | `Unknown` | `list<ObjectId>` | Reported objects the leader cannot classify yet (for example a staging id newer than its applied state); keep them. |
 | 3 | `DecisionIndex` | `varuint` | Applied index of the GC decision (0 when `Delete` is empty). |
-| 4 | — | `extensions` | Terminal extension block. |
+| 4 | `VolumeEpoch` | `varuint` | Volume epoch of the decision. As for `DeleteObjectsMessage`, a node ignores the `Delete` list when the epoch is older than the volume epoch it knows (a decision of a superseded authority). |
+| 5 | — | `extensions` | Terminal extension block. |
 
 #### `CopyObjects` = 122 (`CopyObjectsMessage`)
 
@@ -1568,7 +1597,7 @@ Reply to `CopyObjectsMessage`.
 
 #### `RaftBatch` = 130 (`RaftBatchMessage`)
 
-Raft messages from one node to another, batched per destination (node → node). Normally sent one-way; when sent as a request it is answered by `RaftBatchResultMessage`. Receivers drop messages from unknown or removed members, from a stale incarnation (not the registered one), and for groups the receiver does not host. The sender must persist hard state and entries before sending messages that depend on them (CON-004).
+Raft messages from one node to another, batched per destination (node → node). Normally sent one-way; when sent as a request it is answered by `RaftBatchResultMessage`. Receivers drop messages from unknown or removed members, from an incarnation older than the registered one, from a process whose incarnation equals the registered one but whose boot id differs (a cloned disk, RSY-021), and for groups the receiver does not host. A newer, not yet registered incarnation is accepted: a restarted voter must take part in the elections and commits that register it (after a full-cluster restart every voter is in that state). The sender must persist hard state and entries before sending messages that depend on them (CON-004).
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
@@ -1885,7 +1914,7 @@ Reply to `BackupRetentionMessage`.
 
 #### `BackupExportRestore` = 172 (`BackupExportRestoreMessage`)
 
-Pulls a published snapshot from a backup node for restore (restoring cluster → backup node, authenticated as a reader principal). `Describe` pins the snapshot and returns its descriptor; `Manifest` and `Object` return chunks under that pin; `Release` drops the pin. Missing key material fails with <see cref="DfsErrorCode.RecoveryKeyMissing"/>, never with undecryptable bytes (RST-005).
+Pulls a published snapshot from a backup node for restore (restoring cluster → backup node, authenticated as a reader principal). `Describe` pins the snapshot and returns its descriptor; `Manifest` and `Object` return chunks under that pin; `Release` drops the pin. Missing key material fails with `DfsErrorCode.RecoveryKeyMissing`, never with undecryptable bytes (RST-005).
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
@@ -2320,6 +2349,24 @@ One entry of a directory listing page.
 | 6 | `ModifiedUtc` | `timestamp` | Last modification time. |
 | 7 | — | `extensions` | Terminal extension block. |
 
+#### `ErrorDetailData`
+
+Structured details of an `ErrorReplyMessage`, so the typed exception the SDK raises carries the same properties the server's exception had (FMT-011, API.md §A.2). Fields that do not apply to the reply's code are zero/null.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `RequiredCopies` | `varint32` | Placement: durable copies (distinct hosts) the policy requires. |
+| 2 | `AchievedCopies` | `varint32` | Placement: durable copies achieved. |
+| 3 | `RequiredZones` | `varint32` | Placement: distinct (region, zone) pairs the policy requires. |
+| 4 | `AchievedZones` | `varint32` | Placement: distinct zones achieved. |
+| 5 | `LimitName` | `string?` | Limit: name of the exceeded limit (for example `MaxPublishBytes`). |
+| 6 | `Limit` | `varint` | Limit: the configured limit. |
+| 7 | `Requested` | `varint` | Limit: the requested amount. |
+| 8 | `Object` | `ObjectId?` | Integrity: the corrupt or missing object, when known. |
+| 9 | `AdapterId` | `string?` | Adapter failure: the adapter id. |
+| 10 | `Phase` | `string?` | Adapter failure: the failing phase. |
+| 11 | — | `extensions` | Terminal extension block. |
+
 #### `ExtentData`
 
 One extent of a committed file revision as returned by reads: logical range `[Offset, Offset + Length)` maps to object bytes `[ObjectOffset, ObjectOffset + Length)`. Ranges below the file length without an extent are holes (zeroes).
@@ -2462,6 +2509,16 @@ Signed durability receipt for one stored object (ARCHITECTURE §6). A storage no
 | 11 | `Mac` | `bytes[32]` | HMAC-SHA256 with the cluster receipt key over `GetMacInput` (exactly `ProtocolInfo.MacSize` bytes). |
 | 12 | — | `extensions` | Terminal extension block. |
 
+#### `ObjectStagingRef`
+
+A stored copy identified by object and staging session: the unit of garbage-collection decisions (ARCHITECTURE §8, GC-005). Deletability is decided for an (object, staging) pair whose staging session is closed, so a storage node deletes a copy only while its stored record still carries `Staging`; a copy that a later upload re-bound to another (possibly open, possibly committed) staging session is kept.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Object` | `ObjectId` | Stored object. |
+| 2 | `Staging` | `StagingId` | Staging session the decision was taken for. |
+| 3 | — | `extensions` | Terminal extension block. |
+
 #### `RaftEnvelope`
 
 One Raft message addressed to a group (element of `RaftBatchMessage`).
@@ -2563,12 +2620,12 @@ Common header of every volume-scoped request (namespace, files, sessions, transa
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
 | 1 | `Volume` | `string` | Volume name (the server resolves it through the control state). |
-| 2 | `ExpectedVolumeId` | `VolumeId` | Volume identity the caller believes it addresses; `VolumeId` empty = any. /// A mismatch (for example after the name was deleted and re-created) is rejected with /// `DfsErrorCode.EpochMismatch` so handles, sessions and tokens of another volume are never applied (PATH-014, RST-008). |
-| 3 | `ExpectedVolumeEpoch` | `varuint` | Volume epoch the caller believes is current; 0 = any. Mismatch → /// `DfsErrorCode.EpochMismatch`. |
-| 4 | `Session` | `varuint` | The caller's own session on this volume (0 = none). Handles, pins and staging sessions created /// by the request are owned by this session and renewed by its `KeepAlive`. |
-| 5 | `Operation` | `OperationId` | Stable operation id of a mutating request, assigned before the first transmission and reused /// by every retry (OUT-001); empty for reads. It may belong to another session of the same principal (an id persisted /// by a previous process). |
-| 6 | `AckWatermark` | `varuint` | Sequence watermark of `Session`: the client will never retry or query any of /// its operations with a lower sequence, so their outcomes may be retired (ARCHITECTURE §5.2 step 4). 0 = none. |
-| 7 | `Transaction` | `TransactionId?` | Transaction the request belongs to; null outside transactions. Transaction-bound requests are /// applied to the transaction's private working root and are not visible to anyone else before commit. |
+| 2 | `ExpectedVolumeId` | `VolumeId` | Volume identity the caller believes it addresses; `VolumeId` empty = any. A mismatch (for example after the name was deleted and re-created) is rejected with `DfsErrorCode.EpochMismatch` so handles, sessions and tokens of another volume are never applied (PATH-014, RST-008). |
+| 3 | `ExpectedVolumeEpoch` | `varuint` | Volume epoch the caller believes is current; 0 = any. Mismatch → `DfsErrorCode.EpochMismatch`. |
+| 4 | `Session` | `varuint` | The caller's own session on this volume (0 = none). Handles, pins and staging sessions created by the request are owned by this session and renewed by its `KeepAlive`. |
+| 5 | `Operation` | `OperationId` | Stable operation id of a mutating request, assigned before the first transmission and reused by every retry (OUT-001); empty for reads. It may belong to another session of the same principal (an id persisted by a previous process). |
+| 6 | `AckWatermark` | `varuint` | Sequence watermark of `Session`: the client will never retry or query any of its operations with a lower sequence, so their outcomes may be retired (ARCHITECTURE §5.2 step 4). 0 = none. |
+| 7 | `Transaction` | `TransactionId?` | Transaction the request belongs to; null outside transactions. Transaction-bound requests are applied to the transaction's private working root and are not visible to anyone else before commit. |
 | 8 | — | `extensions` | Terminal extension block. |
 
 #### `SnapshotInfoData`
@@ -2612,9 +2669,13 @@ One volume of the cluster map: identity, authority epoch, routing and policies.
 
 ### 11.1 Error replies
 
-Any request may be answered with `ErrorReply { Code, Message, OperationId?, Retryable, LeaderHint?, TransactionId? }`
-(`ErrorCodec`, FMT-011). Codes travel verbatim (codes unknown to an older receiver are preserved); the SDK maps them
-with `DfsErrors.ToException`, so an unknown commit outcome can never degrade into not-found or cancellation.
+Any request may be answered with `ErrorReply { Code, Message, OperationId?, Retryable, LeaderHint?, TransactionId?,
+Detail? }` (`ErrorCodec`, FMT-011). Codes travel verbatim (codes unknown to an older receiver are preserved); the SDK
+maps them with `ErrorReplyMessage.ToException` (`DfsErrors.ToException` plus the transported transaction id, leader hint
+and `Detail`), so an unknown commit outcome can never degrade into not-found or cancellation, and typed properties
+(`DfsPlacementUnavailableException.RequiredCopies`/`AchievedCopies`/`RequiredZones`/`AchievedZones`,
+`DfsLimitExceededException.LimitName`/`Limit`/`Requested`, `DfsIntegrityException.ObjectId`,
+`DfsSnapshotAdapterException.AdapterId`/`Phase`) survive the wire (`ErrorReplyMessage.FromException` fills `Detail`).
 Messages never contain payload bytes or secrets.
 
 | Situation | Code | Retryable | Notes |
@@ -2672,9 +2733,11 @@ Messages never contain payload bytes or secrets.
    (PATH-012, OPEN tests, AT-16) rather than a protocol error.
 4. **`RequestHeader` carries `ExpectedVolumeId` in addition to the epoch**, so a deleted and re-created volume name can
    never accept the old volume's numeric session, handle, pin or continuation ids (PATH-014, RST-008).
-5. **Payload identity** (`OperationPayload`) is defined on the normalized request frame, so legitimate retries from
-   other sessions/processes match while any argument change is detected (OUT-003). Header-bearing requests implement
-   `IVolumeRequest` for generic routing/authority/idempotency handling.
+5. **Payload identity** (`OperationPayload`) is defined on the normalized request frame, without the per-attempt
+   upload artifacts of publications (receipts, staging session, random object ids), so legitimate retries from other
+   sessions/processes — including ones that had to re-upload the content — match while any argument or content change
+   is detected (OUT-003, OUT-006). Header-bearing requests implement `IVolumeRequest` for generic
+   routing/authority/idempotency handling.
 6. **Handshake** uses the SCRAM-SHA-256 key schedule for principals (the server stores no secret-equivalent) and
    label-separated HMACs for nodes, both over a transcript of the exact frames, with mutual MACs (`HandshakeAuth`).
 7. **Receipts** bind volume and staging session in addition to the ARCHITECTURE fields, so a receipt can neither be
@@ -2696,3 +2759,13 @@ Messages never contain payload bytes or secrets.
     without new message types; unknown ops decode and are answered `Unsupported`.
 16. **Backup transfer** messages are keyed by an explicit `BackupTransferKey` (source cluster, volume, epoch, lineage,
     snapshot); the manifest is opaque to the protocol and owned by the backup module.
+17. **Structured error details** (`ErrorReply.Detail`, `ErrorDetailData`) carry the typed exception properties API.md
+    defines (placement shortfall, limit, integrity object, adapter phase) instead of flattening them into the message.
+18. **Process boot ids** (`Hello`, `JoinCluster`, `RegisterIncarnation`): two processes started from a cloned disk pick
+    the same incarnation, so registration is keyed by (incarnation, boot id) and the second process is fenced
+    (RSY-021). Raft traffic of a newer, not yet registered incarnation is accepted, otherwise a full-cluster restart
+    could never commit the registrations.
+19. **GC decisions are per (object, staging session)** (`ObjectStagingRef` in `DeleteObjects` and
+    `InventoryReportResult`), matching ARCHITECTURE §8, and receipts are always bound to the uploading request's
+    staging session (a re-upload under another session re-binds the copy). A delete decision taken for an old pair can
+    therefore never remove a copy that became reachable through a newer staging session (GC-005).

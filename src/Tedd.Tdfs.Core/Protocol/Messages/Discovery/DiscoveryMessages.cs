@@ -157,6 +157,7 @@ public sealed record VolumeRouteResultMessage(
 /// <param name="CapacityBytes">Configured capacity.</param>
 /// <param name="ProtocolMax">Newest protocol version the node speaks (for feature eligibility, FMT-009).</param>
 /// <param name="Features">Features the node supports.</param>
+/// <param name="BootId">Process boot id of the joining node (see <see cref="HelloMessage.BootId"/>); registered with the incarnation.</param>
 public sealed record JoinClusterMessage(
     NodeId Node,
     string Name,
@@ -165,7 +166,8 @@ public sealed record JoinClusterMessage(
     ulong Incarnation,
     long CapacityBytes,
     ushort ProtocolMax,
-    IReadOnlySet<string> Features) : IWireMessage<JoinClusterMessage>
+    IReadOnlySet<string> Features,
+    UInt128 BootId = default) : IWireMessage<JoinClusterMessage>
 {
     /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
@@ -187,6 +189,7 @@ public sealed record JoinClusterMessage(
         writer.WriteVarInt(CapacityBytes);
         writer.WriteVarUInt(ProtocolMax);
         writer.WriteStringSet(Features);
+        writer.WriteUInt128(BootId);
         writer.WriteExtensionBlock(Extensions);
     }
 
@@ -201,8 +204,9 @@ public sealed record JoinClusterMessage(
         long capacity = reader.ReadVarInt();
         ushort protocolMax = reader.ReadVarUInt16();
         IReadOnlySet<string> features = reader.ReadStringSet();
+        UInt128 bootId = reader.ReadUInt128();
         IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
-        return new JoinClusterMessage(node, name, labels, endpoints, incarnation, capacity, protocolMax, features) { Extensions = extensions };
+        return new JoinClusterMessage(node, name, labels, endpoints, incarnation, capacity, protocolMax, features, bootId) { Extensions = extensions };
     }
 }
 
@@ -250,24 +254,29 @@ public sealed record JoinClusterResultMessage(
 
 /// <summary>
 /// Registers a restarted node's new incarnation with the control group (node → control leader) before the node issues
-/// receipts or Raft messages (RCV-02). Also updates the node's endpoints (a restarted node may listen on a new port) and
-/// reported capacity. Rejected with <see cref="DfsErrorCode.StaleIncarnation"/> when the incarnation is not greater than
-/// the registered one (cloned disk, RSY-021), and with <see cref="DfsErrorCode.AccessDenied"/> for a removed node.
-/// Idempotent for the same (node, incarnation).
+/// receipts (RCV-02). Also updates the node's endpoints (a restarted node may listen on a new port) and reported
+/// capacity. Rejected with <see cref="DfsErrorCode.StaleIncarnation"/> when the incarnation is lower than the registered
+/// one, or equal to it with a different <c>BootId</c> (two processes started from a cloned disk pick the same
+/// incarnation; the one registered second is fenced and must stop serving, RSY-021), and with
+/// <see cref="DfsErrorCode.AccessDenied"/> for a removed node. Idempotent for the same (node, incarnation, boot id).
+/// Raft traffic of a newer, not yet registered incarnation is accepted: committing the registration needs a control
+/// quorum, which after a full-cluster restart consists only of not yet registered incarnations.
 /// </summary>
 /// <param name="Node">Node identity.</param>
-/// <param name="Incarnation">New incarnation (strictly greater than the registered one).</param>
+/// <param name="Incarnation">New incarnation (greater than the registered one; equal only for a retry with the same boot id).</param>
 /// <param name="Name">Node name (must match the membership).</param>
 /// <param name="Labels">Current labels from the node configuration.</param>
 /// <param name="Endpoints">Current listen endpoints.</param>
 /// <param name="CapacityBytes">Configured capacity.</param>
+/// <param name="BootId">Process boot id (see <see cref="HelloMessage.BootId"/>).</param>
 public sealed record RegisterIncarnationMessage(
     NodeId Node,
     ulong Incarnation,
     string Name,
     DfsTopologyLabels Labels,
     IReadOnlyList<string> Endpoints,
-    long CapacityBytes) : IWireMessage<RegisterIncarnationMessage>
+    long CapacityBytes,
+    UInt128 BootId = default) : IWireMessage<RegisterIncarnationMessage>
 {
     /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
@@ -287,6 +296,7 @@ public sealed record RegisterIncarnationMessage(
         writer.WriteTopologyLabels(Labels);
         writer.WriteStringList(Endpoints);
         writer.WriteVarInt(CapacityBytes);
+        writer.WriteUInt128(BootId);
         writer.WriteExtensionBlock(Extensions);
     }
 
@@ -299,8 +309,9 @@ public sealed record RegisterIncarnationMessage(
         DfsTopologyLabels labels = reader.ReadTopologyLabels();
         IReadOnlyList<string> endpoints = reader.ReadStringList();
         long capacity = reader.ReadVarInt();
+        UInt128 bootId = reader.ReadUInt128();
         IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
-        return new RegisterIncarnationMessage(node, incarnation, name, labels, endpoints, capacity) { Extensions = extensions };
+        return new RegisterIncarnationMessage(node, incarnation, name, labels, endpoints, capacity, bootId) { Extensions = extensions };
     }
 }
 

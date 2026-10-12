@@ -3,8 +3,11 @@ namespace Tedd.Tdfs.Protocol.Messages;
 /// <summary>
 /// Raft messages from one node to another, batched per destination (node → node). Normally sent one-way; when sent as
 /// a request it is answered by <see cref="RaftBatchResultMessage"/>. Receivers drop messages from unknown or removed
-/// members, from a stale incarnation (not the registered one), and for groups the receiver does not host. The sender
-/// must persist hard state and entries before sending messages that depend on them (CON-004).
+/// members, from an incarnation older than the registered one, from a process whose incarnation equals the registered
+/// one but whose boot id differs (a cloned disk, RSY-021), and for groups the receiver does not host. A newer, not yet
+/// registered incarnation is accepted: a restarted voter must take part in the elections and commits that register it
+/// (after a full-cluster restart every voter is in that state). The sender must persist hard state and entries before
+/// sending messages that depend on them (CON-004).
 /// </summary>
 /// <param name="From">Sending node (must equal the authenticated connection identity).</param>
 /// <param name="Incarnation">Sending node incarnation.</param>

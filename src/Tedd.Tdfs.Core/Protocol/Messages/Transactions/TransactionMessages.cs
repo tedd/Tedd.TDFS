@@ -105,9 +105,12 @@ public sealed record TxBeginResultMessage(
 /// <summary>
 /// Optional batching envelope: executes several transaction-bound requests in order against the transaction's working
 /// root (client → volume leader). Each element is a complete request frame whose header carries the same transaction;
-/// execution stops at the first failing request, whose error reply is the last element of the result. Ordinary
-/// transaction-bound requests do not need this envelope; a server that does not implement it answers <see
-/// cref="DfsErrorCode.Unsupported"/>.
+/// execution stops at the first failing request, whose error reply is the last element of the result. Elements are
+/// decoded one level deep only: an element that is itself a <c>TxOp</c>, <c>TxBegin</c>, <c>TxCommit</c> or
+/// <c>TxAbort</c>, or whose header names another transaction or volume, is answered with
+/// <see cref="DfsErrorCode.InvalidArgument"/> (no nesting, so a hostile frame cannot force recursive decoding). Ordinary
+/// transaction-bound requests do not need this envelope; a server that does not implement it answers
+/// <see cref="DfsErrorCode.Unsupported"/>.
 /// </summary>
 /// <param name="Header">Request header; <see cref="RequestHeader.Transaction"/> identifies the transaction.</param>
 /// <param name="Requests">Encoded request frames.</param>

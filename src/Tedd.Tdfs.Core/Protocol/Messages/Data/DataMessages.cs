@@ -4,7 +4,10 @@ namespace Tedd.Tdfs.Protocol.Messages;
 /// Stores one immutable object (client or node → storage node). The node verifies the staging capability (MAC,
 /// cluster, volume, epoch, staging session, principal, expiry), the declared length and checksum against the payload,
 /// and capacity admission (CapacityExhausted before touching reserves), writes the record and flushes, and only then
-/// returns a signed receipt. Idempotent: re-uploading identical content returns a receipt; the same id with different
+/// returns a signed receipt. A receipt is always bound to the request's staging session. Idempotent: re-uploading
+/// identical content under the same staging session returns a receipt; under another staging session the node first
+/// durably re-binds its copy to the new session (a new record), so a garbage decision taken for the old
+/// (object, staging) pair can no longer remove it (see <see cref="ObjectStagingRef"/>). The same id with different
 /// content is rejected with <see cref="DfsErrorCode.Integrity"/>. Objects are at most <c>MaxObjectSize</c> bytes.
 /// </summary>
 /// <param name="Capability">Encoded staging <see cref="DataCapability"/> (may be empty only for authenticated node peers).</param>
@@ -382,20 +385,22 @@ public sealed record ReplicateObjectResultMessage(
 }
 
 /// <summary>
-/// Deletes objects (volume leader → storage node): garbage the leader proved unreachable at a committed index with a
-/// closed staging session (GC), or excess replicas after repair verified the targets (REP-016). Rejected for an older
-/// volume epoch. Idempotent.
+/// Deletes stored copies (volume leader → storage node): garbage the leader proved unreachable at a committed index with
+/// a closed staging session (GC), or excess replicas after repair verified the targets (REP-016). Copies are identified
+/// by (object, staging session), the unit of GC decisions (ARCHITECTURE §8): a node deletes a copy only while its stored
+/// record still carries that staging session, and keeps a copy that a later upload re-bound to another session.
+/// Rejected for an older volume epoch. Idempotent.
 /// </summary>
 /// <param name="Volume">Owning volume.</param>
 /// <param name="VolumeEpoch">Volume epoch of the decision.</param>
 /// <param name="DecisionIndex">Applied index at which deletability was decided.</param>
-/// <param name="Objects">Objects to delete.</param>
+/// <param name="Objects">Copies to delete.</param>
 /// <param name="ExcessReplicas">True for excess-replica cleanup rather than garbage collection.</param>
 public sealed record DeleteObjectsMessage(
     VolumeId Volume,
     ulong VolumeEpoch,
     ulong DecisionIndex,
-    IReadOnlyList<ObjectId> Objects,
+    IReadOnlyList<ObjectStagingRef> Objects,
     bool ExcessReplicas) : IWireMessage<DeleteObjectsMessage>
 {
     /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
@@ -413,7 +418,7 @@ public sealed record DeleteObjectsMessage(
         writer.WriteVolumeId(Volume);
         writer.WriteVarUInt(VolumeEpoch);
         writer.WriteVarUInt(DecisionIndex);
-        writer.WriteObjectIdList(Objects);
+        writer.WriteList(Objects);
         writer.WriteBool(ExcessReplicas);
         writer.WriteExtensionBlock(Extensions);
     }
@@ -424,7 +429,7 @@ public sealed record DeleteObjectsMessage(
         VolumeId volume = reader.ReadVolumeId();
         ulong volumeEpoch = reader.ReadVarUInt();
         ulong decisionIndex = reader.ReadVarUInt();
-        IReadOnlyList<ObjectId> objects = reader.ReadObjectIdList();
+        IReadOnlyList<ObjectStagingRef> objects = reader.ReadList<ObjectStagingRef>();
         bool excessReplicas = reader.ReadBool();
         IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
         return new DeleteObjectsMessage(volume, volumeEpoch, decisionIndex, objects, excessReplicas) { Extensions = extensions };
@@ -527,13 +532,17 @@ public sealed record InventoryReportMessage(
 /// <summary>
 /// Reply to <see cref="InventoryReportMessage"/>.
 /// </summary>
-/// <param name="Delete">Reported objects that are garbage at <c>DecisionIndex</c> (only on the last page).</param>
+/// <param name="Delete">Reported copies (object, staging session) that are garbage at <c>DecisionIndex</c> (only on the
+/// last page); deleted with the same rule as <see cref="DeleteObjectsMessage"/>.</param>
 /// <param name="Unknown">Reported objects the leader cannot classify yet (for example a staging id newer than its applied state); keep them.</param>
 /// <param name="DecisionIndex">Applied index of the GC decision (0 when <c>Delete</c> is empty).</param>
+/// <param name="VolumeEpoch">Volume epoch of the decision. As for <see cref="DeleteObjectsMessage"/>, a node ignores the
+/// <c>Delete</c> list when the epoch is older than the volume epoch it knows (a decision of a superseded authority).</param>
 public sealed record InventoryReportResultMessage(
-    IReadOnlyList<ObjectId> Delete,
+    IReadOnlyList<ObjectStagingRef> Delete,
     IReadOnlyList<ObjectId> Unknown,
-    ulong DecisionIndex) : IWireMessage<InventoryReportResultMessage>
+    ulong DecisionIndex,
+    ulong VolumeEpoch = 0) : IWireMessage<InventoryReportResultMessage>
 {
     /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
@@ -547,20 +556,22 @@ public sealed record InventoryReportResultMessage(
     /// <inheritdoc />
     public void Write(ref WireWriter writer)
     {
-        writer.WriteObjectIdList(Delete);
+        writer.WriteList(Delete);
         writer.WriteObjectIdList(Unknown);
         writer.WriteVarUInt(DecisionIndex);
+        writer.WriteVarUInt(VolumeEpoch);
         writer.WriteExtensionBlock(Extensions);
     }
 
     /// <inheritdoc />
     public static InventoryReportResultMessage Read(ref WireReader reader)
     {
-        IReadOnlyList<ObjectId> delete = reader.ReadObjectIdList();
+        IReadOnlyList<ObjectStagingRef> delete = reader.ReadList<ObjectStagingRef>();
         IReadOnlyList<ObjectId> unknown = reader.ReadObjectIdList();
         ulong decisionIndex = reader.ReadVarUInt();
+        ulong volumeEpoch = reader.ReadVarUInt();
         IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
-        return new InventoryReportResultMessage(delete, unknown, decisionIndex) { Extensions = extensions };
+        return new InventoryReportResultMessage(delete, unknown, decisionIndex, volumeEpoch) { Extensions = extensions };
     }
 }
 

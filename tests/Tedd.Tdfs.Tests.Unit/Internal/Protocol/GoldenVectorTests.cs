@@ -24,7 +24,18 @@ public sealed class GoldenVectorTests
     public void ErrorReplyPreservesUnknownOutcomeIdentity()
         => AssertVector(
             new ErrorReplyMessage(DfsErrorCode.OutcomeUnknown, "x", new DfsOperationId(1, 2), Retryable: true),
-            "0100" + "2E" + "0178" + "010102" + "01" + "00" + "00" + "00");
+            "0100" + "2E" + "0178" + "010102" + "01" + "00" + "00" + "00" + "00"); // ..., no tx, no detail, extensions
+
+    [Fact]
+    public void ErrorReplyCarriesPlacementDetail()
+        => AssertVector(
+            new ErrorReplyMessage(DfsErrorCode.PlacementUnavailable, "", null, Retryable: true)
+            {
+                Detail = new ErrorDetailData(RequiredCopies: 2, AchievedCopies: 1, RequiredZones: 2, AchievedZones: 1),
+            },
+            "0100" + "28" + "00" + "00" + "01" + "00" + "00" +
+            "01" + "04" + "02" + "04" + "02" + "00" + "00" + "00" + "00" + "00" + "00" + "00" + // detail: zigzag 2,1,2,1; no limit name; 0; 0; no object/adapter/phase; extensions
+            "00");
 
     [Fact]
     public void HelloProof()

@@ -91,6 +91,42 @@ public sealed record InventoryItem(
 }
 
 /// <summary>
+/// A stored copy identified by object and staging session: the unit of garbage-collection decisions (ARCHITECTURE §8,
+/// GC-005). Deletability is decided for an (object, staging) pair whose staging session is closed, so a storage node
+/// deletes a copy only while its stored record still carries <paramref name="Staging"/>; a copy that a later upload
+/// re-bound to another (possibly open, possibly committed) staging session is kept.
+/// </summary>
+/// <param name="Object">Stored object.</param>
+/// <param name="Staging">Staging session the decision was taken for.</param>
+public sealed record ObjectStagingRef(
+    ObjectId Object,
+    StagingId Staging) : IWireRecord<ObjectStagingRef>
+{
+    /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
+    public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
+
+    /// <inheritdoc />
+    public static int MinEncodedSize => 18;
+
+    /// <inheritdoc />
+    public void Write(ref WireWriter writer)
+    {
+        writer.WriteObjectId(Object);
+        writer.WriteStagingId(Staging);
+        writer.WriteExtensionBlock(Extensions);
+    }
+
+    /// <inheritdoc />
+    public static ObjectStagingRef Read(ref WireReader reader)
+    {
+        ObjectId @object = reader.ReadObjectId();
+        StagingId staging = reader.ReadStagingId();
+        IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
+        return new ObjectStagingRef(@object, staging) { Extensions = extensions };
+    }
+}
+
+/// <summary>
 /// One server-side object copy of a <see cref="CopyObjectsMessage"/>.
 /// </summary>
 /// <param name="From">Source object (owned by the source volume).</param>

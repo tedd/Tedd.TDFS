@@ -140,6 +140,10 @@ internal sealed class ProtocolSamples
             instance = primary.Invoke(values);
         }
 
+        // Wire fields added as init-only properties rather than constructor parameters.
+        if (!_minimal && instance is ErrorReplyMessage && _random.Next(2) == 0)
+            type.GetProperty(nameof(ErrorReplyMessage.Detail))!.SetValue(instance, Create(typeof(ErrorDetailData), nameof(ErrorReplyMessage.Detail), depth + 1));
+
         if (!_minimal && IsProtocolRecord(type) && _random.Next(4) == 0)
         {
             PropertyInfo extensions = type.GetProperty("Extensions")!;
