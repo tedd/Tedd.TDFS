@@ -55,8 +55,10 @@ set on; NoPropagateInherit limits inheritance to immediate children; a protected
 effect atomically for the whole subtree with the committing operation (deliberate difference from NTFS's eager
 propagation; observable results equal a completed NTFS propagation).
 
-**ACL-04. Evaluation.** Access checks SHALL use NTFS canonical order: explicit Deny, explicit Allow, inherited Deny
-(nearest ancestor first), inherited Allow (nearest first). A request for rights R is granted iff every bit of R is
+**ACL-04. Evaluation.** Access checks SHALL use NTFS canonical order: explicit Deny, explicit Allow, then inherited ACEs
+**one generation at a time, nearest first** (the parent's inherited Deny then Allow, then the grandparent's Deny then
+Allow, ...), exactly as NTFS orders a propagated ACL — so an Allow inherited from the parent beats a Deny inherited from
+the grandparent. A request for rights R is granted iff every bit of R is
 allowed before any matching Deny for that bit; anything not allowed is denied. The owner is implicitly granted
 ReadPermissions and ChangePermissions. Members of `Administrators` may always TakeOwnership and ChangePermissions but
 are otherwise subject to the ACL.
