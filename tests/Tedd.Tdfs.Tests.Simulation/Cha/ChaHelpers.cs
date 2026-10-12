@@ -50,6 +50,23 @@ internal static class ChaHelpers
         }
     }
 
+    /// <summary>
+    /// Reads a whole file through an explicit version-pinned read handle granting <c>FileShare.ReadWrite | Delete</c>, so the
+    /// read is compatible with an active writer (test plan §5: a setup-level sharing conflict is not evidence; the share
+    /// mode of the whole-file helpers is not specified) and observes exactly one revision.
+    /// </summary>
+    public static async Task<byte[]> ReadSharedAsync(DfsFileClient files, string path)
+    {
+        await using DfsStream stream = await files.OpenAsync(path, new DfsOpenOptions
+        {
+            Mode = FileMode.Open,
+            Access = FileAccess.Read,
+            Share = FileShare.ReadWrite | FileShare.Delete,
+            ReadView = DfsReadView.VersionPinned,
+        }, Ct);
+        return await ReadToEndAsync(stream);
+    }
+
     /// <summary>Awaits <paramref name="actual"/> and asserts byte-for-byte equality with <paramref name="expected"/>.</summary>
     public static async Task AssertBytesAsync(byte[] expected, Task<byte[]> actual, string? because = null)
     {
@@ -77,6 +94,19 @@ internal static class ChaHelpers
         FileInspection? file = await cluster.Inspect.GetFileAsync(volume, path);
         Assert.True(file is not null, $"{path} must exist in the authoritative state of {volume}");
         return file.Extents.Select(e => e.Object).Distinct().ToArray();
+    }
+
+    /// <summary>
+    /// Maps a logical file offset of the current revision of <paramref name="path"/> to (object, offset within the object),
+    /// so a corruption can be placed inside a specific range read (leader view).
+    /// </summary>
+    public static async Task<(ObjectId Object, long ObjectOffset)> LocateAsync(TestCluster cluster, string path, long logicalOffset, string volume = Vol)
+    {
+        FileInspection? file = await cluster.Inspect.GetFileAsync(volume, path);
+        Assert.True(file is not null, $"{path} must exist in the authoritative state of {volume}");
+        ExtentInspection? extent = file.Extents.FirstOrDefault(e => e.Offset <= logicalOffset && logicalOffset < e.Offset + e.Length);
+        Assert.True(extent is not null, $"offset {logicalOffset} of {path} must be mapped to an extent");
+        return (extent.Object, extent.ObjectOffset + (logicalOffset - extent.Offset));
     }
 
     /// <summary>Nodes currently running.</summary>
@@ -163,6 +193,14 @@ internal static class ChaHelpers
         || ex is DfsException { ErrorCode: DfsErrorCode.NotLeader or DfsErrorCode.Timeout or DfsErrorCode.Unavailable or DfsErrorCode.NodeUnavailable or DfsErrorCode.QuorumUnavailable }
         || ex is OperationCanceledException;
 
+    /// <summary>
+    /// True when a read failed explicitly: integrity failure, availability failure or deadline (never fabricated/zero-filled
+    /// data, false absence or a definite "end of file").
+    /// </summary>
+    public static bool IsExplicitReadFailure(Exception ex) =>
+        ex is DfsIntegrityException or DfsUnavailableException or TimeoutException
+        || ex is DfsException { ErrorCode: DfsErrorCode.Timeout or DfsErrorCode.NodeUnavailable or DfsErrorCode.Unavailable or DfsErrorCode.Integrity };
+
     /// <summary>Asserts that the current state of every replica of <paramref name="volume"/> agrees on <paramref name="path"/>.</summary>
     public static async Task<IReadOnlyList<FileInspection?>> ReplicaViewsAsync(TestCluster cluster, string path, string volume = Vol)
     {
@@ -238,9 +276,22 @@ internal sealed class SafetyMonitor
         return monitor;
     }
 
-    /// <summary>Stops sampling and asserts that at least <paramref name="minSamples"/> samples ran and none failed.</summary>
+    /// <summary>
+    /// Waits (harness clock) until at least <paramref name="minSamples"/> samples completed, so the evidence does not depend
+    /// on how long the preceding steps happened to take, then stops sampling and asserts that none failed.
+    /// </summary>
     public async Task StopAndAssertAsync(int minSamples = 1)
     {
+        try
+        {
+            await _cluster.WaitUntilAsync(() => Task.FromResult(Samples >= minSamples || _violations.Count > 0), TimeSpan.FromSeconds(60),
+                $"safety monitor '{_name}' completes {minSamples} samples", TestContext.Current.CancellationToken);
+        }
+        catch (TimeoutException)
+        {
+            // Reported by the sample-count assertion below.
+        }
+
         await _stop.CancelAsync();
         await _loop;
         Assert.True(Samples >= minSamples, $"safety monitor '{_name}' ran only {Samples} samples (expected at least {minSamples}); missing evidence is not a pass");
@@ -286,6 +337,16 @@ internal sealed class SafetyMonitor
             }
         }
     }
+}
+
+/// <summary>Lets a scenario hold background observers between their transactions (single-threaded simulation state).</summary>
+internal sealed class ObserverGate
+{
+    /// <summary>When true, observers start no new transaction.</summary>
+    public bool Paused { get; set; }
+
+    /// <summary>True while an observer is inside a transaction.</summary>
+    public bool Busy { get; set; }
 }
 
 /// <summary>Monotonic logical clock for building <see cref="TxRecord"/> histories (one event per tick).</summary>

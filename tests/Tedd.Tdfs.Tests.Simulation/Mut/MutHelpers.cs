@@ -362,6 +362,26 @@ internal static class MutHelpers
         }
     }
 
+    /// <summary>
+    /// Policy oracle independent of what the client was told: whatever revision of <paramref name="path"/> is committed
+    /// must meet the ack copy/zone policy, and a write reported as definitely failed must not be committed.
+    /// </summary>
+    private static async Task CheckCommittedMeetsPolicyAsync(TestCluster cluster, VerdictBuilder verdict, string path, Exception? clientFailure,
+        int copies, int zones, string when)
+    {
+        FileInspection? committed = await cluster.Inspect.GetFileAsync(Vol, path);
+        if (committed is null)
+        {
+            verdict.Check(clientFailure is not null, ViolationKind.LostAcknowledgedData, $"an acknowledged write {when} is not in the authoritative state");
+            return;
+        }
+
+        await CheckDurableCopiesAsync(cluster, verdict, path, copies, zones, ViolationKind.PolicyUnderAcknowledged,
+            clientFailure is null ? $"acknowledged {when}" : $"committed {when} although the client saw {clientFailure.GetType().Name}");
+        if (clientFailure is not null && HistoryRecorder.Classify(clientFailure) == OpOutcome.Failed)
+            verdict.Violation(ViolationKind.PolicyUnderAcknowledged, $"a write reported as definitely failed {when} is committed");
+    }
+
     // ------------------------------------------------------------------------------------------------------------------
     // MUT-001 SkipFencingCheck: the stale-writer regression (§9.3).
     // ------------------------------------------------------------------------------------------------------------------
@@ -371,12 +391,18 @@ internal static class MutHelpers
     /// and writer B (generation &gt; g) commits; the delayed publication and a duplicate of it are then delivered. Detects
     /// any acceptance of the stale publication.
     /// </summary>
+    /// <remarks>
+    /// A's stale revision is below the inline threshold, so its publication needs no staging session or receipts: the
+    /// writer-fencing check (handle validity + generation) is the only server-side barrier, and a closed staging session
+    /// cannot mask the mutant. The delayed commit is delivered well inside A's session timeout (lease 2 s, session 10 s),
+    /// so session expiry cannot mask it either.
+    /// </remarks>
     public static Task<ScenarioVerdict> StaleWriterPublicationAsync(SafetyMutations m) =>
         RunScenarioAsync("stale-writer-publication", m, TestClusterOptions.ThreeZones, async (cluster, v) =>
         {
             const string path = MutDir + "/fenced";
             byte[] baseBytes = TestData.Bytes(20_001, MultiExtentLength);
-            byte[] aBytes = TestData.Bytes(20_002, MultiExtentLength + 20_000);
+            byte[] aBytes = TestData.Bytes(20_002, 1_500);   // inline-sized stale revision
             byte[] bBytes = TestData.Bytes(20_003, MultiExtentLength - 20_000);
             TestClientOptions aOptions = Client("wa", m, operationTimeout: TimeSpan.FromSeconds(60));
             await using DfsClient a = await cluster.ConnectAsync(aOptions, Ct);
@@ -390,25 +416,33 @@ internal static class MutHelpers
             ulong generationA = writerA.WriterGeneration;
             await writerA.WriteAsync(aBytes, Ct);
             await writerA.SetLengthAsync(aBytes.Length, Ct);
-            using MessageHold renewals = cluster.Network.Hold(new MessageFilter(From: aOptions.NetworkName, Type: MessageType.KeepAlive));
-            using MessageHold publication = cluster.Network.Hold(new MessageFilter(From: aOptions.NetworkName, Type: MessageType.CommitFile));
+            MessageHold renewals = cluster.Network.Hold(new MessageFilter(From: aOptions.NetworkName, Type: MessageType.KeepAlive));
+            MessageHold publication = cluster.Network.Hold(new MessageFilter(From: aOptions.NetworkName, Type: MessageType.CommitFile));
             Task<CommitToken> staleCommit = writerA.CommitAsync(Ct);
             bool captured = await WaitHeldAsync(publication, 1, TimeSpan.FromSeconds(30));
             v.Reached(captured, "the stale writer's CommitFile is in flight (captured)");
             if (!captured)
+            {
+                publication.Dispose();
+                renewals.Dispose();
                 return;
+            }
 
-            await cluster.DelayAsync(Lease * 4, Ct);
+            // Lease (2 s) expires server-side; OpenWriterEventuallyAsync waits for the expiry if it has not happened yet.
+            await cluster.DelayAsync(Lease * 2, Ct);
             DfsStream writerB = await OpenWriterEventuallyAsync(cluster, bv, path, TimeSpan.FromSeconds(30));
             ulong generationB = writerB.WriterGeneration;
             v.Check(generationB > generationA, ViolationKind.StalePublicationAccepted, $"replacement generation {generationB} does not exceed expired {generationA}");
             await writerB.WriteAsync(bBytes, Ct);
             await writerB.SetLengthAsync(bBytes.Length, Ct);
             await writerB.CommitAsync(Ct);
+            await writerB.DisposeAsync();   // nothing pending; frees the inode for the oracle's whole-file read
 
             CapturedMessage[] frames = publication.Captured.ToArray();
             publication.ReleaseAll();
             renewals.ReleaseAll();
+            publication.Dispose();
+            renewals.Dispose();
             Task finished = await Task.WhenAny(staleCommit, cluster.DelayAsync(TimeSpan.FromSeconds(90), Ct));
             if (!ReferenceEquals(finished, staleCommit))
                 v.Error("the stale writer's commit never terminated");
@@ -433,7 +467,6 @@ internal static class MutHelpers
             v.Check(file is not null && file.WriterGeneration == generationB, ViolationKind.StalePublicationAccepted,
                 $"inode writer generation {file?.WriterGeneration} is not the replacement's {generationB}");
 
-            await writerB.DisposeAsync();
             await CaptureAsync(() => writerA.DisposeAsync().AsTask());
         });
 
@@ -777,19 +810,22 @@ internal static class MutHelpers
     // ------------------------------------------------------------------------------------------------------------------
 
     /// <summary>
-    /// Two transaction pairs: each transaction of the first pair checks that a name is absent and creates the name the
-    /// other checks; each of the second pair enumerates a directory and inserts a new entry. Detects a committed history
-    /// with no strictly serializable order.
+    /// Two transaction pairs. Absent names: T1 checks that /mut-d/x is absent and creates /mut-f/y; T2 checks that
+    /// /mut-f/y is absent and creates /mut-d/x. Enumeration: T3 enumerates /mut-e and inserts into /mut-g; T4 enumerates
+    /// /mut-g and inserts into /mut-e. Within each pair the write sets (files and parent directories) are disjoint and no
+    /// existing item is read, so the absent-name / enumeration predicate is the only conflict: with it, the second commit
+    /// of each pair must abort; without it, both commit and the history has no strictly serializable order.
     /// </summary>
     public static Task<ScenarioVerdict> PhantomWriteSkewAsync(SafetyMutations m) =>
         RunScenarioAsync("phantom-write-skew", m, TestClusterOptions.ThreeZones, async (cluster, v) =>
         {
             await using DfsClient c = await cluster.ConnectAsync(Client("c0", m), Ct);
             DfsVolume vol = c.GetVolume(Vol);
-            await vol.Directories.CreateDirectoryAsync("/mut-d", Ct);
-            await vol.Directories.CreateDirectoryAsync("/mut-e", Ct);
+            foreach (string dir in new[] { "/mut-d", "/mut-e", "/mut-f", "/mut-g" })
+                await vol.Directories.CreateDirectoryAsync(dir, Ct);
             await vol.Files.WriteAllTextAsync("/mut-d/a", "1", ct: Ct);
             await vol.Files.WriteAllTextAsync("/mut-e/a", "1", ct: Ct);
+            await vol.Files.WriteAllTextAsync("/mut-g/b", "1", ct: Ct);
             var clock = new Cha.LogicalClock();
             var records = new List<TxRecord>();
             var none = new Dictionary<string, string?>(StringComparer.Ordinal);
@@ -815,28 +851,32 @@ internal static class MutHelpers
                 }
             }
 
-            // Absent-name dependencies.
+            // Absent-name dependencies (write skew through phantoms).
             long b1 = clock.Tick();
             DfsTransaction t1 = await vol.Transactions.BeginAsync(ct: Ct);
             long b2 = clock.Tick();
             DfsTransaction t2 = await vol.Transactions.BeginAsync(ct: Ct);
             bool t1SawX = await t1.Files.ExistsAsync("/mut-d/x", Ct);
-            bool t2SawY = await t2.Files.ExistsAsync("/mut-d/y", Ct);
-            await t1.Files.WriteAllTextAsync("/mut-d/y", "t1", ct: Ct);
+            bool t2SawY = await t2.Files.ExistsAsync("/mut-f/y", Ct);
+            if (t1SawX || t2SawY)
+                v.Error($"setup: the names checked for absence exist (x={t1SawX}, y={t2SawY})");
+            await t1.Files.WriteAllTextAsync("/mut-f/y", "t1", ct: Ct);
             await t2.Files.WriteAllTextAsync("/mut-d/x", "t2", ct: Ct);
             OpOutcome o1 = await CommitAsync(t1);
             long e1 = clock.Tick();
             OpOutcome o2 = await CommitAsync(t2);
             long e2 = clock.Tick();
-            v.Evidence($"absent-name pair: saw x={t1SawX} y={t2SawY}; outcomes {o1}/{o2}");
+            v.Evidence($"absent-name pair: outcomes {o1}/{o2}");
             records.Add(new TxRecord("absent-1", b1, e1, o1, new Dictionary<string, string?>(StringComparer.Ordinal) { ["/mut-d/x"] = null },
-                new Dictionary<string, string?>(StringComparer.Ordinal) { ["/mut-d/y"] = "t1" }, []));
-            records.Add(new TxRecord("absent-2", b2, e2, o2, new Dictionary<string, string?>(StringComparer.Ordinal) { ["/mut-d/y"] = null },
+                new Dictionary<string, string?>(StringComparer.Ordinal) { ["/mut-f/y"] = "t1" }, []));
+            records.Add(new TxRecord("absent-2", b2, e2, o2, new Dictionary<string, string?>(StringComparer.Ordinal) { ["/mut-f/y"] = null },
                 new Dictionary<string, string?>(StringComparer.Ordinal) { ["/mut-d/x"] = "t2" }, []));
             v.Check(!(o1 == OpOutcome.Ok && o2 == OpOutcome.Ok), ViolationKind.NonSerializableTransactions,
                 "both absent-name transactions committed (write skew through phantoms)");
+            if (o1 != OpOutcome.Ok)
+                v.Error($"the first absent-name transaction did not commit ({o1}); the pair is not a conflict test");
 
-            // Enumeration predicates.
+            // Enumeration predicates (phantom inserts).
             long b3 = clock.Tick();
             DfsTransaction t3 = await vol.Transactions.BeginAsync(ct: Ct);
             long b4 = clock.Tick();
@@ -846,21 +886,25 @@ internal static class MutHelpers
             await foreach (DfsEntryInfo entry in t3.Directories.EnumerateAsync("/mut-e", options, Ct))
                 seen3.Add(entry.Name);
             HashSet<string> seen4 = [];
-            await foreach (DfsEntryInfo entry in t4.Directories.EnumerateAsync("/mut-e", options, Ct))
+            await foreach (DfsEntryInfo entry in t4.Directories.EnumerateAsync("/mut-g", options, Ct))
                 seen4.Add(entry.Name);
-            await t3.Files.WriteAllTextAsync("/mut-e/p", "t3", ct: Ct);
+            if (!seen3.SetEquals(["a"]) || !seen4.SetEquals(["b"]))
+                v.Error($"setup: unexpected enumerations /mut-e={{{string.Join(",", seen3)}}} /mut-g={{{string.Join(",", seen4)}}}");
+            await t3.Files.WriteAllTextAsync("/mut-g/p", "t3", ct: Ct);
             await t4.Files.WriteAllTextAsync("/mut-e/q", "t4", ct: Ct);
             OpOutcome o3 = await CommitAsync(t3);
             long e3 = clock.Tick();
             OpOutcome o4 = await CommitAsync(t4);
             long e4 = clock.Tick();
             v.Evidence($"enumeration pair: outcomes {o3}/{o4}");
-            records.Add(new TxRecord("enum-3", b3, e3, o3, none, new Dictionary<string, string?>(StringComparer.Ordinal) { ["/mut-e/p"] = "t3" }, [("/mut-e", seen3)]));
-            records.Add(new TxRecord("enum-4", b4, e4, o4, none, new Dictionary<string, string?>(StringComparer.Ordinal) { ["/mut-e/q"] = "t4" }, [("/mut-e", seen4)]));
+            records.Add(new TxRecord("enum-3", b3, e3, o3, none, new Dictionary<string, string?>(StringComparer.Ordinal) { ["/mut-g/p"] = "t3" }, [("/mut-e", seen3)]));
+            records.Add(new TxRecord("enum-4", b4, e4, o4, none, new Dictionary<string, string?>(StringComparer.Ordinal) { ["/mut-e/q"] = "t4" }, [("/mut-g", seen4)]));
             v.Check(!(o3 == OpOutcome.Ok && o4 == OpOutcome.Ok), ViolationKind.NonSerializableTransactions,
                 "both enumerating transactions committed (phantom insert)");
+            if (o3 != OpOutcome.Ok)
+                v.Error($"the first enumerating transaction did not commit ({o3}); the pair is not a conflict test");
 
-            var initial = new Dictionary<string, string?>(StringComparer.Ordinal) { ["/mut-d/a"] = "1", ["/mut-e/a"] = "1" };
+            var initial = new Dictionary<string, string?>(StringComparer.Ordinal) { ["/mut-d/a"] = "1", ["/mut-e/a"] = "1", ["/mut-g/b"] = "1" };
             v.History(SerializabilityChecker.CheckStrict(records, initial), ViolationKind.NonSerializableTransactions, "strict serializability of the transaction history");
         });
 
@@ -923,8 +967,9 @@ internal static class MutHelpers
     // ------------------------------------------------------------------------------------------------------------------
 
     /// <summary>
-    /// Overwritten revisions remain referenced by a snapshot and by a version-pinned reader while GC demonstrably runs
-    /// (it reclaims unrelated garbage). Detects pinned history that was reclaimed or became unreadable.
+    /// Two overwritten revisions stay protected while GC demonstrably runs (it reclaims unrelated garbage): /h's old revision
+    /// only by a snapshot root, /p's old revision only by a version-pinned reader (it was written after the snapshot).
+    /// Detects pinned history that was reclaimed or became unreadable, for either kind of root.
     /// </summary>
     public static Task<ScenarioVerdict> PinnedHistoryGcAsync(SafetyMutations m) =>
         RunScenarioAsync("pinned-history-gc", m, TestClusterOptions.ThreeZones, async (cluster, v) =>
@@ -936,10 +981,11 @@ internal static class MutHelpers
             DfsVolume vol = c.GetVolume(Vol);
             await vol.Directories.CreateDirectoryAsync(dir, Ct);
             await vol.Files.WriteAllBytesAsync(dir + "/h", h1, Ct);
+            await vol.Snapshots.CreateAsync("mut-gc-s1", ct: Ct);   // snapshot root holds h1 only (/p does not exist yet)
             await vol.Files.WriteAllBytesAsync(dir + "/p", p1, Ct);
-            var protectedObjects = new HashSet<ObjectId>(await ObjectsOfAsync(cluster, dir + "/h"));
-            protectedObjects.UnionWith(await ObjectsOfAsync(cluster, dir + "/p"));
-            await vol.Snapshots.CreateAsync("mut-gc-s1", ct: Ct);
+            var snapshotOnly = new HashSet<ObjectId>(await ObjectsOfAsync(cluster, dir + "/h"));
+            var protectedObjects = new HashSet<ObjectId>(snapshotOnly);
+            protectedObjects.UnionWith(await ObjectsOfAsync(cluster, dir + "/p"));   // p1: protected only by the reader pin below
             DfsStream pinned = await vol.Files.OpenAsync(dir + "/p", new DfsOpenOptions
             {
                 Mode = FileMode.Open,
@@ -969,7 +1015,8 @@ internal static class MutHelpers
             foreach (ObjectId obj in protectedObjects)
             {
                 int copies = (await cluster.Inspect.GetObjectHoldersAsync(obj)).Count;
-                v.Check(copies > 0, ViolationKind.ReclaimedProtectedData, $"protected object {obj} has no copy left");
+                string root = snapshotOnly.Contains(obj) ? "snapshot-root" : "reader-pin";
+                v.Check(copies > 0, ViolationKind.ReclaimedProtectedData, $"{root}-protected object {obj} has no copy left");
             }
 
             await using (DfsSnapshotView view = await vol.Snapshots.OpenAsync("mut-gc-s1", Ct))
@@ -1074,9 +1121,21 @@ internal static class MutHelpers
     // MUT-011 SkipChecksumVerification: corrupted replicas.
     // ------------------------------------------------------------------------------------------------------------------
 
-    /// <summary>Every replica of a file's objects is corrupted; a cold client reads it. Detects corrupted bytes delivered as a successful read.</summary>
+    /// <summary>
+    /// Every replica of a file's objects is corrupted (including a byte inside the range read); a cold client reads it.
+    /// Detects corrupted bytes delivered as a successful read. Read-path checksum verification is made the only check
+    /// standing between the corrupt replicas and the caller: background scrubbing is pushed out of the scenario window (a
+    /// scrub quarantining them first would mask the mutant) and encryption at rest is off (an AES-GCM tag failure would
+    /// reject the flipped ciphertext independently of the checksum).
+    /// </summary>
     public static Task<ScenarioVerdict> CorruptReplicaReadAsync(SafetyMutations m) =>
-        RunScenarioAsync("corrupt-replica-read", m, TestClusterOptions.ThreeZones, async (cluster, v) =>
+        RunScenarioAsync("corrupt-replica-read", m,
+            TestClusterOptions.ThreeZones with
+            {
+                EncryptAtRest = false,
+                Timings = NodeTimings.Fast with { ScrubInterval = TimeSpan.FromHours(1) },
+            },
+            async (cluster, v) =>
         {
             const string path = "/mut-cr/f";
             byte[] bytes = TestData.Bytes(21_101, MultiExtentLength);
@@ -1087,6 +1146,7 @@ internal static class MutHelpers
             }
 
             await cluster.WaitForRepairAsync(Vol, TimeSpan.FromSeconds(30), Ct);
+            (ObjectId rangeObject, long rangeOffset) = await LocateAsync(cluster, path, 70_033);   // inside the range read below
             int corrupted = 0;
             foreach (ObjectId obj in await ObjectsOfAsync(cluster, path))
             {
@@ -1095,6 +1155,8 @@ internal static class MutHelpers
                     if (await node.Inspect.HasObjectAsync(obj))
                     {
                         await node.Disk.CorruptObjectAsync(obj, offset: 33);
+                        if (obj == rangeObject)
+                            await node.Disk.CorruptObjectAsync(obj, rangeOffset);
                         corrupted++;
                     }
                 }
@@ -1103,15 +1165,27 @@ internal static class MutHelpers
             v.Reached(corrupted > 0, $"corrupted {corrupted} stored replicas");
             await using DfsClient reader = await cluster.ConnectAsync(Client("reader", m), Ct);
             DfsFileClient files = reader.GetVolume(Vol).Files;
+
+            // With verification, every read must fail with an explicit integrity (or availability) error; any other failure
+            // (false absence, fabricated EOF, ...) means the baseline itself is wrong, so it is an error, not evidence.
+            void Explicit(Exception ex, string what)
+            {
+                if (IsExplicitReadFailure(ex))
+                    v.Evidence($"{what} failed explicitly: {ex.GetType().Name}");
+                else
+                    v.Error($"{what} failed without an explicit integrity/availability error: {ex.GetType().Name}: {ex.Message}");
+            }
+
             try
             {
                 byte[] seen = await files.ReadAllBytesAsync(path, Ct);
                 v.Check(seen.AsSpan().SequenceEqual(bytes), ViolationKind.CorruptBytesDelivered,
                     $"a whole-file read returned {seen.Length} bytes that differ from the written content without an integrity error");
+                v.Error("a whole-file read succeeded although every replica is corrupt");
             }
             catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)
             {
-                v.Evidence($"whole-file read failed explicitly: {ex.GetType().Name}");
+                Explicit(ex, "whole-file read");
             }
 
             try
@@ -1122,10 +1196,11 @@ internal static class MutHelpers
                 await stream.ReadExactlyAsync(window, Ct);
                 v.Check(window.AsSpan().SequenceEqual(bytes.AsSpan(70_000, 1_000)), ViolationKind.CorruptBytesDelivered,
                     "a range read returned corrupted bytes without an integrity error");
+                v.Error("a range read covering a corrupted byte of every replica succeeded");
             }
             catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)
             {
-                v.Evidence($"range read failed explicitly: {ex.GetType().Name}");
+                Explicit(ex, "range read");
             }
         });
 
@@ -1159,18 +1234,13 @@ internal static class MutHelpers
             await zoneTwo.CrashAsync();
             v.Reached(zoneTwo.State == TestNodeState.Crashed, "zone z2 unavailable");
             Exception? failure = await CaptureAsync(() => files.WriteAllBytesAsync(path, TestData.Bytes(21_202, MultiExtentLength), Ct));
-            if (failure is null)
+            v.Evidence(failure switch
             {
-                await CheckDurableCopiesAsync(cluster, v, path, 2, 2, ViolationKind.PolicyUnderAcknowledged, "acknowledged while only z1 was reachable");
-            }
-            else
-            {
-                v.Evidence(failure is DfsPlacementUnavailableException p
-                    ? $"placement unavailable: zones {p.AchievedZones}/{p.RequiredZones}, copies {p.AchievedCopies}/{p.RequiredCopies}"
-                    : $"write failed: {failure.GetType().Name}");
-                if (HistoryRecorder.Classify(failure) == OpOutcome.Failed)
-                    v.Check(await TryReadAllAsync(files, path) is null, ViolationKind.PolicyUnderAcknowledged, "a write that failed its zone policy became visible");
-            }
+                null => "write acknowledged",
+                DfsPlacementUnavailableException p => $"placement unavailable: zones {p.AchievedZones}/{p.RequiredZones}, copies {p.AchievedCopies}/{p.RequiredCopies}",
+                _ => $"write failed: {failure.GetType().Name}",
+            });
+            await CheckCommittedMeetsPolicyAsync(cluster, v, path, failure, 2, 2, "while only z1 was reachable");
 
             await zoneTwo.RestartAsync();
         });
@@ -1221,13 +1291,17 @@ internal static class MutHelpers
             Exception? retry = await CaptureAsync(() => vol.Files.AppendAllBytesAsync(path, suffix, new DfsMutationOptions { OperationId = id }, Ct));
             if (retry is null)
                 v.Violation(ViolationKind.ExpiredIdReplayed, $"retired operation id {id} was accepted instead of being rejected as expired");
+            else if (retry is DfsOperationExpiredException)
+                v.Evidence("retry of the retired id rejected as expired");
             else
-                v.Evidence($"retry of the retired id rejected with {retry.GetType().Name}");
+                v.Error($"retry of the retired id must be rejected with the explicit expired-outcome error (FSD §13), got {retry.GetType().Name}: {retry.Message}");
 
             foreach (CapturedMessage frame in frames)
             {
                 DfsErrorCode code = await cluster.Network.ReplayAsync(frame);
                 v.Check(code != DfsErrorCode.None, ViolationKind.ExpiredIdReplayed, "a delayed duplicate of the retired request was executed");
+                if (code is not DfsErrorCode.None and not DfsErrorCode.OperationExpired)
+                    v.Error($"a delayed duplicate of the retired request must be rejected as expired, got {code}");
             }
 
             byte[]? content = await ReadOracleAsync(v, vol.Files, path, ViolationKind.LostAcknowledgedData);
@@ -1244,8 +1318,13 @@ internal static class MutHelpers
 
     /// <summary>
     /// The volume requires three copies in three zones before acknowledgement and one zone is down, so acknowledgements time
-    /// out. Detects a write acknowledged with fewer copies/zones than the policy requires (or a failed write that became visible).
+    /// out. Detects a write acknowledged with fewer copies/zones than the policy requires, or a weakened commit that lands
+    /// after the client gave up (or a failed write that became visible).
     /// </summary>
+    /// <remarks>
+    /// The client deadline is long (60 s) so a server-side "relax on timeout" fires before the caller abandons the request,
+    /// and the committed state is inspected after a further grace period, independent of what the client was told.
+    /// </remarks>
     public static Task<ScenarioVerdict> StrongPolicyTimeoutAsync(SafetyMutations m)
     {
         var strong = new DfsStoragePolicy { TargetCopies = 3, TargetDistinctZones = 3, DurableCopiesBeforeAck = 3, DurableZonesBeforeAck = 3 };
@@ -1253,7 +1332,7 @@ internal static class MutHelpers
         return RunScenarioAsync("strong-policy-timeout", m, options, async (cluster, v) =>
         {
             const string path = "/mut-p/f";
-            await using DfsClient c = await cluster.ConnectAsync(Client("c0", m, operationTimeout: TimeSpan.FromSeconds(6)), Ct);
+            await using DfsClient c = await cluster.ConnectAsync(Client("c0", m, operationTimeout: TimeSpan.FromSeconds(60)), Ct);
             DfsFileClient files = c.GetVolume(Vol).Files;
             await c.GetVolume(Vol).Directories.CreateDirectoryAsync("/mut-p", Ct);
             await files.WriteAllBytesAsync("/mut-p/warm", TestData.Bytes(21_501, MultiExtentLength), Ct);
@@ -1264,16 +1343,9 @@ internal static class MutHelpers
             await down.CrashAsync();
             v.Reached(down.State == TestNodeState.Crashed, $"zone of {down.Name} unavailable");
             Exception? failure = await CaptureAsync(() => files.WriteAllBytesAsync(path, TestData.Bytes(21_502, MultiExtentLength), Ct));
-            if (failure is null)
-            {
-                await CheckDurableCopiesAsync(cluster, v, path, 3, 3, ViolationKind.PolicyUnderAcknowledged, "acknowledged with one of three zones down");
-            }
-            else
-            {
-                v.Evidence($"write failed: {failure.GetType().Name}");
-                if (HistoryRecorder.Classify(failure) == OpOutcome.Failed)
-                    v.Check(await TryReadAllAsync(files, path) is null, ViolationKind.PolicyUnderAcknowledged, "a write that failed its policy became visible");
-            }
+            v.Evidence(failure is null ? "write acknowledged" : $"write failed: {failure.GetType().Name}");
+            await cluster.DelayAsync(TimeSpan.FromSeconds(10), Ct);   // a weakened commit may land after the caller gave up
+            await CheckCommittedMeetsPolicyAsync(cluster, v, path, failure, 3, 3, "with one of three zones down");
 
             await down.RestartAsync();
         });

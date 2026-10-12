@@ -33,14 +33,32 @@ public sealed class ChaSimulationTests
         Move,
     }
 
-    /// <summary>Every mutation × every crash point after the quorum commit (F11 before apply, F12 before reply, F13 reply send).</summary>
-    public static TheoryData<LostReplyMutation, string> Cha001Cases()
+    /// <summary>When the new client retries K relative to metadata compaction and outcome retention (§9.2 repeats).</summary>
+    public enum RetryWindow
     {
-        var data = new TheoryData<LostReplyMutation, string>();
+        /// <summary>Right after the failover.</summary>
+        Immediate,
+
+        /// <summary>After the metadata log was compacted past K's entry, still within the retained outcome window.</summary>
+        AfterCompactionWithinWindow,
+
+        /// <summary>After compaction and after K's outcome retention expired: explicit expired-id rejection, never a replay.</summary>
+        BeyondRetentionWindow,
+    }
+
+    /// <summary>
+    /// Every mutation × every crash point after the quorum commit (F11 before apply, F12 before reply, F13 reply send), retried
+    /// immediately; plus every mutation retried after compaction within / beyond the outcome window (crash at F12).
+    /// </summary>
+    public static TheoryData<LostReplyMutation, string, RetryWindow> Cha001Cases()
+    {
+        var data = new TheoryData<LostReplyMutation, string, RetryWindow>();
         foreach (LostReplyMutation mutation in Enum.GetValues<LostReplyMutation>())
         {
             foreach (string site in new[] { FaultSites.RaftAfterCommitBeforeApply, FaultSites.ApplyAfterBeforeReply, FaultSites.RpcReplySend })
-                data.Add(mutation, site);
+                data.Add(mutation, site, RetryWindow.Immediate);
+            data.Add(mutation, FaultSites.ApplyAfterBeforeReply, RetryWindow.AfterCompactionWithinWindow);
+            data.Add(mutation, FaultSites.ApplyAfterBeforeReply, RetryWindow.BeyondRetentionWindow);
         }
 
         return data;
@@ -50,15 +68,28 @@ public sealed class ChaSimulationTests
     /// §9.2: the caller persists operation id K, submits the mutation, the leader crashes after the quorum commit and every
     /// reply to the caller is lost, the caller's process dies; a new client queries and retries K through the new leader.
     /// Exactly one complete durable mutation results, the retry reports the original commit, and incompatible reuse of K is
-    /// rejected.
+    /// rejected. Repeated after metadata compaction within the retained outcome window (same result) and beyond it, where K
+    /// must be rejected as expired (query reports <see cref="DfsOutcomeStatus.Expired"/>) and never re-executed.
     /// </summary>
     [Theory]
     [MemberData(nameof(Cha001Cases))]
     [Catalog("CHA-001", "S", "INV-01", "INV-02", "INV-06")]
-    public async Task CHA_001_LeaderFailoverPlusLostCommitReply(LostReplyMutation mutation, string crashSite)
+    public async Task CHA_001_LeaderFailoverPlusLostCommitReply(LostReplyMutation mutation, string crashSite, RetryWindow window)
     {
         CancellationToken ct = Ct;
-        await ClusterTest.RunAsync(Sim(TestClusterOptions.ThreeZones), async cluster =>
+
+        // "Within the window" must not depend on how long the compaction takes: in that variant the dead caller's session
+        // timeout and the outcome retention are long, so K's outcome is certainly still retained when it is queried/retried.
+        TestClusterOptions options = Sim(TestClusterOptions.ThreeZones);
+        if (window == RetryWindow.AfterCompactionWithinWindow)
+        {
+            options = options with
+            {
+                Timings = NodeTimings.Fast with { SessionTimeout = TimeSpan.FromSeconds(120), OutcomeRetention = TimeSpan.FromSeconds(120) },
+            };
+        }
+
+        await ClusterTest.RunAsync(options, async cluster =>
         {
             const string dir = "/cha001";
             const string target = dir + "/target";
@@ -144,21 +175,49 @@ public sealed class ChaSimulationTests
 
             await using DfsClient c1 = await ConnectAsync(cluster, "c1");
             DfsVolume v1 = c1.GetVolume(Vol);
+            if (window != RetryWindow.Immediate)
+            {
+                // Compact the metadata log past K's entry (through another client/session, so K's own session keeps its window).
+                ulong appliedBefore = (await newLeader.Inspect.GetGroupAsync(Vol))!.AppliedIndex;
+                await FillLogAsync(v1, $"{dir}/fill", cluster.Options.Timings.RaftSnapshotThreshold + 40);
+                await cluster.WaitUntilAsync(async () => (await (await cluster.GetLeaderAsync(Vol, ct)).Inspect.GetGroupAsync(Vol))!.SnapshotIndex > appliedBefore,
+                    TimeSpan.FromSeconds(30), "the metadata log was compacted past K's committed entry", ct);
+                if (window == RetryWindow.BeyondRetentionWindow)
+                {
+                    // The dead caller's session times out, then K's outcome retention elapses.
+                    await cluster.DelayAsync(cluster.Options.Timings.SessionTimeout + cluster.Options.Timings.OutcomeRetention + TimeSpan.FromSeconds(10), ct);
+                }
+            }
+
             DfsOperationOutcome outcome = await v1.QueryOperationAsync(k, resolve: false, ct);
-            Assert.Equal(DfsOutcomeStatus.Committed, outcome.Status);
-            Assert.False(outcome.Token.IsNone);
-            Assert.Equal(cluster.ClusterId, outcome.Token.ClusterId);
-            if (firstError is null)
-                Assert.Equal(firstToken, outcome.Token);
-            else if (historyId != 0)
-                history.Resolve(historyId, OpOutcome.Ok, outcome.Token);
+            if (window == RetryWindow.BeyondRetentionWindow)
+            {
+                // Outside the retained window: explicit expiry, never "not found" (which would invite a replay) or a new effect.
+                Assert.Equal(DfsOutcomeStatus.Expired, outcome.Status);
+                await AssertEx.ThrowsDfsAsync<DfsOperationExpiredException>(
+                    () => ApplyLostReplyMutationAsync(v1, mutation, target, moved, elsewhere, payload, changed, k, changedArguments: false),
+                    DfsErrorCode.OperationExpired);
+                await AssertEx.ThrowsDfsAsync<DfsOperationExpiredException>(
+                    () => ApplyLostReplyMutationAsync(v1, mutation, target, moved, elsewhere, payload, changed, k, changedArguments: true),
+                    DfsErrorCode.OperationExpired);
+            }
+            else
+            {
+                Assert.Equal(DfsOutcomeStatus.Committed, outcome.Status);
+                Assert.False(outcome.Token.IsNone);
+                Assert.Equal(cluster.ClusterId, outcome.Token.ClusterId);
+                if (firstError is null)
+                    Assert.Equal(firstToken, outcome.Token);
+                else if (historyId != 0)
+                    history.Resolve(historyId, OpOutcome.Ok, outcome.Token);
 
-            CommitToken retried = await ApplyLostReplyMutationAsync(v1, mutation, target, moved, elsewhere, payload, changed, k, changedArguments: false);
-            Assert.Equal(outcome.Token, retried);   // the original committed result, not a second execution
+                CommitToken retried = await ApplyLostReplyMutationAsync(v1, mutation, target, moved, elsewhere, payload, changed, k, changedArguments: false);
+                Assert.Equal(outcome.Token, retried);   // the original committed result, not a second execution
 
-            await AssertEx.ThrowsDfsAsync<DfsOperationIdMismatchException>(
-                () => ApplyLostReplyMutationAsync(v1, mutation, target, moved, elsewhere, payload, changed, k, changedArguments: true),
-                DfsErrorCode.OperationIdMismatch);
+                await AssertEx.ThrowsDfsAsync<DfsOperationIdMismatchException>(
+                    () => ApplyLostReplyMutationAsync(v1, mutation, target, moved, elsewhere, payload, changed, k, changedArguments: true),
+                    DfsErrorCode.OperationIdMismatch);
+            }
 
             (string finalPath, byte[] expected) = mutation switch
             {
@@ -458,6 +517,16 @@ public sealed class ChaSimulationTests
                 authoritative = bBytes;
             }
 
+            // §9.3: a metadata leader change between A's expiry and A's return; the new term must not revive A's authority.
+            ulong termBefore = (await newLeader.Inspect.GetGroupAsync(Vol))!.Term;
+            await newLeader.CrashAsync();
+            await newLeader.RestartAsync();
+            newLeader = await WaitForLeaderAmongAsync(cluster, majority, Vol, stale.Name, TimeSpan.FromSeconds(30),
+                "the majority re-elects a leader after the leader crash");
+            Assert.True((await newLeader.Inspect.GetGroupAsync(Vol))!.Term > termBefore, "a new leadership term began after A's expiry");
+            Assert.DoesNotContain((await newLeader.Inspect.GetVolumeStateAsync(Vol))!.Handles,
+                h => h.IsWriter && !h.Expired && h.Generation == generationA);
+
             if (compactBeyondStaleNode)
             {
                 await FillLogAsync(setupVol, "/cha003/fill", RaftSnapshotThreshold + 40);
@@ -480,7 +549,7 @@ public sealed class ChaSimulationTests
                         return $"{node.Name} applied the expired writer's publication (length {f.Length})";
                 }
 
-                byte[] seen = await bVol.Files.ReadAllBytesAsync(path, ct);
+                byte[] seen = await ReadSharedAsync(bVol.Files, path);   // writer B is still open: use a compatible reader
                 return seen.AsSpan().SequenceEqual(authoritative) ? null : $"live read returned {seen.Length} bytes that are not the authoritative revision";
             });
 
@@ -521,7 +590,7 @@ public sealed class ChaSimulationTests
                 Assert.True((await stale.Inspect.GetGroupAsync(Vol))!.SnapshotIndex > staleIndex, "the stale node caught up through a checkpoint install");
 
             await using (DfsClient viaStale = await ConnectAsync(cluster, "via-stale", seeds: [stale.Name]))
-                await AssertBytesAsync(authoritative, viaStale.GetVolume(Vol).Files.ReadAllBytesAsync(path, ct), "read routed via the returned node");
+                await AssertBytesAsync(authoritative, ReadSharedAsync(viaStale.GetVolume(Vol).Files, path), "read routed via the returned node");
 
             // Orphans: A's uploads are reclaimed once its handle/staging session is safely abandoned.
             try
@@ -656,7 +725,13 @@ public sealed class ChaSimulationTests
 
             // C returns; its first installation is interrupted. c2 can reach only C.
             FaultArm interrupt = cluster.Faults.Arm(new FaultMatch(interruptSite, Node: c.Name), FaultAction.CrashNode(interruptMode));
-            var c2Options = new TestClientOptions { Name = "c2", SeedNodes = [c.Name], OperationTimeout = TimeSpan.FromSeconds(2) };
+            var c2Options = new TestClientOptions
+            {
+                Name = "c2",
+                SeedNodes = [c.Name],
+                OperationTimeout = TimeSpan.FromSeconds(2),
+                ConnectTimeout = TimeSpan.FromSeconds(2),   // keep each probe well inside the monitor's 5 s sample budget
+            };
             cluster.Network.CutBoth(c2Options.NetworkName, a.Name);
             cluster.Network.CutBoth(c2Options.NetworkName, b.Name);
             SafetyMonitor staleReads = SafetyMonitor.Start(cluster, "cha004-no-stale-live-read", TimeSpan.FromSeconds(1), async () =>
@@ -998,6 +1073,18 @@ public sealed class ChaSimulationTests
             foreach ((string path, byte[] bytes) in s1State)
                 await AssertBytesAsync(bytes, rv.Files.ReadAllBytesAsync(path, ct), $"restored {path} equals S1");
             Assert.False(await rv.Files.ExistsAsync("/cha006/f4", ct), "nothing from the incomplete S2 is invented");
+
+            // The namespace record matches S1 exactly (f2 deleted only in the lost interval, f4 created only there).
+            var restoredNames = new List<string>();
+            await foreach (DfsEntryInfo entry in rv.Directories.EnumerateAsync("/cha006", ct: ct))
+            {
+                restoredNames.Add(entry.Name);
+                Assert.Equal(DfsEntryKind.File, entry.Kind);
+                Assert.True(s1State.TryGetValue(entry.Path, out byte[]? expectedBytes), $"restored volume contains {entry.Path}, which is not in S1");
+                Assert.Equal(expectedBytes.Length, entry.Length);
+            }
+
+            Assert.Equal(["f1", "f2", "f3"], restoredNames.Order(StringComparer.Ordinal).ToArray());
         }, ct);
     }
 
@@ -1068,8 +1155,9 @@ public sealed class ChaSimulationTests
 
             var clock = new LogicalClock();
             var records = new List<TxRecord>();
+            var observerGate = new ObserverGate();
             using var stopReaders = new CancellationTokenSource();
-            Task readers = RunReadOnlyTransactionsAsync(cluster, "observer", dir, clock, records, stopReaders.Token);
+            Task readers = RunReadOnlyTransactionsAsync(cluster, "observer", dir, clock, records, stopReaders.Token, observerGate);
 
             await using DfsClient writerClient = await ConnectAsync(cluster, "writer", operationTimeout: TimeSpan.FromSeconds(5));
             DfsTransaction tx = await writerClient.GetVolume(Vol).Transactions.BeginAsync(ct: ct);
@@ -1078,12 +1166,20 @@ public sealed class ChaSimulationTests
             await tx.Files.WriteAllTextAsync($"{dir}/b", "b1", ct: ct);
             await tx.Files.WriteAllBytesAsync($"{dir}/c", cNew, ct);   // staged on the nodes that still have space
 
+            // The crash arm matches TxCommit: hold the observers' (read-only) commits back until the writer's commit has hit
+            // it, so the injected crash is the writer's commit and not an observer's; they resume during the in-doubt period.
+            observerGate.Paused = true;
+            await cluster.WaitUntilAsync(() => Task.FromResult(!observerGate.Busy), TimeSpan.FromSeconds(30), "observers are between transactions", ct);
             FaultArm crash = cluster.Faults.Arm(new FaultMatch(crashSite, Node: leader.Name, Volume: Vol, Operation: DfsOperationKind.TxCommit), FaultAction.CrashNode());
+            Task<CommitToken> commit = tx.CommitAsync(ct);
+            await crash.WaitTriggeredAsync(TimeSpan.FromSeconds(30));
+            cluster.Faults.AssertReached(crash);
+            observerGate.Paused = false;
             CommitToken committedToken = CommitToken.None;
             Exception? commitError = null;
             try
             {
-                committedToken = await tx.CommitAsync(ct);
+                committedToken = await commit;
             }
             catch (Exception ex)
             {
@@ -1091,7 +1187,6 @@ public sealed class ChaSimulationTests
             }
 
             long end = clock.Tick();
-            cluster.Faults.AssertReached(crash);
             OpOutcome reported = commitError is null ? OpOutcome.Ok : HistoryRecorder.Classify(commitError);
             if (commitError is not null)
             {
@@ -1156,8 +1251,9 @@ public sealed class ChaSimulationTests
 
     /// <summary>
     /// CHA-007 variant: required storage on both followers is exhausted down to the reserve, so the transaction's data cannot
-    /// meet its acknowledgement policy. The transaction fails explicitly (capacity/placement or an unknown outcome that
-    /// resolves to aborted), nothing becomes visible, and once space returns a new transaction commits.
+    /// meet its acknowledgement policy. The transaction fails explicitly (capacity/placement or an unknown outcome), the
+    /// leader then crashes so the outcome is resolved by a new leader whose disk is still full (metadata progress uses the
+    /// reserve): it resolves to aborted, nothing becomes visible, and once space returns a new transaction commits.
     /// </summary>
     [Fact]
     [Catalog("CHA-007", "S", "INV-02", "INV-06", "INV-08", "INV-16")]
@@ -1188,10 +1284,6 @@ public sealed class ChaSimulationTests
             });
             Assert.True(failure is DfsCapacityException or DfsPlacementUnavailableException or DfsCommitOutcomeUnknownException,
                 $"exhausted required storage must surface as capacity/placement unavailability (or an unknown outcome), got {failure}");
-            DfsOperationOutcome resolved = await vol.Transactions.QueryOutcomeAsync(tx.Id, resolve: true, ct);
-            Assert.Equal(DfsOutcomeStatus.Aborted, resolved.Status);
-            Assert.Equal("a0", await vol.Files.ReadAllTextAsync($"{dir}/a", ct: ct));
-            await AssertBytesAsync(cOld, vol.Files.ReadAllBytesAsync($"{dir}/c", ct), "no partial publication under disk pressure");
             try
             {
                 await tx.DisposeAsync();
@@ -1201,6 +1293,21 @@ public sealed class ChaSimulationTests
                 Log($"disposing the failed transaction surfaced {ex.GetType().Name}");
             }
 
+            // Leader change while the followers' disks are still full: the outcome is resolved by the new authority.
+            await leader.CrashAsync();
+            TestNode newLeader = await WaitForLeaderAmongAsync(cluster, followers, Vol, leader.Name, TimeSpan.FromSeconds(30),
+                "a full-disk follower is elected (metadata progress may use the reserve)");
+            await using DfsClient resolver = await ConnectAsync(cluster, "resolver", seeds: Names(followers));
+            DfsVolume rv = resolver.GetVolume(Vol);
+            DfsOperationOutcome resolved = await rv.Transactions.QueryOutcomeAsync(tx.Id, resolve: true, ct);
+            Assert.Equal(DfsOutcomeStatus.Aborted, resolved.Status);
+            Assert.Equal("a0", await rv.Files.ReadAllTextAsync($"{dir}/a", ct: ct));
+            await AssertBytesAsync(cOld, rv.Files.ReadAllBytesAsync($"{dir}/c", ct), "no partial publication under disk pressure");
+            Log($"outcome resolved by {newLeader.Name}");
+
+            await leader.RestartAsync();
+            await cluster.WaitForStableAsync(TimeSpan.FromSeconds(60), ct);
+            Assert.Equal(DfsOutcomeStatus.Aborted, (await rv.Transactions.QueryOutcomeAsync(tx.Id, resolve: false, ct)).Status);
             foreach (TestNode follower in followers)
                 Unfill(follower);
             await using (DfsTransaction retry = await vol.Transactions.BeginAsync(ct: ct))
@@ -1219,14 +1326,30 @@ public sealed class ChaSimulationTests
     private static void Unfill(TestNode node) => node.Disk.Faults.CapacityOverride = null;
 
     private static async Task RunReadOnlyTransactionsAsync(TestCluster cluster, string name, string dir, LogicalClock clock,
-        List<TxRecord> records, CancellationToken stop)
+        List<TxRecord> records, CancellationToken stop, ObserverGate? gate = null)
     {
         await using DfsClient reader = await ConnectAsync(cluster, name, operationTimeout: TimeSpan.FromSeconds(2));
         DfsVolume volume = reader.GetVolume(Vol);
         int n = 0;
         while (!stop.IsCancellationRequested)
         {
+            if (gate is { Paused: true })
+            {
+                try
+                {
+                    await cluster.DelayAsync(TimeSpan.FromMilliseconds(50), stop);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+
+                continue;
+            }
+
             long begin = clock.Tick();
+            if (gate is not null)
+                gate.Busy = true;
             try
             {
                 await using DfsTransaction tx = await volume.Transactions.BeginAsync(ct: Ct);
@@ -1240,6 +1363,11 @@ public sealed class ChaSimulationTests
             catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)
             {
                 // A failed/aborted read-only transaction does not constrain the history.
+            }
+            finally
+            {
+                if (gate is not null)
+                    gate.Busy = false;
             }
 
             try
@@ -1332,6 +1460,14 @@ public sealed class ChaSimulationTests
                 }
             }
 
+            if (damage == ReplicaDamage.CorruptPayload)
+            {
+                // Also damage a byte inside the range read below, so that read cannot legitimately succeed from verified
+                // undamaged units of the damaged copy.
+                (ObjectId rangeObject, long rangeOffset) = await LocateAsync(cluster, path, 70_017);
+                await damaged.Disk.CorruptObjectAsync(rangeObject, rangeOffset);
+            }
+
             cluster.Network.Isolate(partitioned.Name);
             var dataPlaneCut = new List<MessageRule>();
             if (!healthyCopyReachable)
@@ -1354,7 +1490,7 @@ public sealed class ChaSimulationTests
             else
             {
                 Exception whole = await Assert.ThrowsAnyAsync<Exception>(() => rv.Files.ReadAllBytesAsync(path, ct));
-                Assert.True(whole is DfsIntegrityException or DfsUnavailableException,
+                Assert.True(IsExplicitReadFailure(whole),
                     $"without a healthy reachable source the read must fail explicitly, got {whole}");
                 await using DfsStream stream = await rv.Files.OpenReadAsync(path, ct);
                 stream.Seek(70_000, SeekOrigin.Begin);
@@ -1364,7 +1500,7 @@ public sealed class ChaSimulationTests
                     int read = await stream.ReadAsync(buffer, ct);
                     Log($"range read unexpectedly returned {read} bytes without a healthy source");
                 });
-                Assert.True(partial is DfsIntegrityException or DfsUnavailableException, $"range read must fail explicitly, got {partial}");
+                Assert.True(IsExplicitReadFailure(partial), $"range read must fail explicitly, got {partial}");
                 Assert.Equal(70_000, stream.Position);   // a failed read does not move the position
             }
 
@@ -1448,6 +1584,11 @@ public sealed class ChaSimulationTests
             await vol.Files.WriteAllBytesAsync($"{dir}/b", b2, ct);
             await vol.Snapshots.CreateAsync("cha009-s2", ct: ct);
             DfsSnapshotView view1 = await vol.Snapshots.OpenAsync("cha009-s1", ct);
+
+            // A GC-sweep crash is armed before the snapshot deletion so the sweep interleaves with the deletion and with the
+            // garbage created next (arming later could miss every sweep: GC may already have reclaimed everything).
+            bool gcCrash = crashSite == FaultSites.GcSweep;
+            FaultArm? crash = gcCrash ? cluster.Faults.Arm(new FaultMatch(crashSite), FaultAction.CrashNode(crashMode)) : null;
             await vol.Snapshots.DeleteAsync("cha009-s1", ct);   // retention reference gone; the open reader still pins S1
 
             var garbage = new HashSet<ObjectId>();
@@ -1458,14 +1599,16 @@ public sealed class ChaSimulationTests
                 await vol.Files.WriteAllBytesAsync($"{dir}/g", TestData.Bytes(9100 + (ulong)i, MultiExtentLength), ct);
             }
 
-            await cluster.WaitForRepairAsync(Vol, TimeSpan.FromSeconds(30), ct);
-            FaultArm crash = cluster.Faults.Arm(new FaultMatch(crashSite), FaultAction.CrashNode(crashMode));
-            if (crashSite != FaultSites.GcSweep)
+            if (!gcCrash)
             {
+                await cluster.WaitForRepairAsync(Vol, TimeSpan.FromSeconds(30), ct);
                 await WaitUntilReclaimedAsync(cluster, garbage, TimeSpan.FromSeconds(60), "GC deleted the unreferenced /g versions, leaving dead space to compact");
+                crash = cluster.Faults.Arm(new FaultMatch(crashSite), FaultAction.CrashNode(crashMode));
                 foreach (TestNode node in Running(cluster))
                     await node.CompactObjectStoreAsync(ct);
             }
+
+            Assert.NotNull(crash);
 
             await crash.WaitTriggeredAsync(TimeSpan.FromSeconds(60));
             cluster.Faults.AssertReached(crash);
@@ -1579,6 +1722,8 @@ public sealed class ChaSimulationTests
             await vol.Backups.RequestSyncAsync(target, "cha010-s2", ct);
             await interrupt.WaitTriggeredAsync(TimeSpan.FromSeconds(60));
             cluster.Faults.AssertReached(interrupt);
+            await cluster.WaitUntilAsync(() => Task.FromResult(backup.State == TestNodeState.Crashed), TimeSpan.FromSeconds(30),
+                "the backup crashed at the injected reseed point (the rotation happens while the reseed is interrupted)", ct);
 
             FaultArm rotation = cluster.Faults.Arm(new FaultMatch(FaultSites.KeyRotation), FaultAction.Delay(TimeSpan.FromMilliseconds(100)));
             await cluster.Admin.RotateDataKeyAsync(Vol, ct);
@@ -1587,8 +1732,7 @@ public sealed class ChaSimulationTests
             await vol.Files.WriteAllBytesAsync("/cha010/f3", s3["/cha010/f3"], ct);   // encrypted under the new key version
             await vol.Snapshots.CreateAsync("cha010-s3", ct: ct);
 
-            if (backup.State != TestNodeState.Running)
-                await backup.RestartAsync();
+            await backup.RestartAsync();
             await vol.Backups.RequestSyncAsync(target, "cha010-s2", ct);
             await vol.Backups.AwaitBackupSnapshotAsync(target, "cha010-s2", TimeSpan.FromSeconds(120), ct);
             await vol.Backups.RequestSyncAsync(target, "cha010-s3", ct);
@@ -1662,9 +1806,11 @@ public sealed class ChaSimulationTests
             Assert.Equal(TestSoftwareVersion.Next.Name, upgraded.SoftwareVersion.Name);
             await cluster.WaitForStableAsync(TimeSpan.FromSeconds(60), ct);
 
-            DfsException refused = await Assert.ThrowsAnyAsync<DfsException>(() => cluster.Admin.SetFeatureAsync(TestSoftwareVersion.NextFeature, true, ct));
-            Assert.True(refused.ErrorCode is DfsErrorCode.Unsupported or DfsErrorCode.InvalidArgument,
-                $"activation before every member supports the feature must be rejected explicitly, got {refused.ErrorCode}");
+            // Unsupported/InvalidArgument may surface as NotSupportedException/ArgumentException (API.md A.2), hence DfsErrors.ToCode.
+            Exception refused = await Assert.ThrowsAnyAsync<Exception>(() => cluster.Admin.SetFeatureAsync(TestSoftwareVersion.NextFeature, true, ct));
+            DfsErrorCode refusedCode = DfsErrors.ToCode(refused);
+            Assert.True(refusedCode is DfsErrorCode.Unsupported or DfsErrorCode.InvalidArgument,
+                $"activation before every member supports the feature must be rejected explicitly, got {refusedCode}: {refused}");
             Assert.DoesNotContain(TestSoftwareVersion.NextFeature, (await cluster.Admin.GetClusterStatusAsync(ct)).ActiveFeatures);
 
             TestNode failing = await cluster.GetLeaderAsync(Vol, ct);
@@ -1726,8 +1872,8 @@ public sealed class ChaSimulationTests
             await cluster.Inspect.AssertNoSplitBrainAsync();
             LinearizabilityChecker.Check(cluster.History.Operations.Where(o => o.Key == register).ToArray(), new RegisterModel()).AssertValid();
 
-            if (downgraded.State is TestNodeState.Running or TestNodeState.Crashed)
-                await downgraded.StopAsync();
+            if (downgraded.State is TestNodeState.Running or TestNodeState.Paused)
+                await downgraded.StopAsync();   // a refused (crashed/stopped) start needs no stop before the restart
             await downgraded.RestartWithSoftwareAsync(TestSoftwareVersion.Next);
             await cluster.WaitForStableAsync(TimeSpan.FromSeconds(60), ct);
         }, ct);
@@ -1809,7 +1955,14 @@ public sealed class ChaSimulationTests
     public async Task CHA_012_RetryStormDuringMetadataRecovery(int clientCount, MetadataRecovery recovery)
     {
         CancellationToken ct = Ct;
-        await ClusterTest.RunAsync(Sim(TestClusterOptions.ThreeZones, 20), async cluster =>
+
+        // The saved ids must be retried inside their retained outcome window whatever the recovery takes: this scenario is
+        // about deduplication and bounds under a storm, not about window expiry (CHA-001/CHA-004/MUT-013 cover expiry).
+        TestClusterOptions options = Sim(TestClusterOptions.ThreeZones, 20) with
+        {
+            Timings = NodeTimings.Fast with { SessionTimeout = TimeSpan.FromSeconds(120), OutcomeRetention = TimeSpan.FromSeconds(120) },
+        };
+        await ClusterTest.RunAsync(options, async cluster =>
         {
             const string log = "/cha012/log";
             const int recordLength = 64;
@@ -1894,6 +2047,14 @@ public sealed class ChaSimulationTests
             await cluster.DelayAsync(TimeSpan.FromSeconds(1), ct);   // the storm is under way while recovery is held
             recoveryPoint.Release();
             CommitToken[] tokens = await Task.WhenAll(storm);
+
+            // Incompatible reuse of a saved id is rejected (checked right after the storm, well inside the outcome window
+            // of the dead clients' sessions); the content check below also proves it did not append.
+            await using DfsClient check = await ConnectAsync(cluster, "check");
+            DfsFileClient files = check.GetVolume(Vol).Files;
+            await AssertEx.ThrowsDfsAsync<DfsOperationIdMismatchException>(() => files.AppendAllBytesAsync(log, Record(clientCount + 1),
+                new DfsMutationOptions { OperationId = ids[0] }, ct), DfsErrorCode.OperationIdMismatch);
+
             if (heldRestart is not null)
                 await heldRestart;
             await cluster.WaitForStableAsync(TimeSpan.FromSeconds(60), ct);
@@ -1911,8 +2072,6 @@ public sealed class ChaSimulationTests
                     cluster.History.Resolve(historyIds[i], OpOutcome.Ok, tokens[i]);
             }
 
-            await using DfsClient check = await ConnectAsync(cluster, "check");
-            DfsFileClient files = check.GetVolume(Vol).Files;
             byte[] content = await files.ReadAllBytesAsync(log, ct);
             long readId = cluster.History.Invoke("check", "read", log, null);
             cluster.History.Complete(readId, OpOutcome.Ok, content);
@@ -1928,9 +2087,6 @@ public sealed class ChaSimulationTests
 
             Assert.All(counts, c => Assert.Equal(1, c));
             LinearizabilityChecker.Check(cluster.History.Operations.Where(o => o.Key == log).ToArray(), new AppendLogModel()).AssertValid();
-
-            await AssertEx.ThrowsDfsAsync<DfsOperationIdMismatchException>(() => files.AppendAllBytesAsync(log, Record(clientCount + 1),
-                new DfsMutationOptions { OperationId = ids[0] }, ct), DfsErrorCode.OperationIdMismatch);
 
             VolumeStateInspection state = await cluster.Inspect.GetVolumeStateAsync(Vol);
             Assert.All(state.Sessions, s => Assert.True(s.RetainedOutcomes <= NodeTimings.Fast.MaxOutcomesPerSession,
@@ -2090,7 +2246,7 @@ public sealed class ChaSimulationTests
             await monitor.StopAndAssertAsync(minSamples: 5);
             await cluster.Inspect.AssertNoSplitBrainAsync();
             await cluster.Inspect.AssertReplicasConvergedAsync(Vol);
-            await AssertBytesAsync(r3, bv.Files.ReadAllBytesAsync(path, ct), "B's latest commit stays authoritative");
+            await AssertBytesAsync(r3, ReadSharedAsync(bv.Files, path), "B's latest commit stays authoritative");   // B is still open
             foreach (FileInspection? view in await ReplicaViewsAsync(cluster, path))
             {
                 Assert.NotNull(view);
@@ -2182,7 +2338,8 @@ public sealed class ChaSimulationTests
                     ReadView = DfsReadView.VersionPinned,
                 }, ct)
                 : null;
-            DateTimeOffset expires = cluster.Time.GetUtcNow() + (last == LastObligation.ReaderPin ? TimeSpan.FromSeconds(4) : TimeSpan.FromSeconds(40));
+            // Retention-last: long enough that repair completes and several checks run before the deadline.
+            DateTimeOffset expires = cluster.Time.GetUtcNow() + (last == LastObligation.ReaderPin ? TimeSpan.FromSeconds(4) : TimeSpan.FromSeconds(60));
             await vol.Snapshots.CreateAsync("cha014-s", new DfsSnapshotOptions { Retention = new DfsRetention(expires) }, ct);
             DfsSnapshotView? view = pinKind == PinKind.SnapshotView ? await vol.Snapshots.OpenAsync("cha014-s", ct) : null;
             await vol.Files.WriteAllBytesAsync(path, f2, ct);   // the old objects are now protected only by the snapshot and the pin
@@ -2412,8 +2569,16 @@ public sealed class ChaSimulationTests
             // The dead client's session is fenced: its writer reservation is released by server-side expiry only.
             await using (DfsStream reopened = await OpenWriterEventuallyAsync(cluster, fv, $"{dir}/s1", SessionTimeout * 4))
                 Assert.True(reopened.WriterGeneration > stagedGeneration);
-            VolumeStateInspection state = await cluster.Inspect.GetVolumeStateAsync(Vol);
-            Assert.DoesNotContain(state.Sessions, s => s.Id == a1.Session && !s.Expired);
+
+            // The old session itself is expired by the server (not by time on any client), and is then fenced: an id from it
+            // that was never used is rejected as expired rather than executed as a new operation.
+            await cluster.WaitUntilAsync(async () =>
+                    (await cluster.Inspect.GetVolumeStateAsync(Vol)).Sessions.All(s => s.Id != a1.Session || s.Expired),
+                SessionTimeout * 4, "the dead client's session is expired by the server after the cold start", ct);
+            var neverUsed = new DfsOperationId(a1.Session, Math.Max(a1.Sequence, a2.Sequence) + 1_000);
+            await AssertEx.ThrowsDfsAsync<DfsOperationExpiredException>(() => fv.Files.AppendAllBytesAsync($"{dir}/log", p2,
+                new DfsMutationOptions { OperationId = neverUsed }, ct), DfsErrorCode.OperationExpired);
+            await AssertRecoveredStateAsync("after an operation from the fenced session was attempted");
 
             // Only definitively abandoned data is reclaimed; every committed object remains.
             await WaitUntilReclaimedAsync(cluster, stagedObjects, TimeSpan.FromSeconds(60), "staged objects of the expired session are reclaimed");
@@ -2552,10 +2717,13 @@ public sealed class ChaSimulationTests
                 await pv.Files.WriteAllBytesAsync("/cha016/x", x, ct);
 
                 // Old-authority identity cannot act on the new authority.
-                DfsException boundary = await Assert.ThrowsAnyAsync<DfsException>(() => pv.Snapshots.CreateAsync("cha016-old-boundary",
+                // InvalidArgument surfaces as ArgumentException under the canonical mapping (API.md A.2), hence DfsErrors.ToCode.
+                Exception boundary = await Assert.ThrowsAnyAsync<Exception>(() => pv.Snapshots.CreateAsync("cha016-old-boundary",
                     new DfsSnapshotOptions { MinimumCommit = sourceToken }, ct));
-                Assert.True(boundary.ErrorCode is DfsErrorCode.EpochMismatch or DfsErrorCode.ClusterMismatch or DfsErrorCode.InvalidArgument,
-                    $"an old-authority commit token must be rejected, got {boundary.ErrorCode}");
+                DfsErrorCode boundaryCode = DfsErrors.ToCode(boundary);
+                Assert.True(boundaryCode is DfsErrorCode.EpochMismatch or DfsErrorCode.ClusterMismatch or DfsErrorCode.CrossVolume or DfsErrorCode.InvalidArgument,
+                    $"an old-authority commit token must be rejected as incomparable, got {boundaryCode}: {boundary}");
+                Assert.DoesNotContain(await pv.Snapshots.ListAsync(ct), s => s.Name == "cha016-old-boundary");
                 try
                 {
                     DfsOperationOutcome foreign = await pv.QueryOperationAsync(sourceOp, resolve: false, ct);
