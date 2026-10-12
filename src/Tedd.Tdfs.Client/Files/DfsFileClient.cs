@@ -314,8 +314,8 @@ public sealed partial class DfsFileClient
         Validation.MutationOptions(options);
         EnsureWritable();
         using DfsTransaction.TransactionOperation? txOperation = EnterTransaction();
-        if (bytes.Length > Runtime.Capabilities.MaxPublishBytes)
-            throw new DfsLimitExceededException(nameof(DfsServerCapabilities.MaxPublishBytes), Runtime.Capabilities.MaxPublishBytes, bytes.Length);
+        if (bytes.Length > Context.MaxPublishBytes)
+            throw new DfsLimitExceededException(nameof(DfsVolumeLimits.MaxPublishBytes), Context.MaxPublishBytes, bytes.Length);
         scope.Path = p;
         await scope.ValidatedAsync().ConfigureAwait(false);
         return await WriteAllCoreAsync(p, bytes, options, scope).ConfigureAwait(false);
@@ -365,8 +365,8 @@ public sealed partial class DfsFileClient
         Validation.MutationOptions(options);
         EnsureWritable();
         using DfsTransaction.TransactionOperation? txOperation = EnterTransaction();
-        if (bytes.Length > Runtime.Capabilities.MaxPublishBytes)
-            throw new DfsLimitExceededException(nameof(DfsServerCapabilities.MaxPublishBytes), Runtime.Capabilities.MaxPublishBytes, bytes.Length);
+        if (bytes.Length > Context.MaxPublishBytes)
+            throw new DfsLimitExceededException(nameof(DfsVolumeLimits.MaxPublishBytes), Context.MaxPublishBytes, bytes.Length);
         scope.Path = p;
         await scope.ValidatedAsync().ConfigureAwait(false);
         return await AppendCoreAsync(p, _ => bytes, options, scope).ConfigureAwait(false);

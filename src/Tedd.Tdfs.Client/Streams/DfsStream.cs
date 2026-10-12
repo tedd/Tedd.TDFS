@@ -478,9 +478,9 @@ public sealed class DfsStream : Stream, ILeaseHolder
             }
 
             long offset = IsAppend ? _overlay!.Length : _position;
-            long maximum = _runtime.Capabilities.MaxFileLength;
+            long maximum = _volume.MaxFileLength;
             if (offset > maximum - owned.Length)
-                throw new DfsLimitExceededException(nameof(DfsServerCapabilities.MaxFileLength), maximum, offset + owned.Length);
+                throw new DfsLimitExceededException(nameof(DfsVolumeLimits.MaxFileLength), maximum, offset + owned.Length);
         }
         catch
         {
@@ -593,8 +593,8 @@ public sealed class DfsStream : Stream, ILeaseHolder
             if (!_canWrite)
                 throw new NotSupportedException("The stream was opened without write access.");
             ArgumentOutOfRangeException.ThrowIfNegative(length);
-            if (length > _runtime.Capabilities.MaxFileLength)
-                throw new DfsLimitExceededException(nameof(DfsServerCapabilities.MaxFileLength), _runtime.Capabilities.MaxFileLength, length);
+            if (length > _volume.MaxFileLength)
+                throw new DfsLimitExceededException(nameof(DfsVolumeLimits.MaxFileLength), _volume.MaxFileLength, length);
             ThrowIfFaulted();
             ct.ThrowIfCancellationRequested();
         }
@@ -868,6 +868,13 @@ public sealed class DfsStream : Stream, ILeaseHolder
             return _lastToken;
 
         VolumeEntry entry = await EnsureEntryAsync(scope).ConfigureAwait(false);
+        long publishing = overlay.PendingBytes;
+        if (publishing > _volume.MaxPublishBytes)
+        {
+            // Nothing is uploaded or published: the limit applies to the whole publication (PUB-024).
+            throw new DfsLimitExceededException(nameof(DfsVolumeLimits.MaxPublishBytes), _volume.MaxPublishBytes, publishing);
+        }
+
         DfsStoragePolicy policy = ContentLayout.ResolvePolicy(entry, _policyName) ?? entry.DefaultPolicy;
         long newLength = overlay.Length;
         int threshold = ContentLayout.InlineThreshold(entry, _runtime.Capabilities);

@@ -76,6 +76,12 @@ internal sealed class VolumeContext : IRpcRouter
         }
     }
 
+    /// <summary>Largest publication of one request: the volume's limit when known, never above the cluster's.</summary>
+    public long MaxPublishBytes => Math.Min(Runtime.Capabilities.MaxPublishBytes, Entry?.Limits.MaxPublishBytes ?? long.MaxValue);
+
+    /// <summary>Largest file length: the volume's limit when known, never above the cluster's.</summary>
+    public long MaxFileLength => Math.Min(Runtime.Capabilities.MaxFileLength, Entry?.Limits.MaxFileLength ?? long.MaxValue);
+
     /// <summary>The bound volume id (empty before the first route).</summary>
     public VolumeId VolumeId
     {
