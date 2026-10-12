@@ -263,8 +263,7 @@ public sealed class ProtocolReviewTests
             .OrderByDescending(c => c.GetParameters().Length)
             .First();
         List<string> names = primary.GetParameters().Select(p => p.Name!).ToList();
-        if (type == typeof(ErrorReplyMessage))
-            names.Add(nameof(ErrorReplyMessage.Detail));
+        names.AddRange(ProtocolSamples.InitOnlyWireFields(type).Select(p => p.Name));
         return names;
     }
 

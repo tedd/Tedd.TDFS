@@ -29,4 +29,10 @@ public sealed class NodeEnvironment
 
     /// <summary>Event-loop factory (the simulation supplies its own).</summary>
     public INodeLoopFactory LoopFactory { get; init; } = ThreadNodeLoopFactory.Instance;
+
+    /// <summary>
+    /// Volume state machine factory override (tests); null uses the build's production factory
+    /// (<c>VolumeHost.ResolveDefaultFactory</c>).
+    /// </summary>
+    internal Volumes.IVolumeStateMachineFactory? VolumeStateMachines { get; init; }
 }
