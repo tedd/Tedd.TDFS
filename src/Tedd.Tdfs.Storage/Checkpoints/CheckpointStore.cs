@@ -178,18 +178,27 @@ public sealed class CheckpointStore
     /// <exception cref="DfsIntegrityException">The checkpoint file is missing, truncated or corrupt.</exception>
     public async ValueTask<CheckpointReader?> OpenLatestAsync(bool verifyContent = true, CancellationToken ct = default)
     {
-        CheckpointInfo? current = Current;
-        if (current is null)
-            return null;
-        string path = FilePath(current.Sequence);
+        CheckpointInfo? current;
+        string path;
         IStorageFile file;
-        try
+        while (true)
         {
-            file = await _medium.OpenAsync(path, StorageOpenMode.OpenExisting, ct);
-        }
-        catch (FileNotFoundException ex)
-        {
-            throw new DfsIntegrityException($"Current checkpoint file '{path}' is missing.", ex);
+            current = Current;
+            if (current is null)
+                return null;
+            path = FilePath(current.Sequence);
+            try
+            {
+                file = await _medium.OpenAsync(path, StorageOpenMode.OpenExisting, ct);
+                break;
+            }
+            catch (FileNotFoundException ex)
+            {
+                // A newer checkpoint may have been installed (and this one deleted) while the file was being opened.
+                if (!Equals(Current, current))
+                    continue;
+                throw new DfsIntegrityException($"Current checkpoint file '{path}' is missing.", ex);
+            }
         }
 
         try
@@ -374,7 +383,11 @@ public sealed class CheckpointStore
     }
 }
 
-/// <summary>Streams one checkpoint to its file. Dispose without <see cref="CompleteAsync"/> discards it.</summary>
+/// <summary>
+/// Streams one checkpoint to its file. Dispose without <see cref="CompleteAsync"/> discards it. A failed write or flush
+/// makes the writer unusable (every later call throws <see cref="InvalidOperationException"/>); the checkpoint must be
+/// aborted and written again.
+/// </summary>
 public sealed class CheckpointWriter : IAsyncDisposable
 {
     private readonly CheckpointStore _store;
@@ -387,6 +400,7 @@ public sealed class CheckpointWriter : IAsyncDisposable
     private long _plaintextBytes;
     private bool _completed;
     private bool _finished;
+    private Exception? _fault;
 
     internal CheckpointWriter(CheckpointStore store, IStorageFile file, string path, ulong sequence, ulong index, ulong term, int headerLength, uint keyVersion)
     {
@@ -449,9 +463,13 @@ public sealed class CheckpointWriter : IAsyncDisposable
         {
             await file.WriteFullyAsync(_offset, buffer, ct);
         }
-        catch (Exception ex) when (StorageErrors.IsDiskFull(ex))
+        catch (Exception ex)
         {
-            throw new DfsCapacityException($"Storage is full while writing checkpoint '{_path}'.", ex);
+            // Part of the chunk may be on the device: the checkpoint can no longer be completed consistently.
+            _fault = ex;
+            if (StorageErrors.IsDiskFull(ex))
+                throw new DfsCapacityException($"Storage is full while writing checkpoint '{_path}'.", ex);
+            throw;
         }
 
         _offset += buffer.Length;
@@ -480,9 +498,14 @@ public sealed class CheckpointWriter : IAsyncDisposable
             await file.WriteFullyAsync(_offset, trailer, ct);
             await file.FlushAsync(ct);
         }
-        catch (Exception ex) when (StorageErrors.IsDiskFull(ex))
+        catch (Exception ex)
         {
-            throw new DfsCapacityException($"Storage is full while writing checkpoint '{_path}'.", ex);
+            // Never retried: after a failed barrier a device may drop the written pages and report success to the next
+            // flush, so a retry could install a checkpoint whose content never reached the medium.
+            _fault = ex;
+            if (StorageErrors.IsDiskFull(ex))
+                throw new DfsCapacityException($"Storage is full while writing checkpoint '{_path}'.", ex);
+            throw;
         }
 
         _offset += trailer.Length;
@@ -517,6 +540,8 @@ public sealed class CheckpointWriter : IAsyncDisposable
 
     private IStorageFile ThrowIfUnusable()
     {
+        if (_fault is not null && !_finished)
+            throw new InvalidOperationException($"Writing checkpoint '{_path}' failed earlier; abort it and write a new one.", _fault);
         if (_finished || _file is null)
             throw new InvalidOperationException(_completed ? "The checkpoint was already completed." : "The checkpoint writer is no longer usable.");
         return _file;
