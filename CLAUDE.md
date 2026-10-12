@@ -36,3 +36,14 @@ Distributed filesystem with a .NET client SDK. Requirements: `docs/spec/distribu
   `DfsBackupCheckpoint`) live in Core (namespace `Tedd.Tdfs`).
 - `MessageCodec` registrations go in `src/Tedd.Tdfs.Core/Protocol/MessageCodec.Registrations.cs`; message records
   implement `IWireMessage<TSelf>`.
+- Tedd.Quicly 0.2.2: an `MsQuicTransportListener` that owns its registration can deadlock in `Dispose` (it closes the
+  registration before its listener handle). `QuiclyRpcTransport` therefore always passes its own `MsQuicRegistration`
+  and closes it on a background thread. Use `QuiclyTransportFactory.CreateDevelopmentCertificate()`/`ComputeSpkiPin` for
+  test certificates (non-exportable, non-persisted key: nothing is left in the user's key store).
+- Tedd.Quicly 0.2.2: `QuiclyPeer.Close`/`QuiclyClient.Close` travel on Quicly's own control stream and end the session
+  without waiting for messages already admitted on channel streams (up to `SendBudgetBytes` is silently lost). Wait until
+  `GetChannelStatistics` shows `QueuedMessages + InFlightMessages == 0` first (MsQuic runs without send buffering, so a
+  reliable send completes on the peer's ack); `QuiclyRpcTransport.CloseSession` does this for graceful closes.
+- Transport threads (QUIC pump, inbound executors) must not run handler code: cancel handler tokens with
+  `CancellationTokenSource.CancelAsync()`, since `Cancel()` runs `ct.Register` callbacks, and the handler code they resume,
+  inline on the cancelling thread.
