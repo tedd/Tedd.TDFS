@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Shared identifiers, paths, errors, policies, wire codec and protocol messages for Tedd.TDFS.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.IO.Hashing" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Tedd.Tdfs.Transport" />
+    <InternalsVisibleTo Include="Tedd.Tdfs.Client" />
+    <InternalsVisibleTo Include="Tedd.Tdfs.Storage" />
+    <InternalsVisibleTo Include="Tedd.Tdfs.Consensus" />
+    <InternalsVisibleTo Include="Tedd.Tdfs.Server" />
+    <InternalsVisibleTo Include="Tedd.Tdfs.Host" />
+    <InternalsVisibleTo Include="Tedd.Tdfs.Testing" />
+    <InternalsVisibleTo Include="Tedd.Tdfs.Tests.Unit" />
+    <InternalsVisibleTo Include="Tedd.Tdfs.Tests.Simulation" />
+    <InternalsVisibleTo Include="Tedd.Tdfs.Tests.Integration" />
+    <InternalsVisibleTo Include="Tedd.Tdfs.Tests.Models" />
+    <InternalsVisibleTo Include="Tedd.Tdfs.Tests.Performance" />
+  </ItemGroup>
+</Project>

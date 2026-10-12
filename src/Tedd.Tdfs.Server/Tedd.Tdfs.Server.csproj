@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Tedd.TDFS node runtime: control and volume state machines, extent store, leases, transactions, snapshots, maintenance and late-sync backup.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Tedd.Tdfs.Core\Tedd.Tdfs.Core.csproj" />
+    <ProjectReference Include="..\Tedd.Tdfs.Transport\Tedd.Tdfs.Transport.csproj" />
+    <ProjectReference Include="..\Tedd.Tdfs.Storage\Tedd.Tdfs.Storage.csproj" />
+    <ProjectReference Include="..\Tedd.Tdfs.Consensus\Tedd.Tdfs.Consensus.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Tedd.Tdfs.Host" />
+    <InternalsVisibleTo Include="Tedd.Tdfs.Testing" />
+    <InternalsVisibleTo Include="Tedd.Tdfs.Tests.Unit" />
+    <InternalsVisibleTo Include="Tedd.Tdfs.Tests.Simulation" />
+    <InternalsVisibleTo Include="Tedd.Tdfs.Tests.Integration" />
+    <InternalsVisibleTo Include="Tedd.Tdfs.Tests.Models" />
+    <InternalsVisibleTo Include="Tedd.Tdfs.Tests.Performance" />
+  </ItemGroup>
+</Project>

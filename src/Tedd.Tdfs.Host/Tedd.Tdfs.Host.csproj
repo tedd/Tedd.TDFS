@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <Description>Tedd.TDFS server host executable (live node or late-sync backup node).</Description>
+    <IsPackable>false</IsPackable>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Tedd.Tdfs.Server\Tedd.Tdfs.Server.csproj" />
+    <ProjectReference Include="..\Tedd.Tdfs.Client\Tedd.Tdfs.Client.csproj" />
+  </ItemGroup>
+</Project>

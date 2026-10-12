@@ -1,0 +1,19 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Tedd.Tdfs.Core/Tedd.Tdfs.Core.csproj" />
+    <Project Path="src/Tedd.Tdfs.Transport/Tedd.Tdfs.Transport.csproj" />
+    <Project Path="src/Tedd.Tdfs.Client/Tedd.Tdfs.Client.csproj" />
+    <Project Path="src/Tedd.Tdfs.Storage/Tedd.Tdfs.Storage.csproj" />
+    <Project Path="src/Tedd.Tdfs.Consensus/Tedd.Tdfs.Consensus.csproj" />
+    <Project Path="src/Tedd.Tdfs.Server/Tedd.Tdfs.Server.csproj" />
+    <Project Path="src/Tedd.Tdfs.Host/Tedd.Tdfs.Host.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Tedd.Tdfs.Testing/Tedd.Tdfs.Testing.csproj" />
+    <Project Path="tests/Tedd.Tdfs.Tests.Unit/Tedd.Tdfs.Tests.Unit.csproj" />
+    <Project Path="tests/Tedd.Tdfs.Tests.Simulation/Tedd.Tdfs.Tests.Simulation.csproj" />
+    <Project Path="tests/Tedd.Tdfs.Tests.Integration/Tedd.Tdfs.Tests.Integration.csproj" />
+    <Project Path="tests/Tedd.Tdfs.Tests.Models/Tedd.Tdfs.Tests.Models.csproj" />
+    <Project Path="tests/Tedd.Tdfs.Tests.Performance/Tedd.Tdfs.Tests.Performance.csproj" />
+  </Folder>
+</Solution>
