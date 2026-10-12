@@ -117,6 +117,29 @@ public abstract class RaftLogStoreContractTests : StorageContractTests
         Assert.Equal(10ul, store.LastIndex);
     }
 
+    /// <summary>
+    /// A batch that conflicts with the log at index 4 but whose term is below the term of entry 3 is invalid (terms
+    /// never decrease along a log). It must be rejected before anything is changed: the entries it would have replaced
+    /// may already have been acknowledged to a leader and must not be truncated durably by a rejected call.
+    /// </summary>
+    [Fact]
+    public async Task ConflictingBatchWithDecreasingTerm_IsRejectedWithoutTruncating()
+    {
+        await using (RaftLogStore store = await OpenAsync())
+        {
+            await store.AppendAsync([.. RaftTestData.Range(1, 3, 2), .. RaftTestData.Range(4, 5, 3)]);
+            await store.FlushAsync();
+            await Assert.ThrowsAsync<ArgumentException>(async () => await store.AppendAsync([RaftTestData.Entry(4, 1)]));
+            Assert.Equal(5ul, store.LastIndex);
+            Assert.Equal(3ul, store.TermAt(5));
+        }
+
+        await using RaftLogStore reopened = await OpenAsync(medium: Host.Restart());
+        Assert.Equal(5ul, reopened.LastIndex);
+        foreach (LogEntryRecord e in reopened.Entries(1, 6, 0))
+            RaftTestData.AssertEntry(RaftTestData.Entry(e.Index, e.Index <= 3 ? 2ul : 3ul), e);
+    }
+
     [Fact]
     public async Task InvalidBatches_AreRejected()
     {
@@ -382,6 +405,7 @@ public sealed class RaftLogStoreSimulatedTests : RaftLogStoreContractTests
 
     [Theory]
     [InlineData(25, 1)]
+    [InlineData(40, 1)]
     [InlineData(60, 3)]
     public async Task CrashMatrix_CompactOrInstallSnapshot(ulong index, ulong term)
     {

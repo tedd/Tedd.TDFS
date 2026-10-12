@@ -13,8 +13,12 @@ namespace Tedd.Tdfs.Storage;
 /// bytes. Deletes write durable tombstones; quarantine records durably retire one damaged record.</para>
 /// <para><b>Recovery.</b> Opening finishes or rolls back an interrupted compaction, scans every segment in order and
 /// rebuilds the index. Damaged regions are skipped and reported in <see cref="Quarantined"/> (zero-filled regions left
-/// by lost unflushed writes are skipped silently); damaged records are never indexed. In the active (last) segment every
-/// payload is verified, a torn tail is truncated and whatever was recovered is flushed before use.</para>
+/// by lost unflushed writes are skipped silently); damaged records are never indexed. A quarantine record retires
+/// exactly the record it names (that record neither is indexed nor replaces an earlier copy of the object). In the
+/// active (last) segment every payload is verified, a torn tail is truncated and whatever was recovered is flushed
+/// before use; a segment is complete and durable before a newer one is created, and quarantine records always go into
+/// the active segment, so older segments are only verified where a newer copy would replace an earlier one. Bytes
+/// inside a record whose header is intact are never interpreted as records.</para>
 /// <para><b>Capacity.</b> Puts are rejected with <see cref="DfsCapacityException"/> when the medium's used bytes plus the
 /// record would exceed its capacity minus <see cref="ObjectStoreOptions.ReservedBytes"/>; deletes, quarantine and
 /// compaction may use the reserve.</para>
@@ -35,6 +39,7 @@ public sealed partial class ObjectStore : IAsyncDisposable
     private readonly List<SegmentFile> _segments = [];
     private readonly List<QuarantinedRecord> _quarantined = [];
     private readonly Dictionary<ObjectId, long> _recentDeletes = [];
+    private readonly Dictionary<ObjectId, PendingPut> _pendingPuts = [];
     private readonly SerialGate _writeGate = new();
     private readonly SerialGate _compactionGate = new();
     private SegmentFile? _active;
@@ -165,15 +170,24 @@ public sealed partial class ObjectStore : IAsyncDisposable
         SegmentFile segment;
         IndexEntry entry;
         long sequence;
+        long failuresAtWrite;
         using (await _writeGate.EnterAsync(ct))
         {
             ThrowIfDisposed();
             IndexEntry? existing = Lookup(id);
             byte[]? quarantine = null;
+            lock (_sync)
+            {
+                // A put of the same id that is still waiting for its barrier counts as stored for the immutability
+                // check: two uploads of different bytes under one id must never both be acknowledged.
+                if (_pendingPuts.TryGetValue(id, out PendingPut? pending) && !SameContent(pending.Info, volume, checksum, plaintext.Length))
+                    throw new DfsIntegrityException(id, $"Object {id} is being stored with different content or owner; objects are immutable.");
+            }
+
             if (existing is not null)
             {
                 ObjectRecordInfo info = existing.Info;
-                if (info.Volume != volume || info.Checksum != checksum || info.Length != plaintext.Length)
+                if (!SameContent(info, volume, checksum, plaintext.Length))
                     throw new DfsIntegrityException(id, $"Object {id} is already stored with different content or owner; objects are immutable.");
                 bool intact = await VerifyGuardedAsync(existing, ct);
                 if (intact && info.Staging == staging)
@@ -185,6 +199,8 @@ public sealed partial class ObjectStore : IAsyncDisposable
             byte[] record = BuildObjectRecord(id, volume, staging, plaintext.Span, checksum, out RecordHeader header);
             byte[] buffer = quarantine is null ? record : [.. quarantine, .. record];
             EnsureCapacity(buffer.Length);
+            SegmentFile target = await EnsureActiveSegmentAsync(buffer.Length, ct);
+            failuresAtWrite = FlushFailuresOf(target);
             (segment, long offset) = await AppendLockedAsync(buffer, quarantine is null ? 1 : 2, ct);
             if (quarantine is not null)
                 RetireDamaged(existing!, "copy failed verification during an idempotent put");
@@ -203,23 +219,28 @@ public sealed partial class ObjectStore : IAsyncDisposable
 
                 segment.InflightWrites++;
                 _inflightPuts++;
+                if (_pendingPuts.TryGetValue(id, out PendingPut? pending))
+                    pending.Count++;
+                else
+                    _pendingPuts.Add(id, new PendingPut(entry.Info));
             }
         }
 
+        bool acknowledged = false;
         try
         {
             if (_faults.IsEnabled)
                 await _faults.HitAsync(new FaultContext(FaultStage.F07, FaultSites.ObjectBeforeFlush, _options.NodeName, Operation: DfsOperationKind.PutObject, Object: id), ct);
-            IStorageFile file = segment.File ?? throw new ObjectDisposedException(nameof(ObjectStore));
             try
             {
-                await file.FlushAsync(ct);
+                await FlushSegmentAsync(segment, ct);
             }
             catch (Exception ex) when (StorageErrors.IsDiskFull(ex))
             {
                 throw new DfsCapacityException($"Storage is full while flushing object {id}.", ex);
             }
 
+            ThrowIfFlushFailedSince(segment, failuresAtWrite, $"object {id}");
             lock (_sync)
             {
                 ThrowIfDisposed();
@@ -229,6 +250,7 @@ public sealed partial class ObjectStore : IAsyncDisposable
                     IndexLocked(entry);
             }
 
+            acknowledged = true;
             return entry.Info;
         }
         finally
@@ -244,9 +266,16 @@ public sealed partial class ObjectStore : IAsyncDisposable
 
                 if (--_inflightPuts == 0)
                     _recentDeletes.Clear();
+                if (_pendingPuts.TryGetValue(id, out PendingPut? pending) && --pending.Count == 0)
+                    _pendingPuts.Remove(id);
             }
 
             drained?.TrySetResult();
+
+            // The record was written but never acknowledged: it may be missing, partial or complete on the device.
+            // Retire it durably (best effort) so a later open never indexes it, wherever its segment ends up.
+            if (!acknowledged)
+                await VoidUnacknowledgedAsync(entry);
         }
     }
 
@@ -350,10 +379,12 @@ public sealed partial class ObjectStore : IAsyncDisposable
         if (existing is null)
             return;
         byte[] tombstone = BuildMarkerRecord(KindTombstone, id, existing.Info.Volume);
+        long failuresAtWrite = FlushFailuresOf(await EnsureActiveSegmentAsync(tombstone.Length, ct));
         (SegmentFile segment, long offset) = await AppendLockedAsync(tombstone, 1, ct);
         try
         {
-            await segment.File!.FlushAsync(ct);
+            await FlushSegmentAsync(segment, ct);
+            ThrowIfFlushFailedSince(segment, failuresAtWrite, $"the tombstone of object {id}");
         }
         catch
         {
@@ -491,9 +522,21 @@ public sealed partial class ObjectStore : IAsyncDisposable
     }
 
     /// <summary>Appends records to the active segment. The caller holds the write gate; nothing is flushed.</summary>
-    private async ValueTask<(SegmentFile Segment, long Offset)> AppendLockedAsync(byte[] buffer, int recordCount, CancellationToken ct)
+    private ValueTask<(SegmentFile Segment, long Offset)> AppendLockedAsync(byte[] buffer, int recordCount, CancellationToken ct)
+        => AppendLockedAsync(buffer, recordCount, mayRollOver: true, ct);
+
+    /// <summary>Appends records to the active segment. The caller holds the write gate; nothing is flushed.</summary>
+    /// <param name="buffer">Encoded records.</param>
+    /// <param name="recordCount">Number of records in <paramref name="buffer"/>.</param>
+    /// <param name="mayRollOver">
+    /// False for quarantine and void records: they go into the current active segment even when it is full. Rolling
+    /// over first would seal the segment (it is then no longer payload-verified at open) before the record that retires
+    /// a damaged record in it is durable, so a crash in between would let the next open index the damaged record.
+    /// </param>
+    /// <param name="ct">Cancellation token.</param>
+    private async ValueTask<(SegmentFile Segment, long Offset)> AppendLockedAsync(byte[] buffer, int recordCount, bool mayRollOver, CancellationToken ct)
     {
-        SegmentFile segment = await EnsureActiveSegmentAsync(buffer.Length, ct);
+        SegmentFile segment = !mayRollOver && _active is { } current ? current : await EnsureActiveSegmentAsync(buffer.Length, ct);
         long offset = segment.Length;
         try
         {
@@ -530,6 +573,107 @@ public sealed partial class ObjectStore : IAsyncDisposable
         await TruncateQuietlyAsync(segment, offset);
     }
 
+    private static bool SameContent(ObjectRecordInfo info, VolumeId volume, UInt128 checksum, long length)
+        => info.Volume == volume && info.Checksum == checksum && info.Length == length;
+
+    private long FlushFailuresOf(SegmentFile segment)
+    {
+        lock (_sync)
+            return segment.FlushFailures;
+    }
+
+    /// <summary>
+    /// Flushes a segment file. A failure is remembered on the segment: a device may report a failed write-back only to
+    /// the first flush that observes it and then drop the affected pages, so a later flush of the same file can succeed
+    /// although earlier writes never reached the medium (see <see cref="ThrowIfFlushFailedSince"/>).
+    /// </summary>
+    private async ValueTask FlushSegmentAsync(SegmentFile segment, CancellationToken ct)
+    {
+        IStorageFile file = segment.File ?? throw new ObjectDisposedException(nameof(ObjectStore), $"Segment '{segment.Path}' is closed.");
+        try
+        {
+            await file.FlushAsync(ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            lock (_sync)
+                segment.FlushFailures++;
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Throws when a flush of <paramref name="segment"/> failed after <paramref name="failuresAtWrite"/> was sampled
+    /// (before the caller's write): the caller's bytes may have been dropped with that failure even though its own
+    /// flush succeeded, so the write must not be acknowledged (DSK-004).
+    /// </summary>
+    private void ThrowIfFlushFailedSince(SegmentFile segment, long failuresAtWrite, string what)
+    {
+        if (FlushFailuresOf(segment) != failuresAtWrite)
+            throw new IOException($"A concurrent flush of '{segment.Path}' failed; the durability of {what} is unknown and it is not acknowledged.");
+    }
+
+    /// <summary>
+    /// Makes a segment that is being left behind (rollover, compaction) complete and durable: bytes of failed appends
+    /// beyond its logical end are cut and the file is flushed. The caller holds the write gate.
+    /// </summary>
+    private async ValueTask SealLockedAsync(SegmentFile segment, CancellationToken ct)
+    {
+        IStorageFile? file = segment.File;
+        if (file is null)
+            return;
+        try
+        {
+            if (file.Length > segment.Length)
+                await file.SetLengthAsync(segment.Length, ct);
+            await FlushSegmentAsync(segment, ct);
+        }
+        catch (Exception ex) when (StorageErrors.IsDiskFull(ex) && ex is not DfsCapacityException)
+        {
+            throw new DfsCapacityException($"Storage is full while sealing segment '{segment.Path}'.", ex);
+        }
+    }
+
+    /// <summary>
+    /// Best-effort durable retirement of a put's record that was written but not acknowledged (failed or cancelled
+    /// before or during its barrier): a quarantine record naming its location keeps the next open from indexing it.
+    /// </summary>
+    private async ValueTask VoidUnacknowledgedAsync(IndexEntry entry)
+    {
+        try
+        {
+            using (await _writeGate.EnterAsync(CancellationToken.None))
+            {
+                lock (_sync)
+                {
+                    if (_disposed)
+                        return;
+                    if (_index.TryGetValue(entry.Info.Id, out IndexEntry? current) && ReferenceEquals(current, entry))
+                        return;
+                }
+
+                byte[] marker = BuildMarkerRecord(KindQuarantine, entry.Info.Id, entry.Info.Volume, entry.Segment.Key, entry.Offset);
+                (SegmentFile segment, long offset) = await AppendLockedAsync(marker, 1, mayRollOver: false, CancellationToken.None);
+                try
+                {
+                    await FlushSegmentAsync(segment, CancellationToken.None);
+                }
+                catch
+                {
+                    await RollbackAppendAsync(segment, offset, marker.Length, 1);
+                    throw;
+                }
+            }
+        }
+#pragma warning disable CA1031 // Best-effort cleanup on a failure path: the put's own exception is what the caller must see.
+        catch (Exception)
+#pragma warning restore CA1031
+        {
+            // Without the marker the record may be indexed at the next open if it survived complete (allowed for an
+            // unacknowledged write, DSK-013); a partial copy is still never served (reads verify every unit).
+        }
+    }
+
     private static async ValueTask TruncateQuietlyAsync(SegmentFile segment, long length)
     {
         try
@@ -548,6 +692,11 @@ public sealed partial class ObjectStore : IAsyncDisposable
         SegmentFile? active = _active;
         if (active is not null && !(active.RecordCount > 0 && active.Length + recordBytes > _options.SegmentSize))
             return active;
+
+        // Only the newest segment is payload-verified at open, so the segment being left behind must be complete and
+        // durable before a newer one can exist: puts still waiting for their own barrier have written into it.
+        if (active is not null)
+            await SealLockedAsync(active, ct);
 
         var key = new SegmentKey(_nextMajor++, 0);
         string path = PathOf(SegmentFileName(key));
@@ -600,16 +749,22 @@ public sealed partial class ObjectStore : IAsyncDisposable
     }
 
     /// <summary>Takes a read reference on the entry's segment when the entry is still current.</summary>
-    private bool TryAcquire(IndexEntry e)
+    private bool TryAcquire(IndexEntry e) => TryAcquireCurrent(e) == AcquireResult.Acquired;
+
+    /// <summary>
+    /// Takes a read reference on the entry's segment when the entry is still current, telling a closed store (or
+    /// closed segment) apart from an entry that was deleted, replaced or retired meanwhile.
+    /// </summary>
+    private AcquireResult TryAcquireCurrent(IndexEntry e)
     {
         lock (_sync)
         {
-            if (_disposed || e.Segment.File is null)
-                return false;
             if (!_index.TryGetValue(e.Info.Id, out IndexEntry? current) || !ReferenceEquals(current, e))
-                return false;
+                return AcquireResult.NotCurrent;
+            if (_disposed || e.Segment.File is null)
+                return AcquireResult.Closed;
             e.Segment.Refs++;
-            return true;
+            return AcquireResult.Acquired;
         }
     }
 
@@ -630,10 +785,17 @@ public sealed partial class ObjectStore : IAsyncDisposable
     }
 
     /// <summary>Verifies an entry's full payload while holding a read reference; false when damaged or unreadable.</summary>
+    /// <exception cref="ObjectDisposedException">The store was closed.</exception>
     private async ValueTask<bool> VerifyGuardedAsync(IndexEntry e, CancellationToken ct)
     {
-        if (!TryAcquire(e))
-            return false;
+        switch (TryAcquireCurrent(e))
+        {
+            case AcquireResult.NotCurrent:
+                return false;
+            case AcquireResult.Closed:
+                throw new ObjectDisposedException(nameof(ObjectStore), $"The object store was closed while verifying object {e.Info.Id}.");
+        }
+
         try
         {
             return await VerifyPayloadAsync(e.Segment, e.PayloadOffset, e.Header, e.Info.Checksum, ct);
@@ -761,6 +923,25 @@ public sealed partial class ObjectStore : IAsyncDisposable
 
         /// <summary>Replaced by a compaction; the file is closed when the last reader releases it.</summary>
         public bool Retired { get; set; }
+
+        /// <summary>Number of failed flushes of this file (writes made before a failure may have been dropped).</summary>
+        public long FlushFailures { get; set; }
+    }
+
+    /// <summary>Outcome of <see cref="TryAcquireCurrent"/>.</summary>
+    private enum AcquireResult
+    {
+        Acquired,
+        NotCurrent,
+        Closed,
+    }
+
+    /// <summary>Puts of one object id written but still waiting for their barrier.</summary>
+    private sealed class PendingPut(ObjectRecordInfo info)
+    {
+        public ObjectRecordInfo Info { get; } = info;
+
+        public int Count { get; set; } = 1;
     }
 
     /// <summary>Index entry: where an object's current record lives.</summary>

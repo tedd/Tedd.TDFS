@@ -6,8 +6,8 @@ namespace Tedd.Tdfs.Storage;
 //   1. Seal the active segment (new puts go to a new segment with a higher major) and wait for in-flight puts on the
 //      sealed segments. Inputs = every existing segment; outputs are keyed (maxInput.Major, maxInput.Minor + 1 + n),
 //      so they order after every input and before every newer segment.
-//   2. Copy every live record (re-verified; damaged ones are quarantined instead) into ".ocmp" output files, flush
-//      them and the directory.                                                   [fault site compaction.copy before]
+//   2. Copy every live record (re-verified; damaged ones are quarantined instead; a read error or a closed store
+//      abandons the run) into ".ocmp" output files, flush them and the directory. [fault site compaction.copy before]
 //   3. Durably write the manifest (inputs + outputs) with AtomicFile: the commit point. [compaction.publish before]
 //   4. Rename outputs to ".oseg", flush the directory, switch the in-memory index.
 //   5. Delete the inputs, flush the directory, delete the manifest.              [compaction.delete before]
@@ -40,6 +40,11 @@ public sealed partial class ObjectStore
                 inputs = [.. _segments];
             }
 
+            // New writes go to a newer segment from now on, so the current one stops being the newest (the only one
+            // payload-verified at open): make it complete and durable first, including records of puts that are
+            // still waiting for their own barrier.
+            if (_active is { } sealing)
+                await SealLockedAsync(sealing, ct);
             _active = null;
         }
 
@@ -54,6 +59,7 @@ public sealed partial class ObjectStore
             await _medium.FlushDirectoryAsync(_directory, ct);
             if (_faults.IsEnabled)
                 await _faults.HitAsync(new FaultContext(FaultStage.F20, FaultSites.CompactionPublish, _options.NodeName, Operation: DfsOperationKind.Compaction), ct);
+            ThrowIfDisposed();
             await AtomicFile.WriteAsync(_medium, ManifestPath, EncodeManifest([.. run.Inputs.Select(s => s.Key)], [.. run.Outputs.Select(s => s.Key)]), ct);
             run.Committed = true;
         }
@@ -151,10 +157,10 @@ public sealed partial class ObjectStore
             byte[] buffer = [.. records.SelectMany(r => r)];
             try
             {
-                (SegmentFile segment, long offset) = await AppendLockedAsync(buffer, records.Count, ct);
+                (SegmentFile segment, long offset) = await AppendLockedAsync(buffer, records.Count, mayRollOver: false, ct);
                 try
                 {
-                    await segment.File!.FlushAsync(ct);
+                    await FlushSegmentAsync(segment, ct);
                 }
                 catch
                 {
@@ -212,9 +218,16 @@ public sealed partial class ObjectStore
         foreach (IndexEntry e in live)
         {
             ct.ThrowIfCancellationRequested();
-            if (!TryAcquire(e))
-                continue;
-            byte[]? raw = null;
+            switch (TryAcquireCurrent(e))
+            {
+                case AcquireResult.NotCurrent:
+                    continue; // deleted, replaced or retired meanwhile: nothing to copy
+                case AcquireResult.Closed:
+                    // The store was closed: a record that could not be read is not a record that is no longer live.
+                    throw new ObjectDisposedException(nameof(ObjectStore), "The object store was closed during compaction.");
+            }
+
+            byte[]? raw;
             try
             {
                 raw = new byte[e.RecordLength];
@@ -222,8 +235,10 @@ public sealed partial class ObjectStore
                 if (!VerifyRawRecord(e, raw))
                     raw = null;
             }
-            catch (Exception ex) when (ex is EndOfStreamException || (ex is IOException && ex is not DfsException))
+            catch (EndOfStreamException)
             {
+                // The record is cut short on the device: damaged. Any other read error propagates and abandons the
+                // compaction: the bytes may be intact, and a committed compaction deletes whatever it did not copy.
                 raw = null;
             }
             finally
@@ -326,6 +341,22 @@ public sealed partial class ObjectStore
     /// <summary>Publishes a committed compaction: rename outputs, switch the index, delete inputs and the manifest.</summary>
     private async ValueTask CompleteCommittedAsync(CompactionRun run, CancellationToken ct)
     {
+        if (_disposed)
+        {
+            // A closed store leaves a committed compaction to the next open, which rolls it forward.
+            if (!run.Switched)
+            {
+                foreach (SegmentFile output in run.Outputs)
+                {
+                    IStorageFile? file = output.File;
+                    output.File = null;
+                    await StorageFormat.CloseQuietlyAsync(file);
+                }
+            }
+
+            ThrowIfDisposed();
+        }
+
         if (!run.Renamed)
         {
             foreach (SegmentFile output in run.Outputs)

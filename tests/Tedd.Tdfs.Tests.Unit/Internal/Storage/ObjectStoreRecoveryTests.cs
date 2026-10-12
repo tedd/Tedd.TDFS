@@ -313,7 +313,7 @@ public sealed class ObjectStoreRecoveryTests
 
         await using ObjectStore again = await OpenAsync();
         Assert.Equal(ObjectTestData.Content(1, 1000), await ObjectTestData.ReadAllAsync(again, ObjectTestData.Id(1)));
-        Assert.Single(again.Quarantined); // the record from the first open only; the quarantine record covers it
+        Assert.Empty(again.Quarantined); // reported once (first open); the durable quarantine record retires it for good
     }
 
     [Fact]

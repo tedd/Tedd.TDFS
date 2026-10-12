@@ -27,9 +27,53 @@ public sealed partial class ObjectStore
             _segments.Add(new SegmentFile(key, path) { File = file, Length = file.Length });
         }
 
-        var quarantine = new Dictionary<(SegmentKey, long), byte[]>();
+        var scanned = new List<ScannedRecord>();
         for (int i = 0; i < _segments.Count; i++)
-            await ScanSegmentAsync(_segments[i], i == _segments.Count - 1, quarantine, ct);
+            await ScanSegmentAsync(_segments[i], i == _segments.Count - 1, scanned, ct);
+
+        // A quarantine record retires the record at its target location (an earlier open, a scrub, a damaged copy
+        // replaced by an idempotent put, or the void record of an unacknowledged put). It is always written after its
+        // target, so every target is collected first: a retired record must neither be indexed nor displace an earlier
+        // valid record of the same object (which a later "remove if current" would then lose with it).
+        var retired = new HashSet<(SegmentKey, long)>();
+        foreach (ScannedRecord r in scanned)
+        {
+            if (r.Header.Kind == KindQuarantine)
+                retired.Add((r.Header.TargetKey, r.Header.TargetOffset));
+        }
+
+        var damaged = new List<ScannedRecord>();
+        SegmentFile? newest = _segments.Count > 0 ? _segments[^1] : null;
+        foreach (ScannedRecord r in scanned)
+        {
+            if (r.Header.Kind == KindObject)
+            {
+                if (retired.Contains((r.Segment.Key, r.Offset)))
+                    continue;
+
+                // Only the newest segment can hold records whose payload never reached the device (older segments are
+                // complete and durable before a newer one is created), so its payloads are always verified. Elsewhere a
+                // record is verified only when it would replace an earlier copy of the same object: a damaged newer
+                // copy must never hide an intact one.
+                bool intact = r.Segment == newest
+                    ? await VerifyPayloadAsync(r.Segment, r.Offset + r.Header.HeaderLength, r.Header, r.Header.Checksum, ct)
+                    : Lookup(r.Header.Id) is null || await VerifyDisplacingCopyAsync(r, ct);
+                if (!intact)
+                {
+                    damaged.Add(r);
+                    continue;
+                }
+            }
+
+            ApplyRecord(r.Header, r.Segment, r.Offset);
+        }
+
+        // Damage not retired yet is reported now and retired durably below.
+        foreach (ScannedRecord r in damaged)
+        {
+            Report(r.Header.Id, r.Segment.Path, r.Offset, "payload failed verification at open");
+            CountFailure();
+        }
 
         if (_segments.Count > 0)
         {
@@ -37,22 +81,22 @@ public sealed partial class ObjectStore
             _nextMajor = _segments.Max(s => s.Key.Major) + 1;
         }
 
-        if (quarantine.Count > 0)
+        if (damaged.Count > 0)
         {
-            byte[] buffer = [.. quarantine.OrderBy(q => q.Key.Item1).ThenBy(q => q.Key.Item2).SelectMany(q => q.Value)];
-            (SegmentFile segment, _) = await AppendLockedAsync(buffer, quarantine.Count, ct);
-            await segment.File!.FlushAsync(ct);
+            byte[] buffer = [.. damaged.SelectMany(r => BuildMarkerRecord(KindQuarantine, r.Header.Id, r.Header.Volume, r.Segment.Key, r.Offset))];
+            (SegmentFile segment, _) = await AppendLockedAsync(buffer, damaged.Count, mayRollOver: false, ct);
+            await FlushSegmentAsync(segment, ct);
         }
 
         await _medium.FlushDirectoryAsync(_directory, ct);
     }
 
-    /// <summary>Scans one segment, applying valid records to the index and skipping (and reporting) damage.</summary>
+    /// <summary>Scans one segment, collecting its valid records in order and skipping (and reporting) damaged regions.</summary>
     /// <param name="segment">Segment to scan (its file is open).</param>
-    /// <param name="isActive">True for the newest segment: payloads are verified and a torn tail is cut.</param>
-    /// <param name="quarantine">Damaged active-segment records that still need a durable quarantine record, keyed by location.</param>
+    /// <param name="isActive">True for the newest segment: a torn tail is cut and the result is flushed.</param>
+    /// <param name="scanned">Receives the valid records (complete header, record within the file) in file order.</param>
     /// <param name="ct">Cancellation token.</param>
-    private async ValueTask ScanSegmentAsync(SegmentFile segment, bool isActive, Dictionary<(SegmentKey, long), byte[]> quarantine, CancellationToken ct)
+    private async ValueTask ScanSegmentAsync(SegmentFile segment, bool isActive, List<ScannedRecord> scanned, CancellationToken ct)
     {
         IStorageFile file = segment.File!;
         long length = file.Length;
@@ -66,7 +110,7 @@ public sealed partial class ObjectStore
 
         if (!headerOk)
         {
-            if (isActive && (length <= SegmentHeaderSize || await FindNextRecordAsync(file, segment.Path, SegmentHeaderSize, length, ct) >= length))
+            if (isActive && (length <= SegmentHeaderSize || await NextRecordFromBoundaryAsync(file, segment.Path, SegmentHeaderSize, length, ct) >= length))
             {
                 // Torn creation of the newest segment: nothing in it was ever acknowledged.
                 await file.SetLengthAsync(0, ct);
@@ -91,25 +135,15 @@ public sealed partial class ObjectStore
             RecordHeader? h = await TryReadHeaderAsync(file, segment.Path, pos, length, ct);
             if (h is not null && pos + h.RecordLength <= length)
             {
-                if (isActive && h.Kind == KindObject && !await VerifyPayloadAsync(segment, pos + h.HeaderLength, h, h.Checksum, ct))
-                {
-                    Report(h.Id, segment.Path, pos, "payload failed verification at open");
-                    CountFailure();
-                    quarantine[(segment.Key, pos)] = BuildMarkerRecord(KindQuarantine, h.Id, h.Volume, segment.Key, pos);
-                }
-                else
-                {
-                    if (h.Kind == KindQuarantine)
-                        quarantine.Remove((h.TargetKey, h.TargetOffset)); // already retired durably
-                    ApplyRecord(h, segment, pos);
-                }
-
+                scanned.Add(new ScannedRecord(h, segment, pos));
                 segment.RecordCount++;
                 pos += h.RecordLength;
                 continue;
             }
 
-            long next = await FindNextRecordAsync(file, segment.Path, pos + 1, length, ct);
+            // A record whose header is intact but which runs past the end of the file was cut short: nothing can follow
+            // it, and its bytes are payload (possibly supplied by a client), never records, so they are not searched.
+            long next = h is not null ? length : await FindNextRecordAsync(file, segment.Path, pos + 1, length, ct);
             if (next >= length && isActive)
             {
                 // Torn tail of the active segment (unacknowledged writes): cut it off.
@@ -128,6 +162,31 @@ public sealed partial class ObjectStore
             await file.FlushAsync(ct);
     }
 
+    /// <summary>
+    /// Verifies a record of a sealed segment that would replace an earlier copy of the same object. Unreadable counts as
+    /// damaged (the earlier copy is kept); a copy whose key is unavailable cannot be judged and is accepted, as every
+    /// other sealed-segment record is.
+    /// </summary>
+    private async ValueTask<bool> VerifyDisplacingCopyAsync(ScannedRecord r, CancellationToken ct)
+    {
+        try
+        {
+            return await VerifyPayloadAsync(r.Segment, r.Offset + r.Header.HeaderLength, r.Header, r.Header.Checksum, ct);
+        }
+        catch (DfsRecoveryKeyMissingException)
+        {
+            return true;
+        }
+        catch (IOException ex) when (ex is not DfsException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>A valid record found by the open-time scan.</summary>
+    private sealed record ScannedRecord(RecordHeader Header, SegmentFile Segment, long Offset);
+
+    /// <summary>Applies a scanned record to the index (quarantine records were applied up front by skipping their targets).</summary>
     private void ApplyRecord(RecordHeader h, SegmentFile segment, long offset)
     {
         lock (_sync)
@@ -139,10 +198,6 @@ public sealed partial class ObjectStore
                     break;
                 case KindTombstone:
                     RemoveLocked(h.Id);
-                    break;
-                case KindQuarantine:
-                    if (_index.TryGetValue(h.Id, out IndexEntry? e) && e.Segment.Key == h.TargetKey && e.Offset == h.TargetOffset)
-                        RemoveLocked(h.Id);
                     break;
             }
         }
@@ -168,6 +223,19 @@ public sealed partial class ObjectStore
         fixedPart.CopyTo(raw, 0);
         await file.ReadFullyAsync(pos + FixedHeaderSize, raw.AsMemory(FixedHeaderSize), ct);
         return TryParseHeader(raw, path, pos, out RecordHeader header) ? header : null;
+    }
+
+    /// <summary>
+    /// Offset of the first valid, complete record at or after the record boundary <paramref name="pos"/>, or
+    /// <paramref name="length"/>. An intact header at the boundary decides alone: its record is either complete or cut
+    /// short (then nothing follows it).
+    /// </summary>
+    private static async ValueTask<long> NextRecordFromBoundaryAsync(IStorageFile file, string path, long pos, long length, CancellationToken ct)
+    {
+        RecordHeader? h = await TryReadHeaderAsync(file, path, pos, length, ct);
+        if (h is not null)
+            return pos + h.RecordLength <= length ? pos : length;
+        return await FindNextRecordAsync(file, path, pos + 1, length, ct);
     }
 
     /// <summary>Offset of the next valid, complete record at or after <paramref name="from"/>, or <paramref name="length"/>.</summary>

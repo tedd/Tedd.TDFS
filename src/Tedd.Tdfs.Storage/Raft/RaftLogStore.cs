@@ -116,6 +116,10 @@ public sealed class RaftLogStore : IAsyncDisposable
                 await store.LoadEntriesAsync(ct);
             }
 
+            // The store keeps its own view of the entries; the journal's replay buffer would otherwise pin every
+            // payload replayed at open, including entries discarded by later compactions.
+            journal.ReleaseReplayedRecords();
+
             if (hard.Commit > store.LastIndex)
             {
                 throw new DfsIntegrityException(
@@ -180,6 +184,7 @@ public sealed class RaftLogStore : IAsyncDisposable
         int next = 0;
         while (next < entries.Count && entries[next].Index <= _snapshot.Index)
             next++;
+        bool conflict = false;
         while (next < entries.Count && entries[next].Index <= LastIndex)
         {
             LogEntryRecord e = entries[next];
@@ -191,17 +196,29 @@ public sealed class RaftLogStore : IAsyncDisposable
 
             if (e.Index <= _hardState.Commit)
                 throw new InvalidOperationException($"Entry {e.Index} (term {e.Term}) conflicts with a committed entry.");
-            await _journal.TruncateAfterAsync((long)e.Index - 1, ct);
-            int keep = checked((int)(e.Index - 1 - _snapshot.Index));
-            _entries.RemoveRange(keep, _entries.Count - keep);
+            conflict = true;
             break;
+        }
+
+        if (next == entries.Count)
+            return;
+
+        // Validate before changing anything: a rejected batch must not have truncated the log durably.
+        LogEntryRecord firstNew = entries[next];
+        ulong previousTerm = TermAt(firstNew.Index - 1);
+        if (firstNew.Term < previousTerm)
+            throw new ArgumentException($"Entry {firstNew.Index} has term {firstNew.Term}, below the term {previousTerm} of the entry before it.", nameof(entries));
+
+        if (conflict)
+        {
+            await _journal.TruncateAfterAsync((long)firstNew.Index - 1, ct);
+            int keep = checked((int)(firstNew.Index - 1 - _snapshot.Index));
+            _entries.RemoveRange(keep, _entries.Count - keep);
         }
 
         for (; next < entries.Count; next++)
         {
             LogEntryRecord e = entries[next];
-            if (e.Term < LastTerm)
-                throw new ArgumentException($"Entry {e.Index} has term {e.Term}, below the last term {LastTerm}.", nameof(entries));
             var copy = new LogEntryRecord(e.Index, e.Term, e.Kind, e.Data.ToArray());
             long index = await _journal.AppendAsync(EncodeEntry(copy), ct);
             if ((ulong)index != e.Index)

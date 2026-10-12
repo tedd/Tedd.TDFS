@@ -9,9 +9,11 @@ namespace Tedd.Tdfs.Storage;
 /// <remarks>
 /// <para><b>Layout.</b> The directory holds segment files named <c>{firstIndex:x16}.jseg</c>. A segment starts with a
 /// 24-byte header (<c>u32 magic "TDJS" | u16 version | u16 flags | i64 firstIndex | u32 reserved | u32 CRC-32C</c>)
-/// followed by records. A record is a 40-byte header (<c>u32 magic "TJRL" | u8 kind | u8 flags | u16 0 |
-/// u32 storedLength | u32 keyVersion | i64 index | i64 durableThrough | u32 0 | u32 header CRC-32C</c>), the stored
-/// payload and a 4-byte trailer (CRC-32C of header + payload). Entry records carry contiguous indexes; marker records
+/// followed by records. Header flag 1 marks a <i>reset</i> segment (created by <see cref="DropBeforeAsync"/> past the
+/// last record, before the old segments are deleted): recovery treats every older segment as obsolete. A record is a
+/// 40-byte header (<c>u32 magic "TJRL" | u8 kind | u8 flags | u16 0 | u32 storedLength | u32 keyVersion | i64 index |
+/// i64 durableThrough | u32 0 | u32 header CRC-32C</c>), the stored payload and a 4-byte trailer (CRC-32C of header +
+/// payload). Entry records carry contiguous indexes; marker records
 /// carry no payload and certify durability (one is written, without an extra barrier, after every successful flush, and
 /// flushed on clean close).</para>
 /// <para><b>Encryption.</b> With a cipher, payloads are sealed with the cipher's current key version and associated
@@ -25,7 +27,10 @@ namespace Tedd.Tdfs.Storage;
 /// made durable. At open, damage in a sealed (non-last) segment, or damage in the last segment that a later valid record
 /// proves durable, throws <see cref="DfsIntegrityException"/>; any other damage in the last segment is a torn tail and
 /// is truncated. Corruption of the final flushed batch is indistinguishable from a torn write only when its marker
-/// never reached the device (power loss right after the flush); it is then treated as a torn tail.</para>
+/// never reached the device (power loss right after the flush); it is then treated as a torn tail. Bytes inside a
+/// record whose header is intact (payload, possibly supplied by a client) are never searched for later records. Several
+/// segments are deleted one durable step at a time, so file systems that persist unflushed unlinks in any order still
+/// leave a contiguous run of segments.</para>
 /// <para>Calls are serialized internally; the journal is intended for one owner on a node loop.</para>
 /// </remarks>
 public sealed class Journal : IAsyncDisposable
@@ -42,6 +47,9 @@ public sealed class Journal : IAsyncDisposable
     internal const byte KindEntry = 1;
     internal const byte KindMarker = 2;
     internal const byte FlagEncrypted = 1;
+
+    /// <summary>Segment header flag: the segment starts a fresh journal and every older segment is obsolete.</summary>
+    internal const ushort SegmentFlagReset = 1;
 
     private readonly IStorageMedium _medium;
     private readonly string _directory;
@@ -178,17 +186,14 @@ public sealed class Journal : IAsyncDisposable
             if (keepSegment < 0)
                 throw new InvalidOperationException($"No segment holds index {index + 1}.");
 
-            // Later segments go first (newest first) and durably, so a crash can only leave a prefix of the old log.
-            if (keepSegment < _segments.Count - 1)
+            // Later segments go first (newest first), each one durably before the next (file systems need not persist
+            // unflushed unlinks in order), so a crash can only leave a contiguous prefix of the old log.
+            for (int s = _segments.Count - 1; s > keepSegment; s--)
             {
-                for (int s = _segments.Count - 1; s > keepSegment; s--)
-                {
-                    await CloseSegmentFileAsync(_segments[s]);
-                    await _medium.DeleteAsync(_segments[s].Path, ct);
-                }
-
+                await CloseSegmentFileAsync(_segments[s]);
+                await _medium.DeleteAsync(_segments[s].Path, ct);
                 await _medium.FlushDirectoryAsync(_directory, ct);
-                _segments.RemoveRange(keepSegment + 1, _segments.Count - keepSegment - 1);
+                _segments.RemoveAt(s);
             }
 
             Segment seg = _segments[keepSegment];
@@ -216,7 +221,8 @@ public sealed class Journal : IAsyncDisposable
     /// Drops records with an index lower than <paramref name="index"/> (segment granularity: a segment is deleted only
     /// when all of its records are below <paramref name="index"/>). Buffered records are flushed first. When
     /// <paramref name="index"/> is beyond the last record the journal becomes empty and continues at
-    /// <paramref name="index"/> (recorded durably in a new empty segment). Durable on return.
+    /// <paramref name="index"/> (recorded durably in a new empty reset segment, created atomically before the old
+    /// segments are deleted, so a crash leaves either the old records or the new start). Durable on return.
     /// </summary>
     public async ValueTask DropBeforeAsync(long index, CancellationToken ct = default)
     {
@@ -242,29 +248,33 @@ public sealed class Journal : IAsyncDisposable
             }
 
             bool all = deleteCount == _segments.Count;
-            if (deleteCount > 0)
-            {
-                // Oldest first: a crash leaves a contiguous suffix of segments.
-                for (int s = 0; s < deleteCount; s++)
-                {
-                    await CloseSegmentFileAsync(_segments[s]);
-                    await _medium.DeleteAsync(_segments[s].Path, ct);
-                }
-
-                await _medium.FlushDirectoryAsync(_directory, ct);
-                _segments.RemoveRange(0, deleteCount);
-            }
-
             if (all)
             {
+                // The new start index is recorded durably (in a reset segment) BEFORE anything is deleted: a crash
+                // then leaves either the old segments only, or a reset segment that makes every older one obsolete
+                // (recovery discards them). Deleting first would leave an empty directory that forgets the new start.
                 long newFirst = Math.Max(index, _nextIndex);
+                await CreateResetSegmentAsync(newFirst, ct);
                 _nextIndex = newFirst;
                 _writtenIndex = newFirst - 1;
                 _durableIndex = newFirst - 1;
                 _certifiedOnDisk = newFirst - 1;
-                Segment seg = await CreateSegmentAsync(newFirst, ct);
-                await seg.File!.FlushAsync(ct);
-                await _medium.FlushDirectoryAsync(_directory, ct);
+            }
+
+            if (deleteCount > 0)
+            {
+                // Oldest first, and (unless a reset segment already makes them all obsolete) each one durably before
+                // the next, since file systems need not persist unflushed unlinks in order: a crash then leaves a
+                // contiguous suffix of segments.
+                for (int s = 0; s < deleteCount; s++)
+                {
+                    await CloseSegmentFileAsync(_segments[s]);
+                    await _medium.DeleteAsync(_segments[s].Path, ct);
+                    if (!all || s == deleteCount - 1)
+                        await _medium.FlushDirectoryAsync(_directory, ct);
+                }
+
+                _segments.RemoveRange(0, deleteCount);
             }
         }
         catch (Exception ex)
@@ -300,6 +310,12 @@ public sealed class Journal : IAsyncDisposable
 
     /// <inheritdoc />
     public override string ToString() => $"Journal({_medium.Name}:{_directory}, [{FirstIndex}..{LastIndex}])";
+
+    /// <summary>
+    /// Drops the reference to the records replayed at open (<see cref="Records"/> becomes empty) once the owner has
+    /// taken what it needs, so payloads the owner later discards (for example after log compaction) can be freed.
+    /// </summary>
+    internal void ReleaseReplayedRecords() => _records = [];
 
     internal static string SegmentFileName(long firstIndex) => StorageFormat.Hex16((ulong)firstIndex) + SegmentExtension;
 
@@ -459,17 +475,89 @@ public sealed class Journal : IAsyncDisposable
         return seg;
     }
 
+    /// <summary>
+    /// Durably creates an empty reset segment starting at <paramref name="firstIndex"/> (header flag
+    /// <see cref="SegmentFlagReset"/>: every older segment is obsolete). The segment appears atomically (temp file, flush,
+    /// rename, directory flush), so a crash never leaves a torn reset segment behind a gap.
+    /// </summary>
+    private async ValueTask<Segment> CreateResetSegmentAsync(long firstIndex, CancellationToken ct)
+    {
+        string path = SegmentPath(firstIndex);
+        string temp = path + AtomicFile.TempSuffix;
+        IStorageFile staged = await _medium.OpenAsync(temp, StorageOpenMode.Truncate, ct);
+        try
+        {
+            await staged.WriteFullyAsync(0, EncodeSegmentHeader(firstIndex, SegmentFlagReset), ct);
+            await staged.FlushAsync(ct);
+        }
+        finally
+        {
+            await StorageFormat.CloseQuietlyAsync(staged);
+        }
+
+        await _medium.RenameAsync(temp, path, overwrite: true, ct);
+        await _medium.FlushDirectoryAsync(_directory, ct);
+        IStorageFile file = await _medium.OpenAsync(path, StorageOpenMode.OpenExisting, ct);
+        var seg = new Segment(firstIndex, path) { File = file, Length = SegmentHeaderSize };
+        _segments.Add(seg);
+        return seg;
+    }
+
+    /// <summary>True when the segment at <paramref name="path"/> has a valid header carrying <see cref="SegmentFlagReset"/>.</summary>
+    private async ValueTask<bool> IsResetSegmentAsync(string path, long first, CancellationToken ct)
+    {
+        IStorageFile file = await _medium.OpenAsync(path, StorageOpenMode.OpenExisting, ct);
+        try
+        {
+            if (file.Length < SegmentHeaderSize)
+                return false;
+            var header = new byte[SegmentHeaderSize];
+            await file.ReadFullyAsync(0, header, ct);
+            return ParseSegmentHeader(header, first, out _, out ushort flags) == HeaderStatus.Ok && (flags & SegmentFlagReset) != 0;
+        }
+        finally
+        {
+            await StorageFormat.CloseQuietlyAsync(file);
+        }
+    }
+
     private async ValueTask RecoverAsync(CancellationToken ct)
     {
         IReadOnlyList<string> names = await _medium.ListAsync(_directory, ct);
         var found = new List<long>();
+        bool cleaned = false;
         foreach (string name in names)
         {
             if (TryParseSegmentFileName(name, out long first))
+            {
                 found.Add(first);
+            }
+            else if (name.EndsWith(SegmentExtension + AtomicFile.TempSuffix, StringComparison.Ordinal))
+            {
+                // A reset segment that was never published (crash before its rename).
+                await _medium.DeleteAsync(StoragePath.Combine(_directory, name), ct);
+                cleaned = true;
+            }
         }
 
         found.Sort();
+
+        // The newest reset segment (written by DropBeforeAsync past the end before it deletes anything) makes every
+        // older segment obsolete: they are leftovers of an interrupted drop and are deleted durably, oldest first.
+        for (int i = found.Count - 1; i > 0; i--)
+        {
+            if (!await IsResetSegmentAsync(SegmentPath(found[i]), found[i], ct))
+                continue;
+            for (int k = 0; k < i; k++)
+                await _medium.DeleteAsync(SegmentPath(found[k]), ct);
+            found.RemoveRange(0, i);
+            cleaned = true;
+            break;
+        }
+
+        if (cleaned)
+            await _medium.FlushDirectoryAsync(_directory, ct);
+
         var records = new List<JournalRecord>();
         long expected = -1;
         long maxCertified = long.MinValue;
@@ -546,7 +634,7 @@ public sealed class Journal : IAsyncDisposable
                             $"Journal segment '{path}' is damaged at offset {pos} (record {expected}); sealed segments must be complete.");
                     }
 
-                    if (ScanCertification(data, pos + 1) >= expected)
+                    if (ScanCertification(data, DamagedRecordEnd(data, pos)) >= expected)
                     {
                         throw new DfsIntegrityException(
                             $"Journal record {expected} at offset {pos} of '{path}' is corrupt, but later records prove it was durable.");
@@ -640,6 +728,24 @@ public sealed class Journal : IAsyncDisposable
 
     private ParseStatus TryParseRecord(ReadOnlySpan<byte> data, int pos, long? expected, out ParsedRecord rec)
     {
+        ParseStatus header = TryParseRecordHeader(data, pos, out rec);
+        if (header != ParseStatus.Ok)
+            return header;
+        if (data.Length - pos < rec.TotalLength)
+            return ParseStatus.Incomplete;
+        if (!StorageFormat.CheckCrc(data.Slice(pos, rec.TotalLength), RecordHeaderSize + rec.StoredLength))
+            return ParseStatus.Corrupt;
+        if (expected is long e && ((rec.Kind == KindEntry && rec.Index != e) || (rec.Kind == KindMarker && rec.Index >= e)))
+            return ParseStatus.Corrupt;
+        return ParseStatus.Ok;
+    }
+
+    /// <summary>
+    /// Validates the 40-byte record header at <paramref name="pos"/> (magic, header CRC and field consistency) without
+    /// looking at the payload or trailer. On success <paramref name="rec"/> describes the record's claimed extent.
+    /// </summary>
+    private ParseStatus TryParseRecordHeader(ReadOnlySpan<byte> data, int pos, out ParsedRecord rec)
+    {
         rec = default;
         if (data.Length - pos < RecordHeaderSize)
             return ParseStatus.Incomplete;
@@ -659,38 +765,43 @@ public sealed class Journal : IAsyncDisposable
             || stored > (uint)(_options.MaxRecordSize + CipherSupport.MaxOverhead)
             || ((flags & FlagEncrypted) != 0) != (keyVersion != 0)
             || (kind == KindMarker && (stored != 0 || flags != 0))
+            || (kind == KindEntry && durable >= index)
             || index < 0)
         {
             return ParseStatus.Corrupt;
         }
 
         int total = RecordHeaderSize + (int)stored + TrailerSize;
-        if (data.Length - pos < total)
-            return ParseStatus.Incomplete;
-        if (!StorageFormat.CheckCrc(data.Slice(pos, total), RecordHeaderSize + (int)stored))
-            return ParseStatus.Corrupt;
-        if (kind == KindEntry && durable >= index)
-            return ParseStatus.Corrupt;
-        if (expected is long e && ((kind == KindEntry && index != e) || (kind == KindMarker && index >= e)))
-            return ParseStatus.Corrupt;
-
         rec = new ParsedRecord(kind, flags, keyVersion, index, durable, pos + RecordHeaderSize, (int)stored, total);
         return ParseStatus.Ok;
     }
 
-    /// <summary>Highest durability certificate carried by any valid record at or after <paramref name="from"/>.</summary>
-    private long ScanCertification(ReadOnlySpan<byte> data, int from)
+    /// <summary>
+    /// Offset after the damaged record at <paramref name="pos"/>: the end of its claimed extent when its header is intact
+    /// (only its payload or trailer is damaged or missing), otherwise <paramref name="pos"/> + 1.
+    /// </summary>
+    private long DamagedRecordEnd(ReadOnlySpan<byte> data, int pos)
+        => TryParseRecordHeader(data, pos, out ParsedRecord rec) == ParseStatus.Ok ? (long)pos + rec.TotalLength : pos + 1L;
+
+    /// <summary>
+    /// Highest durability certificate carried by any valid record at or after <paramref name="from"/>. A record whose
+    /// header is intact is skipped as a whole even when its payload or trailer is damaged: bytes inside a record are
+    /// payload (possibly supplied by a client), never records, so they can neither certify nor hide anything.
+    /// </summary>
+    private long ScanCertification(ReadOnlySpan<byte> data, long from)
     {
         long certified = long.MinValue;
-        int limit = data.Length - RecordHeaderSize;
-        int q = Math.Max(from, 0);
+        long limit = data.Length - RecordHeaderSize;
+        long q = Math.Max(from, 0);
         while (q <= limit)
         {
-            if (BinaryPrimitives.ReadUInt32LittleEndian(data[q..]) == StorageFormat.JournalRecordMagic
-                && TryParseRecord(data, q, null, out ParsedRecord rec) == ParseStatus.Ok)
+            int at = (int)q;
+            if (BinaryPrimitives.ReadUInt32LittleEndian(data[at..]) == StorageFormat.JournalRecordMagic
+                && TryParseRecordHeader(data, at, out ParsedRecord header) == ParseStatus.Ok)
             {
-                certified = Math.Max(certified, rec.Kind == KindEntry ? rec.DurableThrough : rec.Index);
-                q += rec.TotalLength;
+                if (TryParseRecord(data, at, null, out ParsedRecord rec) == ParseStatus.Ok)
+                    certified = Math.Max(certified, rec.Kind == KindEntry ? rec.DurableThrough : rec.Index);
+                q += header.TotalLength;
             }
             else
             {
@@ -701,12 +812,12 @@ public sealed class Journal : IAsyncDisposable
         return certified;
     }
 
-    private static byte[] EncodeSegmentHeader(long firstIndex)
+    private static byte[] EncodeSegmentHeader(long firstIndex, ushort flags = 0)
     {
         var header = new byte[SegmentHeaderSize];
         BinaryPrimitives.WriteUInt32LittleEndian(header, StorageFormat.JournalSegmentMagic);
         BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(4), FormatVersion);
-        BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(6), 0);
+        BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(6), flags);
         BinaryPrimitives.WriteInt64LittleEndian(header.AsSpan(8), firstIndex);
         BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(16), 0);
         StorageFormat.SealCrc(header, 20);
@@ -714,14 +825,19 @@ public sealed class Journal : IAsyncDisposable
     }
 
     private static HeaderStatus ParseSegmentHeader(ReadOnlySpan<byte> data, long expectedFirst, out ushort version)
+        => ParseSegmentHeader(data, expectedFirst, out version, out _);
+
+    private static HeaderStatus ParseSegmentHeader(ReadOnlySpan<byte> data, long expectedFirst, out ushort version, out ushort flags)
     {
         version = 0;
+        flags = 0;
         if (data.Length < SegmentHeaderSize)
             return HeaderStatus.Damaged;
         if (BinaryPrimitives.ReadUInt32LittleEndian(data) != StorageFormat.JournalSegmentMagic || !StorageFormat.CheckCrc(data, 20))
             return HeaderStatus.Damaged;
         version = BinaryPrimitives.ReadUInt16LittleEndian(data[4..]);
-        if (version != FormatVersion || BinaryPrimitives.ReadUInt16LittleEndian(data[6..]) != 0)
+        flags = BinaryPrimitives.ReadUInt16LittleEndian(data[6..]);
+        if (version != FormatVersion || (flags & ~SegmentFlagReset) != 0)
             return HeaderStatus.Unsupported;
         if (BinaryPrimitives.ReadInt64LittleEndian(data[8..]) != expectedFirst)
             return HeaderStatus.Damaged;
