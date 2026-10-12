@@ -19,7 +19,7 @@ public Task<RawStagedWriter> OpenStagedWriterAsync(string volume, string path, F
 ```
 Opens a writable handle (`FileAccess.Write`, `FileShare.Read`) through the volume leader, creates a staging session bound
 to it and returns a `RawStagedWriter`. Open/staging failures throw the mapped SDK exception (`DfsErrors.ToException`).
-**Used by:** LAY-018, LAY-019, REP-012, REP-013.
+**Used by:** LAY-018, LAY-019, REP-012, REP-013, REP-017 (`_MixtureNeverSatisfies`).
 
 ## `RawStagedWriter` (new) — `RawStagedWriter.cs`
 
@@ -46,7 +46,7 @@ Behaviour:
   `newLength`, the extent refs exactly as given (no helper-side validation) and each receipt's `Wire` bytes verbatim;
   returns the server's error code.
 
-**Used by:** LAY-018 (`_CommitExtents`), LAY-019 (`_ConflictingReupload`), REP-012, REP-013.
+**Used by:** LAY-018 (`_CommitExtents`), LAY-019 (`_ConflictingReupload`), REP-012, REP-013, REP-017 (`_MixtureNeverSatisfies`).
 
 ## `RawReceipt`, `RawPutResult`, `RawExtentSpec` (new records) — `RawReceipt.cs`
 
@@ -65,7 +65,7 @@ public sealed record RawExtentSpec(long Offset, long Length, ObjectId Object, lo
 `RawReceipt` carries the decoded receipt fields (ARCHITECTURE §6: object, checksum, length, encoding, node id,
 incarnation, placement epoch) for assertions and the exact encoded receipt (`Wire`, fields + MAC) for replay/tampering.
 `RawExtentSpec` mirrors the `ExtentRef` of a `CommitFile` change; every field is sent verbatim.
-**Used by:** LAY-018, LAY-019, REP-012, REP-013.
+**Used by:** LAY-018, LAY-019, REP-012, REP-013, REP-017 (`_MixtureNeverSatisfies`).
 
 ## Conventions the tests rely on (no new members)
 

@@ -71,6 +71,58 @@ internal static class RepHelpers
         Assert.Equal(requiredZones, ex.RequiredZones);
         Assert.True(ex.AchievedCopies <= maxAchievedCopies, $"reported {ex.AchievedCopies} achieved copies; at most {maxAchievedCopies} exist");
         Assert.True(ex.AchievedZones <= maxAchievedZones, $"reported {ex.AchievedZones} achieved zones; at most {maxAchievedZones} exist");
+        Assert.True(ex.AchievedCopies < ex.RequiredCopies || ex.AchievedZones < ex.RequiredZones,
+            $"a placement failure must report a real deficit (achieved {ex.AchievedCopies}/{ex.AchievedZones}, required {ex.RequiredCopies}/{ex.RequiredZones})");
+    }
+
+    /// <summary>
+    /// Runs a publication that must not succeed because a required data target is missing. A placement failure must carry
+    /// honest counts. When the missing target is silent (paused, isolated or holding its flush) rather than refusing
+    /// connections, the SDK may instead give up on it with a timeout-class failure (<paramref name="silentTarget"/>);
+    /// success, quorum unavailability and unknown outcomes are never acceptable here (no commit can be proposed without
+    /// the receipts).
+    /// </summary>
+    public static async Task AssertPlacementBlockedAsync(Func<Task> action, int requiredCopies, int maxAchievedCopies, int requiredZones,
+        int maxAchievedZones, bool silentTarget, string what)
+    {
+        try
+        {
+            await action();
+        }
+        catch (DfsPlacementUnavailableException ex)
+        {
+            AssertPlacementCounts(ex, requiredCopies, maxAchievedCopies, requiredZones, maxAchievedZones);
+            return;
+        }
+        catch (Exception ex) when (silentTarget && ex is TimeoutException or DfsException { ErrorCode: DfsErrorCode.Timeout or DfsErrorCode.NodeUnavailable })
+        {
+            Log($"{what}: silent target reported as {ex.GetType().Name} ({(ex as DfsException)?.ErrorCode})");
+            return;
+        }
+
+        Assert.Fail($"{what}: succeeded without the required copies/zones");
+    }
+
+    /// <summary>Aborts and disposes a stream whose publication failed, without letting cleanup errors mask the test outcome.</summary>
+    public static async Task DiscardAsync(DfsStream stream)
+    {
+        try
+        {
+            await stream.AbortAsync(Ct);
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException or ObjectDisposedException or TimeoutException)
+        {
+            Log($"abort after a failed publication reported {ex.GetType().Name}: {ex.Message}");
+        }
+
+        try
+        {
+            await stream.DisposeAsync();
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException or TimeoutException)
+        {
+            Log($"dispose after a failed publication reported {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     /// <summary>

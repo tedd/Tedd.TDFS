@@ -161,7 +161,7 @@ public sealed class RepUnitTests
             if (variant == "ThirdNodeOffline")
                 await third.StopAsync();
             else
-                held = cluster.Faults.Arm(new FaultMatch(FaultSites.ObjectBeforeFlush, Node: "n2", Volume: Vol, Count: int.MaxValue), FaultAction.Block());
+                held = cluster.Faults.Arm(new FaultMatch(FaultSites.ObjectBeforeFlush, Node: "n2", Count: int.MaxValue), FaultAction.Block());
 
             await using DfsClient client = await cluster.ConnectAsync(new TestClientOptions { SeedNodes = ["n0", "n1"] }, Ct);
             DfsVolume vol = client.GetVolume(Vol);
@@ -169,7 +169,12 @@ public sealed class RepUnitTests
             CommitToken token = await vol.Files.WriteAllBytesAsync("/p", data, Ct);
             Assert.False(token.IsNone);
             if (held is not null)
+            {
+                // The third copy's flush is held either by the client's own upload or, if the client uploaded only the
+                // acknowledgement count, by the first repair attempt; either way n2 must reach the held flush.
+                await held.WaitTriggeredAsync(TimeSpan.FromSeconds(15));
                 cluster.Faults.AssertReached(held);
+            }
 
             IReadOnlyList<ObjectId> objects = await ObjectsOfAsync(cluster, "/p");
             foreach (ObjectId o in objects)
@@ -180,6 +185,9 @@ public sealed class RepUnitTests
                 Assert.Equal((2, 2), await cluster.Inspect.CountDurableDomainsAsync(o));
             }
 
+            // The leader learns locations from receipts/inventory reports; wait (bounded) for the deficit to be reported.
+            await cluster.WaitUntilAsync(async () => (await cluster.Admin.GetReplicaHealthAsync(Vol, Ct)).UnderReplicatedObjects >= objects.Count,
+                TimeSpan.FromSeconds(15), "the pending third copies must be reported as under-replicated", Ct);
             DfsReplicaHealth health = await cluster.Admin.GetReplicaHealthAsync(Vol, Ct);
             Assert.True(health.UnderReplicatedObjects >= objects.Count, $"the pending third copies must be reported ({health.UnderReplicatedObjects} < {objects.Count})");
             Assert.Equal(0, health.MissingObjects);
@@ -466,7 +474,7 @@ public sealed class RepUnitTests
         for (int p = 0; p < 4; p++)
         {
             var copy = nodes.ToList();
-            shuffler.Shuffle(copy);
+            Shuffle(shuffler, copy);
             permutations.Add(copy);
         }
 
@@ -492,7 +500,7 @@ public sealed class RepUnitTests
                 Assert.Equal(nodes.Count, fallback.Count);
                 Assert.All(reference, n => Assert.Contains(n, fallback));
 
-                int availableZones = nodes.Select(n => n.Labels.ZoneKey).Distinct().Count();
+                int availableZones = nodes.Select(n => (n.Labels.Region, n.Labels.Zone)).Distinct().Count();
                 int availableHosts = nodes.Select(n => n.Labels.Host).Distinct(StringComparer.Ordinal).Count();
                 (int hosts, int zones) = Placement.CountDomains(reference.Select(n => n.Labels));
                 Assert.Equal(Math.Min(Math.Min(policy.TargetDistinctZones, policy.TargetCopies), availableZones), Math.Min(zones, policy.TargetDistinctZones));
@@ -601,19 +609,25 @@ public sealed class RepUnitTests
 
             cluster.Node("n4").Disk.Fill(leaveFreeBytes: 4L << 20);
             await cluster.Admin.DrainNodeAsync("n3", Ct);
+            // Draining n3 must re-create its copies on eligible nodes: every old object reaches 3 hosts in 3 zones without
+            // counting n3 (n4 is full, so replacements can only land on n0..n2).
+            IReadOnlyList<DfsNodeInfo> listed = await cluster.Admin.ListNodesAsync(Ct);
+            var labelsByName = listed.ToDictionary(n => n.Name, n => n.Labels, StringComparer.Ordinal);
             await cluster.WaitUntilAsync(async () =>
             {
                 for (int i = 0; i < 4; i++)
                 {
                     foreach (ObjectId o in await ObjectsOfAsync(cluster, $"/old{i}"))
                     {
-                        if ((await cluster.Inspect.GetObjectHoldersAsync(o)).Contains("n3"))
+                        var withoutDrained = (await cluster.Inspect.GetObjectHoldersAsync(o)).Where(h => h != "n3").Select(h => labelsByName[h]);
+                        (int c, int z) = Placement.CountDomains(withoutDrained);
+                        if (c < 3 || z < 3)
                             return false;
                     }
                 }
 
                 return true;
-            }, TimeSpan.FromSeconds(30), "draining n3 must move its copies to eligible nodes", Ct);
+            }, TimeSpan.FromSeconds(30), "draining n3 must re-create its copies on eligible nodes", Ct);
             DfsNodeInfo n3 = (await cluster.Admin.ListNodesAsync(Ct)).Single(n => n.Name == "n3");
             Assert.True(n3.Status is DfsNodeStatus.Draining or DfsNodeStatus.Drained, $"n3 status {n3.Status}");
 
@@ -636,7 +650,10 @@ public sealed class RepUnitTests
                 Assert.True(holders.SetEquals(["n0", "n1"]), $"object {o} placed on [{string.Join(",", holders)}]; only n0/n1 are eligible");
             }
 
-            Assert.True((await cluster.Admin.GetReplicaHealthAsync(Vol, Ct)).UnderReplicatedObjects > 0, "the unreachable third target must be reported as a deficit");
+            await cluster.WaitUntilAsync(async () => (await cluster.Admin.GetReplicaHealthAsync(Vol, Ct)).UnderReplicatedObjects > 0,
+                TimeSpan.FromSeconds(15), "the missing third copy (no eligible third host) must be reported as a deficit", Ct);
+            foreach (ObjectId o in await ObjectsOfAsync(cluster, "/two-eligible"))
+                Assert.DoesNotContain(await cluster.Inspect.GetObjectHoldersAsync(o), h => h is "n2" or "n3" or "n4");
 
             cluster.Node("n1").Disk.Fill(leaveFreeBytes: 4L << 20);
             DfsPlacementUnavailableException ex = await AssertEx.ThrowsDfsAsync<DfsPlacementUnavailableException>(

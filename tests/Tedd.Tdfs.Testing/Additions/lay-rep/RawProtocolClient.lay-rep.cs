@@ -24,7 +24,7 @@ public sealed partial class RawProtocolClient
     /// returns a <see cref="RawStagedWriter"/> that can upload objects to chosen storage nodes and publish arbitrary
     /// (possibly invalid) extent maps with arbitrary (possibly forged, stale or mismatched) receipts. Failures to open the
     /// handle or the staging session throw the mapped SDK exception (<see cref="DfsErrors.ToException"/>). Used by
-    /// LAY-018, LAY-019, REP-012 and REP-013.
+    /// LAY-018, LAY-019, REP-012, REP-013 and REP-017.
     /// </summary>
     /// <param name="volume">Volume name.</param>
     /// <param name="path">Normalized path.</param>

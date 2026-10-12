@@ -67,6 +67,18 @@ internal static class RepHelpers
         Assert.Equal(requiredZones, ex.RequiredZones);
         Assert.True(ex.AchievedCopies <= maxAchievedCopies, $"reported {ex.AchievedCopies} achieved copies; at most {maxAchievedCopies} exist");
         Assert.True(ex.AchievedZones <= maxAchievedZones, $"reported {ex.AchievedZones} achieved zones; at most {maxAchievedZones} exist");
+        Assert.True(ex.AchievedCopies < ex.RequiredCopies || ex.AchievedZones < ex.RequiredZones,
+            $"a placement failure must report a real deficit (achieved {ex.AchievedCopies}/{ex.AchievedZones}, required {ex.RequiredCopies}/{ex.RequiredZones})");
+    }
+
+    /// <summary>Deterministic Fisher-Yates shuffle driven by the API-listed <see cref="IRandomSource.Next"/>.</summary>
+    public static void Shuffle<T>(IRandomSource random, IList<T> list)
+    {
+        for (int i = list.Count - 1; i > 0; i--)
+        {
+            int j = random.Next(i + 1);
+            (list[i], list[j]) = (list[j], list[i]);
+        }
     }
 
     /// <summary>Byte-exact comparison usable with awaited arguments.</summary>

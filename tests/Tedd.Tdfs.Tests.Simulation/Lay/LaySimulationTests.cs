@@ -150,16 +150,17 @@ public sealed class LaySimulationTests
     };
 
     /// <summary>
-    /// Overwriting a small range of a 2 MiB file replicates only the changed update unit(s) and one bounded mapping update:
-    /// stored bytes across all replicas, uploaded object bytes and the commit request are bounded by the change (plus an
-    /// explicitly measured metadata overhead), every untouched extent keeps its object, and the contents are exact.
+    /// Overwriting a small range of an 8 MiB (128-extent) file replicates only the changed update unit(s) and one bounded
+    /// mapping update: stored bytes across all replicas, uploaded object bytes and the commit request are bounded by the
+    /// change (plus an explicitly measured metadata overhead) — the commit bound is below the size of the file's whole
+    /// mapping — every untouched extent keeps its object, and the contents are exact.
     /// </summary>
     [Theory]
     [MemberData(nameof(OverwriteCases))]
     [Catalog("LAY-010", "S", "INV-01", "INV-02", "INV-09", "INV-16")]
     public async Task LAY_010_SmallOverwriteDoesNotResendWholeFile(string where, int length)
     {
-        const int size = 32 * 64 * 1024;
+        const int size = 128 * 64 * 1024;
         await ClusterTest.RunAsync(Deterministic(), async cluster =>
         {
             await using DfsClient client = await cluster.ConnectAsync(ct: Ct);
@@ -199,10 +200,17 @@ public sealed class LaySimulationTests
             Log($"{where}/{length}: stored {stored} B, uploaded {uploaded} B, commit {commit} B, raft {raft} B, puts {done.ObjectPuts - baseline.ObjectPuts}; " +
                 $"data bound {dataBound} B; whole-file resend would be {(long)size * copies} B");
 
+            // A resend of the whole mapping costs at least object id + checksum (32 bytes) per extent: with the 128 update
+            // units of this file that alone reaches the 4 KiB commit bound.
+            long wholeMappingFloor = 32L * before.Extents.Count;
+            const long commitBound = 4096;
+            Log($"{where}/{length}: {before.Extents.Count} extents before the overwrite; whole mapping >= {wholeMappingFloor} B");
             Assert.True(stored <= dataBound, $"a {length}-byte overwrite stored {stored} bytes across replicas (bound {dataBound})");
             Assert.True(uploaded <= dataBound, $"a {length}-byte overwrite uploaded {uploaded} bytes (bound {dataBound})");
-            Assert.True(commit > 0 && commit <= 4096, $"the mapping update for one changed range must be small, was {commit} bytes");
-            Assert.True(raft <= 256 * 1024, $"metadata replication for one small overwrite used {raft} bytes");
+            Assert.True(commit > 0 && commit <= commitBound,
+                $"the mapping update for one changed range must be small, was {commit} bytes (bound {commitBound}; whole mapping >= {wholeMappingFloor})");
+            // Includes heartbeats/keep-alives while waiting for repair; payload routed through the log would be >= 8 MiB per follower.
+            Assert.True(raft <= 1024 * 1024, $"metadata replication for one small overwrite used {raft} bytes (file {size} B)");
 
             patch.CopyTo(data, offset);
             Same(data, await ReadCompatibleAsync(vol, "/large"), $"{where}/{length}: contents");
@@ -225,9 +233,9 @@ public sealed class LaySimulationTests
     /// The mapping record of a publication (the metadata log entry carrying the new extent map) must be durable on a
     /// metadata majority before success is reported, even when every payload object is already durable:
     /// <list type="bullet">
-    /// <item>FollowersCut: payload receipts are validated, then the leader is cut from both followers before it can
-    /// replicate the entry — success is never reported while cut; after healing, the outcome is resolved and the file
-    /// shows exactly the old or the complete new revision.</item>
+    /// <item>FollowersCut: payload receipts are validated, then the leader (and the client) are cut from both followers
+    /// before the leader can replicate the entry — success is never reported while cut and the followers keep the old
+    /// revision; after healing, the outcome is resolved and the file shows exactly the old or the complete new revision.</item>
     /// <item>CrashLeaderAfterLocalAppend: the leader crashes right after appending the entry locally — the outcome is a
     /// success (after a retried commit), or unknown and then resolved; never a half-published mapping.</item>
     /// <item>OneFollowerCut: the leader plus one follower form the majority — success is reported, and after crashing the
@@ -281,8 +289,15 @@ public sealed class LaySimulationTests
 
             if (variant == "FollowersCut")
             {
+                // The client is also cut from the followers, so the only node it can reach is the isolated leader: an SDK
+                // retry of the same operation through a newly elected majority leader (which would legitimately succeed)
+                // cannot happen while the cut lasts, and any success reported now could only rest on the leader's local log.
                 foreach (string f in followers)
+                {
                     cluster.Network.CutBoth(leader.Name, f);
+                    cluster.Network.CutBoth("client:c0", f);
+                }
+
                 arm.Release();
                 for (int i = 0; i < 20; i++)
                 {
@@ -315,8 +330,10 @@ public sealed class LaySimulationTests
                 Assert.Equal(opId, unknown.OperationId);
             }
             catch (Exception ex) when (variant != "OneFollowerCut" && ex is DfsUnavailableException or TimeoutException
+                                       or DfsLeaseLostException or DfsSharingViolationException
                                        or DfsException { ErrorCode: DfsErrorCode.Timeout or DfsErrorCode.NotLeader })
             {
+                // Anything but an unknown outcome is a definite answer: the operation must then resolve as aborted.
                 definiteFailure = true;
             }
 
@@ -397,7 +414,12 @@ public sealed class LaySimulationTests
 
             await vol.Files.WriteAllBytesAsync("/retry", data, Ct);
             if (arm is not null)
+            {
+                // n1's upload may still be in flight when the 2-of-3 acknowledgement completes the write (or n1 may only be
+                // reached by repair): wait for the injected point instead of assuming it was hit before the reply.
+                await arm.WaitTriggeredAsync(TimeSpan.FromSeconds(15));
                 cluster.Faults.AssertReached(arm);
+            }
             if (rule is not null)
                 Assert.True(rule.Matched > 0, "the duplicated upload must have happened");
 
@@ -492,12 +514,38 @@ public sealed class LaySimulationTests
             await cluster.WaitForReplicationAsync(Vol, Ct);
             await cluster.DelayAsync(TimeSpan.FromSeconds(2), Ct);
             await using DfsClient client = await cluster.ConnectAsync(ct: Ct);
-            Same(a, await client.GetVolume(Vol).Files.ReadAllBytesAsync("/conflict", Ct), "published bytes are the original content");
-            Assert.True((await cluster.Inspect.GetObjectHoldersAsync(id)).Count >= 2, "the two matching receipts' holders remain verified holders");
+            DfsVolume vol = client.GetVolume(Vol);
+            Same(a, await vol.Files.ReadAllBytesAsync("/conflict", Ct), "published bytes are the original content");
+
+            // n0 and n2 (the receipts that proved the commit) keep the original content. n1 may still hold its
+            // conflicting copy — whether it is quarantined/replaced now is not the point — but it must never be served.
+            UInt128 published = ObjectChecksum.Compute(a);
+            var matching = new List<string>();
             foreach (string holder in await cluster.Inspect.GetObjectHoldersAsync(id))
             {
                 ObjectRecordInfo record = (await cluster.Node(holder).Inspect.ListObjectsAsync(Vol)).Single(r => r.Id == id);
-                Assert.Equal(ObjectChecksum.Compute(a), record.Checksum);
+                if (record.Checksum == published)
+                    matching.Add(holder);
+                else
+                    Assert.Equal("n1", holder);
+            }
+
+            Assert.Contains("n0", matching);
+            Assert.Contains("n2", matching);
+
+            // Force reads of the object away from n0/n2: the only copy left to serve is n1's (if it kept the conflicting
+            // bytes), which must be rejected against the published checksum — never returned as the file's content.
+            cluster.Network.DropNext(new MessageFilter(To: "n0", Type: MessageType.GetObject), count: 10_000);
+            cluster.Network.DropNext(new MessageFilter(To: "n2", Type: MessageType.GetObject), count: 10_000);
+            await using DfsClient forced = await cluster.ConnectAsync(new TestClientOptions { Name = "forced", OperationTimeout = TimeSpan.FromSeconds(5) }, Ct);
+            try
+            {
+                Same(a, await forced.GetVolume(Vol).Files.ReadAllBytesAsync("/conflict", Ct), "a successful read must be the published content");
+            }
+            catch (Exception ex) when (ex is DfsIntegrityException or DfsUnavailableException or TimeoutException
+                                       or DfsException { ErrorCode: DfsErrorCode.Timeout or DfsErrorCode.NodeUnavailable })
+            {
+                Log($"read with n0/n2 unavailable for object reads reported {ex.GetType().Name}: {ex.Message}");
             }
         }, Ct);
     }

@@ -33,8 +33,9 @@ public sealed class RepSimulationTests
 
     /// <summary>
     /// Policy acknowledge-three with exactly three eligible hosts: with one target crashed, isolated or paused, writes
-    /// through every publication path fail with placement unavailability (never succeed with two copies), leave the
-    /// previous revision current, and succeed with three copies in three zones once the target returns.
+    /// through every publication path fail with placement unavailability reporting honest counts (or, for a silent target,
+    /// a timeout-class failure) — never succeed with two copies — leave the previous revision current, and succeed with
+    /// three copies in three zones once the target returns.
     /// </summary>
     [Theory]
     [MemberData(nameof(AllCopiesCases))]
@@ -59,9 +60,9 @@ public sealed class RepSimulationTests
                 case "Pause": await n2.PauseAsync(); break;
             }
 
-            DfsPlacementUnavailableException ex = await AssertEx.ThrowsDfsAsync<DfsPlacementUnavailableException>(
-                () => RunOperationAsync(vol, operation, 3_001), DfsErrorCode.PlacementUnavailable);
-            AssertPlacementCounts(ex, requiredCopies: 3, maxAchievedCopies: 2, requiredZones: 3, maxAchievedZones: 2);
+            // A crashed target refuses connections; a paused or isolated one may simply stay silent until the SDK gives up.
+            await AssertPlacementBlockedAsync(() => RunOperationAsync(vol, operation, 3_001), requiredCopies: 3, maxAchievedCopies: 2,
+                requiredZones: 3, maxAchievedZones: 2, silentTarget: offline != "Crash", $"{offline}/{operation}");
 
             DfsFileInfo after = await vol.Files.GetInfoAsync("/a", Ct);
             Assert.Equal(before.Revision, after.Revision);
@@ -102,8 +103,8 @@ public sealed class RepSimulationTests
                     }
                     catch
                     {
-                        await s.AbortAsync(Ct);
-                        await s.DisposeAsync();
+                        // Always release the writer reservation, or the later reopen of "/a" would conflict with it.
+                        await DiscardAsync(s);
                         throw;
                     }
 
@@ -181,9 +182,14 @@ public sealed class RepSimulationTests
             {
                 await write;
             }
-            catch (DfsPlacementUnavailableException ex)
+            catch (Exception ex) when (ex is DfsPlacementUnavailableException or TimeoutException
+                                       or DfsException { ErrorCode: DfsErrorCode.Timeout or DfsErrorCode.NodeUnavailable })
             {
-                AssertPlacementCounts(ex, requiredCopies: 2, maxAchievedCopies: 2, requiredZones: 2, maxAchievedZones: 1);
+                // The SDK may give up on the silent second zone before the hold is released; that is a definite failure.
+                if (ex is DfsPlacementUnavailableException placement)
+                    AssertPlacementCounts(placement, requiredCopies: 2, maxAchievedCopies: 2, requiredZones: 2, maxAchievedZones: 1);
+                Assert.False(await vol.Files.ExistsAsync("/z", Ct) && (await vol.Files.GetInfoAsync("/z", Ct)).Length > 0,
+                    "a write that failed with one zone durable must not have published");
                 await vol.Files.WriteAllBytesAsync("/z", data, Ct);
             }
 
@@ -231,11 +237,13 @@ public sealed class RepSimulationTests
                 await setup.GetVolume(Vol).Files.WriteAllBytesAsync("/base", baseline, Ct);
             await cluster.WaitForReplicationAsync(Vol, Ct);
 
-            foreach (string n in lost)
-                await cluster.Node(n).CrashAsync();
-
+            // Connect while the cluster is whole (discovery is not what REP-010 tests); the client then only knows the
+            // survivors as seeds and must find whatever authority remains.
             await using DfsClient client = await cluster.ConnectAsync(new TestClientOptions { Name = "survivor", SeedNodes = survivors, OperationTimeout = TimeSpan.FromSeconds(3) }, Ct);
             DfsVolume vol = client.GetVolume(Vol);
+
+            foreach (string n in lost)
+                await cluster.Node(n).CrashAsync();
             byte[] during = TestData.Bytes(10_001, 2 * Chunk);
             var unknowns = new List<(DfsCommitOutcomeUnknownException Ex, string What)>();
 
@@ -349,9 +357,9 @@ public sealed class RepSimulationTests
             await vol.Files.WriteAllBytesAsync("/during", during, Ct);
             await AssertDurableAsync(cluster, "/during", 2, 2, $"{zone} lost: ack-two write");
             await vol.Directories.CreateDirectoryAsync("/meta-" + zone, Ct);
-            DfsPlacementUnavailableException ex = await AssertEx.ThrowsDfsAsync<DfsPlacementUnavailableException>(
-                () => vol.Files.WriteAllBytesAsync("/strong", during, new DfsMutationOptions { StoragePolicy = "all3" }, Ct), DfsErrorCode.PlacementUnavailable);
-            AssertPlacementCounts(ex, requiredCopies: 3, maxAchievedCopies: 2, requiredZones: 3, maxAchievedZones: 2);
+            await AssertPlacementBlockedAsync(() => vol.Files.WriteAllBytesAsync("/strong", during, new DfsMutationOptions { StoragePolicy = "all3" }, Ct),
+                requiredCopies: 3, maxAchievedCopies: 2, requiredZones: 3, maxAchievedZones: 2, silentTarget: mode == "Isolate", $"{zone} {mode}: ack-three write");
+            Assert.False(await vol.Files.ExistsAsync("/strong", Ct), "a rejected ack-three write must not publish");
 
             if (mode == "Crash")
             {
@@ -477,7 +485,7 @@ public sealed class RepSimulationTests
     /// Receipts are bound to the issuing node incarnation and placement epoch: a receipt from before an empty-disk
     /// restart, from a node relabelled into the other holder's zone, or from a removed node cannot satisfy the
     /// acknowledge-2-copies/2-zones policy; a receipt from before a same-disk restart counts only if the copy is verified
-    /// to still exist. Fresh receipts under the current incarnation/epoch then commit normally.
+    /// to still exist. Fresh receipts under the current incarnations/epoch (re-issued by idempotent re-puts) then commit.
     /// </summary>
     [Theory]
     [InlineData("EmptyDiskNewIncarnation")]
@@ -506,23 +514,28 @@ public sealed class RepSimulationTests
             switch (variant)
             {
                 case "EmptyDiskNewIncarnation":
+                {
                     await nb.CrashAsync();
                     await nb.ReplaceDiskWithEmptyAsync();
                     await nb.RestartAsync();
                     await cluster.WaitForStableAsync(ct: Ct);
-                    Assert.True(nb.Incarnation > rb.Incarnation, "restart must advance the incarnation");
+                    // The incarnation number of an empty replacement is not prescribed (its superblock is new); what matters
+                    // is that b's pre-replacement receipt can no longer prove a copy b does not hold.
                     Assert.False(await nb.Inspect.HasObjectAsync(x), "the replaced disk no longer holds the object");
-                    Assert.Equal(DfsErrorCode.PlacementUnavailable, await writer.CommitExtentsAsync(payload.Length, [extent], [ra, rb]));
+                    DfsErrorCode code = await writer.CommitExtentsAsync(payload.Length, [extent], [ra, rb]);
+                    Assert.True(code is DfsErrorCode.PlacementUnavailable or DfsErrorCode.StaleIncarnation, $"receipt from a replaced disk: {code}");
                     break;
+                }
+
                 case "RestartSameDisk":
                 {
                     await nb.CrashAsync(CrashMode.LoseUnflushed);
                     await nb.RestartAsync();
                     await cluster.WaitForStableAsync(ct: Ct);
-                    Assert.True(nb.Incarnation > rb.Incarnation);
+                    Assert.True(nb.Incarnation > rb.Incarnation, "a same-disk restart must advance the incarnation (ARCHITECTURE §2.2)");
                     Assert.True(await nb.Inspect.HasObjectAsync(x), "a receipted object was flushed before the receipt and survives the crash");
                     DfsErrorCode code = await writer.CommitExtentsAsync(payload.Length, [extent], [ra, rb]);
-                    Assert.True(code is DfsErrorCode.None or DfsErrorCode.PlacementUnavailable, $"stale-incarnation receipt: {code}");
+                    Assert.True(code is DfsErrorCode.None or DfsErrorCode.PlacementUnavailable or DfsErrorCode.StaleIncarnation, $"stale-incarnation receipt: {code}");
                     if (code == DfsErrorCode.None)
                     {
                         IReadOnlyList<string> holders = await cluster.Inspect.GetObjectHoldersAsync(x);
@@ -546,12 +559,16 @@ public sealed class RepSimulationTests
                     break;
                 }
                 case "RemovedNode":
+                {
                     await nb.CrashAsync();
                     await cluster.Admin.RemoveNodeAsync(b, force: true, Ct);
                     await cluster.WaitUntilAsync(async () => (await cluster.Admin.ListNodesAsync(Ct)).All(n => n.Name != b || n.Status == DfsNodeStatus.Removed),
                         TimeSpan.FromSeconds(10), "the removal must be committed", Ct);
-                    Assert.Equal(DfsErrorCode.PlacementUnavailable, await writer.CommitExtentsAsync(payload.Length, [extent], [ra, rb]));
+                    DfsErrorCode code = await writer.CommitExtentsAsync(payload.Length, [extent], [ra, rb]);
+                    Assert.True(code is DfsErrorCode.PlacementUnavailable or DfsErrorCode.StaleIncarnation, $"receipt from a removed node: {code}");
                     break;
+                }
+
                 default:
                     throw new ArgumentOutOfRangeException(nameof(variant));
             }
@@ -562,10 +579,15 @@ public sealed class RepSimulationTests
                 Assert.Equal(0L, rejected.Length);
             }
 
-            string fresh = variant is "EmptyDiskNewIncarnation" ? b : c;
-            RawReceipt rf = await PutAsync(writer, fresh, x, payload);
-            var receipts = new List<RawReceipt> { ra, rf };
-            Assert.Equal(DfsErrorCode.None, await writer.CommitExtentsAsync(payload.Length, [extent], receipts));
+            // Fresh receipts under the current incarnations and placement epoch (a's old receipt may itself be from an
+            // older epoch now, so it is re-issued too): b's new incarnation after a same-disk restart, otherwise c.
+            string second = variant == "RestartSameDisk" ? b : c;
+            RawReceipt raFresh = await PutAsync(writer, a, x, payload);
+            RawReceipt rf = await PutAsync(writer, second, x, payload);
+            if (variant == "RestartSameDisk")
+                Assert.True(rf.Incarnation > rb.Incarnation, "the re-issued receipt carries b's new incarnation");
+            var receipts = new List<RawReceipt> { raFresh, rf };
+            Assert.Equal(DfsErrorCode.None, await writer.CommitExtentsAsync(payload.Length, [RawExtentSpec.FromReceipt(raFresh, 0, payload.Length)], receipts));
             await AssertDurableAsync(cluster, "/epoch", 2, 2, $"{variant}: fresh receipts");
         }, Ct);
 
@@ -603,23 +625,29 @@ public sealed class RepSimulationTests
                 await vol.Files.WriteAllBytesAsync($"/u{i}", files[$"/u{i}"], Ct);
             }
 
-            bool rejected = false;
+            // The upgrade may be accepted as a pending migration, or refused/left unresolved while the third zone is down
+            // (an admin call that waits for the migration may time out). Either way it must not become effective.
+            bool accepted = true;
             try
             {
                 await cluster.Admin.SetDefaultPolicyAsync(Vol, AllThree, migrateExisting: true, Ct);
             }
-            catch (DfsPlacementUnavailableException)
+            catch (Exception ex) when (ex is DfsUnavailableException or TimeoutException or DfsCommitOutcomeUnknownException
+                                       or DfsException { ErrorCode: DfsErrorCode.Timeout })
             {
-                rejected = true;
+                accepted = false;
+                Log($"upgrade while a zone is offline reported {ex.GetType().Name}");
             }
 
             for (int i = 0; i < 12; i++)
             {
                 DfsPolicyMigrationStatus status = await cluster.Admin.GetPolicyMigrationStatusAsync(Vol, Ct);
-                Assert.False(status.Effective, "the stronger policy was advertised effective while no object can have three copies");
-                if (!rejected)
+                // When the upgrade was refused the status describes the old (one-copy) policy, which is legitimately effective.
+                Assert.False(status.Effective && status.Target == AllThree, "the stronger policy was advertised effective while no object can have three copies");
+                if (accepted)
                 {
                     Assert.Equal(AllThree, status.Target);
+                    Assert.False(status.Effective, "a pending upgrade must not be reported effective");
                     Assert.True(status.PendingObjects > 0, "pending migration work must be reported");
                 }
 
@@ -631,13 +659,13 @@ public sealed class RepSimulationTests
 
             await cluster.Node("n2").RestartAsync();
             await cluster.WaitForStableAsync(ct: Ct);
-            if (rejected)
+            if (!accepted)
                 await cluster.Admin.SetDefaultPolicyAsync(Vol, AllThree, migrateExisting: true, Ct);
 
             await cluster.WaitUntilAsync(async () =>
             {
                 DfsPolicyMigrationStatus status = await cluster.Admin.GetPolicyMigrationStatusAsync(Vol, Ct);
-                if (!status.Effective)
+                if (!status.Effective || status.Target != AllThree)
                     return false;
                 foreach (string path in files.Keys)
                     await AssertDurableAsync(cluster, path, 3, 3, "policy reported effective");
@@ -668,14 +696,17 @@ public sealed class RepSimulationTests
             await vol.Files.WriteAllBytesAsync("/f", data, new DfsMutationOptions { StoragePolicy = "weak" }, Ct);
             Assert.Equal("weak", (await vol.Files.GetInfoAsync("/f", Ct)).StoragePolicy);
 
+            // Accepted as a pending per-file migration, or refused/unresolved while the zone is down; never effective early.
             bool rejected = false;
             try
             {
                 await vol.Files.SetStoragePolicyAsync("/f", "strong", Ct);
             }
-            catch (DfsPlacementUnavailableException)
+            catch (Exception ex) when (ex is DfsUnavailableException or TimeoutException or DfsCommitOutcomeUnknownException
+                                       or DfsException { ErrorCode: DfsErrorCode.Timeout })
             {
                 rejected = true;
+                Log($"per-file upgrade while a zone is offline reported {ex.GetType().Name}");
             }
 
             for (int i = 0; i < 10; i++)
@@ -750,17 +781,25 @@ public sealed class RepSimulationTests
                 foreach (TestNode n in cluster.Nodes.Where(n => n.State == TestNodeState.Crashed).ToList())
                     await n.RestartAsync();
 
-                DfsPolicyMigrationStatus status = await cluster.Admin.GetPolicyMigrationStatusAsync(Vol, Ct);
-                bool allSingle = true;
+                // Read the holders first and the migration status afterwards: "effective" is monotonic, so a status that is
+                // still not effective after the holder reads proves the holders were observed before the transition.
+                // Holder counts only include running nodes, so copy-count checks apply only when no node was down meanwhile.
+                bool allRunning = cluster.Nodes.All(n => n.State == TestNodeState.Running);
+                var observed = new List<(ObjectId Object, IReadOnlyList<string> Holders)>();
                 foreach (ObjectId o in objects)
+                    observed.Add((o, await cluster.Inspect.GetObjectHoldersAsync(o)));
+                DfsPolicyMigrationStatus status = await cluster.Admin.GetPolicyMigrationStatusAsync(Vol, Ct);
+                allRunning &= cluster.Nodes.All(n => n.State == TestNodeState.Running);
+
+                bool allSingle = true;
+                foreach ((ObjectId o, IReadOnlyList<string> holders) in observed)
                 {
-                    IReadOnlyList<string> holders = await cluster.Inspect.GetObjectHoldersAsync(o);
-                    if (!status.Effective)
+                    if (!status.Effective && allRunning)
                     {
                         (int c, int z) = Domains(holders, labels);
                         Assert.True(c >= 2 && z >= 2, $"step {step}: object {o} dropped to {c} copies/{z} zones before the downgrade was effective");
                     }
-                    else if (variant != "CrashDuringDelete" || cluster.Nodes.All(n => n.State == TestNodeState.Running))
+                    else if (allRunning)
                     {
                         Assert.True(holders.Count >= 1, $"step {step}: object {o} has no verified copy left");
                     }
@@ -768,7 +807,7 @@ public sealed class RepSimulationTests
                     allSingle &= holders.Count == 1;
                 }
 
-                converged = status.Effective && allSingle;
+                converged = status.Effective && allSingle && allRunning;
                 if (!converged)
                     await cluster.DelayAsync(TimeSpan.FromMilliseconds(100), Ct);
             }
@@ -788,8 +827,9 @@ public sealed class RepSimulationTests
 
     /// <summary>
     /// Rebalancing (drain a node, or add a node that changes deterministic targets) under foreground reads and writes:
-    /// whenever a replica is about to be deleted, the remaining verified copies already meet the target (3 hosts in 3
-    /// zones); foreground operations all succeed with exact bytes; placement converges to the new targets.
+    /// every replica deletion is held at its fault point, and for each live object the copies that remain once all its
+    /// pending deletions execute already meet the target (3 hosts in 3 zones); foreground operations all succeed with
+    /// exact bytes; placement converges to the new targets.
     /// </summary>
     [Theory]
     [InlineData("Drain")]
@@ -815,34 +855,41 @@ public sealed class RepSimulationTests
             int foregroundOps = 0;
             Task foreground = ForegroundAsync();
 
-            for (int k = 0; k < 3; k++)
+            // Hold every replica deletion (not just the first: unblocked ones would race past the checks), let the rebalance
+            // queue up its deletions, then check them jointly — after all pending deletions of an object execute, the copies
+            // left must still meet the target. Then release them all.
+            FaultArm arm = cluster.Faults.Arm(new FaultMatch(FaultSites.ReplicaDelete, Count: int.MaxValue), FaultAction.Block());
+            if (trigger == "Drain")
+                await cluster.Admin.DrainNodeAsync("n0", Ct);
+            else
+                await cluster.AddNodeAsync(new TestNodeSpec("n4", "z5"), ct: Ct);
+
+            await arm.WaitTriggeredAsync(TimeSpan.FromSeconds(30));
+            cluster.Faults.AssertReached(arm);
+            await cluster.DelayAsync(TimeSpan.FromSeconds(2), Ct);
+
+            IReadOnlyList<FaultContext> pending = arm.Contexts.ToList();
+            Log($"{trigger}: {pending.Count} replica deletions held");
+            VolumeStateInspection state = await cluster.Inspect.GetVolumeStateAsync(Vol);
+            IReadOnlySet<ObjectId> reachable = state.ReachableObjects();
+            IReadOnlyDictionary<string, DfsTopologyLabels> labels = await CurrentLabelsAsync(cluster.Admin);
+            Assert.All(pending, c => Assert.NotNull(c.Object));
+            int checkedDeletes = 0;
+            foreach (IGrouping<ObjectId, FaultContext> perObject in pending.GroupBy(c => c.Object!.Value))
             {
-                FaultArm arm = cluster.Faults.Arm(new FaultMatch(FaultSites.ReplicaDelete), FaultAction.Block());
-                if (k == 0)
-                {
-                    if (trigger == "Drain")
-                        await cluster.Admin.DrainNodeAsync("n0", Ct);
-                    else
-                        await cluster.AddNodeAsync(new TestNodeSpec("n4", "z5"), ct: Ct);
-                }
-
-                await arm.WaitTriggeredAsync(TimeSpan.FromSeconds(30));
-                cluster.Faults.AssertReached(arm);
-                FaultContext ctx = arm.Contexts[0];
-                Assert.NotNull(ctx.Object);
-                VolumeStateInspection state = await cluster.Inspect.GetVolumeStateAsync(Vol);
-                if (state.ReachableObjects().Contains(ctx.Object.Value))
-                {
-                    IReadOnlyDictionary<string, DfsTopologyLabels> labels = await CurrentLabelsAsync(cluster.Admin);
-                    var remaining = (await cluster.Inspect.GetObjectHoldersAsync(ctx.Object.Value)).Where(h => h != ctx.Node).ToList();
-                    (int copies, int zones) = Domains(remaining, labels);
-                    Assert.True(copies >= 3 && zones >= 3,
-                        $"replica of {ctx.Object} on {ctx.Node} deleted while only [{string.Join(",", remaining)}] ({copies}/{zones}) hold verified copies");
-                }
-
-                arm.Disarm();
-                arm.Release();
+                if (!reachable.Contains(perObject.Key))
+                    continue;
+                var deleting = perObject.Select(c => c.Node).ToHashSet(StringComparer.Ordinal);
+                var remaining = (await cluster.Inspect.GetObjectHoldersAsync(perObject.Key)).Where(h => !deleting.Contains(h)).ToList();
+                (int copies, int zones) = Domains(remaining, labels);
+                Assert.True(copies >= 3 && zones >= 3,
+                    $"replica(s) of {perObject.Key} on [{string.Join(",", deleting)}] deleted while only [{string.Join(",", remaining)}] ({copies}/{zones}) hold verified copies");
+                checkedDeletes++;
             }
+
+            Assert.True(checkedDeletes > 0, "the rebalance must delete at least one superseded replica of a live object");
+            arm.Disarm();
+            arm.Release();
 
             await stop.CancelAsync();
             await foreground;
@@ -905,8 +952,9 @@ public sealed class RepSimulationTests
 
     /// <summary>
     /// Staged chunks were acknowledged by n0 and n1 while both were in zone z1; then both are relabelled into z2 before the
-    /// flush (third zone's node offline). No consistent placement map — old, intermediate-per-node, or current — gives two
-    /// zones, only a mixture of epochs would; the flush must fail with placement unavailability and publish nothing.
+    /// flush (third zone's node offline). Neither the map pinned at staging (both z1) nor the current map (both z2) gives
+    /// two zones; only a mixture (n0 judged by its new label, n1 by its old one) would. Both a raw commit offering such
+    /// receipts and the SDK flush must fail with placement unavailability and publish nothing.
     /// </summary>
     [Fact]
     [Catalog("REP-017", "S", "INV-01", "INV-08", "INV-11", "INV-18")]
@@ -929,21 +977,51 @@ public sealed class RepSimulationTests
             DfsFileInfo before = await vol.Files.GetInfoAsync("/t", Ct);
             await cluster.Node("n2").StopAsync();
 
+            // Raw path: receipts for one object from n0 and n1 issued while both are in z1, offered after both moved to z2.
+            // This exercises the leader's receipt validation directly, independent of when the SDK checks placement.
+            TestNode leader = await cluster.GetLeaderAsync(Vol, Ct);
+            await using RawProtocolClient raw = await cluster.ConnectRawAsync(leader.Name, Ct);
+            Assert.Equal(DfsErrorCode.None, await raw.AuthenticateAsync(cluster.AdminCredentials));
+            await using RawStagedWriter writer = await raw.OpenStagedWriterAsync(Vol, "/raw", FileMode.CreateNew);
+            ObjectId x = ObjectId.New(new SeededRandom(17_050));
+            byte[] payload = TestData.Bytes(17_051, 6000);
+            var staged = new List<RawReceipt>();
+            foreach (string node in new[] { "n0", "n1" })
+            {
+                RawPutResult put = await writer.PutObjectAsync(node, x, payload);
+                Assert.Equal(DfsErrorCode.None, put.Error);
+                Assert.NotNull(put.Receipt);
+                staged.Add(put.Receipt);
+            }
+
+            // SDK path: chunks staged through a stream before the relabel. An SDK may already refuse them at upload time
+            // (both holders are in z1 under the map current then); that is a legal, earlier form of the same rejection.
             cluster.Network.Log.Reset();
             DfsStream s = await vol.Files.OpenAsync("/t", FileMode.Open, FileAccess.Write, FileShare.Read, Ct);
-            await s.WriteAsync(TestData.Bytes(17_001, 3 * Chunk).AsMemory(), Ct);
-            await cluster.WaitUntilAsync(() => Task.FromResult(cluster.Network.Log.CountMessages(new MessageFilter(Type: MessageType.PutObject)) > 0),
-                TimeSpan.FromSeconds(10), "staged chunks must be uploaded before the topology change", Ct);
+            DfsPlacementUnavailableException? sdkFailure = null;
+            try
+            {
+                await s.WriteAsync(TestData.Bytes(17_001, 3 * Chunk).AsMemory(), Ct);
+                await cluster.WaitUntilAsync(() => Task.FromResult(cluster.Network.Log.CountMessages(new MessageFilter(Type: MessageType.PutObject)) > 0),
+                    TimeSpan.FromSeconds(10), "staged chunks must be uploaded before the topology change", Ct);
+            }
+            catch (DfsPlacementUnavailableException early)
+            {
+                sdkFailure = early;
+            }
 
             IReadOnlyDictionary<string, DfsTopologyLabels> labels = await CurrentLabelsAsync(cluster.Admin);
             await cluster.Admin.SetNodeLabelsAsync("n0", labels["n0"] with { Zone = "z2" }, Ct);
             await cluster.Admin.SetNodeLabelsAsync("n1", labels["n1"] with { Zone = "z2" }, Ct);
 
-            DfsPlacementUnavailableException ex = await AssertEx.ThrowsDfsAsync<DfsPlacementUnavailableException>(() => s.FlushAsync(Ct), DfsErrorCode.PlacementUnavailable);
-            Assert.Equal(2, ex.RequiredZones);
-            Assert.True(ex.AchievedZones <= 1, $"reported {ex.AchievedZones} zones; no consistent map gives more than one");
-            await s.AbortAsync(Ct);
-            await s.DisposeAsync();
+            Assert.Equal(DfsErrorCode.PlacementUnavailable,
+                await writer.CommitExtentsAsync(payload.Length, [RawExtentSpec.FromReceipt(staged[0], 0, payload.Length)], staged));
+            Assert.Equal(0L, (await vol.Files.GetInfoAsync("/raw", Ct)).Length);
+
+            sdkFailure ??= await AssertEx.ThrowsDfsAsync<DfsPlacementUnavailableException>(() => s.FlushAsync(Ct), DfsErrorCode.PlacementUnavailable);
+            Assert.Equal(2, sdkFailure.RequiredZones);
+            Assert.True(sdkFailure.AchievedZones <= 1, $"reported {sdkFailure.AchievedZones} zones; neither the pinned nor the current map gives more than one");
+            await DiscardAsync(s);
 
             DfsFileInfo after = await vol.Files.GetInfoAsync("/t", Ct);
             Assert.Equal(before.Revision, after.Revision);
@@ -974,20 +1052,22 @@ public sealed class RepSimulationTests
             byte[] data = TestData.Bytes(17_100, 3 * Chunk);
 
             cluster.Network.Log.Reset();
-            await using (DfsStream s = await vol.Files.OpenAsync("/p", FileMode.CreateNew, FileAccess.Write, FileShare.Read, Ct))
+            DfsStream s = await vol.Files.OpenAsync("/p", FileMode.CreateNew, FileAccess.Write, FileShare.Read, Ct);
+            await s.WriteAsync(data.AsMemory(), Ct);
+            await cluster.WaitUntilAsync(() => Task.FromResult(cluster.Network.Log.CountMessages(new MessageFilter(Type: MessageType.PutObject)) > 0),
+                TimeSpan.FromSeconds(10), "staged chunks must be uploaded before the topology change", Ct);
+            await cluster.Admin.SetNodeLabelsAsync("n1", oldLabels["n1"] with { Zone = oldLabels["n0"].Zone }, Ct);
+            try
             {
-                await s.WriteAsync(data.AsMemory(), Ct);
-                await cluster.WaitUntilAsync(() => Task.FromResult(cluster.Network.Log.CountMessages(new MessageFilter(Type: MessageType.PutObject)) > 0),
-                    TimeSpan.FromSeconds(10), "staged chunks must be uploaded before the topology change", Ct);
-                await cluster.Admin.SetNodeLabelsAsync("n1", oldLabels["n1"] with { Zone = oldLabels["n0"].Zone }, Ct);
-                try
-                {
-                    await s.FlushAsync(Ct);
-                }
-                catch (DfsPlacementUnavailableException)
-                {
-                    await s.AbortAsync(Ct);
-                }
+                await s.FlushAsync(Ct);
+                await s.DisposeAsync();
+            }
+            catch (DfsPlacementUnavailableException placement)
+            {
+                // Rejecting the staged receipts under the migrated map is a legal outcome; the counts must be honest.
+                Assert.True(placement.AchievedCopies < placement.RequiredCopies || placement.AchievedZones < placement.RequiredZones,
+                    $"placement failure without a deficit ({placement.AchievedCopies}/{placement.AchievedZones})");
+                await DiscardAsync(s);
             }
 
             if (!await vol.Files.ExistsAsync("/p", Ct) || (await vol.Files.GetInfoAsync("/p", Ct)).Length != data.Length)
@@ -1030,9 +1110,10 @@ public sealed class RepSimulationTests
             await b1.RegisterAsync(Vol);
             await using DfsClient client = await cluster.ConnectAsync(ct: Ct);
             DfsVolume vol = client.GetVolume(Vol);
-            CommitToken token = await vol.Files.WriteAllBytesAsync("/barrier", TestData.Bytes(18_000, 2 * Chunk), Ct);
 
+            // b0 is disconnected before the commit exists, so no schedule can have shipped a covering checkpoint to it.
             cluster.Network.Isolate(b0.Name);
+            CommitToken token = await vol.Files.WriteAllBytesAsync("/barrier", TestData.Bytes(18_000, 2 * Chunk), Ct);
             await vol.Backups.RequestSyncAsync(b1.TargetName, ct: Ct);
             DfsBackupCheckpoint fromB1 = await vol.Backups.AwaitBackupAsync(b1.TargetName, token, TimeSpan.FromSeconds(30), Ct);
             Assert.Equal(b1.TargetName, fromB1.Target);
@@ -1065,9 +1146,11 @@ public sealed class RepSimulationTests
     }
 
     /// <summary>
-    /// An acknowledge-all-three policy is a fixed contract: disconnecting a target, or removing it from membership, during
-    /// staging makes the flush fail with placement unavailability (or, if the removal itself is refused, the target stays
-    /// and the flush succeeds with three copies) — it never succeeds with the two remaining copies.
+    /// An acknowledge-all-three policy is a fixed contract. The publication is waiting for its third target (n2's object
+    /// flush is held, so n2 has issued no receipt), then n2 is disconnected or removed from membership: the wait fails
+    /// with placement unavailability (or, for a silent disconnected target, a timeout-class failure) and nothing is
+    /// published — it never completes with the two remaining copies. If the removal itself is refused, n2 stays a
+    /// required target and the publication completes with three copies once its flush is released.
     /// </summary>
     [Theory]
     [InlineData("Disconnect")]
@@ -1083,9 +1166,16 @@ public sealed class RepSimulationTests
             await vol.Files.WriteAllBytesAsync("/all", v1, Ct);
             DfsFileInfo before = await vol.Files.GetInfoAsync("/all", Ct);
 
+            // Hold n2's object flushes so the barrier is genuinely waiting on n2 (no n2 receipt exists) when n2 goes away;
+            // a receipt n2 had already issued would legitimately keep counting after a later disconnect.
+            FaultArm held = cluster.Faults.Arm(new FaultMatch(FaultSites.ObjectBeforeFlush, Node: "n2", Count: int.MaxValue), FaultAction.Block());
             DfsStream s = await vol.Files.OpenAsync("/all", FileMode.Open, FileAccess.Write, FileShare.Read, Ct);
             byte[] v2 = TestData.Bytes(18_101, 2 * Chunk);
-            await s.WriteAsync(v2.AsMemory(), Ct);
+            // Write and flush as one pending task: an SDK may already wait for staged-chunk receipts inside WriteAsync.
+            Task flush = WriteAndFlushAsync(s, v2);
+            await held.WaitTriggeredAsync(TimeSpan.FromSeconds(10));
+            cluster.Faults.AssertReached(held);
+            Assert.False(flush.IsCompletedSuccessfully, "the all-three publication succeeded while n2's copy was not durable");
 
             bool removalRefused = false;
             if (how == "Disconnect")
@@ -1098,27 +1188,38 @@ public sealed class RepSimulationTests
                 {
                     await cluster.Admin.RemoveNodeAsync("n2", force: true, Ct);
                 }
-                catch (DfsException)
+                catch (DfsException ex)
                 {
                     removalRefused = true;
+                    Log($"removal of a required target refused: {ex.ErrorCode}");
                 }
             }
 
+            // Let n2 finish its (now irrelevant or undeliverable) flush; for a removed node its receipt must not count.
+            held.Disarm();
+            held.Release();
+
             if (removalRefused)
             {
-                await s.FlushAsync(Ct);
+                await flush;
                 await s.DisposeAsync();
                 await AssertDurableAsync(cluster, "/all", 3, 3, "removal refused: the original target set still acknowledged");
+                Same(v2, await vol.Files.ReadAllBytesAsync("/all", Ct));
                 return;
             }
 
-            DfsPlacementUnavailableException ex = await AssertEx.ThrowsDfsAsync<DfsPlacementUnavailableException>(() => s.FlushAsync(Ct), DfsErrorCode.PlacementUnavailable);
-            AssertPlacementCounts(ex, requiredCopies: 3, maxAchievedCopies: 2, requiredZones: 3, maxAchievedZones: 2);
-            await s.AbortAsync(Ct);
-            await s.DisposeAsync();
+            await AssertPlacementBlockedAsync(() => flush, requiredCopies: 3, maxAchievedCopies: 2, requiredZones: 3, maxAchievedZones: 2,
+                silentTarget: how == "Disconnect", $"{how}: all-three barrier");
+            await DiscardAsync(s);
             Assert.Equal(before.Revision, (await vol.Files.GetInfoAsync("/all", Ct)).Revision);
             Same(v1, await vol.Files.ReadAllBytesAsync("/all", Ct), "the barrier did not shrink to the remaining nodes");
         }, Ct);
+
+        static async Task WriteAndFlushAsync(DfsStream stream, byte[] bytes)
+        {
+            await stream.WriteAsync(bytes.AsMemory(), Ct);
+            await stream.FlushAsync(Ct);
+        }
     }
 
     /// <summary>
@@ -1238,7 +1339,8 @@ public sealed class RepSimulationTests
                 {
                     Same(data, await vol.Files.ReadAllBytesAsync(path, Ct), $"{path}: a successful read must be exact");
                 }
-                catch (Exception ex) when (ex is DfsUnavailableException or DfsIntegrityException)
+                catch (Exception ex) when (ex is DfsUnavailableException or DfsIntegrityException or TimeoutException
+                                           or DfsException { ErrorCode: DfsErrorCode.Timeout or DfsErrorCode.NodeUnavailable })
                 {
                     Log($"{path}: all copies of some object are offline; read reported {ex.GetType().Name}");
                 }
@@ -1339,6 +1441,9 @@ public sealed class RepSimulationTests
 
             if (variant is "NodeLostNoSpare" or "SpareFull")
             {
+                await cluster.WaitUntilAsync(async () => (await cluster.Admin.GetReplicaHealthAsync(Vol, Ct)).UnderReplicatedObjects > 0,
+                    TimeSpan.FromSeconds(20), "losing a replica holder must be reported as a deficit", Ct);
+                // Give repair ample opportunity (Fast inventory/repair interval: 250 ms) to paper over the deficit.
                 await cluster.DelayAsync(TimeSpan.FromSeconds(5), Ct);
                 DfsReplicaHealth health = await cluster.Admin.GetReplicaHealthAsync(Vol, Ct);
                 Assert.True(health.UnderReplicatedObjects > 0, "the deficit must stay visible while no legal capacity exists");
