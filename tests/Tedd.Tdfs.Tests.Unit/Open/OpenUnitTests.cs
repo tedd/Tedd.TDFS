@@ -68,7 +68,7 @@ public sealed class OpenUnitTests
     {
         FileAccess access = (FileAccess)accessValue;
         OpenHelpers.Log($"CreateNew with access {accessName}");
-        await ClusterTest.RunAsync(OpenHelpers.UnitOptions, async cluster =>
+        await ClusterTest.RunAsync(OpenHelpers.MatrixOptions, async cluster =>
         {
             await using OpenMatrix matrix = await OpenMatrix.StartAsync(cluster, "/open001");
             foreach (FileShare share in OpenOracle.AllShares)
@@ -160,7 +160,7 @@ public sealed class OpenUnitTests
     {
         FileAccess access = (FileAccess)accessValue;
         OpenHelpers.Log($"Create on existing files with access {accessName}");
-        await ClusterTest.RunAsync(OpenHelpers.UnitOptions, async cluster =>
+        await ClusterTest.RunAsync(OpenHelpers.MatrixOptions, async cluster =>
         {
             await using OpenMatrix matrix = await OpenMatrix.StartAsync(cluster, "/open003");
             foreach (FileShare share in OpenOracle.AllShares)
@@ -218,6 +218,7 @@ public sealed class OpenUnitTests
             Assert.Equal(before.Inode, info.InodeId);
             Assert.Equal(0L, info.Length);
             Assert.Empty(await OpenHelpers.ReadSharedAsync(reader.GetVolume(Vol).Files, path)); // the killed writer's lease may still be live
+            await cluster.WaitForReplicationAsync(Vol, Ct);
             await cluster.Inspect.AssertReplicasConvergedAsync(Vol);
         }, Ct);
     }
@@ -239,7 +240,9 @@ public sealed class OpenUnitTests
             DfsStream stream = await client.GetVolume(Vol).Files.OpenAsync(path, FileMode.Create, FileAccess.Write, FileShare.Read, Ct);
             Assert.Equal(0L, (await obs.GetInfoAsync(path, Ct)).Length);
 
-            FaultArm arm = cluster.Faults.Arm(new FaultMatch(FaultSites.ObjectWrite, Volume: Vol, Count: 100_000), FaultAction.IoError());
+            // No Volume filter: a storage node's object-write site need not know the volume's name, and no other object
+            // writes are expected while the arm is active (an I/O error on a concurrent repair copy would be harmless).
+            FaultArm arm = cluster.Faults.Arm(new FaultMatch(FaultSites.ObjectWrite, Count: int.MaxValue), FaultAction.IoError());
             await stream.WriteAsync(TestData.Bytes(0x3005, 20_000), Ct); // above the inline threshold: needs object writes
             Exception? flushError = await Record.ExceptionAsync(() => stream.FlushAsync(Ct));
             cluster.Faults.AssertReached(arm);
@@ -262,6 +265,66 @@ public sealed class OpenUnitTests
         }, Ct);
     }
 
+    /// <summary>
+    /// The Create helpers (CreateAsync and the synchronous Create: FileMode.Create, ReadWrite, Share.Read) truncate an
+    /// existing file at open — same inode, truncation published before any write, extents dropped — and create a missing
+    /// one; the handle carries exactly the documented defaults and is the only reservation.
+    /// </summary>
+    [Theory, Catalog("OPEN-003", "U", "INV-02", "INV-07")]
+    [InlineData("CreateAsync", true)]
+    [InlineData("CreateAsync", false)]
+    [InlineData("Create", true)]
+    [InlineData("Create", false)]
+    public async Task OPEN_003_CreateExistingTruncatesAtOpen_CreateHelpers(string helper, bool existing)
+    {
+        await ClusterTest.RunAsync(OpenHelpers.UnitOptions, async cluster =>
+        {
+            await using DfsClient client = await cluster.ConnectAsync(new TestClientOptions { Name = "c0" }, Ct);
+            await using DfsClient observer = await cluster.ConnectAsync(new TestClientOptions { Name = "obs" }, Ct);
+            DfsFileClient files = client.GetVolume(Vol).Files;
+            DfsFileClient obs = observer.GetVolume(Vol).Files;
+            const string path = "/created";
+            DfsFileInfo? before = null;
+            if (existing)
+            {
+                await obs.WriteAllBytesAsync(path, TestData.Bytes(0x3006, 9000), Ct);
+                before = await obs.GetInfoAsync(path, Ct);
+            }
+
+            DfsStream s = helper == "CreateAsync" ? await files.CreateAsync(path, Ct) : files.Create(path);
+            await using (s)
+            {
+                Assert.Equal(FileAccess.ReadWrite, s.Access);
+                Assert.Equal(FileShare.Read, s.Share);
+                Assert.False(s.IsAppend);
+                Assert.True(s.CanSeek && s.CanRead && s.CanWrite, "a Create handle is a seekable read/write stream");
+                Assert.True(s.WriterGeneration > 0);
+                Assert.Equal(0L, s.Position);
+                Assert.Equal(0L, await s.GetLengthAsync(Ct));
+
+                DfsFileInfo info = await obs.GetInfoAsync(path, Ct);
+                Assert.Equal(s.InodeId, info.InodeId);
+                Assert.Equal(0L, info.Length);
+                if (before is not null)
+                {
+                    Assert.Equal(before.InodeId, info.InodeId);
+                    Assert.True(info.Revision > before.Revision, "the truncation is published by the open itself");
+                }
+
+                FileInspection file = Assert.IsType<FileInspection>(await cluster.Inspect.GetFileAsync(Vol, path));
+                Assert.Equal(0L, file.Length);
+                Assert.Empty(file.Extents);
+                HandleInspection reservation = Assert.Single(await OpenHelpers.LiveHandlesAsync(cluster, s.InodeId));
+                Assert.True(reservation.IsWriter);
+                Assert.Equal(FileAccess.ReadWrite, reservation.Access);
+                Assert.Equal(FileShare.Read, reservation.Share);
+                Assert.Equal(s.WriterGeneration, reservation.Generation);
+            }
+
+            Assert.Empty(await obs.ReadAllBytesAsync(path, Ct));
+        }, Ct);
+    }
+
     // ------------------------------------------------------------------------------------------------------------
     // OPEN-004 CreateMissingCreates
     // ------------------------------------------------------------------------------------------------------------
@@ -273,7 +336,7 @@ public sealed class OpenUnitTests
     {
         FileAccess access = (FileAccess)accessValue;
         OpenHelpers.Log($"Create on missing names with access {accessName}");
-        await ClusterTest.RunAsync(OpenHelpers.UnitOptions, async cluster =>
+        await ClusterTest.RunAsync(OpenHelpers.MatrixOptions, async cluster =>
         {
             await using OpenMatrix matrix = await OpenMatrix.StartAsync(cluster, "/open004");
             foreach (FileShare share in OpenOracle.AllShares)
@@ -456,7 +519,8 @@ public sealed class OpenUnitTests
             }
 
             Assert.Null(unexpected); // success without a majority would be a fabricated durable create
-            Assert.True(error is DfsUnavailableException or DfsCommitOutcomeUnknownException or TimeoutException,
+            Assert.True(error is DfsUnavailableException or DfsCommitOutcomeUnknownException or TimeoutException
+                    or DfsException { ErrorCode: DfsErrorCode.Timeout or DfsErrorCode.Unavailable or DfsErrorCode.QuorumUnavailable or DfsErrorCode.NodeUnavailable or DfsErrorCode.NotLeader },
                 "expected an availability failure or an unknown outcome, got " + OpenHelpers.Describe(error));
             if (error is DfsCommitOutcomeUnknownException unknown)
                 Assert.Equal(id, unknown.OperationId);
@@ -505,7 +569,7 @@ public sealed class OpenUnitTests
     {
         FileAccess access = (FileAccess)accessValue;
         OpenHelpers.Log($"Open on missing names with access {accessName}");
-        await ClusterTest.RunAsync(OpenHelpers.UnitOptions, async cluster =>
+        await ClusterTest.RunAsync(OpenHelpers.MatrixOptions, async cluster =>
         {
             await using OpenMatrix matrix = await OpenMatrix.StartAsync(cluster, "/open005");
             foreach (FileShare share in OpenOracle.AllShares)
@@ -529,9 +593,10 @@ public sealed class OpenUnitTests
             DfsDirectoryClient dirs = client.GetVolume(Vol).Directories;
             await dirs.CreateDirectoryAsync("/n", Ct);
 
+            int inodes = (await cluster.Inspect.GetVolumeStateAsync(Vol)).InodeCount;
             await files.WriteAllBytesAsync("/n/deleted", TestData.Bytes(1, 100), Ct);
             await files.DeleteAsync("/n/deleted", Ct);
-            int inodes = (await cluster.Inspect.GetVolumeStateAsync(Vol)).InodeCount;
+            await OpenHelpers.WaitForInodeCountAsync(cluster, inodes, "the deleted inode (no handles) is reclaimed before the baseline is used");
             foreach (FileAccess access in OpenOracle.ValidAccesses)
             {
                 FileShare share = access == FileAccess.Read ? FileShare.ReadWrite : FileShare.Read;
@@ -573,7 +638,7 @@ public sealed class OpenUnitTests
     {
         FileAccess access = (FileAccess)accessValue;
         OpenHelpers.Log($"Open on existing files with access {accessName}");
-        await ClusterTest.RunAsync(OpenHelpers.UnitOptions, async cluster =>
+        await ClusterTest.RunAsync(OpenHelpers.MatrixOptions, async cluster =>
         {
             await using OpenMatrix matrix = await OpenMatrix.StartAsync(cluster, "/open006");
             foreach (FileShare share in OpenOracle.AllShares)
@@ -659,7 +724,7 @@ public sealed class OpenUnitTests
     {
         FileAccess access = (FileAccess)accessValue;
         OpenHelpers.Log($"Truncate with access {accessName}");
-        await ClusterTest.RunAsync(OpenHelpers.UnitOptions, async cluster =>
+        await ClusterTest.RunAsync(OpenHelpers.MatrixOptions, async cluster =>
         {
             await using OpenMatrix matrix = await OpenMatrix.StartAsync(cluster, "/open008");
             foreach (FileShare share in OpenOracle.AllShares)
@@ -783,7 +848,7 @@ public sealed class OpenUnitTests
     {
         FileAccess access = (FileAccess)accessValue;
         OpenHelpers.Log($"OpenOrCreate with access {accessName}");
-        await ClusterTest.RunAsync(OpenHelpers.UnitOptions, async cluster =>
+        await ClusterTest.RunAsync(OpenHelpers.MatrixOptions, async cluster =>
         {
             await using OpenMatrix matrix = await OpenMatrix.StartAsync(cluster, "/open009");
             foreach (FileShare share in OpenOracle.AllShares)
@@ -944,6 +1009,12 @@ public sealed class OpenUnitTests
             {
                 await s.WriteAsync(staged, Ct); // pending, unflushed append
                 long end = prefix.Length + staged.Length;
+
+                // Baseline after the open: a writable open may legitimately record a new writer generation (and with it a
+                // new inode revision); only the rejected call itself is measured here.
+                DfsFileInfo atOpen = await obs.GetInfoAsync(path, Ct);
+                Assert.Equal(before.InodeId, atOpen.InodeId);
+                Assert.Equal(prefix.LongLength, atOpen.Length); // the open and the unflushed append published nothing
                 Func<Task> act = operation switch
                 {
                     "Seek(0,Begin)" => () => Sync(() => s.Seek(0, SeekOrigin.Begin)),
@@ -963,7 +1034,8 @@ public sealed class OpenUnitTests
                 Assert.False(s.IsFaulted, "a rejected unsupported call must not fault the append handle");
 
                 DfsFileInfo during = await obs.GetInfoAsync(path, Ct);
-                Assert.Equal(before.Revision, during.Revision);
+                Assert.Equal(atOpen.Revision, during.Revision);
+                Assert.Equal(prefix.LongLength, during.Length);
                 await OpenHelpers.AssertBytesAsync(prefix, OpenHelpers.ReadSharedAsync(obs, path), "committed contents unchanged by the rejected " + operation);
 
                 await s.WriteAsync(after, Ct);
@@ -981,7 +1053,7 @@ public sealed class OpenUnitTests
     {
         FileAccess access = (FileAccess)accessValue;
         OpenHelpers.Log($"Append with access {accessName}");
-        await ClusterTest.RunAsync(OpenHelpers.UnitOptions, async cluster =>
+        await ClusterTest.RunAsync(OpenHelpers.MatrixOptions, async cluster =>
         {
             await using OpenMatrix matrix = await OpenMatrix.StartAsync(cluster, "/open011");
             foreach (FileShare share in OpenOracle.AllShares)
@@ -1363,7 +1435,7 @@ public sealed class OpenUnitTests
     public async Task OPEN_019_UnsupportedOsFeaturesFailExplicitly_UndefinedModeValues(int modeValue)
     {
         FileMode mode = (FileMode)modeValue;
-        await ClusterTest.RunAsync(OpenHelpers.UnitOptions, async cluster =>
+        await ClusterTest.RunAsync(OpenHelpers.MatrixOptions, async cluster =>
         {
             await using OpenMatrix matrix = await OpenMatrix.StartAsync(cluster, "/open019m");
             IReadOnlyList<FileAccess> accesses = [.. OpenOracle.ValidAccesses, .. OpenOracle.InvalidAccesses];
@@ -1464,7 +1536,7 @@ public sealed class OpenUnitTests
     private static async Task RunActiveHandleMatrixAsync(string directory, FileMode mode, FileAccess access, string accessName, params OpenOutcome[] requiredOutcomes)
     {
         OpenHelpers.Log($"{mode} with access {accessName} against active handles");
-        await ClusterTest.RunAsync(OpenHelpers.UnitOptions, async cluster =>
+        await ClusterTest.RunAsync(OpenHelpers.MatrixOptions, async cluster =>
         {
             await using OpenMatrix matrix = await OpenMatrix.StartAsync(cluster, directory);
             foreach (IReadOnlyList<HeldHandle> held in OpenOracle.HeldHandleSets)

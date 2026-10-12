@@ -41,14 +41,18 @@ public sealed class OpenSimulationTests
             await setup.GetVolume(Vol).Directories.CreateDirectoryAsync("/race", Ct);
             const string path = "/race/f";
             InodeId? deleted = null;
+            int inodesBefore = (await cluster.Inspect.GetVolumeStateAsync(Vol)).InodeCount;
             if (previouslyDeleted)
             {
                 await setupFiles.WriteAllBytesAsync(path, TestData.Bytes(seed, 123), Ct);
                 deleted = (await setupFiles.GetInfoAsync(path, Ct)).InodeId;
                 await setupFiles.DeleteAsync(path, Ct);
-            }
 
-            int inodesBefore = (await cluster.Inspect.GetVolumeStateAsync(Vol)).InodeCount;
+                // A deleted inode may be reclaimed asynchronously; take the exact baseline only once it is gone, so the
+                // "exactly one new inode" checks below cannot be skewed by a late reclamation.
+                await cluster.WaitUntilAsync(async () => (await cluster.Inspect.GetVolumeStateAsync(Vol)).InodeCount == inodesBefore,
+                    TimeSpan.FromSeconds(15), "the deleted inode (no open handles) is reclaimed", Ct);
+            }
             var clients = new List<DfsClient>();
             for (int i = 0; i < clientCount; i++)
                 clients.Add(await cluster.ConnectAsync(new TestClientOptions { Name = "c" + i }, Ct));
@@ -376,7 +380,16 @@ public sealed class OpenSimulationTests
                     FileInspection? file = state.GetFile(path);
                     bool applied = creating ? file is not null : file is not null && file.Revision != original!.Revision;
                     if (applied && !state.Handles.Any(h => h.Inode == file!.Inode && h.IsWriter && h.Share == FileShare.None))
-                        violations.Add($"{phase}: replica {node.Name} applied the {mode} without its writer reservation in the same state");
+                    {
+                        // The reservation is guaranteed to be present only while it is younger than one lease (2 s): an
+                        // open whose reply never reached its client is never renewed, and server-side expiry (LOCK-05)
+                        // may legitimately have removed it later. The trigger precedes the grant (F10/F11) or follows it
+                        // immediately (F12/F13), so 1.5 s after the trigger leaves a margin inside the 2 s lease.
+                        if (cluster.Time.GetElapsedTime(triggeredAt) < TimeSpan.FromSeconds(1.5))
+                            violations.Add($"{phase}: replica {node.Name} applied the {mode} without its writer reservation in the same state");
+                        else
+                            OpenHelpers.Log($"{phase}: replica {node.Name} shows the {mode} without a reservation after the unrenewed lease could have expired");
+                    }
                 }
             }
 
@@ -512,7 +525,10 @@ public sealed class OpenSimulationTests
         FileMode fileMode = Enum.Parse<FileMode>(mode[..mode.IndexOf('-', StringComparison.Ordinal)]);
         await ClusterTest.RunAsync(OpenHelpers.Deterministic(3, OpenHelpers.SeedOf("OPEN-015", mode, retry)), async cluster =>
         {
-            TimeSpan operationTimeout = retry == "sdk-retry" ? TimeSpan.FromSeconds(10) : TimeSpan.FromMilliseconds(500);
+            // The lost open's reservation is not renewed until its client learns of it, so every successful recovery of the
+            // original outcome must happen well inside the 2 s lease: 1.5 s deadline for SDK-internal recovery, 500 ms
+            // for the attempt that the application retries itself.
+            TimeSpan operationTimeout = retry == "sdk-retry" ? TimeSpan.FromSeconds(1.5) : TimeSpan.FromMilliseconds(500);
             await using DfsClient a = await cluster.ConnectAsync(new TestClientOptions { Name = "c0", OperationTimeout = operationTimeout }, Ct);
             await using DfsClient b = await cluster.ConnectAsync(new TestClientOptions { Name = "other" }, Ct);
             DfsVolume va = a.GetVolume(Vol);
@@ -544,17 +560,46 @@ public sealed class OpenSimulationTests
 
             if (retry == "sdk-retry")
             {
-                DfsStream s = await va.Files.OpenAsync(path, options, Ct);
+                // The FSD does not fix the SDK's per-attempt timeout, so within the operation deadline the SDK either
+                // recovers the original outcome itself (retransmitting the same id or querying it) or reports an unknown
+                // outcome carrying the id. It may never report a definite failure or a second, independent effect.
+                Exception? sdkError = null;
+                DfsStream? s = null;
+                try
+                {
+                    s = await va.Files.OpenAsync(path, options, Ct);
+                }
+                catch (Exception ex)
+                {
+                    sdkError = ex;
+                }
+
                 cluster.Faults.AssertReached(dropOpenReplies);
                 dropOpenReplies.Disarm();
-                long retransmissions = OpenHelpers.CountOpenRequests(cluster, "c0") - requestsBefore;
-                long queries = cluster.Network.Log.CountMessages(new MessageFilter(From: "client:c0", Type: MessageType.QueryOperation)) - queriesBefore;
-                Assert.True(retransmissions >= 2 || queries >= 1,
-                    "after the lost reply the SDK must retransmit the open under the same id or query that id; it may not guess the outcome");
-                await AssertSingleEffectAsync(s.InodeId, s.WriterGeneration);
-                await s.WriteAsync(data, Ct);
-                await s.DisposeAsync();
-                await OpenHelpers.AssertBytesAsync(data, fb.ReadAllBytesAsync(path, Ct), "the retried open truncated/created exactly once");
+                if (s is not null)
+                {
+                    long retransmissions = OpenHelpers.CountOpenRequests(cluster, "c0") - requestsBefore;
+                    long queries = cluster.Network.Log.CountMessages(new MessageFilter(From: "client:c0", Type: MessageType.QueryOperation)) - queriesBefore;
+                    Assert.True(retransmissions >= 2 || queries >= 1,
+                        "after the lost reply the SDK must retransmit the open under the same id or query that id; it may not guess the outcome");
+                    await AssertSingleEffectAsync(s.InodeId, s.WriterGeneration);
+                    await s.WriteAsync(data, Ct);
+                    await s.DisposeAsync();
+                    await OpenHelpers.AssertBytesAsync(data, fb.ReadAllBytesAsync(path, Ct), "the retried open truncated/created exactly once");
+                    return;
+                }
+
+                DfsCommitOutcomeUnknownException sdkUnknown = Assert.IsType<DfsCommitOutcomeUnknownException>(sdkError, exactMatch: false);
+                Assert.Equal(id, sdkUnknown.OperationId);
+                DfsOperationOutcome resolvedOutcome = await va.QueryOperationAsync(id, resolve: false, Ct);
+                Assert.Equal(DfsOutcomeStatus.Committed, resolvedOutcome.Status); // the leader applied it; only a reply was lost
+                DfsFileInfo once = await fb.GetInfoAsync(path, Ct);
+                Assert.Equal(0L, once.Length);
+                Assert.Equal(resolvedOutcome.Token.Sequence, once.Revision); // no second create/truncate by an SDK retry
+                if (existing)
+                    Assert.Equal(before!.InodeId, once.InodeId);
+                Assert.True((await OpenHelpers.LiveHandlesAsync(cluster, once.InodeId)).Count(h => h.IsWriter) <= 1, "SDK retries created a second writer reservation");
+                Assert.Equal(expectedInodes, (await cluster.Inspect.GetVolumeStateAsync(Vol)).InodeCount);
                 return;
             }
 
@@ -929,12 +974,19 @@ public sealed class OpenSimulationTests
             byte[] y = TestData.Bytes(0x1711, 2500), other = TestData.Bytes(0x1712, 100);
             await af.WriteAllBytesAsync("/y", y, Ct);
             await af.WriteAllBytesAsync("/other", other, Ct);
-            DfsFileInfo before = await af.GetInfoAsync("/y", Ct);
 
             DfsStream h = await holder.GetVolume(Vol).Files.OpenAsync("/y", FileMode.Open, access, share, Ct);
-            DfsSharingViolationException del = await AssertEx.ThrowsDfsAsync<DfsSharingViolationException>(() => af.DeleteAsync("/y", Ct), DfsErrorCode.SharingViolation);
+            // Baseline after the open: a writable open may record a new writer generation (and revision) itself.
+            DfsFileInfo before = await af.GetInfoAsync("/y", Ct);
+            DfsFileInfo otherBefore = await af.GetInfoAsync("/other", Ct);
+            // FSD §13 fixes only the typed sharing/writer-conflict exception; either code is acceptable.
+            DfsSharingViolationException del = await AssertEx.ThrowsDfsAsync<DfsSharingViolationException>(() => af.DeleteAsync("/y", Ct));
+            Assert.Contains(del.ErrorCode, new[] { DfsErrorCode.SharingViolation, DfsErrorCode.WriterConflict });
             Assert.True(del.IsRetryable);
-            await AssertEx.ThrowsDfsAsync<DfsSharingViolationException>(() => af.MoveAsync("/other", "/y", overwrite: true, Ct), DfsErrorCode.SharingViolation);
+            DfsSharingViolationException over = await AssertEx.ThrowsDfsAsync<DfsSharingViolationException>(() => af.MoveAsync("/other", "/y", overwrite: true, Ct));
+            Assert.Contains(over.ErrorCode, new[] { DfsErrorCode.SharingViolation, DfsErrorCode.WriterConflict });
+            Assert.True(over.IsRetryable);
+            Assert.Equal(otherBefore.InodeId, (await af.GetInfoAsync("/other", Ct)).InodeId); // the refused rename left its source in place
 
             DfsFileInfo after = await af.GetInfoAsync("/y", Ct);
             Assert.Equal(before.InodeId, after.InodeId);

@@ -193,11 +193,11 @@ internal static class OpenOracle
         var conflicts = active.Where(h => !IsCompatible(h, access, share)).ToList();
         if (conflicts.Count > 0)
         {
-            bool writerVsWriter = conflicts.Any(h => (h.Access & FileAccess.Write) != 0 && (access & FileAccess.Write) != 0);
-            IReadOnlyList<DfsErrorCode> codes = writerVsWriter
-                ? [DfsErrorCode.SharingViolation, DfsErrorCode.WriterConflict]
-                : [DfsErrorCode.SharingViolation];
-            return new OpenExpectation(OpenOutcome.SharingViolation, [typeof(DfsSharingViolationException)], codes,
+            // FSD §13 requires a typed IOException subtype with retryability; API.md gives DfsSharingViolationException
+            // either code. Neither document says which conflicts are "sharing" and which are "writer" conflicts (a reader
+            // blocked by an active writer is plausibly either), so both codes are accepted for every conflict.
+            return new OpenExpectation(OpenOutcome.SharingViolation, [typeof(DfsSharingViolationException)],
+                [DfsErrorCode.SharingViolation, DfsErrorCode.WriterConflict],
                 "conflicts with active handle(s) " + string.Join(", ", conflicts) + " (FSD §7 LOCK-01/02/03)");
         }
 
@@ -281,6 +281,21 @@ internal static class OpenHelpers
 
     /// <summary>The U-level SDK-contract configuration (three hosts, one per zone, in-memory, simulated storage).</summary>
     public static TestClusterOptions UnitOptions => TestClusterOptions.ThreeZones;
+
+    /// <summary>
+    /// <see cref="UnitOptions"/> for the combination matrices: one realtime cluster evaluates up to several hundred opens
+    /// (each with its own setup writes and inspections), so the 120 s default scenario timeout is raised to keep a slow
+    /// machine from turning a long-but-correct run into a failure.
+    /// </summary>
+    public static TestClusterOptions MatrixOptions => TestClusterOptions.ThreeZones with { ScenarioTimeout = TimeSpan.FromMinutes(15) };
+
+    /// <summary>
+    /// Waits until the leader's applied inode count equals <paramref name="expected"/>: deleted inodes without handles may
+    /// be reclaimed asynchronously (ReclaimDetached), so exact inode-count baselines are taken only once that happened.
+    /// </summary>
+    public static Task WaitForInodeCountAsync(TestCluster cluster, int expected, string because) =>
+        cluster.WaitUntilAsync(async () => (await cluster.Inspect.GetVolumeStateAsync(Volume)).InodeCount == expected,
+            TimeSpan.FromSeconds(15), because, Ct);
 
     public static FileAccess Access(int value) => (FileAccess)value;
 
@@ -458,7 +473,7 @@ internal sealed class OpenMatrix : IAsyncDisposable
                 holders.Add(await HolderFiles.OpenAsync(path, FileMode.Open, h.Access, h.Share, OpenHelpers.Ct));
 
             DfsFileInfo? before = exists ? await ObserverFiles.GetInfoAsync(path, OpenHelpers.Ct) : null;
-            int liveBefore = (await _cluster.Inspect.GetVolumeStateAsync(OpenHelpers.Volume)).Handles.Count(h => !h.Expired);
+            HashSet<HandleId> liveBefore = await LiveHandleIdsAsync();
             long requestsBefore = OpenHelpers.CountOpenRequests(_cluster, ActorName);
 
             Exception? error = null;
@@ -636,7 +651,14 @@ internal sealed class OpenMatrix : IAsyncDisposable
             failures.Add("an invalid option was reported as a sharing conflict");
     }
 
-    private async Task VerifyUnchangedAsync(string path, bool exists, DfsFileInfo? before, int liveBefore, List<string> failures)
+    /// <summary>Ids of every live reservation in the volume at the leader.</summary>
+    private async Task<HashSet<HandleId>> LiveHandleIdsAsync()
+    {
+        VolumeStateInspection state = await _cluster.Inspect.GetVolumeStateAsync(OpenHelpers.Volume);
+        return [.. state.Handles.Where(h => !h.Expired).Select(h => h.Id)];
+    }
+
+    private async Task VerifyUnchangedAsync(string path, bool exists, DfsFileInfo? before, HashSet<HandleId> liveBefore, List<string> failures)
     {
         if (exists)
         {
@@ -656,9 +678,12 @@ internal sealed class OpenMatrix : IAsyncDisposable
                 failures.Add("the leader holds a namespace entry for a failed open");
         }
 
-        int liveAfter = (await _cluster.Inspect.GetVolumeStateAsync(OpenHelpers.Volume)).Handles.Count(h => !h.Expired);
-        if (liveAfter != liveBefore)
-            failures.Add($"a failed open leaked a reservation ({liveBefore} -> {liveAfter} live handles)");
+        // Compare identities rather than counts: an unrelated reservation released concurrently (e.g. a helper's internal
+        // pin handle) must not mask, or be mistaken for, a reservation created by the failed open.
+        HashSet<HandleId> liveAfter = await LiveHandleIdsAsync();
+        liveAfter.ExceptWith(liveBefore);
+        if (liveAfter.Count != 0)
+            failures.Add($"a failed open leaked {liveAfter.Count} reservation(s): handle id(s) {string.Join(", ", liveAfter.Select(h => h.Value))}");
     }
 
     private async Task VerifyAfterCloseAsync(string path, bool exists, OpenExpectation expected, byte[] initial, InodeId? targetInode, List<string> failures)
