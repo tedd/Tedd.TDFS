@@ -54,6 +54,7 @@ internal sealed partial class ControlStateMachine : IReplicatedStateMachine, ICo
             AdmitMemberCommand c => ApplyAdmitMember(c, index),
             SetMemberStatusCommand c => ApplySetMemberStatus(c),
             SetMemberLabelsCommand c => ApplySetMemberLabels(c),
+            SetMemberReleaseCommand c => ApplySetMemberRelease(c),
             CreateVolumeCommand c => ApplyCreateVolume(c.Creation, c.WrappedDataKey, WireVolumeState.Active, index),
             CreateRestoringVolumeCommand c => ApplyCreateVolume(c.Creation, c.WrappedDataKey, WireVolumeState.Restoring, index),
             FinishRestoringVolumeCommand c => ApplyFinishRestoringVolume(c),

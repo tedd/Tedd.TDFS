@@ -85,7 +85,13 @@ internal static class ControlBootstrap
     }
 
     /// <summary>The initial control log: membership of the control group, then the bootstrap command.</summary>
-    public static IReadOnlyList<RaftEntry> BuildEntries(ClusterBootstrap bootstrap, KeyHierarchy keys)
+    /// <param name="bootstrap">The bootstrap description.</param>
+    /// <param name="keys">Keys derived from the cluster secret.</param>
+    /// <param name="memberFeatures">
+    /// Features of the bootstrapping release (every initial member runs it; default: this build's), recorded for each member
+    /// (feature eligibility, FMT-009).
+    /// </param>
+    public static IReadOnlyList<RaftEntry> BuildEntries(ClusterBootstrap bootstrap, KeyHierarchy keys, IReadOnlySet<string>? memberFeatures = null)
     {
         ArgumentNullException.ThrowIfNull(bootstrap);
         ArgumentNullException.ThrowIfNull(keys);
@@ -108,7 +114,7 @@ internal static class ControlBootstrap
             target,
             bootstrap.Members.Select(m => new BootstrapMemberData(m.Id, m.Name, m.Labels, m.Endpoints ?? [])).ToArray(),
             principals,
-            ProtocolFeatures.Supported.Order(StringComparer.Ordinal).ToArray());
+            (memberFeatures ?? ProtocolFeatures.Supported).Order(StringComparer.Ordinal).ToArray());
         return RaftBootstrap.BuildEntries(voters, learners, [ControlCommandCodec.Encode(command)]);
     }
 }

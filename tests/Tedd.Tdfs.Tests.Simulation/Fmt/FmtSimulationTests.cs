@@ -277,8 +277,9 @@ public sealed class FmtSimulationTests
             Exception? early = await Record.ExceptionAsync(() => admin.SetFeatureAsync(feature, true, Ct));
             if (early is not null)
             {
-                DfsException refusal = Assert.IsAssignableFrom<DfsException>(early);
-                Assert.Contains(refusal.ErrorCode, new[] { DfsErrorCode.Unsupported, DfsErrorCode.InvalidArgument });
+                // Unsupported/InvalidArgument surface as NotSupportedException/ArgumentException (API.md A.2 canonical mapping,
+                // pinned by FMT-011), hence DfsErrors.ToCode rather than a DfsException type check.
+                Assert.Contains(DfsErrors.ToCode(early), new[] { DfsErrorCode.Unsupported, DfsErrorCode.InvalidArgument });
             }
 
             for (int i = 0; i < 10; i++)

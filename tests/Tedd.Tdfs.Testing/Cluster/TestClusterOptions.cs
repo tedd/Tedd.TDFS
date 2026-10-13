@@ -71,6 +71,12 @@ public sealed record TestClusterOptions
     /// <summary>Run real Tedd.Tdfs.Host processes (requires <see cref="TransportKind.Quic"/> and <see cref="StorageKind.Disk"/>).</summary>
     public bool OutOfProcess { get; init; } = false;
 
+    /// <summary>
+    /// The software release every live node of the cluster is created and bootstrapped by (null: the build under test);
+    /// set by <see cref="VersionedClusterTest.RunAsync"/> (FMT suite).
+    /// </summary>
+    internal SoftwareVersionProfile? InitialSoftwareVersion { get; init; }
+
     /// <summary>Data root; null means <c>$TDFS_TEST_ROOT</c> or <c>%TEMP%/tdfs-tests</c> (per-test subfolder below it).</summary>
     public string? DataRoot { get; init; }
 

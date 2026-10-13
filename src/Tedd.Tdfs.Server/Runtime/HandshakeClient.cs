@@ -17,9 +17,11 @@ internal sealed record HandshakeOutcome(HelloChallengeMessage Challenge, HelloRe
 /// <param name="Incarnation">Current incarnation.</param>
 /// <param name="BootId">Process boot id.</param>
 /// <param name="NodeAuthKey">HKDF-derived node authentication key (proves knowledge of the cluster secret).</param>
-/// <param name="Features">Features this build supports.</param>
+/// <param name="Features">Features this node's release supports.</param>
+/// <param name="ProtocolMin">Lowest protocol version this node's release negotiates.</param>
+/// <param name="ProtocolMax">Highest protocol version this node's release negotiates.</param>
 internal sealed record NodeCredentials(Guid ExpectedClusterId, string Name, NodeId NodeId, ulong Incarnation, UInt128 BootId,
-    byte[] NodeAuthKey, IReadOnlySet<string> Features);
+    byte[] NodeAuthKey, IReadOnlySet<string> Features, int ProtocolMin = ProtocolInfo.MinSupportedVersion, int ProtocolMax = ProtocolInfo.CurrentVersion);
 
 /// <summary>
 /// Peer side of the connection handshake (PROTOCOL.md §3): <c>Hello → HelloChallenge → HelloProof → HelloResult</c>,
@@ -43,7 +45,7 @@ internal static class HandshakeClient
     {
         ArgumentNullException.ThrowIfNull(connection);
         ArgumentNullException.ThrowIfNull(credentials);
-        var hello = new HelloMessage(credentials.ExpectedClusterId, ProtocolInfo.MinSupportedVersion, ProtocolInfo.CurrentVersion, credentials.Features,
+        var hello = new HelloMessage(credentials.ExpectedClusterId, (ushort)credentials.ProtocolMin, (ushort)credentials.ProtocolMax, credentials.Features,
             PeerRole.Node, credentials.Name, credentials.NodeId, credentials.Incarnation, null, random.NextBytes(ProtocolInfo.NonceSize), credentials.BootId);
         byte[] helloFrame = MessageCodec.Encode(hello);
         (HelloChallengeMessage challenge, byte[] challengeFrame) = await ExchangeHelloAsync(connection, helloFrame, credentials.ExpectedClusterId, timeout, ct);

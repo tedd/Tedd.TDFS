@@ -21,12 +21,11 @@ public static class VersionedClusterTest
     /// <param name="scenario">The scenario.</param>
     /// <param name="ct">Cancellation.</param>
     /// <remarks>
-    /// Implementation status: the node runtime has no release emulation, so only <see cref="SoftwareVersionProfile.Current"/>
-    /// can create a cluster (exactly <see cref="ClusterTest.RunAsync(TestClusterOptions, Func{TestCluster, Task}, CancellationToken)"/>);
-    /// any other member of the supported window is rejected with <see cref="NotSupportedException"/> before anything starts.
+    /// Live nodes emulate the release in-process (see <see cref="TestNode.RestartAsSoftwareVersionAsync"/>); out-of-process
+    /// clusters run the build under test only.
     /// </remarks>
     /// <exception cref="ArgumentException"><paramref name="initialRelease"/> is outside the supported window.</exception>
-    /// <exception cref="NotSupportedException"><paramref name="initialRelease"/> is not the build under test.</exception>
+    /// <exception cref="NotSupportedException">An out-of-process cluster and a release other than the build under test.</exception>
     public static Task RunAsync(TestClusterOptions options, SoftwareVersionProfile initialRelease, Func<TestCluster, Task> scenario, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -34,12 +33,14 @@ public static class VersionedClusterTest
         ArgumentNullException.ThrowIfNull(scenario);
         if (!SoftwareVersionProfile.SupportedWindow.Contains(initialRelease))
             throw new ArgumentException($"Release '{initialRelease.Name}' is outside the supported window.", nameof(initialRelease));
-        if (!ReferenceEquals(initialRelease, SoftwareVersionProfile.Current))
+        if (ReferenceEquals(initialRelease, SoftwareVersionProfile.Current))
+            return ClusterTest.RunAsync(options, scenario, ct);
+        if (options.OutOfProcess)
         {
             throw new NotSupportedException(
-                $"A cluster cannot be created by release '{initialRelease.Name}': the node runtime has no release emulation (protocol range, features and disk format are fixed by the build).");
+                $"A cluster cannot be created by release '{initialRelease.Name}' out of process: hosts run the build under test (release emulation is in-process).");
         }
 
-        return ClusterTest.RunAsync(options, scenario, ct);
+        return ClusterTest.RunAsync(options with { InitialSoftwareVersion = initialRelease }, scenario, ct);
     }
 }

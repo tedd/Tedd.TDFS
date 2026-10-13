@@ -91,10 +91,21 @@ internal sealed class ControlHost
     public DfsServerCapabilities BuildCapabilities()
     {
         NodeTimings t = _s.Timings;
+        NodeRelease release = _s.Release;
+
+        // The cluster speaks the newest version every live member speaks (mixed releases negotiate the older one during a
+        // rolling upgrade), and only active features this node's release understands are advertised.
+        int version = release.ProtocolMax;
+        foreach (MemberRecord member in State.Members.Values)
+        {
+            if (member.IsLive && !member.PendingAdmission && member.ProtocolMax > 0)
+                version = Math.Min(version, member.ProtocolMax);
+        }
+
         return new DfsServerCapabilities
         {
-            ProtocolVersion = ProtocolInfo.CurrentVersion,
-            Features = State.Features.ToHashSet(StringComparer.Ordinal),
+            ProtocolVersion = Math.Max(version, release.ProtocolMin),
+            Features = State.Features.Where(release.Supports).ToHashSet(StringComparer.Ordinal),
             ChunkSize = t.ChunkSize,
             MaxObjectSize = t.MaxObjectSize,
             LeaseDuration = t.LeaseDuration,

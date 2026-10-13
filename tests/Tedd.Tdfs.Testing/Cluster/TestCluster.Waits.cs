@@ -241,7 +241,9 @@ public sealed partial class TestCluster
                     return true;
                 try
                 {
-                    return (await node.Inspect.GetNodeStatusAsync()).IsSelfRegistered;
+                    // A node that stopped serving by itself (its release cannot interpret an active feature) never registers.
+                    HarnessNodeStatus status = await node.Inspect.GetNodeStatusAsync();
+                    return status.IsSelfRegistered || status.IsStopping;
                 }
                 catch (Exception ex) when (IsNodeGone(ex))
                 {

@@ -1235,7 +1235,9 @@ public sealed class ChaSimulationTests
             await cluster.DelayAsync(TimeSpan.FromSeconds(5), ct);
             await AssertAllOrNothingAsync("after further time (resolution is final)");
 
-            await stopReaders.CancelAsync();
+            // Cancel inline on the simulation thread: CancelAsync runs the token callbacks (cancelled Task.Delay waits, their
+            // timers and continuations) on the thread pool, an uncontrolled dependency of the deterministic run (HAR-002).
+            stopReaders.Cancel();
             await readers;
             Assert.True(records.Count >= 2, $"observers completed only {records.Count} read-only transactions");
             OpOutcome writerOutcome = committed ? OpOutcome.Ok : OpOutcome.Failed;
@@ -1805,7 +1807,8 @@ public sealed class ChaSimulationTests
             SafetyMonitor election = SafetyMonitor.Start(cluster, "cha011-election-safety", TimeSpan.FromMilliseconds(200),
                 () => SampleLeadersAsync(cluster, leaders));
             using var stopLoad = new CancellationTokenSource();
-            Task<int> load = RunRegisterLoadAsync(cluster, "load", register, stopLoad.Token);
+            var loadProgress = new System.Runtime.CompilerServices.StrongBox<int>();
+            Task<int> load = RunRegisterLoadAsync(cluster, "load", register, stopLoad.Token, loadProgress);
 
             TestNode leader = await cluster.GetLeaderAsync(Vol, ct);
             TestNode[] followers = cluster.Nodes.Where(n => n.Name != leader.Name).ToArray();
@@ -1876,7 +1879,15 @@ public sealed class ChaSimulationTests
             }
 
             Assert.Contains(SoftwareVersionProfile.NextFeature, (await cluster.Admin.GetClusterStatusAsync(ct)).ActiveFeatures);
-            await stopLoad.CancelAsync();
+
+            // The evidence bound is a number of completed operations, not a duration: when the steps above finish quickly
+            // (an old build refused at start) the load keeps running until it has done enough work (or stalls, and fails).
+            await cluster.WaitUntilAsync(() => Task.FromResult(Volatile.Read(ref loadProgress.Value) >= 10 || load.IsCompleted), TimeSpan.FromSeconds(60),
+                "the register load completes at least 10 operations", ct);
+
+            // Cancel inline on the simulation thread: CancelAsync runs the token callbacks (cancelled Task.Delay waits, their
+            // timers and continuations) on the thread pool, an uncontrolled dependency of the deterministic run (HAR-002).
+            stopLoad.Cancel();
             int completed = await load;
             Assert.True(completed >= 10, $"the register load completed only {completed} operations");
             await election.StopAndAssertAsync(minSamples: 10);
@@ -1891,7 +1902,8 @@ public sealed class ChaSimulationTests
     }
 
     /// <summary>Sequential writes and reads of one register file, recorded in the cluster history; returns the number of Ok operations.</summary>
-    private static async Task<int> RunRegisterLoadAsync(TestCluster cluster, string name, string path, CancellationToken stop)
+    private static async Task<int> RunRegisterLoadAsync(TestCluster cluster, string name, string path, CancellationToken stop,
+        System.Runtime.CompilerServices.StrongBox<int>? progress = null)
     {
         await using DfsClient client = await ConnectAsync(cluster, name, operationTimeout: TimeSpan.FromSeconds(2));
         DfsFileClient files = client.GetVolume(Vol).Files;
@@ -1903,8 +1915,12 @@ public sealed class ChaSimulationTests
             {
                 await cluster.History.RecordAsync(name, "write", path, value, () => files.WriteAllBytesAsync(path, value, Ct));
                 ok++;
+                if (progress is not null)
+                    Volatile.Write(ref progress.Value, ok);
                 await cluster.History.RecordAsync(name, "read", path, null, () => TryReadAllAsync(files, path));
                 ok++;
+                if (progress is not null)
+                    Volatile.Write(ref progress.Value, ok);
             }
             catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)
             {

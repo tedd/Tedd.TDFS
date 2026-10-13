@@ -374,8 +374,16 @@ public sealed partial class TestCluster
             Log = log,
             LoopFactory = Runtime.CreateLoopFactory(log),
             VolumeStateMachines = StartOptions.VolumeStateMachines,
+            Release = ReleaseOf(node.SoftwareVersion),
         };
     }
+
+    /// <summary>The node-runtime release emulating <paramref name="profile"/> (null for the build under test).</summary>
+    internal static Server.Runtime.NodeRelease? ReleaseOf(SoftwareVersionProfile profile) =>
+        ReferenceEquals(profile, SoftwareVersionProfile.Current)
+            ? null
+            : new Server.Runtime.NodeRelease(profile.Name, profile.ProtocolVersionMin, profile.ProtocolVersionMax, profile.Features,
+                profile.MaxReadableDiskFormatVersion);
 
     /// <summary>
     /// The transport factory of one start of a live node. Over QUIC a node whose options name a certificate

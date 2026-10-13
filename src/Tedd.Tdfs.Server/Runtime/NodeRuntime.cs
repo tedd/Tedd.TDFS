@@ -77,7 +77,17 @@ internal sealed partial class NodeRuntime
 
         await medium.CreateDirectoryDurableAsync(options.DataDirectory, ct);
         string superblockPath = s.DataPath(SuperblockFile);
-        Superblock? superblock = await Superblock.LoadAsync(medium, superblockPath, ct);
+
+        // A release refuses an image it cannot interpret before writing anything (FMT-006): a minimum-reader marker raised
+        // by an irreversible feature it lacks, or a newer format.
+        NodeRelease release = s.Release;
+        Superblock? superblock = await Superblock.LoadAsync(medium, superblockPath, ct, release.MaxReadableFormat);
+        if (superblock is not null && superblock.FormatVersion > release.MaxReadableFormat)
+        {
+            throw new DfsProtocolException(DfsErrorCode.Unsupported,
+                $"The data directory of {options.Name} uses format version {superblock.FormatVersion}; release {release.Name} reads up to {release.MaxReadableFormat}.");
+        }
+
         IReadOnlyList<RaftEntry>? controlBootstrap = null;
         bool seedJoin = false;
         if (superblock is null)
@@ -85,7 +95,7 @@ internal sealed partial class NodeRuntime
             if (options.Bootstrap is { } bootstrap)
             {
                 BootstrapMember self = ControlBootstrap.Validate(bootstrap, options.Name);
-                controlBootstrap = ControlBootstrap.BuildEntries(bootstrap, s.Keys);
+                controlBootstrap = ControlBootstrap.BuildEntries(bootstrap, s.Keys, release.Features);
                 superblock = await Superblock.CreateAsync(medium, superblockPath, bootstrap.ClusterId, self.Id, options.Name, ct);
                 s.Info("node", NodeServices.Inv($"Bootstrapping cluster {bootstrap.ClusterName} ({bootstrap.ClusterId}) as {self.Id}."));
             }
@@ -117,7 +127,7 @@ internal sealed partial class NodeRuntime
                 BootstrapMember self = ControlBootstrap.Validate(bootstrap, options.Name);
                 if (self.Id != superblock.NodeId)
                     throw new InvalidOperationException($"The data directory belongs to node id {superblock.NodeId}; the bootstrap lists {options.Name} as {self.Id}.");
-                controlBootstrap = ControlBootstrap.BuildEntries(bootstrap, s.Keys);
+                controlBootstrap = ControlBootstrap.BuildEntries(bootstrap, s.Keys, release.Features);
             }
         }
 
@@ -131,7 +141,7 @@ internal sealed partial class NodeRuntime
             superblock = await DiscoverAndCreateSuperblockAsync(superblockPath, ct);
 
         // The incarnation is durably incremented before the node serves anything (ARCHITECTURE §2.5, RCV-02).
-        superblock = await Superblock.BumpIncarnationAsync(medium, superblockPath, ct);
+        superblock = await Superblock.BumpIncarnationAsync(medium, superblockPath, ct, release.MaxReadableFormat);
         s.Superblock = superblock;
         s.NodeId = superblock!.NodeId;
         s.ClusterId = superblock.ClusterId;
@@ -158,6 +168,7 @@ internal sealed partial class NodeRuntime
 
         await s.Control.OpenAsync(controlBootstrap, ct);
         s.Volumes.Start();
+        await ReplayControlAndCheckReleaseAsync(ct);
         s.Raft.StartTicking();
         s.IsServing = true;
         s.Info("node", NodeServices.Inv($"Node {options.Name} ({s.NodeId}) serving at {s.Endpoint}, incarnation {s.Incarnation}."));
@@ -214,7 +225,8 @@ internal sealed partial class NodeRuntime
     {
         NodeServices s = Services;
         s.NodeId = NodeId.New(s.Random);
-        var credentials = new NodeCredentials(Guid.Empty, s.NodeName, s.NodeId, 0, s.BootId, s.Keys.NodeAuthKey, ProtocolFeatures.Supported);
+        var credentials = new NodeCredentials(Guid.Empty, s.NodeName, s.NodeId, 0, s.BootId, s.Keys.NodeAuthKey, s.Release.Features,
+            s.Release.ProtocolMin, s.Release.ProtocolMax);
         Exception? last = null;
         foreach (string seed in s.Options.JoinSeeds)
         {
@@ -264,7 +276,7 @@ internal sealed partial class NodeRuntime
     {
         NodeServices s = Services;
         var message = new JoinClusterMessage(s.NodeId, s.NodeName, s.Options.Labels, [s.Endpoint], s.Incarnation, s.Options.CapacityBytes,
-            ProtocolInfo.CurrentVersion, ProtocolFeatures.Supported, s.BootId);
+            (ushort)s.Release.ProtocolMax, s.Release.Features, s.BootId);
         Exception? last = null;
         for (int i = 0; i < candidates.Count; i++)
         {
@@ -336,11 +348,15 @@ internal sealed partial class NodeRuntime
         if (control.IsLeader)
         {
             using CancellationTokenSource deadline = s.CreateDeadline();
-            await _controlService.RegisterAsync(s.NodeId, s.Incarnation, s.BootId, s.Options.Labels, [s.Endpoint], s.Options.CapacityBytes, deadline.Token);
+            await _controlService.RegisterAsync(s.NodeId, s.Incarnation, s.BootId, s.Options.Labels, [s.Endpoint], s.Options.CapacityBytes, deadline.Token,
+                (s.Release.ProtocolMax, s.Release.Features.Order(StringComparer.Ordinal).ToArray()));
         }
         else if (control.Leader is { } leader && leader != s.NodeId)
         {
-            var message = new RegisterIncarnationMessage(s.NodeId, s.Incarnation, s.NodeName, s.Options.Labels, [s.Endpoint], s.Options.CapacityBytes, s.BootId);
+            var message = new RegisterIncarnationMessage(s.NodeId, s.Incarnation, s.NodeName, s.Options.Labels, [s.Endpoint], s.Options.CapacityBytes, s.BootId)
+            {
+                Extensions = [ControlService.EncodeRelease(s.Release)],
+            };
             await s.Peers.CallAsync(leader, message);
         }
         else

@@ -224,6 +224,17 @@ internal sealed partial class GroupRuntime
                 await WriteBootstrapAsync(view, bootstrap, ct);
 
             var group = new GroupRuntime(services, host, spec, view, storeOptions, checkpoints, latest);
+
+            // Entries committed before the restart and replayed from the local journal are checkpointed once they are applied
+            // again (the restart's metadata checkpoint install, test plan F16): the next restart starts from that state instead
+            // of replaying the same suffix, and an interrupted install is recovered like any other (DSK-012).
+            ulong replayTarget = Math.Min(store.HardState.Commit, store.LastIndex);
+            if (replayTarget > view.Snapshot.Index)
+            {
+                group.ReplayTarget = replayTarget;
+                group._recoveryCheckpointAt = replayTarget;
+            }
+
             group.CreateNode(view.Snapshot.Index);
             return group;
         }
@@ -412,6 +423,22 @@ internal sealed partial class GroupRuntime
         var waiter = new AppliedWaiter(index);
         _appliedWaiters.Add(waiter);
         return ct.CanBeCanceled ? waiter.Completion.Task.WaitAsync(ct) : waiter.Completion.Task;
+    }
+
+    /// <summary>Last entry committed before the restart that the local journal holds (0 when nothing was to be replayed).</summary>
+    public ulong ReplayTarget { get; private set; }
+
+    /// <summary>
+    /// Applies the entries committed before the restart from the local journal (no peer is needed) and completes once they
+    /// are applied (local journal replay, test plan F16).
+    /// </summary>
+    public Task ReplayLocalAsync(CancellationToken ct = default)
+    {
+        if (_appliedIndex >= ReplayTarget)
+            return Task.CompletedTask;
+        Task applied = WaitForAppliedAsync(ReplayTarget, ct);
+        Kick();
+        return applied;
     }
 
     /// <summary>Stops the group: fails waiters, waits for the Ready loop, closes the log (and deletes the data when asked).</summary>

@@ -23,13 +23,14 @@ internal sealed partial class RpcDispatcher
                 $"This node belongs to cluster {_s.ClusterId}, not {hello.ExpectedClusterId}.");
         }
 
-        int low = Math.Max((int)hello.ProtocolMin, ProtocolInfo.MinSupportedVersion);
-        int high = Math.Min((int)hello.ProtocolMax, ProtocolInfo.CurrentVersion);
+        NodeRelease release = _s.Release;
+        int low = Math.Max((int)hello.ProtocolMin, release.ProtocolMin);
+        int high = Math.Min((int)hello.ProtocolMax, release.ProtocolMax);
         if (low > high)
         {
             Reject(state);
             return new ErrorReplyMessage(DfsErrorCode.Unsupported,
-                $"No common protocol version: peer {hello.ProtocolMin}..{hello.ProtocolMax}, server {ProtocolInfo.MinSupportedVersion}..{ProtocolInfo.CurrentVersion}.");
+                $"No common protocol version: peer {hello.ProtocolMin}..{hello.ProtocolMax}, server {release.ProtocolMin}..{release.ProtocolMax}.");
         }
 
         ControlState control = _s.Control.State;
@@ -69,7 +70,8 @@ internal sealed partial class RpcDispatcher
                 return new ErrorReplyMessage(DfsErrorCode.AuthenticationFailed, "Unknown peer role.");
         }
 
-        IReadOnlySet<string> features = control.Features.Where(hello.Features.Contains).ToHashSet(StringComparer.Ordinal);
+        // Only active features both ends understand: a node never offers a feature its own release cannot interpret.
+        IReadOnlySet<string> features = control.Features.Where(f => hello.Features.Contains(f) && release.Supports(f)).ToHashSet(StringComparer.Ordinal);
         var challenge = new HelloChallengeMessage(_s.ClusterId, control.ClusterName, (ushort)high, features, _s.NodeName, PeerRole.Node, _s.NodeId,
             _s.Incarnation, _s.Random.NextBytes(ProtocolInfo.NonceSize), salt, iterations);
         byte[] challengeFrame = MessageCodec.Encode(challenge);

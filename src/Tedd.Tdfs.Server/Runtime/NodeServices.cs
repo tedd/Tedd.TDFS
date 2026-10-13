@@ -53,6 +53,9 @@ internal sealed class NodeServices
 
     public string NodeName => Options.Name;
 
+    /// <summary>The software release this node runs as (this build unless the environment emulates another one).</summary>
+    public NodeRelease Release => Env.Release ?? NodeRelease.Current;
+
     public NodeMetrics Metrics { get; }
 
     // ---- identity (set during start-up)
@@ -108,7 +111,7 @@ internal sealed class NodeServices
 
     /// <summary>The identity this node presents in node handshakes.</summary>
     public NodeCredentials CreateNodeCredentials()
-        => new(ClusterId, NodeName, NodeId, Incarnation, BootId, Keys.NodeAuthKey, ProtocolFeatures.Supported);
+        => new(ClusterId, NodeName, NodeId, Incarnation, BootId, Keys.NodeAuthKey, Release.Features, Release.ProtocolMin, Release.ProtocolMax);
 
     /// <summary>Path of <paramref name="relative"/> inside the node data directory.</summary>
     public string DataPath(string relative) => StoragePath.Combine(Options.DataDirectory, relative);

@@ -292,7 +292,9 @@ internal sealed class SafetyMonitor
             // Reported by the sample-count assertion below.
         }
 
-        await _stop.CancelAsync();
+        // Cancel inline on the simulation thread: CancelAsync runs the token callbacks (cancelled Task.Delay waits, their
+        // timers and continuations) on the thread pool, an uncontrolled dependency of the deterministic run (HAR-002).
+        _stop.Cancel();
         await _loop;
         Assert.True(Samples >= minSamples, $"safety monitor '{_name}' ran only {Samples} samples (expected at least {minSamples}); missing evidence is not a pass");
         Assert.True(_violations.Count == 0, $"safety monitor '{_name}' observed violations:{Environment.NewLine}{string.Join(Environment.NewLine, _violations)}");

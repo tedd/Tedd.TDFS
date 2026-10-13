@@ -101,8 +101,45 @@ internal sealed class ControlService
         if (!Control.IsLeader)
             throw Control.NotLeader();
         MemberRecord member = await RegisterAsync(message.Node, message.Incarnation, message.BootId, message.Labels, message.Endpoints, message.CapacityBytes,
-            context.Cancellation);
+            context.Cancellation, ReadRelease(message.Extensions));
         return new RegisterIncarnationResultMessage(true, member.Incarnation, member.Status, Control.State.AppliedIndex, Control.State.PlacementEpoch);
+    }
+
+    /// <summary>Optional extension of <c>RegisterIncarnation</c> carrying the registering node's release (varint32 protocol max, string list features).</summary>
+    public const uint ReleaseExtension = 1;
+
+    /// <summary>The release extension describing <paramref name="release"/>.</summary>
+    public static WireExtension EncodeRelease(NodeRelease release)
+    {
+        ArgumentNullException.ThrowIfNull(release);
+        var buffer = new System.Buffers.ArrayBufferWriter<byte>(64);
+        var writer = new WireWriter(buffer);
+        writer.WriteVarInt32(release.ProtocolMax);
+        writer.WriteStringList(release.Features.Order(StringComparer.Ordinal).ToArray());
+        return new WireExtension(ReleaseExtension, Required: false, buffer.WrittenSpan.ToArray());
+    }
+
+    /// <summary>The release carried by a registration's extensions, or null (older senders omit it).</summary>
+    private static (int ProtocolMax, IReadOnlyList<string> Features)? ReadRelease(IReadOnlyList<WireExtension> extensions)
+    {
+        foreach (WireExtension extension in extensions)
+        {
+            if (extension.FieldId != ReleaseExtension)
+                continue;
+            try
+            {
+                var reader = new WireReader(extension.Value.Span, WireLimits.Default);
+                int protocolMax = reader.ReadVarInt32();
+                IReadOnlyList<string> features = reader.ReadStringList();
+                return (protocolMax, features);
+            }
+            catch (DfsProtocolException)
+            {
+                return null; // malformed optional extension: treated as absent
+            }
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -119,10 +156,23 @@ internal sealed class ControlService
         }
     }
 
-    /// <summary>Proposes an incarnation registration (control leader) and returns the registered member.</summary>
+    /// <summary>
+    /// Proposes an incarnation registration (control leader) and returns the registered member. When the registering process
+    /// runs another software release than the member record lists (<paramref name="release"/>: protocol maximum and
+    /// understood features), the release is recorded first, so feature eligibility (FMT-009) reflects the restarted node
+    /// as soon as it counts as registered.
+    /// </summary>
     public async Task<MemberRecord> RegisterAsync(NodeId node, ulong incarnation, UInt128 bootId, DfsTopologyLabels labels, IReadOnlyList<string> endpoints,
-        long capacityBytes, CancellationToken ct)
+        long capacityBytes, CancellationToken ct, (int ProtocolMax, IReadOnlyList<string> Features)? release = null)
     {
+        if (release is { } r && Control.State.FindMember(node) is { IsLive: true } known
+            && (known.ProtocolMax != r.ProtocolMax || !known.Features.SequenceEqual(r.Features.Order(StringComparer.Ordinal), StringComparer.Ordinal)))
+        {
+            ApplyOutcome recorded = await Control.ProposeAsync(new SetMemberReleaseCommand(Control.NewHeader(), node, r.ProtocolMax, r.Features), ct);
+            if (!recorded.IsSuccess)
+                throw recorded.ToException();
+        }
+
         var command = new RegisterIncarnationCommand(Control.NewHeader(), node, incarnation, bootId, labels, endpoints, capacityBytes);
         ApplyOutcome outcome = await Control.ProposeAsync(command, ct);
         if (!outcome.IsSuccess)
