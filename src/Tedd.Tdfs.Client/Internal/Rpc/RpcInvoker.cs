@@ -16,6 +16,8 @@ namespace Tedd.Tdfs.Client.Internal.Rpc;
 /// otherwise <see cref="DfsCommitOutcomeUnknownException"/> carrying the operation (and transaction) id — never a definite
 /// abort (unless the <see cref="SafetyMutations.TreatUnknownAsAborted"/> negative control is enabled).</item>
 /// </list>
+/// A transmission answered with <c>NotLeader</c> is settled (the node refuses before proposing, nothing was executed): a
+/// mutation whose every transmission was refused that way failed definitively.
 /// </summary>
 internal sealed class RpcInvoker
 {
@@ -40,7 +42,8 @@ internal sealed class RpcInvoker
     public async Task<IWireMessage> InvokeAsync(RpcRequest request, OperationScope scope)
     {
         bool mutation = request.Kind == CallKind.Mutation;
-        bool transmitted = false;
+        bool transmitted = false;   // a mutation transmission may have been executed (it is not settled by a definite refusal)
+        int unsettled = 0;
         int transmissions = 0;
         int failures = 0;
         int redirects = 0;
@@ -166,7 +169,11 @@ internal sealed class RpcInvoker
             {
                 transmissions++;
                 request.Transmissions = transmissions;
-                transmitted |= mutation;
+                if (mutation)
+                {
+                    unsettled++;
+                    transmitted = true;
+                }
             }
 
             ReadOnlyMemory<byte> raw;
@@ -253,6 +260,7 @@ internal sealed class RpcInvoker
                 {
                     // The hook replaced an id that was definitively rejected without effect: the new id starts afresh.
                     transmitted = false;
+                    unsettled = 0;
                     transmissions = 0;
                     request.Transmissions = 0;
                     scope.OperationId = request.Operation;
@@ -265,6 +273,8 @@ internal sealed class RpcInvoker
             {
                 case DfsErrorCode.NotLeader:
                     last = error.ToException(request.Path);
+                    if (mutation && --unsettled == 0)
+                        transmitted = false; // every transmission so far was refused before it was proposed
                     request.Router.OnNotLeader(endpoint, error.LeaderHint);
                     if (error.LeaderHint is { Length: > 0 } hint && !string.Equals(hint, endpoint, StringComparison.Ordinal) && redirects < MaxRedirects)
                     {

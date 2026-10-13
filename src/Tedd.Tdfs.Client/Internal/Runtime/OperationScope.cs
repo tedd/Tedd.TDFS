@@ -132,15 +132,29 @@ internal sealed class OperationScope : IDisposable
             return new OperationCanceledException($"{Kind} was cancelled by the caller.", lastFailure, UserToken);
         if (IsKilled)
             return new ObjectDisposedException($"{Kind} was cancelled because the DfsClient was disposed.", lastFailure);
-        if (lastFailure is DfsException or TimeoutException or ObjectDisposedException)
+        if (lastFailure is DfsUnavailableException { ErrorCode: DfsErrorCode.NotLeader, LeaderHint: null or "" } noLeader)
+        {
+            // The deadline passed without any node knowing a leader: the group cannot elect one (FSD §13, typed quorum loss).
+            return new DfsQuorumUnavailableException($"{Kind} failed: no leader could be found before the deadline; the metadata quorum is unavailable ({noLeader.Message})",
+                noLeader);
+        }
+
+        if (lastFailure is DfsException or ObjectDisposedException)
             return lastFailure;
+        if (lastFailure is TimeoutException)
+        {
+            // Unreachable within the deadline: a typed availability error, never a bare TimeoutException (docs/api-additions/mesh.md §10).
+            return new DfsUnavailableException(DfsErrorCode.Timeout, $"{Kind} failed: the cluster could not be reached before the deadline ({lastFailure.Message})",
+                lastFailure);
+        }
+
         if (lastFailure is not null && lastFailure is not OperationCanceledException)
         {
             // Transport-level failures surface as the typed availability error (never as end of stream or success).
             return new DfsUnavailableException(DfsErrorCode.Unavailable, $"{Kind} failed: the cluster could not be reached ({lastFailure.Message})", lastFailure);
         }
 
-        return new TimeoutException($"{Kind} did not complete within its {Timeout} deadline.", lastFailure);
+        return new DfsUnavailableException(DfsErrorCode.Timeout, $"{Kind} did not complete within its {Timeout} deadline.", lastFailure);
     }
 
     /// <summary>True when the scope's token fired for a reason other than the deadline (caller or shutdown).</summary>
