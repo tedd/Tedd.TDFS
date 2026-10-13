@@ -55,7 +55,12 @@ public sealed class MeshSimulationTests
             foreach (TestNodeSpec spec in cfg.NodeSpecs())
             {
                 DfsNodeInfo info = Assert.Single(listed, i => i.Name == spec.Name);
-                Assert.Equal(DfsNodeStatus.Active, info.Status);
+                // PROTOCOL.md (WireNodeStatus.Unreachable, same values as DfsNodeStatus): an active member the control
+                // leader currently cannot reach is listed Unreachable, which a partial mesh legitimately produces.
+                if (cfg.Mesh == LinkMesh.Full || info.IsReachable)
+                    Assert.Equal(DfsNodeStatus.Active, info.Status);
+                else
+                    Assert.Equal(DfsNodeStatus.Unreachable, info.Status);
                 Assert.Equal(spec.ToLabels(), info.Labels);
                 Assert.Equal(cluster.Node(spec.Name).Id, info.Id);
                 Assert.True(info.IsControlVoter == s.ControlVoters.Contains(spec.Name), $"{spec.Name} control-voter flag disagrees with the committed configuration");

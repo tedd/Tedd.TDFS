@@ -124,7 +124,9 @@ public sealed partial class TestCluster
         }
         else
         {
-            ClusterBootstrap single = BuildStaticBootstrap(planned.Take(1).ToList(), 1);
+            // The seed bootstraps a single-member cluster; the configured control voter count travels with it so the
+            // control leader promotes joined learners until that many voters exist (clipped to the live members).
+            ClusterBootstrap single = BuildStaticBootstrap(planned.Take(1).ToList(), 1) with { ControlVoterTarget = o.ControlVoters };
             IReadOnlyList<IReadOnlyList<int>> seeds = BuildSeedGraph(o.Seeds, planned.Count);
             for (int i = 0; i < planned.Count; i++)
                 AddLiveNode(planned[i], i == 0 ? single : null, seeds[i].Select(j => planned[j].Endpoint).ToArray());

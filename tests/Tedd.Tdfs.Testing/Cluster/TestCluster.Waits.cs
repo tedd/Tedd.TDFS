@@ -394,7 +394,10 @@ public sealed partial class TestCluster
                 return $"volume {volume.Name} leader {volumeLeader.Node.Name} applied {group.AppliedIndex} < commit {group.CommitIndex}";
             foreach (string voter in volume.Voters)
             {
-                if (FindNode(voter) is not { State: TestNodeState.Running } || !Reachable(volumeLeader.Node.Name, voter))
+                // A node learns that it hosts a volume only from the control log, so on a partial mesh a voter without a
+                // direct link to the control leader (exempt from the control checks above) cannot be required to host it.
+                if (FindNode(voter) is not { State: TestNodeState.Running } || !Reachable(volumeLeader.Node.Name, voter)
+                    || (voter != leader.Node.Name && !Reachable(leader.Node.Name, voter)))
                     continue;
                 if (!group.Voters.Contains(voter, StringComparer.Ordinal))
                     return $"volume {volume.Name}: desired voter {voter} is not a configured voter yet";

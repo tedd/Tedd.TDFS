@@ -74,6 +74,8 @@ internal static class ControlBootstrap
 
         if (bootstrap.ControlVoters.Distinct(StringComparer.Ordinal).Count() != bootstrap.ControlVoters.Count)
             throw new ArgumentException("A control voter is listed twice.", nameof(bootstrap));
+        if (bootstrap.ControlVoterTarget is < 1)
+            throw new ArgumentException("The control voter target must be at least 1.", nameof(bootstrap));
         foreach (BootstrapPrincipal p in bootstrap.Principals ?? [])
         {
             if (ControlStateMachine.GetPrincipalNameError(p.Name) is { } error)
@@ -92,7 +94,9 @@ internal static class ControlBootstrap
         var byName = bootstrap.Members.ToDictionary(m => m.Name, StringComparer.Ordinal);
         NodeId[] voters = bootstrap.ControlVoters.Select(n => byName[n].Id).ToArray();
         NodeId[] learners = bootstrap.Members.Where(m => !voters.Contains(m.Id)).Select(m => m.Id).ToArray();
-        int target = bootstrap.Members.Count == 1 ? Math.Max(DefaultControlVoters, bootstrap.ControlVoters.Count) : bootstrap.ControlVoters.Count;
+        int target = bootstrap.ControlVoterTarget is { } configured
+            ? Math.Max(configured, bootstrap.ControlVoters.Count)
+            : bootstrap.Members.Count == 1 ? Math.Max(DefaultControlVoters, bootstrap.ControlVoters.Count) : bootstrap.ControlVoters.Count;
 
         var principals = new List<PrincipalData>();
         foreach (BootstrapPrincipal p in bootstrap.Principals ?? [])
