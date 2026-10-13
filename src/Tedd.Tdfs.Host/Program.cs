@@ -18,7 +18,8 @@ namespace Tedd.Tdfs.Host;
 /// </list>
 /// A running host prints one <c>TDFS-READY {json}</c> line on standard output once it serves (or <c>TDFS-FAILED {json}</c>),
 /// logs to standard error, and accepts the commands <c>stop</c>, <c>pause</c> and <c>resume</c> on standard input; Ctrl+C
-/// and the end of standard input also stop it gracefully.
+/// stops it gracefully. With <c>--control stdin</c> (launchers such as the test harness) the end of standard input stops it
+/// too, so a host never outlives its launcher; without it a host whose standard input is closed (a service) keeps running.
 /// </summary>
 internal static class Program
 {
@@ -54,8 +55,10 @@ internal static class Program
         {
             return args[0] switch
             {
-                "node" => await RunNodeAsync(HostConfigurationJson.Read<NodeHostConfiguration>(Require(flags, "config")), LogLevel(flags)),
-                "backup" => await RunBackupAsync(HostConfigurationJson.Read<BackupHostConfiguration>(Require(flags, "config")), LogLevel(flags)),
+                "node" => await RunNodeAsync(HostConfigurationJson.Read<NodeHostConfiguration>(Require(flags, "config")), LogLevel(flags),
+                    StopAtEndOfInput(flags)),
+                "backup" => await RunBackupAsync(HostConfigurationJson.Read<BackupHostConfiguration>(Require(flags, "config")), LogLevel(flags),
+                    StopAtEndOfInput(flags)),
                 "bootstrap" => Bootstrap(flags),
                 _ => Unknown(args[0]),
             };
@@ -67,7 +70,7 @@ internal static class Program
         }
     }
 
-    private static async Task<int> RunNodeAsync(NodeHostConfiguration configuration, NodeLogLevel logLevel)
+    private static async Task<int> RunNodeAsync(NodeHostConfiguration configuration, NodeLogLevel logLevel, bool stopAtEndOfInput)
     {
         NodeOptions options = configuration.ToNodeOptions();
         using X509Certificate2 certificate = LoadCertificate(configuration.CertificatePath, configuration.CertificatePassword, options.Name);
@@ -84,7 +87,7 @@ internal static class Program
             LoopFactory = new ThreadNodeLoopFactory(log),
         };
 
-        using var control = new HostControl();
+        using var control = new HostControl(stopAtEndOfInput);
         NodeHost host;
         try
         {
@@ -95,13 +98,13 @@ internal static class Program
             return Failed(options.Name, ex);
         }
 
-        Ready(new HostReadyMessage(host.Name, host.Endpoint, host.Id.ToString(), host.Incarnation));
+        Ready(new HostReadyMessage(host.Name, host.Endpoint, host.Id.ToString(), host.Incarnation, DevelopmentCertificates.PersistedKeyName(certificate)));
         await control.RunAsync(host.Pause, host.Resume);
         await host.StopAsync();
         return ExitOk;
     }
 
-    private static async Task<int> RunBackupAsync(BackupHostConfiguration configuration, NodeLogLevel logLevel)
+    private static async Task<int> RunBackupAsync(BackupHostConfiguration configuration, NodeLogLevel logLevel, bool stopAtEndOfInput)
     {
         BackupNodeOptions options = configuration.ToBackupNodeOptions();
         using X509Certificate2 certificate = LoadCertificate(configuration.CertificatePath, configuration.CertificatePassword, options.Name);
@@ -118,7 +121,7 @@ internal static class Program
             LoopFactory = new ThreadNodeLoopFactory(log),
         };
 
-        using var control = new HostControl();
+        using var control = new HostControl(stopAtEndOfInput);
         BackupNodeHost host;
         try
         {
@@ -129,7 +132,7 @@ internal static class Program
             return Failed(options.Name, ex);
         }
 
-        Ready(new HostReadyMessage(host.Name, host.Endpoint, string.Empty, 0));
+        Ready(new HostReadyMessage(host.Name, host.Endpoint, string.Empty, 0, DevelopmentCertificates.PersistedKeyName(certificate)));
         await control.RunAsync(host.Pause, host.Resume);
         await host.StopAsync();
         return ExitOk;
@@ -234,6 +237,19 @@ internal static class Program
             ? Enum.TryParse(value, ignoreCase: true, out NodeLogLevel level) ? level : throw new ArgumentException($"Unknown log level '{value}'.")
             : NodeLogLevel.Info;
 
+    /// <summary><c>--control stdin</c>: the launcher controls the host through standard input (its end stops the host).</summary>
+    private static bool StopAtEndOfInput(Dictionary<string, string> flags)
+    {
+        if (!flags.TryGetValue("control", out string? value))
+            return false;
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "stdin" => true,
+            "none" => false,
+            _ => throw new ArgumentException($"Unknown --control value '{value}' (expected stdin or none)."),
+        };
+    }
+
     private static int Unknown(string command)
     {
         Console.Error.WriteLine($"Unknown command '{command}'.");
@@ -243,12 +259,12 @@ internal static class Program
 
     private static void PrintUsage() => Console.Error.WriteLine(string.Join(Environment.NewLine,
         "Usage:",
-        "  Tedd.Tdfs.Host node --config <file.json> [--log trace|debug|info|warn|error]",
-        "  Tedd.Tdfs.Host backup --config <file.json> [--log <level>]",
+        "  Tedd.Tdfs.Host node --config <file.json> [--log trace|debug|info|warn|error] [--control stdin|none]",
+        "  Tedd.Tdfs.Host backup --config <file.json> [--log <level>] [--control stdin|none]",
         "  Tedd.Tdfs.Host bootstrap --name <node> --listen quic://<ip>:<port> --storage <dir> --out <file.json>",
         "                           [--zone z1] [--region r1] [--rack rk1] [--host <host>] [--device d1]",
         "                           [--cluster-name <name>] [--admin-secret <secret>] [--timings Production|Fast]",
-        "A running host reads 'stop', 'pause' and 'resume' from standard input.",
+        "A running host reads 'stop', 'pause' and 'resume' from standard input; with --control stdin the end of input stops it.",
         string.Create(CultureInfo.InvariantCulture,
             $"Exit codes: {ExitOk} ok, {ExitUsage} usage, {ExitConfiguration} configuration, {ExitStartFailed} start failed, {ExitRecoveryKeyMissing} recovery key missing.")));
 

@@ -35,11 +35,43 @@ internal sealed class HostProcess : IAsyncDisposable
     /// <summary>Completes when the process exited.</summary>
     public Task Exited => _exited.Task;
 
+    /// <summary>The persisted key container of the host's certificate (deleted once the process is gone), or null.</summary>
+    public string? KeyContainer { get; private set; }
+
+    /// <summary>The process exit code, or null while it runs.</summary>
+    public int? ExitCode
+    {
+        get
+        {
+            try
+            {
+                return _process.HasExited ? _process.ExitCode : null;
+            }
+            catch (InvalidOperationException)
+            {
+                return null;
+            }
+        }
+    }
+
+    /// <summary>Closes the host's standard input (its end of input; a launcher-controlled host stops gracefully).</summary>
+    public void CloseInput()
+    {
+        try
+        {
+            _process.StandardInput.Close();
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException or ObjectDisposedException)
+        {
+            // Already gone.
+        }
+    }
+
     /// <summary>Starts a host process and waits for it to serve.</summary>
     /// <exception cref="InvalidOperationException">The process failed to start or exited before it served (the message carries its output).</exception>
     /// <exception cref="DfsException">The host reported a start failure with an error code (for example RecoveryKeyMissing).</exception>
     public static async Task<(HostProcess Process, HostReadyMessage Ready)> StartAsync(string hostDll, string command, string configPath, string name,
-        TimeSpan timeout, Action<string> trace, CancellationToken ct)
+        TimeSpan timeout, Action<string> trace, CancellationToken ct, bool stopAtEndOfInput = true)
     {
         var info = new ProcessStartInfo("dotnet")
         {
@@ -57,6 +89,11 @@ internal sealed class HostProcess : IAsyncDisposable
         info.ArgumentList.Add(configPath);
         info.ArgumentList.Add("--log");
         info.ArgumentList.Add("warn");
+        if (stopAtEndOfInput)
+        {
+            info.ArgumentList.Add("--control");
+            info.ArgumentList.Add("stdin"); // the end of our standard input (the harness died) stops the host
+        }
 
         var process = new Process { StartInfo = info, EnableRaisingEvents = true };
         var host = new HostProcess(process, name, trace);
@@ -69,15 +106,25 @@ internal sealed class HostProcess : IAsyncDisposable
         process.BeginErrorReadLine();
 
         Task first = await Task.WhenAny(host._ready.Task, host._exited.Task, Task.Delay(timeout, ct));
-        if (first == host._ready.Task)
-            return (host, await host._ready.Task);
-        host.Kill();
+        if (first == host._ready.Task && host._ready.Task.IsCompletedSuccessfully)
+        {
+            HostReadyMessage ready = await host._ready.Task;
+            host.KeyContainer = ready.KeyContainer;
+            if (!host.IsRunning)
+                host.DeleteLeftoverKey(); // exited right after reporting ready
+            return (host, ready);
+        }
+
+        // The process is not handed out: end it and release its handles (and any key container it left) before reporting.
+        string exitCode = SafeExitCode(process);
+        string tail = host.OutputTail();
+        await host.DisposeAsync();
         if (host._ready.Task.Exception?.InnerException is DfsException reported)
             throw reported; // the host reported why it could not start
         ct.ThrowIfCancellationRequested();
         throw new InvalidOperationException(first == host._exited.Task
-            ? $"The host process for {name} exited (code {SafeExitCode(process)}) before serving:{Environment.NewLine}{host.OutputTail()}"
-            : $"The host process for {name} did not serve within {timeout}:{Environment.NewLine}{host.OutputTail()}");
+            ? $"The host process for {name} exited (code {exitCode}) before serving:{Environment.NewLine}{tail}"
+            : $"The host process for {name} did not serve within {timeout}:{Environment.NewLine}{tail}");
     }
 
     /// <summary>Graceful stop: sends <c>stop</c> and waits for the exit; kills the process after <paramref name="timeout"/>.</summary>
@@ -199,8 +246,16 @@ internal sealed class HostProcess : IAsyncDisposable
 
     private void OnExited()
     {
+        // A killed host never disposes its certificate: remove the key container it left in the user's key store.
+        DeleteLeftoverKey();
         _exited.TrySetResult();
         _ready.TrySetException(new InvalidOperationException($"The host process for {Name} exited."));
+    }
+
+    private void DeleteLeftoverKey()
+    {
+        if (KeyContainer is { } key && DevelopmentCertificates.DeletePersistedKey(key))
+            _trace($"host {Name}: deleted the key container {key} its killed process left behind");
     }
 
     private static string SafeExitCode(Process process)

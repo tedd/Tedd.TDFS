@@ -159,6 +159,9 @@ public sealed partial class TestBackupNode : IFaultTarget
 
         lock (_gate)
         {
+            // A crash during the graceful stop already ended this process: the node stays Crashed.
+            if (!ReferenceEquals(_host, host) || !ReferenceEquals(_process, process))
+                return;
             _view?.Fence();
             _view = null;
             _host = null;
@@ -316,6 +319,7 @@ public sealed partial class TestBackupNode : IFaultTarget
         lock (_gate)
             _view = view;
         cluster.Record($"backup {Name}: start #{start.ToString(CultureInfo.InvariantCulture)}");
+        await PortAllocator.WaitUntilFreeAsync(Options.ListenEndpoint, TimeSpan.FromSeconds(10), cluster.Runtime);
 
         BackupNodeHost host;
         try

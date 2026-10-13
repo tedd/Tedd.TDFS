@@ -128,14 +128,26 @@ public static class ClusterTest
 
         Exception? outcome = Classify(cluster, scenarioFailure, invariantFailure);
         if (outcome is not null)
-        {
             cluster.KeepData = true;
-            Report(output, options, cluster.Seed, cluster, "scenario failed", outcome);
+
+        // A disposal failure never hides the run's own outcome; it fails an otherwise passing run.
+        Exception? disposeFailure = null;
+        try
+        {
+            await cluster.DisposeAsync();
+        }
+        catch (Exception ex)
+        {
+            disposeFailure = ex;
         }
 
-        await cluster.DisposeAsync();
+        outcome ??= disposeFailure;
         if (outcome is not null)
+        {
+            Report(output, options, cluster.Seed, cluster, "scenario failed", outcome);
             ExceptionDispatchInfo.Capture(outcome).Throw();
+        }
+
         return result;
     }
 
@@ -202,17 +214,18 @@ public static class ClusterTest
             throw;
         }
 
-        // Phase 2: the scenario, inside the simulation, on the "scenario" process.
+        // Phase 2: the scenario, inside the simulation, on the "scenario" process. A run cancelled before it starts still
+        // goes through disposal (the cluster is never leaked).
         Exception? scenarioFailure = null;
         T result = default!;
-        ct.ThrowIfCancellationRequested();
-        Task<T> run = scheduler.RunAsync(() =>
-        {
-            TestCluster.AmbientRuntime.Value = runtime;
-            return RunScenarioAsync(cluster, scenario);
-        }, options.ScenarioTimeout);
         try
         {
+            ct.ThrowIfCancellationRequested();
+            Task<T> run = scheduler.RunAsync(() =>
+            {
+                TestCluster.AmbientRuntime.Value = runtime;
+                return RunScenarioAsync(cluster, scenario);
+            }, options.ScenarioTimeout);
             result = run.GetAwaiter().GetResult();
         }
         catch (SimulationTimeoutException ex)

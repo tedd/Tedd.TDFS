@@ -99,17 +99,22 @@ internal sealed class HarnessLinkPolicy : ILinkPolicy
 
     public void SetPartition(IReadOnlyList<IReadOnlyList<string>> groups)
     {
+        // Validate completely before replacing anything: a rejected partition leaves the current one in force.
+        var partition = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (int i = 0; i < groups.Count; i++)
+        {
+            foreach (string name in groups[i])
+            {
+                if (!partition.TryAdd(name, i))
+                    throw new ArgumentException($"'{name}' is listed in more than one partition group.", nameof(groups));
+            }
+        }
+
         lock (_gate)
         {
             _partition.Clear();
-            for (int i = 0; i < groups.Count; i++)
-            {
-                foreach (string name in groups[i])
-                {
-                    if (!_partition.TryAdd(name, i))
-                        throw new ArgumentException($"'{name}' is listed in more than one partition group.", nameof(groups));
-                }
-            }
+            foreach (KeyValuePair<string, int> entry in partition)
+                _partition[entry.Key] = entry.Value;
         }
     }
 
@@ -218,10 +223,17 @@ internal sealed class HarnessLinkPolicy : ILinkPolicy
     // ------------------------------------------------------------------------------------------------ ILinkPolicy
 
     /// <inheritdoc />
+    /// <remarks>
+    /// Directional like every other decision of the policy: only the direction the connection is opened in counts, so
+    /// <c>Cut(a, b)</c>/<c>BlackHole(a, b)</c> stop <c>a</c> from reaching <c>b</c> but never stop <c>b</c> from opening a
+    /// connection to <c>a</c> and delivering over it (HAR-006: only the <c>from -&gt; to</c> direction is affected; replies
+    /// travelling back over such a connection are still dropped by <see cref="Decide"/>). Symmetric faults (isolation,
+    /// partitions, mesh restrictions) block both directions anyway.
+    /// </remarks>
     public bool CanConnect(string fromName, string toName)
     {
         lock (_gate)
-            return BlockedLocked(fromName, toName) is null && BlockedLocked(toName, fromName) is null;
+            return BlockedLocked(fromName, toName) is null;
     }
 
     /// <inheritdoc />

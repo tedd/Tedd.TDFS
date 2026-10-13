@@ -8,10 +8,19 @@ namespace Tedd.Tdfs.Testing;
 /// a dead incarnation that is still unwinding (realtime threads, a work item running when the loop stopped) can never
 /// change the disk image the next incarnation starts from.
 /// </summary>
+/// <remarks>
+/// The fence check and the start of every namespace operation happen under one gate that <see cref="Fence"/> also takes,
+/// so an operation that passed the check completes before the fence (and therefore before the crash that follows it)
+/// rather than landing on the image the crash produced. Both media complete namespace operations synchronously; the one
+/// that can wait first (<see cref="FaultingFileSystemMedium"/> with an I/O delay) re-checks the fence under its own lock
+/// after the delay. File operations are additionally rejected by the media themselves once a crash invalidated their
+/// handles.
+/// </remarks>
 internal sealed class FencedMedium : IStorageMedium
 {
     private readonly IStorageMedium _inner;
     private readonly string _owner;
+    private readonly object _fenceGate = new();
     private volatile bool _fenced;
 
     public FencedMedium(IStorageMedium inner, string owner)
@@ -35,14 +44,24 @@ internal sealed class FencedMedium : IStorageMedium
     /// <inheritdoc />
     public long UsedBytes => _inner.UsedBytes;
 
-    /// <summary>Fences the view (idempotent).</summary>
-    public void Fence() => _fenced = true;
+    /// <summary>Fences the view (idempotent); waits for a namespace operation that already passed the fence check.</summary>
+    public void Fence()
+    {
+        lock (_fenceGate)
+            _fenced = true;
+    }
 
     /// <inheritdoc />
     public async ValueTask<IStorageFile> OpenAsync(string path, StorageOpenMode mode, CancellationToken ct = default)
     {
-        ThrowIfFenced(path);
-        IStorageFile file = await _inner.OpenAsync(path, mode, ct);
+        ValueTask<IStorageFile> opening;
+        lock (_fenceGate)
+        {
+            ThrowIfFenced(path);
+            opening = _inner is FaultingFileSystemMedium fs ? fs.OpenAsync(path, mode, () => _fenced, ct) : _inner.OpenAsync(path, mode, ct);
+        }
+
+        IStorageFile file = await opening;
         if (_fenced)
         {
             await file.DisposeAsync();
@@ -62,15 +81,21 @@ internal sealed class FencedMedium : IStorageMedium
     /// <inheritdoc />
     public ValueTask DeleteAsync(string path, CancellationToken ct = default)
     {
-        ThrowIfFenced(path);
-        return _inner.DeleteAsync(path, ct);
+        lock (_fenceGate)
+        {
+            ThrowIfFenced(path);
+            return _inner.DeleteAsync(path, ct);
+        }
     }
 
     /// <inheritdoc />
     public ValueTask RenameAsync(string from, string to, bool overwrite, CancellationToken ct = default)
     {
-        ThrowIfFenced(from);
-        return _inner.RenameAsync(from, to, overwrite, ct);
+        lock (_fenceGate)
+        {
+            ThrowIfFenced(from);
+            return _inner.RenameAsync(from, to, overwrite, ct);
+        }
     }
 
     /// <inheritdoc />
@@ -83,15 +108,21 @@ internal sealed class FencedMedium : IStorageMedium
     /// <inheritdoc />
     public ValueTask CreateDirectoryAsync(string directory, CancellationToken ct = default)
     {
-        ThrowIfFenced(directory);
-        return _inner.CreateDirectoryAsync(directory, ct);
+        lock (_fenceGate)
+        {
+            ThrowIfFenced(directory);
+            return _inner.CreateDirectoryAsync(directory, ct);
+        }
     }
 
     /// <inheritdoc />
     public ValueTask FlushDirectoryAsync(string directory, CancellationToken ct = default)
     {
-        ThrowIfFenced(directory);
-        return _inner.FlushDirectoryAsync(directory, ct);
+        lock (_fenceGate)
+        {
+            ThrowIfFenced(directory);
+            return _inner is FaultingFileSystemMedium fs ? fs.FlushDirectoryAsync(directory, () => _fenced, ct) : _inner.FlushDirectoryAsync(directory, ct);
+        }
     }
 
     /// <inheritdoc />

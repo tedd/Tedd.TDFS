@@ -98,7 +98,7 @@ internal sealed class FaultingFileSystemMedium : IStorageMedium
                         continue;
                     writes++;
                     bytes += w.Data?.Length ?? 0;
-                    paths.Add(state.Path);
+                    paths.Add(RelativeOf(state.Path));
                 }
             }
 
@@ -190,6 +190,10 @@ internal sealed class FaultingFileSystemMedium : IStorageMedium
                     lostPaths.Add(op.Path);
                 }
 
+                // Undoing a creation discards the file with every change written to it, including changes a dishonest
+                // flush acknowledged (counted like SimulatedMedium does for nodes whose directory entry is lost).
+                if (op.Kind == OpKind.CreateFile && _states.TryGetValue(Full(op.Path), out FileState? created))
+                    CountLost(created, created.Pending, ref lostWrites, ref lostBytes, lostPaths);
                 UndoNamespace(op);
             }
 
@@ -270,13 +274,20 @@ internal sealed class FaultingFileSystemMedium : IStorageMedium
     }
 
     /// <inheritdoc />
-    public async ValueTask<IStorageFile> OpenAsync(string path, StorageOpenMode mode, CancellationToken ct = default)
+    public ValueTask<IStorageFile> OpenAsync(string path, StorageOpenMode mode, CancellationToken ct = default) => OpenAsync(path, mode, fenced: null, ct);
+
+    /// <summary>
+    /// <see cref="OpenAsync(string, StorageOpenMode, CancellationToken)"/> for a fenced view: <paramref name="fenced"/> is
+    /// re-checked under the medium's lock after an I/O delay, so a dead incarnation never creates or truncates a file.
+    /// </summary>
+    internal async ValueTask<IStorageFile> OpenAsync(string path, StorageOpenMode mode, Func<bool>? fenced, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         string p = FilePath(path);
         await DelayAsync(p, ct);
         lock (_gate)
         {
+            ThrowIfFenced(fenced, p);
             string full = Full(p);
             if (Directory.Exists(full))
                 throw new UnauthorizedAccessException($"Access to the path '{p}' is denied: it is a directory.");
@@ -451,13 +462,17 @@ internal sealed class FaultingFileSystemMedium : IStorageMedium
     }
 
     /// <inheritdoc />
-    public async ValueTask FlushDirectoryAsync(string directory, CancellationToken ct = default)
+    public ValueTask FlushDirectoryAsync(string directory, CancellationToken ct = default) => FlushDirectoryAsync(directory, fenced: null, ct);
+
+    /// <summary><see cref="FlushDirectoryAsync(string, CancellationToken)"/> for a fenced view (re-checked after an I/O delay).</summary>
+    internal async ValueTask FlushDirectoryAsync(string directory, Func<bool>? fenced, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         string d = StoragePath.Normalize(directory);
         await DelayAsync(d, ct);
         lock (_gate)
         {
+            ThrowIfFenced(fenced, d);
             if (!Directory.Exists(Full(d)))
                 throw new DirectoryNotFoundException($"Could not find directory '{directory}'.");
             int last = _pendingNamespace.FindLastIndex(op => op.Touches(d));
@@ -618,6 +633,12 @@ internal sealed class FaultingFileSystemMedium : IStorageMedium
     }
 
     private bool MatchesFilter(string path) => Faults.PathFilter is not { } filter || filter(path);
+
+    private static void ThrowIfFenced(Func<bool>? fenced, string path)
+    {
+        if (fenced is not null && fenced())
+            throw new ObjectDisposedException(path, $"The process that started the operation on '{path}' has crashed or stopped; its view of the disk is fenced.");
+    }
 
     private void ThrowIfReadOnly(string path)
     {
@@ -806,7 +827,7 @@ internal sealed class FaultingFileSystemMedium : IStorageMedium
             RandomAccess.Write(handle, w.Data.AsSpan(0, keep), w.Offset);
     }
 
-    private static void CountLost(FileState state, IEnumerable<PendingWrite> lost, ref int writes, ref long bytes, SortedSet<string> paths)
+    private void CountLost(FileState state, IEnumerable<PendingWrite> lost, ref int writes, ref long bytes, SortedSet<string> paths)
     {
         foreach (PendingWrite w in lost)
         {
@@ -814,8 +835,17 @@ internal sealed class FaultingFileSystemMedium : IStorageMedium
                 continue;
             writes++;
             bytes += w.Data?.Length ?? 0;
-            paths.Add(state.Path);
+            paths.Add(RelativeOf(state.Path));
         }
+    }
+
+    /// <summary>The medium-relative path of a full path under the root (parked files keep their full path).</summary>
+    private string RelativeOf(string full)
+    {
+        string relative = System.IO.Path.GetRelativePath(_root, full);
+        return relative.StartsWith("..", StringComparison.Ordinal) || System.IO.Path.IsPathRooted(relative)
+            ? full
+            : relative.Replace(System.IO.Path.DirectorySeparatorChar, '/');
     }
 
     private long UsedLocked()

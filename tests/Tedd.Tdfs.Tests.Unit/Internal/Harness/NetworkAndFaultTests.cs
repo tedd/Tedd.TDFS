@@ -76,7 +76,7 @@ public sealed class NetworkAndFaultTests
 
             // A replayed Raft batch is delivered again from the leader's identity; Raft treats it as stale/duplicate.
             DfsErrorCode replayed = await cluster.Network.ReplayAsync(first);
-            Assert.Contains(replayed, new[] { DfsErrorCode.None, DfsErrorCode.Unavailable, DfsErrorCode.AccessDenied });
+            Assert.Equal(DfsErrorCode.None, replayed); // sent again over the leader's own node connection
             await cluster.WaitForStableAsync(null, Ct);
             Assert.True(cluster.Network.Log.CountMessages(new MessageFilter(Type: MessageType.RaftBatch)) > 0);
         }, Ct);

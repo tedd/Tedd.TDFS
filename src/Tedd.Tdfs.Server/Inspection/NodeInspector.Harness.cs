@@ -1,3 +1,4 @@
+using Tedd.Tdfs.Data;
 using Tedd.Tdfs.Server.Control;
 using Tedd.Tdfs.Server.Raft;
 using Tedd.Tdfs.Server.Runtime;
@@ -119,6 +120,11 @@ public sealed partial class NodeInspector
     /// Re-reads and verifies (checksum, identity) the whole object from the local store. False when the store does not hold
     /// it or the stored copy fails verification.
     /// </summary>
+    /// <remarks>
+    /// The whole-object checksum of the bytes read is recomputed here and compared with the record's, so the answer does not
+    /// depend on the store's own read verification (which a safety mutation such as
+    /// <see cref="SafetyMutations.SkipChecksumVerification"/> may switch off): harness ground truth stays independent.
+    /// </remarks>
     internal Task<bool> VerifyObjectAsync(ObjectId id) => _loop.InvokeAsync(async () =>
     {
         ObjectStore store = S.ObjectStore;
@@ -136,7 +142,7 @@ public sealed partial class NodeInspector
                 total += read;
             }
 
-            return true;
+            return ObjectChecksum.Compute(buffer) == info.Checksum;
         }
         catch (Exception ex) when (ex is DfsException or IOException or ObjectDisposedException)
         {
@@ -146,7 +152,8 @@ public sealed partial class NodeInspector
 
     /// <summary>
     /// Re-reads and verifies every listed object the local store holds (one node-loop invocation); returns the ids whose
-    /// stored copy verified. Objects not held, unreadable or failing verification are omitted.
+    /// stored copy verified. Objects not held, unreadable or failing verification are omitted. Like
+    /// <see cref="VerifyObjectAsync"/>, the whole-object checksum is recomputed here (independent of mutated read paths).
     /// </summary>
     internal Task<IReadOnlySet<ObjectId>> VerifyObjectsAsync(IReadOnlyCollection<ObjectId> ids)
     {
@@ -179,7 +186,7 @@ public sealed partial class NodeInspector
                         total += read;
                     }
 
-                    if (complete)
+                    if (complete && ObjectChecksum.Compute(buffer.AsSpan(0, checked((int)info.Length))) == info.Checksum)
                         verified.Add(id);
                 }
                 catch (Exception ex) when (ex is DfsException or IOException or ObjectDisposedException)

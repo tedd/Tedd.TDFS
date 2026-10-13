@@ -194,6 +194,10 @@ public sealed partial class TestNode : IFaultTarget, IObjectStoreAccess
 
         lock (_gate)
         {
+            // A crash while the graceful stop ran (a fault point, CrashAsync from another thread) already ended this
+            // incarnation and decided the disk image: the node stays Crashed, never "Stopped".
+            if (!ReferenceEquals(_host, host) || !ReferenceEquals(_process, process))
+                return;
             _view?.Fence();
             _view = null;
             _host = null;
@@ -329,6 +333,7 @@ public sealed partial class TestNode : IFaultTarget, IObjectStoreAccess
         lock (_gate)
             _view = view;
         cluster.Record($"node {Name}: start #{start.ToString(CultureInfo.InvariantCulture)}");
+        await PortAllocator.WaitUntilFreeAsync(Options.ListenEndpoint, TimeSpan.FromSeconds(10), cluster.Runtime);
 
         NodeHost host;
         try

@@ -35,10 +35,14 @@ public sealed partial class TestNetwork
     /// receiver that accepts the tampered bytes as a valid message is a defect. <see cref="MessageRule.Matched"/> counts
     /// tampered transmissions (proof the tamper point was reached). Retransmissions by the transport itself are not
     /// tampered unless <paramref name="count"/> covers them.
-    /// <para>Implementation status: the in-memory and simulated transports carry frames without any integrity protection,
-    /// so the harness alters the transmitted frame itself (the receiver's own validation is what is exercised; a receiver
-    /// that accepts an altered frame as a different valid message is reported by the test). QUIC tampering needs a datagram
-    /// interposer between MsQuic sockets, which this harness does not provide: the call throws
+    /// <para>Implementation status: the in-memory and simulated transports carry frames without a cryptographic envelope, so
+    /// the harness models the protection a real transport has instead of altering application frames (which would test
+    /// the receiver's message validation, a different property): a transmission altered by <see cref="TransportTamper.FlipBit"/>,
+    /// <see cref="TransportTamper.Truncate"/>, <see cref="TransportTamper.AppendGarbage"/> or
+    /// <see cref="TransportTamper.Scramble"/> fails the receiver's integrity check, so nothing reaches the receiving
+    /// application and the connection is torn down (a fatal integrity error); a <see cref="TransportTamper.Replay"/>ed
+    /// transmission is discarded by the receiver's anti-replay check, so the original is delivered exactly once. QUIC
+    /// tampering needs a datagram interposer between MsQuic sockets, which this harness does not provide: the call throws
     /// <see cref="NotSupportedException"/> for <see cref="TransportKind.Quic"/> rather than fabricating evidence.</para>
     /// </remarks>
     public MessageRule TamperNext(MessageFilter filter, TransportTamper mode, int count = 1)

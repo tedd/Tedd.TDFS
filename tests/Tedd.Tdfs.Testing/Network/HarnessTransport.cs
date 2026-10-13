@@ -239,10 +239,6 @@ internal sealed class HarnessConnection : IRpcConnection
         }
     }
 
-    /// <summary>True when <paramref name="other"/> authenticated with the same role and principal.</summary>
-    public bool HasSameIdentity(HarnessConnection other) =>
-        HelloRole == other.HelloRole && string.Equals(HelloPrincipal, other.HelloPrincipal, StringComparison.Ordinal);
-
     /// <summary>Subscribes to the inner connection's close (after registration).</summary>
     public void AttachClosed() => Inner.Closed += OnInnerClosed;
 
@@ -278,26 +274,38 @@ internal sealed class HarnessConnection : IRpcConnection
             return ct.IsCancellationRequested ? ValueTask.FromCanceled(ct) : ValueTask.CompletedTask;
         if (Fabric.Policy.TryTakeRule(MessageRuleKind.Truncate, LocalName, RemoteName, LinkDirection.OneWay, message.Span) is { } truncate)
         {
-            Fabric.Trace($"truncated one-way {TypeOf(message.Span)} {LocalName}->{RemoteName} to {truncate.KeepBytes.ToString(CultureInfo.InvariantCulture)} byte(s)");
-            ValueTask sent = Inner.SendAsync(message[..Math.Min(message.Length, truncate.KeepBytes)], ct);
+            int keep = Math.Min(message.Length, truncate.KeepBytes);
+            Fabric.Trace($"truncated one-way {TypeOf(message.Span)} {LocalName}->{RemoteName} to {keep.ToString(CultureInfo.InvariantCulture)} of {message.Length.ToString(CultureInfo.InvariantCulture)} byte(s), then closed");
+            if (keep >= message.Length)
+            {
+                ValueTask sent = Inner.SendAsync(message, ct);
+                _ = Inner.DisposeAsync();
+                return sent;
+            }
+
+            // A frame cut short by the end of the stream never reaches the receiving application: its transport discards
+            // the partial frame when the connection closes. The bytes were handed to the transport, so the send itself
+            // completes; the connection is gone afterwards.
             _ = Inner.DisposeAsync();
-            return sent;
+            return ValueTask.CompletedTask;
         }
 
         if (Fabric.Policy.TryTakeRule(MessageRuleKind.Tamper, LocalName, RemoteName, LinkDirection.OneWay, message.Span) is { } tamper)
         {
-            Fabric.Trace($"tampered one-way {TypeOf(message.Span)} {LocalName}->{RemoteName} ({tamper.Tamper})");
+            Fabric.Trace($"tampered one-way {TypeOf(message.Span)} {LocalName}->{RemoteName} below integrity protection ({tamper.Tamper}): {TamperOutcome(tamper.Tamper)}");
             if (tamper.Tamper == TransportTamper.Replay)
-            {
-                _ = Inner.SendAsync(message, ct);
-                return Inner.SendAsync(message, ct);
-            }
-
-            return Inner.SendAsync(Fabric.Tamper(message.Span, tamper.Tamper), ct);
+                return Inner.SendAsync(message, ct); // the replayed copy is discarded by the receiver's anti-replay check
+            _ = Inner.DisposeAsync();
+            return ValueTask.CompletedTask;
         }
 
         return Inner.SendAsync(message, ct);
     }
+
+    /// <summary>What the receiver's transport does with a transmission tampered below its integrity protection.</summary>
+    internal static string TamperOutcome(TransportTamper mode) => mode == TransportTamper.Replay
+        ? "the original is delivered once, the replayed copy is discarded by the receiver's anti-replay check"
+        : "the receiver's integrity check rejects it, nothing reaches the application and the connection is torn down";
 
     /// <inheritdoc />
     public ValueTask DisposeAsync() => Inner.DisposeAsync();
@@ -341,27 +349,47 @@ internal sealed class HarnessConnection : IRpcConnection
             }
         }, this, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
 
+    /// <summary>
+    /// A request whose frame is cut after <see cref="MessageRule.KeepBytes"/> bytes by the end of the stream
+    /// (<see cref="TestNetwork.TruncateNext"/>). A partial frame is never a message: the receiver's transport discards it when
+    /// the connection closes, so the receiving application never sees it and the caller sees the connection close (an
+    /// unknown outcome), never a reply to a shortened request. On the simulated network the partial frame really travels
+    /// (one fragment, then the close); the realtime transports cannot write part of a frame, so they close at once, which
+    /// is what the receiver observes either way. <c>KeepBytes</c> at or above the frame length delivers it, then closes.
+    /// </summary>
     private Task<ReadOnlyMemory<byte>> TruncatedCall(ReadOnlyMemory<byte> request, MessageRule rule, TimeSpan timeout, CancellationToken ct)
     {
         int keep = Math.Min(request.Length, rule.KeepBytes);
         Fabric.Trace($"truncated request {TypeOf(request.Span)} {LocalName}->{RemoteName} to {keep.ToString(CultureInfo.InvariantCulture)} of {request.Length.ToString(CultureInfo.InvariantCulture)} byte(s), then closed");
-        Task<ReadOnlyMemory<byte>> call = Inner.CallAsync(request[..keep], timeout, ct);
-        _ = Inner.DisposeAsync();
-        return call;
-    }
-
-    private Task<ReadOnlyMemory<byte>> TamperedCall(ReadOnlyMemory<byte> request, MessageRule rule, TimeSpan timeout, CancellationToken ct)
-    {
-        Fabric.Trace($"tampered request {TypeOf(request.Span)} {LocalName}->{RemoteName} ({rule.Tamper})");
-        if (rule.Tamper == TransportTamper.Replay)
+        if (keep >= request.Length)
         {
-            Task<ReadOnlyMemory<byte>> first = Inner.CallAsync(request, timeout, ct);
-            Task<ReadOnlyMemory<byte>> replayed = Inner.CallAsync(request, timeout, ct);
-            _ = replayed.ContinueWith(static t => _ = t.Exception, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-            return first;
+            Task<ReadOnlyMemory<byte>> whole = Inner.CallAsync(request, timeout, ct);
+            _ = Inner.DisposeAsync();
+            return whole;
         }
 
-        return Inner.CallAsync(Fabric.Tamper(request.Span, rule.Tamper), timeout, ct);
+        if (Inner is Simulation.SimConnectionEnd sim)
+            return sim.CallInPiecesAsync(request, keep > 0 ? [keep] : [], timeout, closeAfterPieces: true);
+        _ = Inner.DisposeAsync();
+        return Task.FromException<ReadOnlyMemory<byte>>(new RpcConnectionException(
+            $"The connection to {RemoteName} closed after {keep} of {request.Length} request byte(s) (truncated by the harness); the request may not have been received."));
+    }
+
+    /// <summary>
+    /// A request tampered with below the transport's integrity protection (<see cref="TestNetwork.TamperNext"/>). The
+    /// in-memory and simulated transports model the protection the real transport has: an altered protected envelope fails
+    /// the receiver's integrity check, so nothing reaches the receiving application and the connection is torn down (a fatal
+    /// integrity error); a replayed envelope is discarded by the receiver's anti-replay check, so the original is delivered
+    /// exactly once. The application frame itself is never altered (that would test a different property).
+    /// </summary>
+    private Task<ReadOnlyMemory<byte>> TamperedCall(ReadOnlyMemory<byte> request, MessageRule rule, TimeSpan timeout, CancellationToken ct)
+    {
+        Fabric.Trace($"tampered request {TypeOf(request.Span)} {LocalName}->{RemoteName} below integrity protection ({rule.Tamper}): {TamperOutcome(rule.Tamper)}");
+        if (rule.Tamper == TransportTamper.Replay)
+            return Inner.CallAsync(request, timeout, ct);
+        _ = Inner.DisposeAsync();
+        return Task.FromException<ReadOnlyMemory<byte>>(new RpcConnectionException(
+            $"The connection to {RemoteName} was torn down: a transmission failed the receiver's integrity check (tampered by the harness)."));
     }
 
     /// <summary>A call on a silently dead connection: nothing arrives; the caller's own timeout or cancellation decides.</summary>
@@ -540,22 +568,29 @@ internal sealed class HarnessHandler : IRpcHandler
     {
         reply = LimitReadResult(connection, request, reply);
         bool close = false;
+        bool deliver = true;
         if (Fabric.Policy.TryTakeRule(MessageRuleKind.Truncate, _transport.LocalName, connection.RemoteName, LinkDirection.Reply, reply.Span) is { } truncate)
         {
+            // A reply frame cut short by the end of the stream is discarded by the caller's transport when the connection
+            // closes: the caller sees the connection close, never a shortened reply (TruncatedCall explains the model).
             int keep = Math.Min(reply.Length, truncate.KeepBytes);
             Fabric.Trace($"truncated reply {HarnessConnection.TypeOf(reply.Span)} {_transport.LocalName}->{connection.RemoteName} to {keep.ToString(CultureInfo.InvariantCulture)} of {reply.Length.ToString(CultureInfo.InvariantCulture)} byte(s), then closed");
-            reply = reply[..keep];
+            deliver = keep >= reply.Length;
             close = true;
         }
         else if (Fabric.Policy.TryTakeRule(MessageRuleKind.Tamper, _transport.LocalName, connection.RemoteName, LinkDirection.Reply, reply.Span) is { } tamper)
         {
-            // A replayed reply is discarded by the caller's transport (its correlation is already answered).
-            Fabric.Trace($"tampered reply {HarnessConnection.TypeOf(reply.Span)} {_transport.LocalName}->{connection.RemoteName} ({tamper.Tamper})");
+            // Below integrity protection: an altered envelope is rejected by the caller's transport (connection torn down),
+            // a replayed one is discarded by its anti-replay check (the original reply is delivered once).
+            Fabric.Trace($"tampered reply {HarnessConnection.TypeOf(reply.Span)} {_transport.LocalName}->{connection.RemoteName} below integrity protection ({tamper.Tamper}): {HarnessConnection.TamperOutcome(tamper.Tamper)}");
             if (tamper.Tamper != TransportTamper.Replay)
-                reply = Fabric.Tamper(reply.Span, tamper.Tamper);
+            {
+                deliver = false;
+                close = true;
+            }
         }
 
-        ReadOnlyMemory<byte> final = reply;
+        ReadOnlyMemory<byte>? final = deliver ? reply : (ReadOnlyMemory<byte>?)null; // null = no reply (an untyped null would convert to an empty frame)
         Fabric.Runtime.Complete(() => result.TrySetResult(final));
         if (close)
             _ = connection.Inner.DisposeAsync();

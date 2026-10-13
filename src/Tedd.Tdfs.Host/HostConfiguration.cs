@@ -150,7 +150,11 @@ public sealed record BackupHostConfiguration
 /// <param name="Endpoint">Bound endpoint.</param>
 /// <param name="NodeId">Node id (live nodes; empty for backup nodes).</param>
 /// <param name="Incarnation">Incarnation (live nodes; 0 for backup nodes).</param>
-public sealed record HostReadyMessage(string Name, string Endpoint, string NodeId, ulong Incarnation);
+/// <param name="KeyContainer">
+/// Persisted key container of the host's certificate (Windows), which a launcher deletes after killing the host (a killed
+/// process never disposes its certificate); null when the platform keeps no per-process key file.
+/// </param>
+public sealed record HostReadyMessage(string Name, string Endpoint, string NodeId, ulong Incarnation, string? KeyContainer = null);
 
 /// <summary>JSON settings and helpers shared by the host and the processes that launch it.</summary>
 public static class HostConfigurationJson

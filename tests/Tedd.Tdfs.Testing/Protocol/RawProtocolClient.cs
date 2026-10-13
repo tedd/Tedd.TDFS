@@ -646,7 +646,9 @@ public sealed partial class RawProtocolClient : IAsyncDisposable
                 HandleId[] handles;
                 lock (_gate)
                 {
-                    if (_stopped || _owner._disposed)
+                    // A raw client the test never disposed must not keep renewing (and keep a timer loop alive) after its
+                    // cluster is gone.
+                    if (_stopped || _owner._disposed || _owner._cluster.IsDisposed)
                         return;
                     handles = [.. _autoRenew];
                 }

@@ -40,11 +40,62 @@ public static class DevelopmentCertificates
     /// Loads a PKCS#12 certificate with a persisted (non-ephemeral) key container, which the platform TLS stack can sign
     /// with; the container is deleted when the certificate is disposed.
     /// </summary>
+    /// <remarks>
+    /// The container is a file in the user's key store (Windows: a CNG key under the user profile). A process that is
+    /// killed never disposes its certificate, so its container is left behind; launchers that kill hosts delete it with
+    /// <see cref="DeletePersistedKey"/>, using the name the host reports in <see cref="HostReadyMessage.KeyContainer"/>.
+    /// </remarks>
     public static X509Certificate2 Load(byte[] pfx, string? password) =>
         X509CertificateLoader.LoadPkcs12(pfx, password, X509KeyStorageFlags.DefaultKeySet);
 
     /// <summary>Parses hex SPKI pins.</summary>
     /// <exception cref="InvalidDataException">A pin is not 32 bytes of hex.</exception>
+    /// <summary>
+    /// The name of the persisted key container holding <paramref name="certificate"/>'s private key (Windows CNG), or null
+    /// when the key is not a named, persisted CNG key (other platforms keep no per-process key files).
+    /// </summary>
+    public static string? PersistedKeyName(X509Certificate2 certificate)
+    {
+        ArgumentNullException.ThrowIfNull(certificate);
+        if (!OperatingSystem.IsWindows())
+            return null;
+        try
+        {
+            using ECDsa? ecdsa = certificate.GetECDsaPrivateKey();
+            if (ecdsa is ECDsaCng { Key: { IsEphemeral: false, KeyName: { Length: > 0 } name } })
+                return name;
+            using RSA? rsa = certificate.GetRSAPrivateKey();
+            return rsa is RSACng { Key: { IsEphemeral: false, KeyName: { Length: > 0 } rsaName } } ? rsaName : null;
+        }
+        catch (CryptographicException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Deletes a persisted key container left behind by a host process that was killed (see <see cref="Load"/>); true when
+    /// it existed. Never throws: a container that is already gone (the host exited cleanly) is not an error.
+    /// </summary>
+    public static bool DeletePersistedKey(string keyName)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(keyName);
+        if (!OperatingSystem.IsWindows())
+            return false;
+        try
+        {
+            if (!CngKey.Exists(keyName, CngProvider.MicrosoftSoftwareKeyStorageProvider))
+                return false;
+            using CngKey key = CngKey.Open(keyName, CngProvider.MicrosoftSoftwareKeyStorageProvider);
+            key.Delete();
+            return true;
+        }
+        catch (CryptographicException)
+        {
+            return false;
+        }
+    }
+
     public static IReadOnlyList<byte[]> ParsePins(IEnumerable<string> pins)
     {
         var result = new List<byte[]>();

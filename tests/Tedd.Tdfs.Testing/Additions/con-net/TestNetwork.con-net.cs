@@ -20,9 +20,12 @@ public sealed partial class TestNetwork
     /// sending side. A <paramref name="keepBytes"/> equal to or larger than the frame length delivers the frame and then
     /// closes. The truncation is recorded in <see cref="TestCluster.Trace"/>. Throws <see cref="ArgumentOutOfRangeException"/>
     /// for negative <paramref name="keepBytes"/> or nonpositive <paramref name="count"/>.
-    /// <para>Implementation: the sending end's interposition layer hands its transport the frame prefix as the message and
-    /// closes the connection right behind it (requests and one-way messages on the sender's connection, replies on the
-    /// responder's), so the close is ordered after the partial frame on every transport.</para>
+    /// <para>Implementation: the sending end's interposition layer applies the rule (requests and one-way messages on the sender's connection,
+    /// replies on the responder's). A partial frame is never handed to the receiving application as a message: on the simulated network a truncated
+    /// request's prefix travels as one fragment followed by the close, and the receiving end discards the incomplete frame when the close arrives;
+    /// replies and the realtime transports cannot carry part of a frame, so they close the connection without it, which is exactly what the
+    /// receiver's application observes in both cases (the pending call fails as a lost connection). A <paramref name="keepBytes"/> at or above the
+    /// frame length delivers the frame and closes right behind it.</para>
     /// </remarks>
     public MessageRule TruncateNext(MessageFilter filter, int keepBytes, int count = 1)
     {

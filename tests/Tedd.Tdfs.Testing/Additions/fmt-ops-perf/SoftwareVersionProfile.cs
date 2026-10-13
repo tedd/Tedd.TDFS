@@ -134,14 +134,20 @@ public sealed record SoftwareVersionProfile(
     public override string ToString() =>
         $"{Name}(protocol {ProtocolVersionMin}..{ProtocolVersionMax}, disk {DiskFormatVersion}/read<={MaxReadableDiskFormatVersion}{(IsEmulated ? ", emulated" : string.Empty)})";
 
-    /// <summary>Disk-format version of every durable structure the build under test writes.</summary>
-    internal const int CurrentDiskFormat = 1;
+    /// <summary>
+    /// Disk-format version the build under test writes: the highest format version of its durable structures (superblock,
+    /// journal segments, checkpoints, object segments), taken from the storage layer itself so a format bump can never leave
+    /// the profile describing an older build.
+    /// </summary>
+    internal static readonly int CurrentDiskFormat = Math.Max(
+        Math.Max(Storage.Superblock.CurrentFormatVersion, (int)Storage.Journal.FormatVersion),
+        Math.Max((int)Storage.CheckpointStore.FormatVersion, (int)Storage.ObjectStore.FormatVersion));
 
     /// <summary>Minimum-reader marker recorded once <see cref="IrreversibleProbeFeature"/> is active.</summary>
-    internal const int IrreversibleProbeMarker = CurrentDiskFormat + 1;
+    internal static readonly int IrreversibleProbeMarker = CurrentDiskFormat + 1;
 
     /// <summary>Minimum-reader marker recorded once <see cref="NextFeature"/> is active.</summary>
-    internal const int NextFeatureMarker = IrreversibleProbeMarker + 1;
+    internal static readonly int NextFeatureMarker = IrreversibleProbeMarker + 1;
 
     /// <summary>The cached built-in profiles (one instance each, see the identity contract above).</summary>
     private static class Profiles

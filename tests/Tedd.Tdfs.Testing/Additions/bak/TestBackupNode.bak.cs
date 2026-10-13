@@ -17,13 +17,13 @@ public sealed partial class TestBackupNode
     /// replies for transfers of <paramref name="volume"/> are rewritten so that the claimed ids are no longer listed as
     /// missing. The node itself is untouched.
     /// </remarks>
-    public Task SetFalseInventoryClaimsAsync(string volume, IReadOnlyCollection<ObjectId> objectIds)
+    public async Task SetFalseInventoryClaimsAsync(string volume, IReadOnlyCollection<ObjectId> objectIds)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(volume);
         ArgumentNullException.ThrowIfNull(objectIds);
+        await Cluster.RefreshVolumeNamesAsync(); // inventory requests name the volume by id
         Cluster.Fabric.SetInventoryClaims(Name, volume, objectIds);
         Cluster.Record($"backup {Name}: {objectIds.Count} false inventory claim(s) for volume {volume}");
-        return Task.CompletedTask;
     }
 
     /// <summary>

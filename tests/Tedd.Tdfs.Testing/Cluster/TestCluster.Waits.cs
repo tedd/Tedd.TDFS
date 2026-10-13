@@ -259,6 +259,16 @@ public sealed partial class TestCluster
         return running[attempt % running.Count].Endpoint;
     }
 
+    /// <summary>
+    /// Refreshes the volume id → name map the interposition layer resolves <c>GetObject</c>/<c>BackupInventory</c> volumes
+    /// with (volumes created after the last stability check are otherwise unknown to it).
+    /// </summary>
+    internal async Task RefreshVolumeNamesAsync()
+    {
+        if (!Options.OutOfProcess)
+            await SnapshotAsync();
+    }
+
     /// <summary>The name of a volume id as last seen in a control state snapshot, or null.</summary>
     internal string? VolumeNameOf(VolumeId id)
     {

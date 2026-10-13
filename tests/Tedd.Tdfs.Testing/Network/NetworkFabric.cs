@@ -46,6 +46,7 @@ internal sealed class NetworkFabric
     private readonly HashSet<string> _names = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _attempts = new(StringComparer.Ordinal);
     private readonly List<HarnessTransport> _transports = [];
+    private readonly Dictionary<string, HarnessTransportFactory> _factories = new(StringComparer.Ordinal);
     private readonly List<HarnessConnection> _connections = [];
     private readonly Dictionary<IRpcConnection, HarnessConnection> _serverConnections = new(ReferenceEqualityComparer.Instance);
     private readonly List<MessageHold> _holds = [];
@@ -62,7 +63,7 @@ internal sealed class NetworkFabric
     {
         Runtime = runtime;
         Kind = kind;
-        _random = random.Fork("fabric/tamper");
+        _random = random.Fork("fabric/replay");
         Policy = new HarnessLinkPolicy(runtime);
         if (runtime.Scheduler is { } scheduler)
         {
@@ -247,6 +248,7 @@ internal sealed class NetworkFabric
         {
             _transports.Add(transport);
             _names.Add(transport.LocalName);
+            _factories[transport.LocalName] = transport.Factory; // replays of the identity outlive its transports
         }
     }
 
@@ -464,45 +466,6 @@ internal sealed class NetworkFabric
         return null;
     }
 
-    /// <summary>Mutates a frame for <see cref="TestNetwork.TamperNext"/> (seeded).</summary>
-    internal byte[] Tamper(ReadOnlySpan<byte> frame, TransportTamper mode)
-    {
-        byte[] copy = frame.ToArray();
-        lock (_gate)
-        {
-            switch (mode)
-            {
-                case TransportTamper.FlipBit:
-                    if (copy.Length > 0)
-                    {
-                        int bit = _random.Next(copy.Length * 8);
-                        copy[bit / 8] ^= (byte)(1 << (bit % 8));
-                    }
-
-                    return copy;
-                case TransportTamper.Truncate:
-                {
-                    if (copy.Length == 0)
-                        return copy;
-                    int removed = 1 + _random.Next(Math.Min(copy.Length, 64));
-                    return copy[..(copy.Length - removed)];
-                }
-                case TransportTamper.AppendGarbage:
-                {
-                    byte[] garbage = new byte[1 + _random.Next(32)];
-                    _random.Fill(garbage);
-                    return [.. copy, .. garbage];
-                }
-
-                case TransportTamper.Scramble:
-                    _random.Fill(copy);
-                    return copy;
-                default:
-                    return copy;
-            }
-        }
-    }
-
     // -------------------------------------------------------------------------------------------- replay
 
     /// <summary>
@@ -526,10 +489,14 @@ internal sealed class NetworkFabric
             return DfsErrorCode.None;
         }
 
-        HarnessConnection? connection = FindReplayConnection(message.From, message.To, origin);
+        // Holds capture at the receiving end, so the origin is the receiver's side of the connection; the sender's side (its
+        // client end, which observed the handshake) and the sender's authenticated identity are resolved from it.
+        HarnessConnection? sender = origin is null ? null : origin.IsClientSide ? origin : CounterpartOf(origin);
+        ReplayIdentity? identity = origin is null ? null : IdentityOf(sender, origin);
+        HarnessConnection? connection = FindReplayConnection(message.From, message.To, sender, identity);
         HarnessTransport? fresh = null;
-        if (connection is null && origin is not null)
-            (connection, fresh) = await OpenReplayConnectionAsync(origin, message.To, timeout);
+        if (connection is null && identity is not null)
+            (connection, fresh) = await OpenReplayConnectionAsync(message.From, message.To, sender, identity, timeout);
         if (connection is null)
         {
             Trace($"replay of {message.Type} {message.From}->{message.To} impossible: no authenticated connection of the sender remains");
@@ -581,44 +548,110 @@ internal sealed class NetworkFabric
         }
     }
 
-    private HarnessConnection? FindReplayConnection(string from, string to, HarnessConnection? origin)
+    /// <summary>The authenticated identity a replay must present: the sender's role, principal and handshake name.</summary>
+    private sealed record ReplayIdentity(PeerRole Role, string? Principal, string? Name);
+
+    /// <summary>The sender's (client-side) end of the connection whose receiving end is <paramref name="receiving"/>, when known.</summary>
+    private HarnessConnection? CounterpartOf(HarnessConnection receiving)
     {
-        if (origin is { IsOpen: true, SilentlyDead: false, IsClientSide: true }
-            && string.Equals(origin.LocalName, from, StringComparison.Ordinal) && string.Equals(origin.RemoteName, to, StringComparison.Ordinal))
-            return origin;
+        object? peer = receiving.Inner is SimConnectionEnd sim ? sim.Peer : null;
+        if (peer is null)
+            return null;
         foreach (HarnessConnection connection in SnapshotConnections())
         {
-            if (connection.IsClientSide && connection.IsOpen && !connection.SilentlyDead && connection.IsAuthenticated
-                && string.Equals(connection.LocalName, from, StringComparison.Ordinal) && string.Equals(connection.RemoteName, to, StringComparison.Ordinal)
-                && (origin is null || connection.HasSameIdentity(origin)))
+            if (connection.IsClientSide && ReferenceEquals(connection.Inner, peer))
                 return connection;
         }
 
         return null;
     }
 
-    private async Task<(HarnessConnection?, HarnessTransport?)> OpenReplayConnectionAsync(HarnessConnection origin, string to, TimeSpan timeout)
+    /// <summary>
+    /// The identity a replay presents: the handshake the sender's end observed, else the identity the receiving end
+    /// authenticated (<see cref="RpcPeerIdentity"/>), else none (an unauthenticated sender cannot be impersonated).
+    /// </summary>
+    private static ReplayIdentity? IdentityOf(HarnessConnection? sender, HarnessConnection origin)
     {
-        if (origin.HelloRole is not { } role || role == PeerRole.Node || origin.HelloPrincipal is not { } principal)
+        if (sender is { HelloRole: { } role })
+            return new ReplayIdentity(role, sender.HelloPrincipal, sender.HelloName);
+        if (origin.IsClientSide)
+            return origin.HelloRole is { } own ? new ReplayIdentity(own, origin.HelloPrincipal, origin.HelloName) : null;
+        RpcPeerIdentity? authenticated = origin.Identity;
+        if (authenticated is null)
+            return null;
+        PeerRole peerRole = authenticated.IsNode ? PeerRole.Node : authenticated.IsBackup ? PeerRole.Backup : PeerRole.Client;
+        return new ReplayIdentity(peerRole, authenticated.Principal, authenticated.NodeName);
+    }
+
+    /// <summary>An open, authenticated connection of the sender to <paramref name="to"/> presenting <paramref name="identity"/>.</summary>
+    private HarnessConnection? FindReplayConnection(string from, string to, HarnessConnection? sender, ReplayIdentity? identity)
+    {
+        if (sender is { IsOpen: true, SilentlyDead: false, IsClientSide: true }
+            && string.Equals(sender.LocalName, from, StringComparison.Ordinal) && string.Equals(sender.RemoteName, to, StringComparison.Ordinal))
+            return sender;
+        foreach (HarnessConnection connection in SnapshotConnections())
+        {
+            if (connection.IsClientSide && connection.IsOpen && !connection.SilentlyDead && connection.IsAuthenticated
+                && string.Equals(connection.LocalName, from, StringComparison.Ordinal) && string.Equals(connection.RemoteName, to, StringComparison.Ordinal)
+                && (identity is null || Presents(connection, identity)))
+                return connection;
+        }
+
+        return null;
+    }
+
+    private static bool Presents(HarnessConnection connection, ReplayIdentity identity) =>
+        connection.HelloRole == identity.Role
+        && (identity.Role == PeerRole.Node || string.Equals(connection.HelloPrincipal, identity.Principal, StringComparison.Ordinal));
+
+    /// <summary>
+    /// A fresh connection of the sender's identity to <paramref name="to"/>, authenticated with the principal's credentials
+    /// (clients and backup principals only: the harness never impersonates a node); null when impossible.
+    /// </summary>
+    private async Task<(HarnessConnection?, HarnessTransport?)> OpenReplayConnectionAsync(string from, string to, HarnessConnection? sender,
+        ReplayIdentity identity, TimeSpan timeout)
+    {
+        if (identity.Role == PeerRole.Node || identity.Principal is not { } principal)
             return (null, null);
-        DfsCredentials? credentials = origin.Owner.Identity.Credentials is { } own && string.Equals(own.Principal, principal, StringComparison.Ordinal)
+        HarnessTransportFactory? factory = sender?.Owner.Factory;
+        if (factory is null)
+        {
+            lock (_gate)
+                factory = _factories.TryGetValue(from, out HarnessTransportFactory? known) ? known : null;
+        }
+
+        if (factory is null)
+            return (null, null);
+        DfsCredentials? credentials = factory.Identity.Credentials is { } own && string.Equals(own.Principal, principal, StringComparison.Ordinal)
             ? own
-            : origin.Owner.Identity.Owner?.FindCredentials(principal);
-        string? endpoint = origin.Endpoint ?? EndpointOfName(to);
+            : factory.Identity.Owner?.FindCredentials(principal);
+        string? endpoint = sender is not null && string.Equals(sender.RemoteName, to, StringComparison.Ordinal)
+            ? sender.Endpoint ?? EndpointOfName(to)
+            : EndpointOfName(to);
         if (credentials is null || endpoint is null)
             return (null, null);
 
-        var transport = (HarnessTransport)origin.Owner.Factory.Create(origin.LocalName, string.Empty);
+        var transport = (HarnessTransport)factory.Create(from, string.Empty);
         try
         {
             var connection = (HarnessConnection)await transport.ConnectAsync(endpoint);
-            await Server.Runtime.HandshakeClient.AuthenticatePrincipalAsync(connection, Guid.Empty, origin.HelloName ?? origin.LocalName, credentials,
-                _random.Fork("replay/" + origin.LocalName), timeout, role);
+            await Server.Runtime.HandshakeClient.AuthenticatePrincipalAsync(connection, Guid.Empty, identity.Name ?? from, credentials,
+                _random.Fork("replay/" + from), timeout, identity.Role);
             return (connection, transport);
         }
-        catch (Exception ex) when (ex is DfsException or UnauthorizedAccessException or IOException or TimeoutException or OperationCanceledException)
+        catch (Exception ex) when (ex is DfsException or UnauthorizedAccessException or IOException or TimeoutException or OperationCanceledException
+            or ObjectDisposedException or ArgumentException)
         {
-            await transport.DisposeAsync();
+            // RpcConnectionException (refused/cut/crashed endpoint) is an IOException: the sender has no usable connection.
+            try
+            {
+                await transport.DisposeAsync();
+            }
+            catch (Exception dispose) when (dispose is ObjectDisposedException or IOException or InvalidOperationException)
+            {
+                // Already torn down.
+            }
+
             return (null, null);
         }
     }
