@@ -414,6 +414,15 @@ public sealed class SimNetwork : IRpcTransportFactory
             return;
         }
 
+        if (to.Transport.IsDead && Options.ResetPeersOnProcessDeath && from.IsOpen && IsHostRunning(toName)
+            && policy.CanConnect(fromName, toName) && policy.CanConnect(toName, fromName))
+        {
+            // The process behind this end died while its reset could not travel (the link was cut), and its host runs again
+            // under the same name: the frame reaches a host without such a connection, which answers with a reset (TCP RST,
+            // QUIC stateless reset). Without it the sender would keep a half-open connection to the restarted node forever.
+            ScheduleClose(from, new RpcConnectionException($"Connection {from.ConnectionId} was reset by {toName}: the process behind it restarted."));
+        }
+
         LinkDirection direction = envelope.Kind switch
         {
             SimEnvelopeKind.Request or SimEnvelopeKind.RequestFragment => LinkDirection.Request,
@@ -445,6 +454,13 @@ public sealed class SimNetwork : IRpcTransportFactory
             default:
                 throw new InvalidOperationException($"The link policy returned an unknown decision '{decision.Kind}'.");
         }
+    }
+
+    /// <summary>True when a live (not killed) transport named <paramref name="name"/> exists: the node runs again.</summary>
+    private bool IsHostRunning(string name)
+    {
+        lock (_gate)
+            return _transports.Exists(t => !t.IsDead && string.Equals(t.LocalName, name, StringComparison.Ordinal));
     }
 
     /// <summary>Closes both ends of a connection with a reset error, each as work of its own process.</summary>
