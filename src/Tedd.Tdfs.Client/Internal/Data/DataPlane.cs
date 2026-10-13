@@ -352,6 +352,7 @@ internal sealed class DataPlane
         candidates = [.. candidates.OrderBy(c => _runtime.Map.EndpointOf(c) is { } e && _runtime.IsRecentlyUnresponsive(e) ? 1 : 0)];
 
         bool located = false;
+        var reconnected = new HashSet<NodeId>();
         for (int i = 0; ; i++)
         {
             if (i >= candidates.Count)
@@ -393,6 +394,11 @@ internal sealed class DataPlane
                                            or DfsException)
             {
                 failures.Add(ex);
+
+                // A pooled connection that turned out dead (reset or closed under the request) says nothing about the
+                // replica: ask it once more on a new connection (NET-005).
+                if (ex is RpcConnectionException && reconnected.Add(candidate) && !scope.Token.IsCancellationRequested)
+                    i--;
             }
         }
 
