@@ -11,7 +11,7 @@ namespace Tedd.Tdfs.Testing;
 /// has its own principals: an export principal (used by the live cluster's exporter, no retention rights), a reader and a
 /// retention administrator; <see cref="RegisterAsync"/> registers it as a backup target of a live volume.
 /// </remarks>
-public sealed partial class TestBackupNode : IFaultTarget
+public sealed partial class TestBackupNode : IFaultTarget, IObjectStoreAccess
 {
     private readonly object _gate = new();
     private readonly TestCluster? _cluster;
@@ -38,6 +38,7 @@ public sealed partial class TestBackupNode : IFaultTarget
         ReaderCredentials = reader;
         RetentionAdminCredentials = retention;
         _endpoint = options.ListenEndpoint;
+        disk.Owner = this;
     }
 
     /// <summary>Node name ("b0", ...).</summary>
@@ -472,6 +473,18 @@ public sealed partial class TestBackupNode : IFaultTarget
         else
             host?.Pause();
         return true;
+    }
+
+    async Task<(ObjectPhysicalLocation Location, long PlaintextLength)?> IObjectStoreAccess.LocateAsync(ObjectId id)
+    {
+        BackupNodeHost host = Host ?? throw new InvalidOperationException($"Backup node {Name} is {State}; its object store is only reachable while it runs in process.");
+        return await host.Inspect.LocateObjectAsync(id);
+    }
+
+    Task<bool> IObjectStoreAccess.DeleteLocallyAsync(ObjectId id)
+    {
+        BackupNodeHost host = Host ?? throw new InvalidOperationException($"Backup node {Name} is {State}; its object store is only reachable while it runs in process.");
+        return host.Inspect.DeleteObjectLocallyAsync(id);
     }
 
     void IFaultTarget.CrashFromFault(CrashMode mode, string reason) => Crash(mode, reason);

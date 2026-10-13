@@ -20,8 +20,24 @@ public sealed partial class TestCluster
     /// </para>
     /// Used by BAK-006, BAK-007, BAK-009, BAK-010.
     /// </summary>
-    public Task<ManualBackupExport> BeginManualBackupExportAsync(string volume, string snapshotName, int backupIndex = 0, CancellationToken ct = default) =>
-        throw Stub.NotYet("TestCluster.BeginManualBackupExportAsync");
+    public async Task<ManualBackupExport> BeginManualBackupExportAsync(string volume, string snapshotName, int backupIndex = 0, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(volume);
+        ArgumentException.ThrowIfNullOrWhiteSpace(snapshotName);
+        TestBackupNode backup = BackupAt(backupIndex);
+        TestNode leader = await GetLeaderAsync(volume, ct);
+        Server.NodeHost host = leader.Host
+            ?? throw new InvalidOperationException($"The leader {leader.Name} of volume {volume} runs out of process; manual exports need an in-process leader.");
+        Server.Backup.ManualBackupTransfer transfer = await host.InvokeAsync(async services =>
+        {
+            Server.Volumes.Service.VolumeService service = services.Volumes.TryGet(volume)?.Service is { IsLeader: true } led
+                ? led
+                : throw new DfsUnavailableException(DfsErrorCode.NotLeader, $"{leader.Name} no longer leads volume {volume}.");
+            return await Server.Backup.ManualBackupTransfer.BeginAsync(services, service, backup.TargetName, snapshotName);
+        });
+        Record($"manual export {volume}/{snapshotName} -> {backup.TargetName}: pinned on {leader.Name} (lineage {transfer.Lineage})");
+        return new ManualBackupExport(this, host, transfer, ForkRandom("manual-export:" + volume + ":" + snapshotName));
+    }
 
     /// <summary>
     /// Connects a <see cref="RawProtocolClient"/> to backup node <paramref name="backupIndex"/> (network identity

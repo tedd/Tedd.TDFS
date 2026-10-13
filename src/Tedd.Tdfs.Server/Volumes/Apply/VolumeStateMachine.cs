@@ -184,6 +184,8 @@ internal sealed partial class VolumeStateMachine : IReplicatedStateMachine, ICom
 
         RecordBackupProgressCommand c => ApplyBackupProgress(s, ctx, c),
         AbandonTransferLineageCommand c => ApplyAbandonLineage(s, ctx, c),
+        RequestBackupSyncCommand c => ApplyRequestBackupSync(s, ctx, c),
+        RemoveBackupTargetStateCommand c => ApplyRemoveBackupTargetState(s, ctx, c),
 
         SetPolicyCommand c => ApplySetPolicy(s, ctx, c),
         SetAclCommand c => ApplySetAcl(s, ctx, c),

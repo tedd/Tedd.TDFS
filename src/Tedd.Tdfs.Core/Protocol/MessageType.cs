@@ -267,6 +267,10 @@ public enum MessageType : ushort
     BackupAwait = 156,
     /// <summary>Backup barrier wait reply.</summary>
     BackupAwaitResult = 157,
+    /// <summary>Backup target registration change forwarded to the control leader (node peers only).</summary>
+    BackupTargetUpdate = 158,
+    /// <summary>Backup target registration change reply.</summary>
+    BackupTargetUpdateResult = 159,
     /// <summary>Backup transfer begin.</summary>
     BackupBegin = 160,
     /// <summary>Backup transfer begin reply.</summary>

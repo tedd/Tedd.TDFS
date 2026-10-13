@@ -138,6 +138,8 @@ public static partial class MessageCodec
         Register<BackupPublishResultMessage>();
         Register<BackupRetentionMessage>();
         Register<BackupRetentionResultMessage>();
+        Register<BackupTargetUpdateMessage>();
+        Register<BackupTargetUpdateResultMessage>();
         Register<BackupExportRestoreMessage>();
         Register<BackupExportRestoreResultMessage>();
     }

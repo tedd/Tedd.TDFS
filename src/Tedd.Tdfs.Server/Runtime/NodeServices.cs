@@ -95,6 +95,9 @@ internal sealed class NodeServices
 
     public BackgroundTasks Jobs { get; set; } = null!;
 
+    /// <summary>Late-sync backup exporters of the volumes this node leads (null until the backup area registered).</summary>
+    public Backup.BackupExporters? BackupExports { get; set; }
+
     public IVolumeStateMachineFactory? VolumeStateMachines { get; set; }
 
     /// <summary>Record ciphers created for this process (disposed at stop).</summary>
