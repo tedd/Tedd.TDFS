@@ -1057,6 +1057,12 @@ internal sealed class VolumeContext : IRpcRouter
             bound = await MutateBoundAsync<CreateStagingResultMessage>(scope, "CreateStaging", null,
                 header => new CreateStagingMessage(header, handle, default), rebindable: false, binding: binding).ConfigureAwait(false);
         }
+        catch (DfsCommitOutcomeUnknownException unknown) when (!scope.IsAbortedByCaller && unknown.InnerException is DfsLeaseLostException lost)
+        {
+            // A retry was answered that the handle is no longer active: whether an earlier transmission created a session or
+            // not, the handle's writer authority is gone, so nothing can be staged or published through it any more.
+            throw new DfsLeaseLostException("A staging session could not be created: " + lost.Message, lost);
+        }
         catch (DfsCommitOutcomeUnknownException unknown)
         {
             throw StagingNotCreated(scope, unknown);

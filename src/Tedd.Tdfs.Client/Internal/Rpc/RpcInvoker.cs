@@ -334,7 +334,7 @@ internal sealed class RpcInvoker
         // the group: it is reported as the operation's deadline, never as quorum loss.
         if (scope.IsAbortedByCaller || last is DfsQuorumUnavailableException || !attempted)
             return last;
-        bool availability = last is null or TimeoutException or RpcConnectionException or IOException
+        bool availability = last is null or TimeoutException or RpcConnectionException or (IOException and not DfsException)
             || last is DfsUnavailableException { ErrorCode: DfsErrorCode.NotLeader or DfsErrorCode.Unavailable or DfsErrorCode.NodeUnavailable or DfsErrorCode.Timeout };
         if (!availability || last is DfsPlacementUnavailableException or DfsCapacityException or DfsBackupNotReachedException)
             return last;
@@ -358,7 +358,18 @@ internal sealed class RpcInvoker
         DfsOperationKind? faultKind = null, ObjectId? obj = null, int occurrence = 0, CancellationToken token = default)
     {
         CancellationToken ct = token.CanBeCanceled ? token : scope.Token;
-        ClientConnection connection = await _runtime.Pool.GetAsync(endpoint, scope, timeout).ConfigureAwait(false);
+        ClientConnection connection;
+        try
+        {
+            connection = await _runtime.Pool.GetAsync(endpoint, scope, timeout).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is TimeoutException or RpcConnectionException || (ex is IOException and not DfsException))
+        {
+            // No connection: the node is down, partitioned or paused.
+            _runtime.NoteUnresponsive(endpoint);
+            throw;
+        }
+
         DfsOperationKind kind = faultKind ?? MessageTypes.OperationOf(message.Type);
         await scope.HitAsync(FaultStage.F03, FaultSites.ClientRequestSend, kind, null, occurrence, obj).ConfigureAwait(false);
         ct.ThrowIfCancellationRequested();
@@ -372,9 +383,12 @@ internal sealed class RpcInvoker
         {
             if (ex is not TimeoutException || IsSilent(connection, timeout))
                 _runtime.Pool.Invalidate(connection);
+            if (ex is TimeoutException)
+                _runtime.NoteUnresponsive(endpoint);
             throw;
         }
 
+        _runtime.NoteResponsive(endpoint);
         IWireMessage reply = MessageCodec.Decode(raw.Span);
         await scope.HitAsync(FaultStage.F14, FaultSites.ClientReplyReceived, kind, null, occurrence, obj).ConfigureAwait(false);
         _runtime.Map.MarkGood(endpoint);

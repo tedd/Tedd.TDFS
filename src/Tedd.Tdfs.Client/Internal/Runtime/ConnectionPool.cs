@@ -5,7 +5,8 @@ namespace Tedd.Tdfs.Client.Internal.Runtime;
 /// <summary>
 /// Authenticated connections of one client, pooled per endpoint (ARCHITECTURE §9.1). Concurrent callers share one
 /// connection per endpoint and one in-progress connect; dead pooled connections (closed by either side, or declared dead
-/// after a timeout on a silently dead link) are detected and replaced. Thread-safe.
+/// after a timeout on a silently dead link) are detected and replaced, and a connect stuck on a lost handshake message is
+/// abandoned once it outlived a caller's wait. Thread-safe.
 /// </summary>
 internal sealed class ConnectionPool
 {
@@ -89,7 +90,14 @@ internal sealed class ConnectionPool
                     return open;
                 if (slot.Pending is { IsCompleted: true })
                     slot.Pending = null;
-                slot.Pending ??= ConnectAsync(endpoint, slot);
+                if (slot.Pending is null)
+                {
+                    var abandon = new CancellationTokenSource();
+                    slot.PendingAbandon = abandon;
+                    slot.PendingStarted = _runtime.Time.GetTimestamp();
+                    slot.Pending = ConnectAsync(endpoint, slot, abandon);
+                }
+
                 pending = slot.Pending;
             }
         }
@@ -105,8 +113,34 @@ internal sealed class ConnectionPool
         }
         catch (OperationCanceledException) when (!scope.Token.IsCancellationRequested && wait.IsCancellationRequested)
         {
+            AbandonIfStuck(endpoint, pending, waitTimeout);
             throw new TimeoutException($"No authenticated connection to {endpoint} within {waitTimeout}.");
         }
+    }
+
+    /// <summary>
+    /// A shared connect that outlived a caller's whole wait (and a tenth of the connect timeout) is presumably stuck on a
+    /// lost handshake message (a black-holed or partitioned link that may have healed since): it is abandoned so the next
+    /// caller starts a fresh connect instead of waiting for the stuck one until the connect timeout.
+    /// </summary>
+    private void AbandonIfStuck(string endpoint, Task<ClientConnection> pending, TimeSpan waited)
+    {
+        TimeSpan tenth = _runtime.Options.ConnectTimeout / 10;
+        TimeSpan threshold = waited > tenth ? waited : tenth;
+        CancellationTokenSource? abandon = null;
+        lock (_sync)
+        {
+            if (_slots.TryGetValue(endpoint, out Slot? slot) && ReferenceEquals(slot.Pending, pending)
+                && _runtime.Time.GetElapsedTime(slot.PendingStarted) >= threshold)
+            {
+                abandon = slot.PendingAbandon;
+                slot.Pending = null;
+                slot.PendingAbandon = null;
+            }
+        }
+
+        if (abandon is not null)
+            ContextFree.Cancel(abandon);
     }
 
     /// <summary>Declares <paramref name="connection"/> dead and removes it from the pool (the next call reconnects).</summary>
@@ -154,12 +188,14 @@ internal sealed class ConnectionPool
         return slot;
     }
 
-    private async Task<ClientConnection> ConnectAsync(string endpoint, Slot slot)
+    private async Task<ClientConnection> ConnectAsync(string endpoint, Slot slot, CancellationTokenSource abandon)
     {
         TimeSpan timeout = _runtime.Options.ConnectTimeout;
         ClientConnection opened;
+        using (abandon)
         using (var deadline = new CancellationTokenSource(timeout, _runtime.Time))
         using (_runtime.KillToken.UnsafeRegister(static s => ContextFree.Cancel((CancellationTokenSource)s!), deadline))
+        using (abandon.Token.UnsafeRegister(static s => ContextFree.Cancel((CancellationTokenSource)s!), deadline))
         {
             try
             {
@@ -170,20 +206,30 @@ internal sealed class ConnectionPool
             {
                 if (_runtime.KillToken.IsCancellationRequested)
                     throw new ObjectDisposedException(nameof(DfsClient), "The client was disposed while connecting.");
+                if (abandon.IsCancellationRequested)
+                    throw new TimeoutException($"Connecting to {endpoint} was abandoned: it did not complete while callers waited for it.");
                 throw new TimeoutException($"Connecting to {endpoint} did not complete within {timeout}.");
             }
-        }
 
-        lock (_sync)
-        {
-            if (_closed)
+            lock (_sync)
             {
-                opened.Poison();
-                throw new ObjectDisposedException(nameof(DfsClient), "The client was disposed while connecting.");
-            }
+                if (_closed)
+                {
+                    opened.Poison();
+                    throw new ObjectDisposedException(nameof(DfsClient), "The client was disposed while connecting.");
+                }
 
-            slot.Connection = opened;
-            slot.Pending = null;
+                if (abandon.IsCancellationRequested)
+                {
+                    // Abandoned (a newer connect may be running for this endpoint): this one is not pooled.
+                    opened.Poison();
+                    throw new TimeoutException($"Connecting to {endpoint} was abandoned: it did not complete while callers waited for it.");
+                }
+
+                slot.Connection = opened;
+                slot.Pending = null;
+                slot.PendingAbandon = null;
+            }
         }
 
         opened.Raw.Closed += (_, _) =>
@@ -201,5 +247,7 @@ internal sealed class ConnectionPool
     {
         public ClientConnection? Connection;
         public Task<ClientConnection>? Pending;
+        public CancellationTokenSource? PendingAbandon;
+        public long PendingStarted;
     }
 }

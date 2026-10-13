@@ -347,6 +347,10 @@ internal sealed class DataPlane
         foreach (PlacementNode node in Placement.FallbackOrder(obj, placementEpoch, storage))
             AddCandidate(node.Id);
 
+        // Replicas on nodes that recently let a request time out are tried last (stable order otherwise): waiting out a
+        // silent node first would delay every read and can outlive the read capability (OFF-002).
+        candidates = [.. candidates.OrderBy(c => _runtime.Map.EndpointOf(c) is { } e && _runtime.IsRecentlyUnresponsive(e) ? 1 : 0)];
+
         bool located = false;
         for (int i = 0; ; i++)
         {

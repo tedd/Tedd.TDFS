@@ -27,6 +27,7 @@ internal sealed class ClientRuntime
     private readonly CancellationTokenSource _kill = new();
     private readonly Dictionary<string, VolumeContext> _volumes = new(StringComparer.Ordinal);
     private readonly Dictionary<(string Salt, int Iterations), ClientKeys> _keys = [];
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _unresponsive = new(StringComparer.Ordinal);
     private int _state;
     private int _inFlight;
     private TaskCompletionSource? _drained;
@@ -58,6 +59,22 @@ internal sealed class ClientRuntime
 
     /// <summary>Clock for every deadline, backoff and lease renewal.</summary>
     public TimeProvider Time { get; }
+
+    /// <summary>How long an endpoint that let a data-plane request time out is tried after the others.</summary>
+    private static readonly TimeSpan UnresponsiveMemory = TimeSpan.FromSeconds(10);
+
+    /// <summary>Remembers that <paramref name="endpoint"/> let a request time out (paused, partitioned or overloaded).</summary>
+    public void NoteUnresponsive(string endpoint) => _unresponsive[endpoint] = Time.GetTimestamp();
+
+    /// <summary>Forgets that <paramref name="endpoint"/> was unresponsive (it answered).</summary>
+    public void NoteResponsive(string endpoint) => _unresponsive.TryRemove(endpoint, out _);
+
+    /// <summary>
+    /// True when <paramref name="endpoint"/> let a request time out recently and has not answered since: replica reads try
+    /// it after the other replicas, so a silent node does not hold up every read (and outlive its read capability).
+    /// </summary>
+    public bool IsRecentlyUnresponsive(string endpoint) =>
+        _unresponsive.TryGetValue(endpoint, out long since) && Time.GetElapsedTime(since) < UnresponsiveMemory;
 
     /// <summary>Thread-safe injected randomness (nonces, object ids, retry jitter).</summary>
     public LockedRandom Random { get; }
