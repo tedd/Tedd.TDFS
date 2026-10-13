@@ -90,7 +90,7 @@ internal sealed class RaftGroupHost
     /// <summary>Stops ticking (the loop exits at its next tick).</summary>
     public void Stop() => _stopped = true;
 
-    /// <summary>Proposes a command to a hosted group (see <see cref="GroupRuntime.ProposeAsync"/>).</summary>
+    /// <summary>Proposes a command to a hosted group (see <see cref="GroupRuntime.ProposeAsync(ReadOnlyMemory{byte}, ProposalContext, CancellationToken)"/>).</summary>
     public Task<ApplyOutcome> ProposeAsync(string group, ReadOnlyMemory<byte> command, ProposalContext context, CancellationToken ct = default)
         => Require(group).ProposeAsync(command, context, ct);
 

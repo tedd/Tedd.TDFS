@@ -62,6 +62,16 @@ public static partial class MessageCodec
         Register<SetPolicyResultMessage>();
         Register<SetAccessMessage>();
         Register<SetAccessResultMessage>();
+        Register<GetAccessControlMessage>();
+        Register<GetAccessControlResultMessage>();
+        Register<SetAccessControlMessage>();
+        Register<SetAccessControlResultMessage>();
+        Register<SetOwnerMessage>();
+        Register<SetOwnerResultMessage>();
+        Register<GetEffectiveRightsMessage>();
+        Register<GetEffectiveRightsResultMessage>();
+        Register<ListStreamsMessage>();
+        Register<ListStreamsResultMessage>();
         Register<TxBeginMessage>();
         Register<TxBeginResultMessage>();
         Register<TxOpMessage>();
@@ -84,6 +94,10 @@ public static partial class MessageCodec
         Register<SetRetentionResultMessage>();
         Register<RestoreSnapshotMessage>();
         Register<RestoreSnapshotResultMessage>();
+        Register<RestoreVolumeMessage>();
+        Register<RestoreVolumeResultMessage>();
+        Register<RestoreInstallMessage>();
+        Register<RestoreInstallResultMessage>();
         Register<PutObjectMessage>();
         Register<PutObjectResultMessage>();
         Register<GetObjectMessage>();

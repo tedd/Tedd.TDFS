@@ -299,13 +299,14 @@ internal sealed partial class RpcDispatcher : IRpcHandler
         _s.Metrics.RpcHandled();
         DfsOperationKind operation = MessageTypes.OperationOf(type);
         bool observed = IsObservedForFaults(type);
-        DfsOperationId? operationId = (message as IVolumeRequest)?.Header.Operation is { IsEmpty: false } op ? op : null;
+        DfsOperationId? operationId = Volumes.Service.RequestFaultInfo.OperationOf(message);
         string? volume = (message as IVolumeRequest)?.Header.Volume;
+        string? path = Volumes.Service.RequestFaultInfo.PathOf(message);
         IWireMessage result;
         try
         {
             if (observed)
-                await _s.HitAsync(FaultStage.F04, FaultSites.RpcRequestAccepted, volume, operation, operationId, ct: ct);
+                await _s.HitAsync(FaultStage.F04, FaultSites.RpcRequestAccepted, volume, operation, operationId, path, ct: ct);
             var context = new RpcContext
             {
                 Connection = connection,
@@ -330,7 +331,7 @@ internal sealed partial class RpcDispatcher : IRpcHandler
         {
             if (DfsErrors.ToCode(ex) == DfsErrorCode.Internal)
                 _s.Error("rpc", NodeServices.Inv($"{type} from {Describe(state)} failed: {ex}"));
-            result = ErrorReplyMessage.FromException(ex, operationId);
+            result = ErrorReplyMessage.FromException(ex, (message as IVolumeRequest)?.Header.Operation is { IsEmpty: false } own ? own : null);
         }
 
         if (!expectsReply)
@@ -339,7 +340,7 @@ internal sealed partial class RpcDispatcher : IRpcHandler
         {
             try
             {
-                await _s.HitAsync(FaultStage.F13, FaultSites.RpcReplySend, volume, operation, operationId, ct: ct);
+                await _s.HitAsync(FaultStage.F13, FaultSites.RpcReplySend, volume, operation, operationId, path, ct: ct);
             }
             catch (FaultReplyDroppedException)
             {

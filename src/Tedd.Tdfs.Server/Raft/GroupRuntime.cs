@@ -302,13 +302,30 @@ internal sealed partial class GroupRuntime
     /// proposal lost (retryable <see cref="DfsErrorCode.NotLeader"/>); a deadline or shutdown before the fate is known
     /// reports <see cref="DfsCommitOutcomeUnknownException"/>.
     /// </summary>
-    public async Task<ApplyOutcome> ProposeAsync(ReadOnlyMemory<byte> command, ProposalContext context, CancellationToken ct = default)
+    public Task<ApplyOutcome> ProposeAsync(ReadOnlyMemory<byte> command, ProposalContext context, CancellationToken ct = default)
+        => ProposeAsync(_ => new ValueTask<ReadOnlyMemory<byte>>(command), context, ct);
+
+    /// <summary>
+    /// <see cref="ProposeAsync(ReadOnlyMemory{byte}, ProposalContext, CancellationToken)"/> whose command is produced by
+    /// <paramref name="finalize"/> immediately before it is appended — after the <see cref="FaultSites.RaftBeforePropose"/>
+    /// stage — so the caller can re-validate the authoritative decision at the last moment (for example re-resolve
+    /// authorization that may have been revoked while the request waited, SEC-006, ACL-026). An exception from
+    /// <paramref name="finalize"/> propagates and nothing is proposed.
+    /// </summary>
+    public async Task<ApplyOutcome> ProposeAsync(Func<CancellationToken, ValueTask<ReadOnlyMemory<byte>>> finalize, ProposalContext context,
+        CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(finalize);
         ThrowIfUnavailable();
         ThrowIfResetting();
         if (_node.Role != RaftRole.Leader)
             throw NotLeader();
         await _s.HitAsync(FaultStage.F10, FaultSites.RaftBeforePropose, VolumeName, context.Operation, context.OperationId, context.Path, ct: ct);
+        ThrowIfUnavailable();
+        ThrowIfResetting();
+        if (_node.Role != RaftRole.Leader)
+            throw NotLeader();
+        ReadOnlyMemory<byte> command = await finalize(ct);
         ThrowIfUnavailable();
         ThrowIfResetting();
         if (!_node.TryPropose(command, out ulong index))

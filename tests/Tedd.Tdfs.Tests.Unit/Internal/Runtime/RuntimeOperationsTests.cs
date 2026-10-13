@@ -79,10 +79,11 @@ public sealed class RuntimeOperationsTests
         Assert.Equal("z9", n2.Labels.Zone);
         Assert.False(n2.PlacementEligible);
 
-        // Volume-scoped operations belong to the volume service.
+        // Volume-scoped operations belong to the volume service; this cluster runs the test state machine, which no volume
+        // service serves.
         var volumeStatus = Assert.IsType<ErrorReplyMessage>(await admin.CallAsync(
             AdminRequestMessage.Create(AdminOp.VolumeStatus, new UInt128(8, 3), new AdminVolumeNameBody("vol"))));
-        Assert.Equal(DfsErrorCode.Unsupported, volumeStatus.Code);
+        Assert.Equal(DfsErrorCode.Unavailable, volumeStatus.Code);
 
         // The audit log names principal, operation, outcome and scope; never secrets.
         var audit = await admin.AdminAsync<AdminAuditLogRequestBody, AdminNameListBody>(AdminOp.AuditLog, new AdminAuditLogRequestBody(100));

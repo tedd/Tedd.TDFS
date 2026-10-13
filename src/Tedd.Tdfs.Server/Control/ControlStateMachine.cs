@@ -54,7 +54,9 @@ internal sealed partial class ControlStateMachine : IReplicatedStateMachine, ICo
             AdmitMemberCommand c => ApplyAdmitMember(c, index),
             SetMemberStatusCommand c => ApplySetMemberStatus(c),
             SetMemberLabelsCommand c => ApplySetMemberLabels(c),
-            CreateVolumeCommand c => ApplyCreateVolume(c, index),
+            CreateVolumeCommand c => ApplyCreateVolume(c.Creation, c.WrappedDataKey, WireVolumeState.Active, index),
+            CreateRestoringVolumeCommand c => ApplyCreateVolume(c.Creation, c.WrappedDataKey, WireVolumeState.Restoring, index),
+            FinishRestoringVolumeCommand c => ApplyFinishRestoringVolume(c),
             DeleteVolumeCommand c => ApplyDeleteVolume(c),
             SetVolumeVotersCommand c => ApplySetVolumeVoters(c),
             SetDefaultPolicyCommand c => ApplySetDefaultPolicy(c),
@@ -117,7 +119,8 @@ internal sealed partial class ControlStateMachine : IReplicatedStateMachine, ICo
     {
         object? value = prior.Kind switch
         {
-            ControlCommandKind.CreateVolume => State.FindVolume(new VolumeId(prior.RefGuid)),
+            ControlCommandKind.CreateVolume or ControlCommandKind.CreateRestoringVolume or ControlCommandKind.FinishRestoringVolume
+                => State.FindVolume(new VolumeId(prior.RefGuid)),
             ControlCommandKind.AdmitMember => State.FindMember(new NodeId(prior.RefGuid)),
             ControlCommandKind.AddDataKey => (uint)prior.RefNumber,
             _ => null,
@@ -136,6 +139,8 @@ internal sealed partial class ControlStateMachine : IReplicatedStateMachine, ICo
     private string ScopeOf(ControlCommand cmd) => cmd switch
         {
             CreateVolumeCommand c => "volume=" + c.Creation.Name,
+            CreateRestoringVolumeCommand c => "volume=" + c.Creation.Name + " restoring",
+            FinishRestoringVolumeCommand c => "volume=" + NameOf(c.Volume) + (c.Activate ? " activate" : " abandon"),
             DeleteVolumeCommand c => "volume=" + NameOf(c.Volume),
             SetDefaultPolicyCommand c => "volume=" + NameOf(c.Volume),
             DefinePolicyCommand c => "volume=" + NameOf(c.Volume) + " policy=" + c.PolicyName,

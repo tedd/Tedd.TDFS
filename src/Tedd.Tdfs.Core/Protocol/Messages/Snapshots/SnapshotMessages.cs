@@ -482,8 +482,10 @@ public sealed record SetRetentionResultMessage(
 /// <summary>
 /// Restores a snapshot into a new volume (client → volume leader, which coordinates with the control leader): new
 /// VolumeId, epoch 1, initial state = the snapshot root, objects copied server-side to new ids owned by the new
-/// volume (<c>CopyObjects</c>). Never rolls a live volume back in place. Errors: SnapshotNotFound, AlreadyExists
-/// (volume name), PlacementUnavailable, AccessDenied (needs VolumeAdmin and ClusterAdmin).
+/// volume (<c>CopyObjects</c>, or read and re-placed when the new volume lives in another storage pool). Never rolls a
+/// live volume back in place. The new volume is not served before the restore is complete. Errors: SnapshotNotFound,
+/// AlreadyExists (volume name), PoolNotFound, InvalidPolicy (the pool cannot satisfy the restored policies),
+/// PlacementUnavailable, AccessDenied (needs VolumeAdmin and ClusterAdmin).
 /// </summary>
 /// <param name="Header">Request header; <see cref="RequestHeader.Operation"/> identifies the restore.</param>
 /// <param name="Name">Snapshot name.</param>
@@ -493,6 +495,9 @@ public sealed record RestoreSnapshotMessage(
     string Name,
     string NewVolumeName) : IWireMessage<RestoreSnapshotMessage>, IVolumeRequest
 {
+    /// <summary>Storage pool of the new volume (POOL-016); null = the source volume's pool.</summary>
+    public string? StoragePool { get; init; }
+
     /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
 
@@ -511,6 +516,7 @@ public sealed record RestoreSnapshotMessage(
         writer.WriteRecord(Header);
         writer.WriteString(Name);
         writer.WriteString(NewVolumeName);
+        writer.WriteOptionalString(StoragePool);
         writer.WriteExtensionBlock(Extensions);
     }
 
@@ -520,8 +526,9 @@ public sealed record RestoreSnapshotMessage(
         RequestHeader header = reader.ReadRecord<RequestHeader>();
         string name = reader.ReadString();
         string newVolumeName = reader.ReadString();
+        string? pool = reader.ReadOptionalString();
         IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
-        return new RestoreSnapshotMessage(header, name, newVolumeName) { Extensions = extensions };
+        return new RestoreSnapshotMessage(header, name, newVolumeName) { StoragePool = pool, Extensions = extensions };
     }
 }
 

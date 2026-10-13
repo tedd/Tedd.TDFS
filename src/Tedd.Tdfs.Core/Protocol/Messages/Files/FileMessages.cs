@@ -239,6 +239,12 @@ public sealed record ReadRangeMessage(
     long Offset,
     long Length) : IWireMessage<ReadRangeMessage>, IVolumeRequest
 {
+    /// <summary>
+    /// Named stream to read when addressing a snapshot by <c>(SnapshotPin, Inode)</c> (Addendum A, ADS-020; trailing field):
+    /// null = the default stream. Must be null for handle reads (a handle is bound to its stream).
+    /// </summary>
+    public string? Stream { get; init; }
+
     /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
 
@@ -260,6 +266,7 @@ public sealed record ReadRangeMessage(
         writer.WriteInodeId(Inode);
         writer.WriteVarInt(Offset);
         writer.WriteVarInt(Length);
+        writer.WriteOptionalString(Stream);
         writer.WriteExtensionBlock(Extensions);
     }
 
@@ -272,8 +279,9 @@ public sealed record ReadRangeMessage(
         InodeId inode = reader.ReadInodeId();
         long offset = reader.ReadVarInt();
         long length = reader.ReadVarInt();
+        string? stream = reader.ReadOptionalString();
         IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
-        return new ReadRangeMessage(header, handle, snapshotPin, inode, offset, length) { Extensions = extensions };
+        return new ReadRangeMessage(header, handle, snapshotPin, inode, offset, length) { Stream = stream, Extensions = extensions };
     }
 }
 

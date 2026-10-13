@@ -20,6 +20,8 @@ internal enum ControlCommandKind : ushort
     DefinePolicy = 24,
     AddDataKey = 25,
     CompletePolicyMigration = 26,
+    CreateRestoringVolume = 27,
+    FinishRestoringVolume = 28,
     CreatePrincipal = 30,
     DeletePrincipal = 31,
     SetGrant = 32,
@@ -108,6 +110,22 @@ internal sealed record CreateVolumeCommand(CommandHeader Header, VolumeCreation 
 internal sealed record DeleteVolumeCommand(CommandHeader Header, VolumeId Volume) : ControlCommand(Header)
 {
     public override ControlCommandKind Kind => ControlCommandKind.DeleteVolume;
+}
+
+/// <summary>Creates the target volume of a restore in the <see cref="WireVolumeState.Restoring"/> state (not served until activated).</summary>
+internal sealed record CreateRestoringVolumeCommand(CommandHeader Header, VolumeCreation Creation, ReadOnlyMemory<byte> WrappedDataKey) : ControlCommand(Header)
+{
+    public override ControlCommandKind Kind => ControlCommandKind.CreateRestoringVolume;
+
+    public override DfsOperationKind FaultOperation => DfsOperationKind.RestoreSnapshot;
+}
+
+/// <summary>Activates a restored volume (<paramref name="Activate"/>) or removes a volume whose restore cannot complete.</summary>
+internal sealed record FinishRestoringVolumeCommand(CommandHeader Header, VolumeId Volume, bool Activate) : ControlCommand(Header)
+{
+    public override ControlCommandKind Kind => ControlCommandKind.FinishRestoringVolume;
+
+    public override DfsOperationKind FaultOperation => DfsOperationKind.RestoreSnapshot;
 }
 
 internal sealed record SetVolumeVotersCommand(CommandHeader Header, VolumeId Volume, IReadOnlyList<NodeId> Voters, IReadOnlyList<NodeId> Learners)
@@ -271,6 +289,14 @@ internal static class ControlCommandCodec
             case DeleteVolumeCommand c:
                 w.WriteVolumeId(c.Volume);
                 break;
+            case CreateRestoringVolumeCommand c:
+                ControlCodec.WriteCreation(ref w, c.Creation);
+                w.WriteBytes(c.WrappedDataKey.Span);
+                break;
+            case FinishRestoringVolumeCommand c:
+                w.WriteVolumeId(c.Volume);
+                w.WriteBool(c.Activate);
+                break;
             case SetVolumeVotersCommand c:
                 w.WriteVolumeId(c.Volume);
                 w.WriteNodeIdList(c.Voters);
@@ -390,6 +416,12 @@ internal static class ControlCommandCodec
                 break;
             case ControlCommandKind.DeleteVolume:
                 command = new DeleteVolumeCommand(header, r.ReadVolumeId());
+                break;
+            case ControlCommandKind.CreateRestoringVolume:
+                command = new CreateRestoringVolumeCommand(header, ControlCodec.ReadCreation(ref r), r.ReadBytesCopy());
+                break;
+            case ControlCommandKind.FinishRestoringVolume:
+                command = new FinishRestoringVolumeCommand(header, r.ReadVolumeId(), r.ReadBool());
                 break;
             case ControlCommandKind.SetVolumeVoters:
                 command = new SetVolumeVotersCommand(header, r.ReadVolumeId(), r.ReadNodeIdList(), r.ReadNodeIdList());
