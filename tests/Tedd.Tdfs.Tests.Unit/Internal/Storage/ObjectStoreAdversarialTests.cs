@@ -670,7 +670,9 @@ public sealed class ObjectStoreAdversarialTests
         IReadOnlyList<string> names = await sim.ListAsync(Dir);
         Assert.DoesNotContain(ObjectStore.ManifestFileName, names);
         Assert.DoesNotContain(names, n => n.EndsWith(ObjectStore.CompactingExtension, StringComparison.Ordinal));
-        Assert.True(reopened.TotalBytes - reopened.LiveBytes <= 3 * ObjectStore.SegmentHeaderSize, "the compaction was not rolled forward");
+        // Compaction proceeds in steps, each committed by its own manifest: the committed step (the one that drops the
+        // deleted record) was rolled forward; at most the deleted object's tombstone is left for the next pass.
+        Assert.True(reopened.DeadBytes < ObjectTestData.Content(2, 1000).Length, "the compaction was not rolled forward");
     }
 
     /// <summary>

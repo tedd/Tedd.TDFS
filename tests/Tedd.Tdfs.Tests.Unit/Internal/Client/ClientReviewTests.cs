@@ -404,10 +404,11 @@ public sealed class ClientReviewTests
             byte[] data = Bytes(10, 200_000);
             await stream.WriteAsync(data);
 
-            // The first object is stored, the next one finds the node full: nothing is published.
-            cluster.PutsBeforeFailure = 1;
+            // The complete chunks were uploaded while writing (bounded memory, ARCHITECTURE 9.3); the last object finds the
+            // node full: nothing is published.
+            cluster.PutsBeforeFailure = 0;
             Exception? flush = await Record.ExceptionAsync(() => stream.FlushAsync());
-            Assert.IsType<DfsPlacementUnavailableException>(flush);
+            Assert.IsType<DfsCapacityException>(flush);
             Assert.False(stream.IsFaulted);
             Assert.Empty(cluster.Content("/rw")!);
 
