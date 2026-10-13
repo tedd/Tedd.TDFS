@@ -44,6 +44,7 @@ internal sealed class RpcInvoker
         int transmissions = 0;
         int failures = 0;
         int redirects = 0;
+        bool leaderless = false;   // a node answered that the group has no leader it knows (or none could be found)
         Exception? last = null;
         if (mutation)
             scope.OperationId = request.Operation;
@@ -82,6 +83,7 @@ internal sealed class RpcInvoker
 
             if (endpoint is null)
             {
+                leaderless = true;
                 last ??= new DfsUnavailableException(DfsErrorCode.NotLeader, $"{request.Name}: no leader is currently known.");
                 failures++;
                 if (!await BackoffAsync(failures, scope).ConfigureAwait(false))
@@ -272,6 +274,8 @@ internal sealed class RpcInvoker
                         continue;
                     }
 
+                    if (error.LeaderHint is not { Length: > 0 } known || string.Equals(known, endpoint, StringComparison.Ordinal))
+                        leaderless = true;
                     failures++;
                     if (!await BackoffAsync(failures, scope).ConfigureAwait(false))
                         goto Exhausted;
@@ -281,6 +285,7 @@ internal sealed class RpcInvoker
                 case DfsErrorCode.NodeUnavailable:
                 case DfsErrorCode.QuorumUnavailable:
                 case DfsErrorCode.Timeout:
+                    leaderless |= error.Code == DfsErrorCode.QuorumUnavailable;
                     last = error.ToException(request.Path);
                     failures++;
                     if (!await BackoffAsync(failures, scope).ConfigureAwait(false))
@@ -301,7 +306,33 @@ internal sealed class RpcInvoker
         }
 
     Exhausted:
-        return await FinishWithoutReplyAsync(request, scope, mutation && transmitted, last).ConfigureAwait(false);
+        return await FinishWithoutReplyAsync(request, scope, mutation && transmitted, ClassifyExhausted(request, scope, last, leaderless)).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The availability failure of a request that ran out of attempts or time (FSD Â§13: quorum unavailability is reported as
+    /// a distinct typed availability error, a deadline never as a bare <see cref="TimeoutException"/>). When a node of the
+    /// group answered that it knows no leader (or no leader could be found at all), the last availability failure, whichever
+    /// node it came from, is reported as <see cref="DfsQuorumUnavailableException"/>: no leader with a quorum could be
+    /// reached. Caller cancellation and shutdown keep their own classification.
+    /// </summary>
+    private static Exception? ClassifyExhausted(RpcRequest request, OperationScope scope, Exception? last, bool leaderless)
+    {
+        if (scope.IsAbortedByCaller || last is DfsQuorumUnavailableException)
+            return last;
+        bool availability = last is null or TimeoutException or RpcConnectionException or IOException
+            || last is DfsUnavailableException { ErrorCode: DfsErrorCode.NotLeader or DfsErrorCode.Unavailable or DfsErrorCode.NodeUnavailable or DfsErrorCode.Timeout };
+        if (!availability || last is DfsPlacementUnavailableException or DfsCapacityException or DfsBackupNotReachedException)
+            return last;
+        if (leaderless)
+        {
+            return new DfsQuorumUnavailableException(
+                $"{request.Name}: no leader with a quorum of its group could be reached{(last is null ? "." : $" ({last.Message})")}", last);
+        }
+
+        return last is TimeoutException and not DfsBackupNotReachedException
+            ? new DfsUnavailableException(DfsErrorCode.Timeout, $"{request.Name}: {last.Message}", last)
+            : last;
     }
 
     /// <summary>

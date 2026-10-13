@@ -126,7 +126,7 @@ public sealed partial class DfsFileClient
             // (or the client's disposal) or an availability failure. A handle it may have created expires with its lease.
             if (scope.IsAbortedByCaller)
                 throw scope.NotTransmittedFailure(unknown.InnerException ?? unknown);
-            throw new DfsUnavailableException(DfsErrorCode.Unavailable, $"Opening '{path}' for reading did not complete.", unknown.InnerException ?? unknown);
+            throw ReadOpenFailure(path, unknown);
         }
 
         OpenHandleResultMessage opened = bound.Reply;
@@ -318,9 +318,18 @@ public sealed partial class DfsFileClient
             // cancellation when the caller cancelled (its handle, if any, expires with its lease).
             if (scope.IsAbortedByCaller)
                 throw scope.NotTransmittedFailure(unknown.InnerException ?? unknown);
-            throw new DfsUnavailableException(DfsErrorCode.Unavailable, $"Opening '{path}' for reading did not complete.", unknown.InnerException ?? unknown);
+            throw ReadOpenFailure(path, unknown);
         }
     }
+
+    /// <summary>
+    /// The availability failure of an unanswered read-only open: a quorum failure stays a quorum failure (FSD Â§13: distinct
+    /// typed availability errors), anything else is reported as <see cref="DfsErrorCode.Unavailable"/>.
+    /// </summary>
+    private static DfsUnavailableException ReadOpenFailure(string path, DfsCommitOutcomeUnknownException unknown) =>
+        unknown.InnerException is DfsQuorumUnavailableException quorum
+            ? new DfsQuorumUnavailableException($"Opening '{path}' for reading did not complete: {quorum.Message}", quorum)
+            : new DfsUnavailableException(DfsErrorCode.Unavailable, $"Opening '{path}' for reading did not complete.", unknown.InnerException ?? unknown);
 
     // ---- Whole-file writes ------------------------------------------------------------------------------------
 
