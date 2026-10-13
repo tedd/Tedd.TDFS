@@ -75,7 +75,7 @@ internal sealed class DataPlane
         var receipts = new List<ObjectReceipt>();
         var holders = new List<DfsTopologyLabels>();
         var tried = new HashSet<NodeId>();
-        var pending = new List<(Task<IWireMessage> Task, PlacementNode Node)>();
+        var pending = new List<(Task<IWireMessage> Task, PlacementNode Node, long Started)>();
         var failures = new List<Exception>();
         bool renewed = false;
         long? satisfiedAt = null;
@@ -113,6 +113,20 @@ internal sealed class DataPlane
                     {
                         satisfiedAt ??= _runtime.Time.GetTimestamp();
                         TimeSpan grace = Grace(scope, uploadStart, satisfiedAt.Value);
+
+                        // Targets already slower than an attempt timeout (fallbacks were started beside them) are not waited
+                        // for once the policy is met: the extra copies are repair's job, and later objects of the same
+                        // operation need the remaining time.
+                        TimeSpan freshest = TimeSpan.Zero;
+                        foreach ((_, _, long started) in pending)
+                        {
+                            TimeSpan left = slowAfter - _runtime.Time.GetElapsedTime(started);
+                            if (left > freshest)
+                                freshest = left;
+                        }
+
+                        if (freshest < grace)
+                            grace = freshest;
                         if (grace <= TimeSpan.Zero || !await Waits.CompletesWithinAsync(any, grace, _runtime.Time, scope.Token).ConfigureAwait(false))
                             break;
                     }
@@ -204,7 +218,7 @@ internal sealed class DataPlane
         finally
         {
             ContextFree.Cancel(cancel);
-            foreach ((Task<IWireMessage> task, _) in pending)
+            foreach ((Task<IWireMessage> task, _, _) in pending)
                 Waits.ObserveQuietly(task);
         }
 
@@ -240,8 +254,8 @@ internal sealed class DataPlane
 
         void Restart(PlacementNode node)
         {
-            pending.Add((SendPutAsync(scope, volume, lease, node, obj, data, checksum, chunkIndex, cancel.Token), node));
             lastStart = _runtime.Time.GetTimestamp();
+            pending.Add((SendPutAsync(scope, volume, lease, node, obj, data, checksum, chunkIndex, cancel.Token), node, lastStart));
         }
 
         bool StartFallbacks(int count)
