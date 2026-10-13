@@ -142,6 +142,11 @@ internal sealed partial class VolumeService
         }, bindTransaction: false);
         if (!(_sm.State.Transactions.TryGetValue(id, out TxRecord? after) && after.State == TxState.Active))
             DropTransaction(id);
+
+        // A refused commit is a transaction failure: the reply carries the transaction id (PROTOCOL.md §11), not only the
+        // commit request's operation id.
+        if (reply is ErrorReplyMessage { TransactionId: null } refused)
+            reply = refused with { TransactionId = new DfsTransactionId(id) };
         return reply;
     }
 

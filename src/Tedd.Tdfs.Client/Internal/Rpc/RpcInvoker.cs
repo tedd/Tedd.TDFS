@@ -247,7 +247,7 @@ internal sealed class RpcInvoker
             DfsOperationId? before = request.Operation;
             if (request.OnError is not null && await request.OnError(error, scope, transmissions).ConfigureAwait(false))
             {
-                last = error.ToException(request.Path);
+                last = ErrorOf(error, request);
                 failures++;
                 if (request.Operation != before)
                 {
@@ -264,7 +264,7 @@ internal sealed class RpcInvoker
             switch (error.Code)
             {
                 case DfsErrorCode.NotLeader:
-                    last = error.ToException(request.Path);
+                    last = ErrorOf(error, request);
                     request.Router.OnNotLeader(endpoint, error.LeaderHint);
                     if (error.LeaderHint is { Length: > 0 } hint && !string.Equals(hint, endpoint, StringComparison.Ordinal) && redirects < MaxRedirects)
                     {
@@ -281,14 +281,14 @@ internal sealed class RpcInvoker
                 case DfsErrorCode.NodeUnavailable:
                 case DfsErrorCode.QuorumUnavailable:
                 case DfsErrorCode.Timeout:
-                    last = error.ToException(request.Path);
+                    last = ErrorOf(error, request);
                     failures++;
                     if (!await BackoffAsync(failures, scope).ConfigureAwait(false))
                         goto Exhausted;
                     continue;
 
                 case DfsErrorCode.OutcomeUnknown when mutation:
-                    last = error.ToException(request.Path);
+                    last = ErrorOf(error, request);
                     failures++;
                     if (!await BackoffAsync(failures, scope).ConfigureAwait(false))
                         goto Exhausted;
@@ -296,7 +296,7 @@ internal sealed class RpcInvoker
 
                 default:
                     request.OnDefinite?.Invoke();
-                    throw error.ToException(request.Path);
+                    throw ErrorOf(error, request);
             }
         }
 
@@ -428,6 +428,22 @@ internal sealed class RpcInvoker
     /// The operation kind of a request at the client wire sites: transaction-bound requests (other than the transaction's
     /// own begin/commit/abort and outcome queries) are <see cref="DfsOperationKind.TxOp"/> operations.
     /// </summary>
+    /// <summary>
+    /// The exception an error reply to <paramref name="request"/> stands for. A transaction failure of a transaction-bound
+    /// request always names the request's transaction (PROTOCOL.md §11): when the reply does not transport the id, the
+    /// request's own transaction id is used instead of the failed request's operation id.
+    /// </summary>
+    private static Exception ErrorOf(ErrorReplyMessage error, RpcRequest request)
+    {
+        if (error.TransactionId is null && request.Transaction is { } tx
+            && error.Code is DfsErrorCode.TransactionConflict or DfsErrorCode.TransactionAborted)
+        {
+            error = error with { TransactionId = tx };
+        }
+
+        return error.ToException(request.Path);
+    }
+
     private static DfsOperationKind WireKindOf(IWireMessage message, RpcRequest request) =>
         request.Transaction is not null
         && message.Type is not (MessageType.TxBegin or MessageType.TxCommit or MessageType.TxAbort or MessageType.QueryOperation)
