@@ -1235,7 +1235,9 @@ public sealed class ChaSimulationTests
             await cluster.DelayAsync(TimeSpan.FromSeconds(5), ct);
             await AssertAllOrNothingAsync("after further time (resolution is final)");
 
-            await stopReaders.CancelAsync();
+            // Synchronous cancellation: CancelAsync runs the registered callbacks on the thread pool, an uncontrolled
+            // dependency of a deterministic run (HAR-002).
+            stopReaders.Cancel();
             await readers;
             Assert.True(records.Count >= 2, $"observers completed only {records.Count} read-only transactions");
             OpOutcome writerOutcome = committed ? OpOutcome.Ok : OpOutcome.Failed;
@@ -1876,7 +1878,9 @@ public sealed class ChaSimulationTests
             }
 
             Assert.Contains(SoftwareVersionProfile.NextFeature, (await cluster.Admin.GetClusterStatusAsync(ct)).ActiveFeatures);
-            await stopLoad.CancelAsync();
+            // Synchronous cancellation: CancelAsync runs the registered callbacks on the thread pool, an uncontrolled
+            // dependency of a deterministic run (HAR-002).
+            stopLoad.Cancel();
             int completed = await load;
             Assert.True(completed >= 10, $"the register load completed only {completed} operations");
             await election.StopAndAssertAsync(minSamples: 10);
