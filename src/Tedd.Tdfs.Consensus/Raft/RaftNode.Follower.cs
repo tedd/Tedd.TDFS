@@ -77,6 +77,17 @@ public sealed partial class RaftNode
 
     private void HandleHeartbeat(Heartbeat m)
     {
+        if (m.Commit > _log.LastIndex)
+        {
+            // The leader advertises a commit index up to what it knows we hold (min(match, commit)), so it believes this
+            // node holds entries it does not have: the node lost its durable state (an empty-disk replacement keeping its
+            // identity). Nothing is committed from this heartbeat; a rejection tells the leader to probe again from what
+            // this node actually holds.
+            Send(new AppendResponse(_self, m.From, _term, Reject: true, MatchIndex: m.Commit, RejectHint: _log.LastIndex));
+            Send(new HeartbeatResponse(_self, m.From, _term, m.ReadContext));
+            return;
+        }
+
         // The leader only advertises a commit index up to what it knows we hold (min(match, commit)).
         if (_log.CommitTo(m.Commit))
             OnCommitAdvanced();

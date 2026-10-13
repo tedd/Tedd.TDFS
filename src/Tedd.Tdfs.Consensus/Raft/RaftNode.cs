@@ -80,6 +80,14 @@ public sealed partial class RaftNode
     // Follower snapshot assembly.
     private IncomingSnapshot? _incoming;
 
+    // Rebuild after the loss of durable state: no votes and no campaigns until caught up with a leader's commit index
+    // after uninterrupted contact with that leader for a full election timeout.
+    private bool _rebuilding;
+    private ulong _rebuildTarget;
+    private NodeId? _rebuildLeader;
+    private ulong _rebuildTerm;
+    private int _rebuildContact;
+
     // Ready bookkeeping.
     private List<RaftMessage> _msgs = [];
     private RaftHardState _prevHardState;
@@ -123,6 +131,7 @@ public sealed partial class RaftNode
         _random = random;
         _self = config.Self;
         _reachableQuorum = options.Mutations.QuorumFromReachableNodes;
+        _rebuilding = options.Rebuilding;
 
         RaftSnapshotMeta snapshot = log.Snapshot ?? throw new ArgumentException("The log view has no snapshot metadata.", nameof(log));
         if (log.FirstIndex != snapshot.Index + 1)
@@ -221,6 +230,12 @@ public sealed partial class RaftNode
     public NodeId? LeadTransferee => _leadTransferee;
 
     /// <summary>
+    /// True while a node started with <see cref="RaftNodeOptions.Rebuilding"/> has not yet caught up with the leader it
+    /// follows (it rejects every vote request and never campaigns meanwhile): see <see cref="RaftNodeOptions.Rebuilding"/>.
+    /// </summary>
+    public bool IsRebuilding => _rebuilding;
+
+    /// <summary>
     /// True when this node is leader and cannot accept a configuration change yet: a change has not been committed, or the
     /// leader has not yet committed an entry of its own term (its election no-op).
     /// </summary>
@@ -239,16 +254,76 @@ public sealed partial class RaftNode
     /// (Raft dissertation §4.2.2): otherwise a leader that removed itself and lost its quorum before the removal committed
     /// could leave the remaining voters unable to elect anyone (it holds the newest log but would never campaign).
     /// </summary>
-    private bool Promotable => _conf.IsVoter(_self) || _confBase.IsVoter(_self);
+    private bool Promotable => !_rebuilding && (_conf.IsVoter(_self) || _confBase.IsVoter(_self));
+
+    /// <summary>
+    /// Tracks a rebuilding node's catch-up with the leader it follows: the target is the highest commit index that leader
+    /// announced in its term (an append carries the leader's commit index, which covers every entry committed before the
+    /// restart); a different leader or term starts over. See <see cref="MaybeFinishRebuild"/>.
+    /// </summary>
+    private void NoteRebuildProgress(ulong leaderCommit)
+    {
+        if (!_rebuilding)
+            return;
+        if (_rebuildLeader != _lead || _rebuildTerm != _term)
+        {
+            _rebuildLeader = _lead;
+            _rebuildTerm = _term;
+            _rebuildTarget = 0;
+            _rebuildContact = 0;
+        }
+
+        _rebuildTarget = Math.Max(_rebuildTarget, leaderCommit);
+        MaybeFinishRebuild();
+    }
+
+    /// <summary>
+    /// Counts a tick of uninterrupted contact (heard within the minimum election timeout) with the leader a rebuilding node
+    /// follows; any gap, or another leader or term, starts the count over.
+    /// </summary>
+    private void TickRebuild()
+    {
+        if (!_rebuilding)
+            return;
+        if (_lead is { } lead && lead == _rebuildLeader && _term == _rebuildTerm && _electionElapsed < _cfg.ElectionTicksMin)
+        {
+            if (_rebuildContact < int.MaxValue)
+                _rebuildContact++;
+        }
+        else
+        {
+            _rebuildContact = 0;
+        }
+
+        MaybeFinishRebuild();
+    }
+
+    /// <summary>
+    /// Ends the rebuild once the node's commit index reached the target of the leader it follows <b>and</b> that leader kept
+    /// replicating to it for a full maximum election timeout. A single append (for example a delayed or duplicated message
+    /// of a deposed leader, whose commit index may be far behind what this member acknowledged before it lost its state)
+    /// never ends the rebuild on its own: a live current leader keeps announcing its commit index, which raises the target
+    /// before the window ends, and a leader of a newer term restarts the count.
+    /// </summary>
+    private void MaybeFinishRebuild()
+    {
+        if (_rebuildTarget > 0 && _log.Committed >= _rebuildTarget && _rebuildContact >= _cfg.ElectionTicksMax)
+            _rebuilding = false;
+    }
 
     /// <summary>Advances the logical clock by one tick (elections and heartbeats).</summary>
     public void Tick()
     {
         _tickCount++;
         if (_state == NodeState.Leader)
+        {
             TickHeartbeat();
+        }
         else
+        {
             TickElection();
+            TickRebuild();
+        }
     }
 
     /// <summary>

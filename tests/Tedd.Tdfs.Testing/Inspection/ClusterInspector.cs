@@ -75,7 +75,33 @@ public sealed partial class ClusterInspector
     {
         RequireInProcess();
         IReadOnlyDictionary<ObjectId, List<TestNode>> holders = await VerifiedHoldersAsync([id]);
-        return holders.TryGetValue(id, out List<TestNode>? nodes) ? Domains(nodes) : (0, 0);
+        return holders.TryGetValue(id, out List<TestNode>? nodes) ? Domains(nodes, await CurrentLabelsAsync()) : (0, 0);
+    }
+
+    /// <summary>
+    /// The members' current topology labels (relabelling changes them at run time), from the most advanced running node's
+    /// applied control state; empty when no node answers (the specification labels are used then).
+    /// </summary>
+    private async Task<IReadOnlyDictionary<string, DfsTopologyLabels>> CurrentLabelsAsync()
+    {
+        HarnessControlSummary? best = null;
+        foreach (TestNode node in _cluster.RunningNodes())
+        {
+            try
+            {
+                HarnessControlSummary control = await node.Inspect.GetControlSummaryAsync();
+                if (best is null || control.AppliedIndex > best.AppliedIndex)
+                    best = control;
+            }
+            catch (Exception ex) when (TestCluster.IsNodeGone(ex))
+            {
+                // A node that stopped meanwhile answers nothing.
+            }
+        }
+
+        return best is null
+            ? new Dictionary<string, DfsTopologyLabels>(StringComparer.Ordinal)
+            : best.Members.ToDictionary(m => m.Name, m => m.Labels, StringComparer.Ordinal);
     }
 
     /// <summary>The policy an object is measured against: the strongest named policy referencing it, else the volume default.</summary>
@@ -118,6 +144,7 @@ public sealed partial class ClusterInspector
         IReadOnlySet<ObjectId> reachable = state.ReachableObjects();
         IReadOnlyDictionary<ObjectId, IReadOnlySet<string>> objectPolicies = state.ObjectPolicies();
         IReadOnlySet<string> poolNodes = PoolMembers(control, summary.StoragePool);
+        Dictionary<string, DfsTopologyLabels> labels = control.Members.ToDictionary(m => m.Name, m => m.Labels, StringComparer.Ordinal);
 
         var lengths = new Dictionary<ObjectId, long>();
         var stored = new HashSet<ObjectId>();
@@ -145,7 +172,7 @@ public sealed partial class ClusterInspector
         foreach (ObjectId id in reachable)
         {
             List<TestNode> nodes = holders.TryGetValue(id, out List<TestNode>? h) ? h : [];
-            (int copies, int zones) = Domains(nodes);
+            (int copies, int zones) = Domains(nodes, labels);
 
             // Each object is measured against the policy of the file(s) referencing it (the strongest when shared).
             DfsStoragePolicy policy = PolicyOf(summary, objectPolicies.GetValueOrDefault(id));
@@ -351,9 +378,13 @@ public sealed partial class ClusterInspector
         return holders;
     }
 
-    private static (int Copies, int Zones) Domains(IReadOnlyCollection<TestNode> nodes) =>
-        (nodes.Select(n => n.Labels.Host).Distinct(StringComparer.Ordinal).Count(),
-            nodes.Select(n => n.Labels.Region + "\0" + n.Labels.Zone).Distinct(StringComparer.Ordinal).Count());
+    /// <summary>Distinct hosts and zones of the holders, judged by the members' current labels (specification labels as fallback).</summary>
+    private static (int Copies, int Zones) Domains(IReadOnlyCollection<TestNode> nodes, IReadOnlyDictionary<string, DfsTopologyLabels> current)
+    {
+        DfsTopologyLabels LabelsOf(TestNode n) => current.TryGetValue(n.Name, out DfsTopologyLabels? labels) ? labels : n.Labels;
+        return (nodes.Select(n => LabelsOf(n).Host).Distinct(StringComparer.Ordinal).Count(),
+            nodes.Select(n => LabelsOf(n).Region + "\0" + LabelsOf(n).Zone).Distinct(StringComparer.Ordinal).Count());
+    }
 
     private static bool TryParseDigestLine(string line, out ulong applied, out string digest)
     {

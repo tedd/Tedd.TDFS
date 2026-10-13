@@ -93,13 +93,13 @@ public sealed partial class DfsAdminClient
             if (spec.Metadata.GetValidationError() is { } metadata)
                 throw new ArgumentException($"Invalid metadata policy: {metadata}", nameof(spec));
             if (spec.DefaultPolicy.GetValidationError() is { } policy)
-                throw new ArgumentException($"Invalid default storage policy: {policy}", nameof(spec));
+                throw new DfsException(DfsErrorCode.InvalidPolicy, $"Invalid default storage policy: {policy}");
             foreach ((string policyName, DfsStoragePolicy named) in spec.NamedPolicies)
             {
                 if (string.IsNullOrEmpty(policyName))
                     throw new ArgumentException("Named policies need non-empty names.", nameof(spec));
                 if (named?.GetValidationError() is { } invalid)
-                    throw new ArgumentException($"Invalid storage policy '{policyName}': {invalid}", nameof(spec));
+                    throw new DfsException(DfsErrorCode.InvalidPolicy, $"Invalid storage policy '{policyName}': {invalid}");
             }
 
             if (spec.InlineThreshold < 0)
@@ -145,7 +145,7 @@ public sealed partial class DfsAdminClient
             Validation.Name(volume, nameof(volume));
             ArgumentNullException.ThrowIfNull(policy);
             if (policy.GetValidationError() is { } invalid)
-                throw new ArgumentException($"Invalid storage policy: {invalid}", nameof(policy));
+                throw new DfsException(DfsErrorCode.InvalidPolicy, $"Invalid storage policy: {invalid}");
             return new AdminSetDefaultPolicyBody(volume, policy, migrateExisting);
         }, Runtime.ControlRouter, DfsOperationKind.PolicyChange, ct);
 
@@ -157,7 +157,7 @@ public sealed partial class DfsAdminClient
             Validation.Name(policyName, nameof(policyName));
             ArgumentNullException.ThrowIfNull(policy);
             if (policy.GetValidationError() is { } invalid)
-                throw new ArgumentException($"Invalid storage policy: {invalid}", nameof(policy));
+                throw new DfsException(DfsErrorCode.InvalidPolicy, $"Invalid storage policy: {invalid}");
             return new AdminDefinePolicyBody(volume, policyName, policy);
         }, Runtime.ControlRouter, DfsOperationKind.PolicyChange, ct);
 

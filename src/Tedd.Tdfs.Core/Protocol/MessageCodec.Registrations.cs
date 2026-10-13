@@ -112,6 +112,8 @@ public static partial class MessageCodec
         Register<InventoryReportResultMessage>();
         Register<CopyObjectsMessage>();
         Register<CopyObjectsResultMessage>();
+        Register<ReportUsageMessage>();
+        Register<ReportUsageResultMessage>();
         Register<RaftBatchMessage>();
         Register<RaftBatchResultMessage>();
         Register<RaftSnapshotChunkMessage>();

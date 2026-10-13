@@ -230,6 +230,10 @@ public enum MessageType : ushort
     CopyObjects = 122,
     /// <summary>Copy objects reply.</summary>
     CopyObjectsResult = 123,
+    /// <summary>Usage and maintenance report (storage node → control leader).</summary>
+    ReportUsage = 124,
+    /// <summary>Usage report reply.</summary>
+    ReportUsageResult = 125,
 
     // consensus (node <-> node)
 

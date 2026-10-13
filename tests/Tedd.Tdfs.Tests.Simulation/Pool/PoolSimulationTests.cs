@@ -1055,6 +1055,7 @@ public sealed class PoolSimulationTests
             await using DfsClient client = await cluster.ConnectAsync(new TestClientOptions { OperationTimeout = TimeSpan.FromSeconds(10) }, Ct);
             DfsVolume va = client.GetVolume(VolA);
             var snapshotModel = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+            await va.Directories.CreateDirectoryAsync("/d", Ct);
             for (int i = 0; i < 5; i++)
             {
                 byte[] data = TestData.Bytes(16_000 + (ulong)i, 2 * Chunk + i);

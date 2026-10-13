@@ -191,6 +191,10 @@ internal sealed partial class ControlStateMachine
     {
         if (!State.Volumes.TryGetValue(c.Volume, out VolumeRecord? v))
             return Fail(DfsErrorCode.VolumeNotFound, $"Volume {c.Volume} does not exist.");
+
+        // A completion established for another target (superseded by a newer SetDefaultPolicy) changes nothing.
+        if (c.Target is { } target && v.MigrationTarget != target)
+            return ApplyOutcome.Success(v);
         VolumeRecord updated = v with { MigrationTarget = null };
         State.Volumes[v.Id] = updated;
         return ApplyOutcome.Success(updated);

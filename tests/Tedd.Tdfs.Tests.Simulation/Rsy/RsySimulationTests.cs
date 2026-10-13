@@ -1792,7 +1792,7 @@ public sealed class RsySimulationTests
         long failuresBefore = (await badSource.GetCountersAsync()).ChecksumFailures + (await target.GetCountersAsync()).ChecksumFailures;
 
         foreach (ObjectId o in objects)
-            await badSource.Disk.CorruptObjectAsync(o, 100);
+            await badSource.Disk.CorruptObjectAsync(o, await CorruptionOffsetAsync(cluster, "/r", o, 100));
         await DeleteCopiesAsync(target, objects);
 
         // Phase 1: the only reachable holder is corrupt (the verified holder is down). Repair must not store its bytes on
@@ -1854,9 +1854,11 @@ public sealed class RsySimulationTests
 
             // The offline holder goes first; the two deletions then happen back to back so repair (32 KiB/s, two seconds per
             // 64 KiB object) cannot re-create a copy before the "single survivor" precondition is checked.
+            // (The harness deletes a copy through the running node's store, so the offline holder loses its copies just
+            // before it stops.)
+            await DeleteCopiesAsync(second, objects);   // offline: its stored copies are gone when it returns
             if (loss == CopyLoss.OfflineAndSilentDeletion)
                 await second.StopAsync();
-            await DeleteCopiesAsync(second, objects);   // offline: its stored copies are gone when it returns
             await DeleteCopiesAsync(silent, objects);
 
             foreach (ObjectId o in objects)
@@ -2359,8 +2361,13 @@ public sealed class RsySimulationTests
                 await cluster.DelayAsync(TimeSpan.FromSeconds(1), Ct);
                 GroupInspection v = await cluster.Inspect.GetVolumeGroupAsync(Volume);
                 GroupInspection k = await cluster.Inspect.GetControlGroupAsync();
-                if (v.Term == volBefore.Term && v.Leader == volBefore.Leader && k.Term == controlBefore.Term && k.Leader == controlBefore.Leader)
+                if (v.Term == volBefore.Term && v.Leader == volBefore.Leader && k.Term == controlBefore.Term && k.Leader == controlBefore.Leader
+                    && v.Voters.Order(StringComparer.Ordinal).SequenceEqual(volBefore.Voters.Order(StringComparer.Ordinal))
+                    && k.Voters.Order(StringComparer.Ordinal).SequenceEqual(controlBefore.Voters.Order(StringComparer.Ordinal)))
+                {
                     break;
+                }
+
                 Assert.True(settle < 10, "terms/leaders did not settle after the membership change (before the stale node returned)");
                 (volBefore, controlBefore) = (v, k);
             }
@@ -2940,7 +2947,7 @@ public sealed class RsySimulationTests
                 if (divergence == SilentDivergence.SilentCorruption)
                 {
                     foreach (ObjectId o in objects)
-                        await target.Disk.CorruptObjectAsync(o, 7);
+                        await target.Disk.CorruptObjectAsync(o, await CorruptionOffsetAsync(cluster, "/m", o, 7));
                     await cluster.Admin.StartScrubAsync(target.Name, Ct);
                 }
                 else

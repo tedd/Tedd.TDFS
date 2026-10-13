@@ -112,6 +112,13 @@ public sealed partial class RaftNode
 
     private void HandleVoteRequest(VoteRequest m)
     {
+        if (_rebuilding)
+        {
+            // A member that lost its durable state cannot know whom it voted for or what it acknowledged.
+            Send(new VoteResponse(_self, m.From, _term, m.PreVote, Reject: true));
+            return;
+        }
+
         bool canVote = _vote == m.From
             || (_vote is null && _lead is null)
             || (m.PreVote && m.Term > _term);
@@ -138,11 +145,13 @@ public sealed partial class RaftNode
                 _electionElapsed = 0;
                 _lead = m.From;
                 HandleAppendEntries(ae);
+                NoteRebuildProgress(ae.Commit);
                 break;
             case Heartbeat hb:
                 _electionElapsed = 0;
                 _lead = m.From;
                 HandleHeartbeat(hb);
+                NoteRebuildProgress(0);
                 break;
             case InstallSnapshot snap:
                 _electionElapsed = 0;

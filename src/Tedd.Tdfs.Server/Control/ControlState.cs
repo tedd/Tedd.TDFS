@@ -10,7 +10,7 @@ namespace Tedd.Tdfs.Server.Control;
 /// log. Every collection is ordinal/ordered so iteration, checkpoints and digests are deterministic. Mutated only by
 /// <see cref="ControlStateMachine"/>; read on the node loop.
 /// </summary>
-internal sealed class ControlState
+internal sealed partial class ControlState
 {
     /// <summary>Audit entries retained (most recent).</summary>
     public const int MaxAuditEntries = 2048;
@@ -180,6 +180,7 @@ internal sealed class ControlState
         Features.Clear();
         Audit.Clear();
         AdminOutcomes.Clear();
+        PoolEpochs.Clear();
     }
 
     /// <summary>Canonical serialization (checkpoints and digests): identical states produce identical bytes.</summary>
@@ -241,7 +242,7 @@ internal sealed class ControlState
             w.WriteVarUInt(o.Index);
         }
 
-        w.WriteExtensionBlock([]);
+        w.WriteExtensionBlock(WriteExtensions());
     }
 
     /// <summary>Replaces this state with a serialized one.</summary>
@@ -307,7 +308,7 @@ internal sealed class ControlState
                 AdminOutcomes[o.RequestId] = o;
             }
 
-            r.ReadExtensions();
+            r.ReadExtensions(UnderstoodExtensions, ReadExtension);
             r.EnsureEnd();
         }
         catch (DfsProtocolException ex)

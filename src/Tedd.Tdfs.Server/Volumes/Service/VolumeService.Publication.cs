@@ -375,6 +375,7 @@ internal sealed partial class VolumeService
 
             ulong epoch = own.FirstOrDefault(r => evaluation.Holders.Contains(r.Node))?.PlacementEpoch ?? control.PlacementEpoch;
             holders[obj] = ([.. evaluation.Holders], epoch);
+            RecordPublishedCopies(obj, staging, c.ObjectLength, c.Checksum, evaluation.Holders);
         }
 
         foreach (RangeChange c in changes)

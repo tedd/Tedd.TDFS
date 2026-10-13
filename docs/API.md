@@ -16,7 +16,7 @@ Implementations may add members, but may not change or remove these. Tests may o
 public readonly record struct VolumeId(Guid Value) { public static VolumeId New(IRandomSource r); public override string ToString(); }
 public readonly record struct NodeId(Guid Value)   { public static NodeId New(IRandomSource r); public override string ToString(); }
 public readonly record struct InodeId(ulong Value) { public static readonly InodeId Root /* = 1 */; }
-public readonly record struct ObjectId(UInt128 Value) { public static ObjectId New(IRandomSource r); public static ObjectId Parse(string s); public override string ToString(); /* 32 hex chars */ }
+public readonly record struct ObjectId(UInt128 Value) : IComparable<ObjectId>, IComparable { public static ObjectId New(IRandomSource r); public static ObjectId Parse(string s); public override string ToString(); /* 32 hex chars */ public int CompareTo(ObjectId other); /* by value; <, >, <=, >= likewise */ }
 public readonly record struct SnapshotId(Guid Value);
 public readonly record struct HandleId(ulong Value);
 public readonly record struct StagingId(ulong Value);

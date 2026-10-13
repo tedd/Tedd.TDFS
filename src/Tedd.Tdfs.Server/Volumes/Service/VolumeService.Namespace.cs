@@ -62,6 +62,7 @@ internal sealed partial class VolumeService
             if (new NamespaceView(State.Inodes).Resolve(DfsStreamPath.GetFilePath(path)) is not { Found: true, Target: { } inode })
                 return command;
             (DfsStoragePolicy policy, string pool) = PolicyOf(request.PolicyName);
+            await EnsurePolicyMetAsync(inode, policy, pool, ct);
             (ImmutableArray<StreamMaterialization> materialized, ulong staging) = await MaterializeInlineAsync(command, inode, policy, pool, op, ct);
             return staging == 0 ? command : command with { Materialized = materialized, LeaderStaging = staging };
         });

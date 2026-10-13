@@ -9,10 +9,12 @@ namespace Tedd.Tdfs.Server.Data;
 
 /// <summary>
 /// Storage-node side of anti-entropy and garbage collection (ARCHITECTURE §6, §8): periodically reports this node's copies
-/// of every volume to the volume's leader (paged <c>InventoryReport</c>) and deletes the copies the leader classifies as
-/// garbage. The decision is the leader's (unreachable from every root, unprotected at the GC watermark, staging session
-/// closed); this node only deletes a reported copy whose record still matches the decision's (object, staging) pair, and
-/// ignores decisions of a superseded volume epoch. Runs on the node loop.
+/// of every volume to the volume's leader (paged <c>InventoryReport</c>) and runs the GC sweep the leader's answer
+/// describes. A node reports every volume it holds copies of and every volume whose storage pools it belongs to (an empty
+/// report tells the leader the node is up and holds nothing). The decision is the leader's (unreachable from every root,
+/// unprotected at the GC watermark, staging session closed); this node only deletes a reported copy whose record still
+/// matches the decision's (object, staging) pair, and ignores decisions of a superseded volume epoch. Every completed
+/// report is one GC sweep on this node (fault site <c>gc.sweep</c>, hit before anything is deleted). Runs on the node loop.
 /// </summary>
 internal sealed class InventoryReporter
 {
@@ -22,6 +24,7 @@ internal sealed class InventoryReporter
     private readonly NodeServices _s;
     private ulong _reports;
     private bool _running;
+    private bool _again;
 
     public InventoryReporter(NodeServices services)
     {
@@ -29,7 +32,23 @@ internal sealed class InventoryReporter
         _s = services;
     }
 
-    /// <summary>One reporting pass over every volume this node holds copies of.</summary>
+    /// <summary>
+    /// Requests a report soon (after a scrub or repair quarantined a copy): runs a pass now when none is running, otherwise
+    /// once more right after the current one.
+    /// </summary>
+    public void RequestReport()
+    {
+        if (_running)
+        {
+            _again = true;
+            return;
+        }
+
+        if (!_s.IsStopping)
+            _s.Jobs.Run("inventory-now", RunAsync);
+    }
+
+    /// <summary>One reporting pass over every volume this node holds copies of or serves storage for.</summary>
     public async Task RunAsync()
     {
         if (_running || !_s.IsServing || _s.IsStopping || !_s.Control.IsSelfRegistered)
@@ -37,29 +56,69 @@ internal sealed class InventoryReporter
         _running = true;
         try
         {
-            ControlState control = _s.Control.State;
-            IReadOnlyList<ObjectRecordInfo> records = _s.ObjectStore.List();
-            foreach (IGrouping<VolumeId, ObjectRecordInfo> group in records.GroupBy(r => r.Volume).OrderBy(g => g.Key.Value))
+            do
             {
-                if (_s.IsStopping)
-                    return;
-                if (control.FindVolume(group.Key) is not { } volume || volume.State == WireVolumeState.Restoring)
-                    continue;
-                try
-                {
-                    await ReportAsync(volume, [.. group.OrderBy(r => r.Id.Value)]);
-                }
-                catch (Exception ex) when (ex is DfsException or IOException or TimeoutException or OperationCanceledException or UnauthorizedAccessException
-                                               or ArgumentException)
-                {
-                    _s.Debug("inventory", NodeServices.Inv($"Inventory of volume {volume.Name} was not reported: {ex.GetType().Name}: {ex.Message}"));
-                }
+                _again = false;
+                await ReportAllAsync();
             }
+            while (_again && !_s.IsStopping);
         }
         finally
         {
             _running = false;
         }
+    }
+
+    private async Task ReportAllAsync()
+    {
+        ControlState control = _s.Control.State;
+        IReadOnlyList<ObjectRecordInfo> records = _s.ObjectStore.List();
+        var byVolume = new SortedDictionary<Guid, List<ObjectRecordInfo>>();
+        foreach (ObjectRecordInfo r in records)
+        {
+            if (!byVolume.TryGetValue(r.Volume.Value, out List<ObjectRecordInfo>? list))
+                byVolume[r.Volume.Value] = list = [];
+            list.Add(r);
+        }
+
+        foreach (VolumeRecord v in control.Volumes.Values)
+        {
+            if (!byVolume.ContainsKey(v.Id.Value) && ServesStorageFor(control, v))
+                byVolume[v.Id.Value] = [];
+        }
+
+        foreach ((Guid id, List<ObjectRecordInfo> list) in byVolume)
+        {
+            if (_s.IsStopping)
+                return;
+            if (control.FindVolume(new VolumeId(id)) is not { } volume || volume.State == WireVolumeState.Restoring)
+                continue;
+            try
+            {
+                await ReportAsync(volume, [.. list.OrderBy(r => r.Id.Value)]);
+            }
+            catch (Exception ex) when (ex is DfsException or IOException or TimeoutException or OperationCanceledException or UnauthorizedAccessException
+                                           or ArgumentException)
+            {
+                _s.Debug("inventory", NodeServices.Inv($"Inventory of volume {volume.Name} was not reported: {ex.GetType().Name}: {ex.Message}"));
+            }
+        }
+    }
+
+    /// <summary>True when this node is a live member of a storage pool the volume places objects in.</summary>
+    private bool ServesStorageFor(ControlState control, VolumeRecord volume)
+    {
+        if (control.FindMember(_s.NodeId) is not { IsLive: true })
+            return false;
+        if (control.PoolMembers(volume.StoragePool).Any(m => m.Id == _s.NodeId))
+            return true;
+        foreach (DfsStoragePolicy policy in volume.NamedPolicies.Values.Append(volume.DefaultPolicy))
+        {
+            if (policy.Pool is { } pool && control.PoolMembers(pool).Any(m => m.Id == _s.NodeId))
+                return true;
+        }
+
+        return false;
     }
 
     private async Task ReportAsync(VolumeRecord volume, IReadOnlyList<ObjectRecordInfo> records)
@@ -75,7 +134,12 @@ internal sealed class InventoryReporter
             last = await SendAsync(volume, message);
         }
 
-        if (last is null || last.Delete.Count == 0 || last.VolumeEpoch < volume.Epoch)
+        if (last is null)
+            return;
+
+        // One GC sweep per completed report, whether or not it deletes anything (fault site F20 on the sweeping node).
+        await _s.HitAsync(FaultStage.F20, FaultSites.GcSweep, volume.Name, DfsOperationKind.Gc, detail: _s.NodeName);
+        if (last.Delete.Count == 0 || _s.Control.State.FindVolume(volume.Id) is not { } current || last.VolumeEpoch < current.Epoch)
             return;
 
         int deleted = 0;

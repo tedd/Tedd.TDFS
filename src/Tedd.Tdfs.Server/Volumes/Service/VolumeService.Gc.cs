@@ -10,9 +10,6 @@ namespace Tedd.Tdfs.Server.Volumes.Service;
 
 internal sealed partial class VolumeService
 {
-    /// <summary>Leader-local object-location map from inventories (holders, most recent knowledge first).</summary>
-    private readonly Dictionary<ObjectId, List<NodeId>> _locations = [];
-
     /// <summary>Inventory reports being received (paged), per (node, report id).</summary>
     private readonly Dictionary<(NodeId Node, ulong Report), InventoryAccumulator> _inventories = [];
 
@@ -24,13 +21,6 @@ internal sealed partial class VolumeService
     /// staged-bytes accounting of replica health (GC-015).
     /// </summary>
     private readonly Dictionary<NodeId, Dictionary<ObjectId, (ulong Staging, long Length)>> _staged = [];
-
-    /// <summary>Location hints of an extent: receipt holders at publication, then nodes that reported a copy.</summary>
-    internal IReadOnlyList<NodeId> LocationsOf(ExtentRef extent)
-    {
-        IEnumerable<NodeId> known = _locations.TryGetValue(extent.Object, out List<NodeId>? holders) ? holders : [];
-        return known.Concat(extent.Locations.IsDefault ? [] : extent.Locations).Distinct().ToArray();
-    }
 
     /// <summary>
     /// <c>InventoryReport</c> (ARCHITECTURE §6, §8): a storage node reports its copies of this volume (paged). The leader
@@ -64,7 +54,11 @@ internal sealed partial class VolumeService
         var key = (request.Node, request.ReportId);
         if (!_inventories.TryGetValue(key, out InventoryAccumulator? accumulator) || request.Page == 0)
         {
-            accumulator = new InventoryAccumulator();
+            // A node reports a volume one report at a time: a new report abandons any unfinished one (a node that crashed
+            // mid-report never finishes it), so accumulators stay bounded.
+            foreach ((NodeId Node, ulong Report) stale in _inventories.Keys.Where(k => k.Node == request.Node && k.Report != request.ReportId).ToArray())
+                _inventories.Remove(stale);
+            accumulator = new InventoryAccumulator(_s.Time.GetTimestamp());
             _inventories[key] = accumulator;
         }
 
@@ -78,7 +72,7 @@ internal sealed partial class VolumeService
 
         _inventories.Remove(key);
         VolumeState s = State;
-        RecordHoldings(request.Node, accumulator.Items);
+        RecordInventory(request.Node, request.Incarnation, accumulator.Items, accumulator.StartedAt);
         HashSet<ObjectId> reachable = VolumeStateMachine.Reachable(s);
         HashSet<ObjectId> protectedObjects = VolumeStateMachine.Protected(s, VolumeStateMachine.Watermark(s, _s.Mutations.IgnoreSnapshotPins));
         var delete = new List<ObjectStagingRef>();
@@ -102,71 +96,7 @@ internal sealed partial class VolumeService
 
         _staged[request.Node] = staged;
         _pendingGc[request.Node] = delete.Count;
-        if (delete.Count > 0)
-            await _s.HitAsync(FaultStage.F20, FaultSites.GcSweep, Name, DfsOperationKind.Gc, detail: _s.Control.NameOf(request.Node), ct: ct);
         return new InventoryReportResultMessage(delete, unknown, delete.Count > 0 ? s.AppliedIndex : 0, Record.Epoch);
-    }
-
-    private void RecordHoldings(NodeId node, IReadOnlyCollection<InventoryItem> items)
-    {
-        var held = new HashSet<ObjectId>(items.Select(i => i.Object));
-        foreach ((ObjectId obj, List<NodeId> holders) in _locations.ToArray())
-        {
-            if (!held.Contains(obj))
-            {
-                holders.Remove(node);
-                if (holders.Count == 0)
-                    _locations.Remove(obj);
-            }
-        }
-
-        foreach (ObjectId obj in held)
-        {
-            if (!_locations.TryGetValue(obj, out List<NodeId>? holders))
-                _locations[obj] = holders = [];
-            holders.Remove(node);
-            holders.Insert(0, node);
-        }
-    }
-
-    /// <summary>Replica health of the volume as the leader knows it (receipts at publication plus inventories).</summary>
-    public ReplicaHealthData ReplicaHealth()
-    {
-        VolumeState s = State;
-        ControlState control = _s.Control.State;
-        var policies = new Dictionary<ObjectId, (DfsStoragePolicy Policy, string Pool, long Length, IReadOnlyList<NodeId> Holders)>();
-        foreach (InodeRecord inode in s.Inodes.Values)
-        {
-            (DfsStoragePolicy policy, string pool) = PolicyOf(inode.PolicyName);
-            foreach (StreamRecord stream in inode.Streams.Values)
-            {
-                if (stream.IsInline)
-                    continue;
-                foreach (ExtentRef e in stream.Extents)
-                    policies.TryAdd(e.Object, (policy, pool, e.ObjectLength, LocationsOf(e)));
-            }
-        }
-
-        long under = 0, zones = 0, missing = 0, violations = 0, backlog = 0;
-        foreach ((ObjectId _, (DfsStoragePolicy policy, string pool, long length, IReadOnlyList<NodeId> holders)) in policies)
-        {
-            var poolMembers = control.PoolMembers(pool).Select(m => m.Id).ToHashSet();
-            var labels = holders.Select(h => control.FindMember(h)).Where(m => m is { IsLive: true }).Select(m => m!.Labels).ToArray();
-            (int copies, int distinctZones) = Tedd.Tdfs.Data.Placement.CountDomains(labels);
-            if (copies == 0)
-                missing++;
-            if (copies < policy.TargetCopies)
-            {
-                under++;
-                backlog += length;
-            }
-
-            if (distinctZones < policy.TargetDistinctZones)
-                zones++;
-            violations += holders.Count(h => !poolMembers.Contains(h));
-        }
-
-        return new ReplicaHealthData(policies.Count, under, zones, missing, violations, backlog, _pendingGc.Values.Sum(), StagedBytes(s), _sm.PinnedBytes);
     }
 
     /// <summary>
@@ -199,6 +129,7 @@ internal sealed partial class VolumeService
     {
         RequireVolumeAdmin(context.Principal ?? string.Empty);
         ulong applied = await ReadBarrierAsync(context.Cancellation);
+        await ProbeDeficitsAsync(context.Cancellation);
         var body = new AdminVolumeStatusBody(_s.Control.ToVolumeEntry(Record), Token(applied), _s.Admin.GroupStatus(Group, Name), ReplicaHealth(), BackupStatuses());
         return AdminResultMessage.Create(request.Op, body);
     }
@@ -208,12 +139,14 @@ internal sealed partial class VolumeService
     {
         RequireVolumeAdmin(context.Principal ?? string.Empty);
         await ReadBarrierAsync(context.Cancellation);
+        await ProbeDeficitsAsync(context.Cancellation);
         return AdminResultMessage.Create(request.Op, ReplicaHealth());
     }
 
     /// <summary>
-    /// <c>AdminOp.PolicyMigrationStatus</c> (VolumeAdmin): the migration target and the referenced objects whose known copies
-    /// do not meet it yet; effective once the control record no longer lists a migration target.
+    /// <c>AdminOp.PolicyMigrationStatus</c> (VolumeAdmin): the migration target and the referenced default-policy objects
+    /// whose counted copies do not meet it yet; effective once the control record no longer lists a migration target (the
+    /// control leader clears it when this leader reports every such object migrated).
     /// </summary>
     public async Task<AdminResultMessage> PolicyMigrationStatusAsync(RpcContext context, AdminRequestMessage request)
     {
@@ -221,32 +154,12 @@ internal sealed partial class VolumeService
         await ReadBarrierAsync(context.Cancellation);
         VolumeRecord record = Record;
         DfsStoragePolicy target = record.MigrationTarget ?? record.DefaultPolicy;
-        ControlState control = _s.Control.State;
         long pending = 0;
-        if (record.MigrationTarget is not null)
+        if (record.MigrationTarget is { } migrating)
         {
-            var seen = new HashSet<ObjectId>();
-            foreach (InodeRecord inode in State.Inodes.Values)
-            {
-                if (inode.PolicyName.Length > 0 && record.NamedPolicies.ContainsKey(inode.PolicyName))
-                    continue;
-                foreach (StreamRecord stream in inode.Streams.Values)
-                {
-                    if (stream.IsInline)
-                        continue;
-                    foreach (ExtentRef e in stream.Extents)
-                    {
-                        if (!seen.Add(e.Object))
-                            continue;
-                        var labels = LocationsOf(e).Select(h => control.FindMember(h)).Where(m => m is { IsLive: true }).Select(m => m!.Labels).ToArray();
-                        (int copies, int zones) = Tedd.Tdfs.Data.Placement.CountDomains(labels);
-                        if (copies < target.TargetCopies || zones < target.TargetDistinctZones)
-                            pending++;
-                    }
-                }
-            }
+            await ProbeDeficitsAsync(context.Cancellation);
+            pending = Math.Max(PendingMigrationObjects(migrating), ReplicaKnowledgeReady ? 0 : 1);
         }
-
         return AdminResultMessage.Create(request.Op, new AdminPolicyMigrationBody(Name, target, record.MigrationTarget is null, pending));
     }
 
@@ -260,8 +173,11 @@ internal sealed partial class VolumeService
         }
     }
 
-    private sealed class InventoryAccumulator
+    private sealed class InventoryAccumulator(long startedAt)
     {
+        /// <summary>Leader timestamp of the first page (the node listed its copies no later than this).</summary>
+        public long StartedAt { get; } = startedAt;
+
         public int NextPage { get; set; }
 
         public List<InventoryItem> Items { get; } = [];

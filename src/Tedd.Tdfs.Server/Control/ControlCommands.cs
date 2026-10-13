@@ -150,8 +150,17 @@ internal sealed record DefinePolicyCommand(CommandHeader Header, VolumeId Volume
     public override DfsOperationKind FaultOperation => DfsOperationKind.PolicyChange;
 }
 
-internal sealed record CompletePolicyMigrationCommand(CommandHeader Header, VolumeId Volume) : ControlCommand(Header)
+/// <summary>
+/// Ends a default-policy migration. <paramref name="Target"/> is the migration target the completion was established for
+/// (optional extension field 1; absent in entries written before it existed): when the volume's pending target is a
+/// different policy by the time the entry applies (a newer <c>SetDefaultPolicy</c> started another migration), the entry
+/// changes nothing, so a completion can never make a later, unmet policy effective (REP-014, CHA-002).
+/// </summary>
+internal sealed record CompletePolicyMigrationCommand(CommandHeader Header, VolumeId Volume, DfsStoragePolicy? Target = null) : ControlCommand(Header)
 {
+    /// <summary>Extension field id of <see cref="Target"/>.</summary>
+    public const uint TargetExtension = 1;
+
     public override ControlCommandKind Kind => ControlCommandKind.CompletePolicyMigration;
 
     public override DfsOperationKind FaultOperation => DfsOperationKind.PolicyChange;
@@ -361,7 +370,7 @@ internal static class ControlCommandCodec
                 throw new ArgumentException($"Unknown control command {command.GetType().Name}.", nameof(command));
         }
 
-        w.WriteExtensionBlock([]);
+        w.WriteExtensionBlock(command is CompletePolicyMigrationCommand { Target: { } target } ? [EncodePolicyExtension(CompletePolicyMigrationCommand.TargetExtension, target)] : []);
         return buffer.WrittenSpan.ToArray();
     }
 
@@ -433,8 +442,17 @@ internal static class ControlCommandCodec
                 command = new DefinePolicyCommand(header, r.ReadVolumeId(), r.ReadString(), r.ReadStoragePolicy());
                 break;
             case ControlCommandKind.CompletePolicyMigration:
-                command = new CompletePolicyMigrationCommand(header, r.ReadVolumeId());
-                break;
+            {
+                VolumeId volume = r.ReadVolumeId();
+                DfsStoragePolicy? target = null;
+                r.ReadExtensions(CompletionExtensions, e =>
+                {
+                    if (e.FieldId == CompletePolicyMigrationCommand.TargetExtension)
+                        target = DecodePolicyExtension(e);
+                });
+                r.EnsureEnd();
+                return new CompletePolicyMigrationCommand(header, volume, target);
+            }
             case ControlCommandKind.AddDataKey:
             {
                 VolumeId volume = r.ReadVolumeId();
@@ -479,5 +497,25 @@ internal static class ControlCommandCodec
         r.ReadExtensions();
         r.EnsureEnd();
         return command;
+    }
+
+    /// <summary>Extension fields <see cref="CompletePolicyMigrationCommand"/> understands.</summary>
+    private static readonly System.Collections.Frozen.FrozenSet<uint> CompletionExtensions =
+        System.Collections.Frozen.FrozenSet.ToFrozenSet([CompletePolicyMigrationCommand.TargetExtension]);
+
+    private static WireExtension EncodePolicyExtension(uint fieldId, DfsStoragePolicy policy)
+    {
+        var buffer = new ArrayBufferWriter<byte>();
+        var w = new WireWriter(buffer);
+        w.WriteStoragePolicy(policy);
+        return new WireExtension(fieldId, Required: false, buffer.WrittenMemory.ToArray());
+    }
+
+    private static DfsStoragePolicy DecodePolicyExtension(WireExtension extension)
+    {
+        var r = new WireReader(extension.Value.Span, WireLimits.Default);
+        DfsStoragePolicy policy = r.ReadStoragePolicy();
+        r.EnsureEnd();
+        return policy;
     }
 }

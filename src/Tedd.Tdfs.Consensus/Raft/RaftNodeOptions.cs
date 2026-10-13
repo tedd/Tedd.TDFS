@@ -18,6 +18,16 @@ public sealed record RaftNodeOptions
     /// </summary>
     public ulong? Applied { get; init; }
 
+    /// <summary>
+    /// True for a member that lost its durable state (an empty-disk replacement keeping its identity, OFF-020): it neither
+    /// votes nor campaigns until its log has caught up with the commit index announced by the leader it follows, after that
+    /// leader replicated to it without interruption for a full maximum election timeout (a single, possibly stale, append
+    /// is not enough). Granting votes with an empty or partly rebuilt log could elect a candidate missing entries this
+    /// member had acknowledged before the loss (its forgotten vote and log were part of earlier majorities). See
+    /// <see cref="RaftNode.IsRebuilding"/>.
+    /// </summary>
+    public bool Rebuilding { get; init; }
+
     /// <summary>Maximum payload bytes per <see cref="InstallSnapshot"/> chunk.</summary>
     public int SnapshotChunkBytes { get; init; } = 1 << 20;
 

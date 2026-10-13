@@ -16,4 +16,24 @@ public sealed record ObjectStoreOptions(long SegmentSize = 64 << 20, long Reserv
 
     /// <summary>Node name reported in fault-injection contexts.</summary>
     public string NodeName { get; init; } = "local";
+
+    /// <summary>
+    /// Bytes of the reserve that <see cref="ObjectAdmission.Repair"/> puts must leave free (metadata progress and one
+    /// compaction step); null means half of <see cref="ReservedBytes"/>.
+    /// </summary>
+    public long? RepairFloorBytes { get; init; }
+
+    /// <summary>The effective repair floor: <see cref="RepairFloorBytes"/>, or half of <see cref="ReservedBytes"/>, never above the reserve.</summary>
+    /// <remarks>
+    /// The lower half of the reserve always stays free for metadata progress and compaction; the upper half is the repair
+    /// reserve: after a failure, re-replication may fill it, while normal admission never does.
+    /// </remarks>
+    public long EffectiveRepairFloorBytes => Math.Clamp(RepairFloorBytes ?? (ReservedBytes / 2), 0, ReservedBytes);
+
+    /// <summary>
+    /// Configured capacity of the store's node (null = the medium's capacity). Admission uses the smaller of this and the
+    /// medium's capacity, so a node configured smaller than its device (for example a metadata witness configured with no
+    /// data capacity) never admits payload beyond its configuration.
+    /// </summary>
+    public long? CapacityLimitBytes { get; init; }
 }

@@ -15,7 +15,15 @@ namespace Tedd.Tdfs.Server.Raft;
 /// the initial members, then initial commands. Null for members added later (they receive the log from the leader).
 /// </param>
 internal sealed record GroupOpenSpec(string Group, string DisplayName, string? VolumeName, string Directory,
-    IReplicatedStateMachine StateMachine, IReadOnlyList<RaftEntry>? BootstrapEntries);
+    IReplicatedStateMachine StateMachine, IReadOnlyList<RaftEntry>? BootstrapEntries)
+{
+    /// <summary>
+    /// True when this member lost the group's durable state (an empty-disk replacement, OFF-020): the group opens without
+    /// bootstrap entries and its Raft node neither votes nor campaigns until it caught up with a leader
+    /// (<see cref="Consensus.RaftNodeOptions.Rebuilding"/>). Persisted in the group directory until the catch-up completes.
+    /// </summary>
+    public bool Rebuilding { get; init; }
+}
 
 /// <summary>Catch-up counters of one group for the current process (RSY suite, <c>RaftGroupStats</c>).</summary>
 internal sealed class GroupStats
@@ -78,6 +86,10 @@ internal sealed partial class GroupRuntime
     private NodeId? _lastLeader;
     private ulong _lastTerm;
     private TaskCompletionSource? _idle;
+    private bool _rebuilding;
+
+    /// <summary>Marker file of a group whose member is rebuilding (see <see cref="GroupOpenSpec.Rebuilding"/>).</summary>
+    internal const string RebuildMarkerFile = "rebuilding";
 
     private GroupRuntime(NodeServices services, RaftGroupHost host, GroupOpenSpec spec, RaftStorageAdapter view, RaftLogStoreOptions storeOptions,
         CheckpointStore checkpoints, RaftSnapshot? latestSnapshot)
@@ -220,11 +232,21 @@ internal sealed partial class GroupRuntime
             }
 
             await RepairHardStateAsync(store, ct);
-            if (store.LastIndex == 0 && store.Snapshot.Index == 0 && spec.BootstrapEntries is { Count: > 0 } bootstrap)
+            string marker = StoragePath.Combine(spec.Directory, RebuildMarkerFile);
+            bool rebuilding = await AtomicFile.ReadAsync(medium, marker, ct) is not null;
+            if ((spec.Rebuilding || ExistedBeforeReplacement(services, spec)) && !rebuilding && store.LastIndex == 0 && store.Snapshot.Index == 0)
+            {
+                await AtomicFile.WriteAsync(medium, marker, new byte[] { 1 }, ct);
+                rebuilding = true;
+            }
+
+            if (!rebuilding && store.LastIndex == 0 && store.Snapshot.Index == 0 && spec.BootstrapEntries is { Count: > 0 } bootstrap)
                 await WriteBootstrapAsync(view, bootstrap, ct);
 
-            var group = new GroupRuntime(services, host, spec, view, storeOptions, checkpoints, latest);
+            var group = new GroupRuntime(services, host, spec, view, storeOptions, checkpoints, latest) { _rebuilding = rebuilding };
             group.CreateNode(view.Snapshot.Index);
+            if (rebuilding)
+                services.Info("raft", NodeServices.Inv($"{spec.Group}: rebuilding lost state; no votes until caught up with a leader."));
             return group;
         }
         catch
@@ -232,6 +254,25 @@ internal sealed partial class GroupRuntime
             await store.DisposeAsync();
             throw;
         }
+    }
+
+    /// <summary>
+    /// True when this node replaced its lost state (<see cref="NodeServices.RebuildIndex"/>) and the group existed by then:
+    /// the control group, or a volume created at or before the replacement's control index.
+    /// </summary>
+    private static bool ExistedBeforeReplacement(NodeServices services, GroupOpenSpec spec)
+    {
+        if (services.RebuildIndex is not { } index)
+            return false;
+        if (string.Equals(spec.Group, Protocol.ProtocolInfo.ControlGroup, StringComparison.Ordinal))
+            return true;
+        foreach (Control.VolumeRecord volume in services.Control.State.Volumes.Values)
+        {
+            if (string.Equals(volume.GroupName, spec.Group, StringComparison.Ordinal))
+                return volume.Creation.CreatedIndex <= index;
+        }
+
+        return false;
     }
 
     /// <summary>Advances the logical clock.</summary>
@@ -462,6 +503,7 @@ internal sealed partial class GroupRuntime
             Applied = applied,
             SnapshotChunkBytes = SnapshotChunkBytes,
             Mutations = _s.Mutations,
+            Rebuilding = _rebuilding,
         };
         _node = new RaftNode(config, _view.HardState, _view.Snapshot.ConfState, _view, _random, options);
         _lastRole = _node.Role;

@@ -1004,13 +1004,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
     }
 
     /// <summary>
-    /// True when buffered staged data should be uploaded before the publication (bounded memory). Only write-only
-    /// streams do so: a readable writer must serve its own staged bytes, and staging capabilities never authorize reads.
+    /// True when buffered staged data should be uploaded before the publication (complete chunks once the buffer bound is
+    /// exceeded, ARCHITECTURE §9.3). A readable writer uploads too but keeps the uploaded bytes to serve its own reads
+    /// (staging capabilities never authorize reading staged objects back), so only write-only streams bound their memory.
     /// </summary>
     private bool NeedsSpill()
     {
-        if (_canRead)
-            return false;
         StagedOverlay overlay = _overlay!;
         long bound = Math.Max(_bufferSize, ContentLayout.ChunkSize(_runtime.Capabilities));
         int inline = ContentLayout.InlineThreshold(_volume.Entry, _runtime.Capabilities);
@@ -1082,7 +1081,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
             long objectOffset = 0;
             for (int i = first; i < last; i++)
             {
-                overlay.ReplaceWithUploaded(pieces[i].Offset, pieces[i].Bytes.Length, uploaded, objectOffset);
+                overlay.ReplaceWithUploaded(pieces[i].Offset, pieces[i].Bytes.Length, uploaded, objectOffset, _canRead ? pieces[i].Bytes.ToArray() : null);
                 objectOffset += pieces[i].Bytes.Length;
             }
 

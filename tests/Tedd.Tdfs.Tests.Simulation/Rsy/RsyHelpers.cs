@@ -419,6 +419,18 @@ internal static class RsyHelpers
         Assert.Equal(node.Name, (await cluster.GetLeaderAsync(Volume, Ct)).Name);
     }
 
+    /// <summary>
+    /// A plaintext offset inside object <paramref name="obj"/> of <paramref name="path"/> to corrupt: <paramref name="preferred"/>,
+    /// or the object's last byte when it is shorter (a file's tail chunk can be only a few bytes long).
+    /// </summary>
+    public static async Task<long> CorruptionOffsetAsync(TestCluster cluster, string path, ObjectId obj, long preferred)
+    {
+        FileInspection? f = await cluster.Inspect.GetFileAsync(Volume, path);
+        Assert.True(f is not null, $"{path} must exist.");
+        long length = f!.Extents.First(e => e.Object == obj).ObjectLength;
+        return Math.Min(preferred, length - 1);
+    }
+
     /// <summary>Distinct objects referenced by a file's authoritative extents (empty for inline files).</summary>
     public static async Task<IReadOnlyList<ObjectId>> ObjectsOfAsync(TestCluster cluster, string path)
     {

@@ -89,6 +89,16 @@ internal sealed class NodeServices
 
     public ObjectService Objects { get; set; } = null!;
 
+    /// <summary>Maintenance plane (inventory/GC sweeps, repair, scrubbing, usage reports); null until the data handlers are registered.</summary>
+    public MaintenancePlane? Maintenance { get; set; }
+
+    /// <summary>
+    /// Control index the cluster had reached when this node replaced its lost data directory (empty-disk replacement);
+    /// groups that existed by then are rebuilt from their leaders without voting until caught up. Null for a node that
+    /// never lost its state.
+    /// </summary>
+    public ulong? RebuildIndex { get; set; }
+
     public AdminService Admin { get; set; } = null!;
 
     public MembershipManager Membership { get; set; } = null!;

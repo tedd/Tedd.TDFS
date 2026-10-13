@@ -80,14 +80,15 @@ internal sealed partial class NodeRuntime
         Superblock? superblock = await Superblock.LoadAsync(medium, superblockPath, ct);
         IReadOnlyList<RaftEntry>? controlBootstrap = null;
         bool seedJoin = false;
+        BootstrapMember? freshBootstrap = null;
         if (superblock is null)
         {
             if (options.Bootstrap is { } bootstrap)
             {
-                BootstrapMember self = ControlBootstrap.Validate(bootstrap, options.Name);
+                // The superblock is created once the transport listens: the other bootstrap members are asked first whether
+                // this member is an empty-disk replacement (NodeRuntime.Rebuild.cs).
+                freshBootstrap = ControlBootstrap.Validate(bootstrap, options.Name);
                 controlBootstrap = ControlBootstrap.BuildEntries(bootstrap, s.Keys);
-                superblock = await Superblock.CreateAsync(medium, superblockPath, bootstrap.ClusterId, self.Id, options.Name, ct);
-                s.Info("node", NodeServices.Inv($"Bootstrapping cluster {bootstrap.ClusterName} ({bootstrap.ClusterId}) as {self.Id}."));
             }
             else if (options.JoinSeeds.Count > 0)
             {
@@ -129,6 +130,9 @@ internal sealed partial class NodeRuntime
 
         if (seedJoin)
             superblock = await DiscoverAndCreateSuperblockAsync(superblockPath, ct);
+        else if (freshBootstrap is not null)
+            superblock = await CreateBootstrapSuperblockAsync(options.Bootstrap!, freshBootstrap, superblockPath, ct);
+        s.RebuildIndex ??= await LoadRebuildIndexAsync(ct);
 
         // The incarnation is durably incremented before the node serves anything (ARCHITECTURE §2.5, RCV-02).
         superblock = await Superblock.BumpIncarnationAsync(medium, superblockPath, ct);
@@ -146,10 +150,11 @@ internal sealed partial class NodeRuntime
         }
 
         s.ObjectStore = await ObjectStore.OpenAsync(medium, s.DataPath(NodeServices.ObjectsDirectory),
-            new ObjectStoreOptions(ReservedBytes: options.ReservedBytes, MaxObjectSize: options.Timings.MaxObjectSize, Cipher: objectCipher)
+            new ObjectStoreOptions(SegmentSizeFor(options), options.ReservedBytes, options.Timings.MaxObjectSize, objectCipher)
             {
                 Mutations = options.Mutations,
                 NodeName = options.Name,
+                CapacityLimitBytes = options.CapacityBytes,
             }, s.Faults, ct);
         s.Metrics.SetStored(s.ObjectStore.ObjectCount, s.ObjectStore.LiveBytes);
         s.Objects = new ObjectService(s, new Capabilities(s.Keys, () => s.ClusterId, s.Time));
