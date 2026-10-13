@@ -33,6 +33,9 @@ internal sealed class TargetExporter
     private static readonly TimeSpan PublishTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan PinnedBytesInterval = TimeSpan.FromSeconds(1);
 
+    /// <summary>Shortest delay (Task.Delay has millisecond resolution; a zero delay would not let the clock advance).</summary>
+    private static readonly TimeSpan MinWait = TimeSpan.FromMilliseconds(1);
+
     private readonly VolumeExporter _volume;
     private readonly NodeServices _s;
     private readonly CancellationTokenSource _cts;
@@ -676,7 +679,7 @@ internal sealed class TargetExporter
         while (_rateNext > now)
         {
             TimeSpan wait = _s.Time.GetElapsedTime(now, _rateNext);
-            await Task.Delay(wait > TimeSpan.FromMilliseconds(1) ? wait : TimeSpan.FromMilliseconds(1), _s.Time, ct);
+            await Task.Delay(wait > MinWait ? wait : MinWait, _s.Time, ct);
             now = _s.Time.GetTimestamp();
         }
 
@@ -888,12 +891,16 @@ internal sealed class TargetExporter
             left = timeout - _s.Time.GetElapsedTime(start);
             if (left <= TimeSpan.Zero)
                 return new BackupAwaitResultMessage(false, null, last);
+            // Task.Delay counts whole milliseconds: a shorter remainder would complete at once without the clock advancing.
             TimeSpan poll = _s.Timings.Tick * 50;
+            TimeSpan wait = left < poll ? left : poll;
+            if (wait < MinWait)
+                wait = MinWait;
             using (var delay = CancellationTokenSource.CreateLinkedTokenSource(ct, changed))
             {
                 try
                 {
-                    await Task.Delay(left < poll ? left : poll, _s.Time, delay.Token);
+                    await Task.Delay(wait, _s.Time, delay.Token);
                 }
                 catch (OperationCanceledException) when (!ct.IsCancellationRequested)
                 {
