@@ -66,6 +66,12 @@ internal static class OperationGate
                 return new GateDecision(GateKind.Expired, $"Operation {id}: its session expired.", null);
             if (id.Sequence <= session.RetiredWatermark)
                 return new GateDecision(GateKind.Expired, $"Operation {id} is below the retired watermark {session.RetiredWatermark}.", null);
+
+            // A session that obtains its sequences from this volume's leader (ReserveOperationIds; the SDK always does) uses
+            // reserved sequences only: an unused sequence outside every reservation was never handed out here — for example
+            // an id of the same principal's session on another volume — and must not execute as a new request (OUT-004).
+            if (!session.Reserved.IsEmpty && !session.Reserved.Exists(r => r.Contains(id.Sequence)))
+                return new GateDecision(GateKind.Invalid, $"Operation {id} was not issued by this volume (session {session.Id} never reserved sequence {id.Sequence}).", null);
         }
 
         return GateDecision.Execute;
