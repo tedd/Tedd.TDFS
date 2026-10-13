@@ -98,7 +98,9 @@ internal static class ControlBootstrap
         var byName = bootstrap.Members.ToDictionary(m => m.Name, StringComparer.Ordinal);
         NodeId[] voters = bootstrap.ControlVoters.Select(n => byName[n].Id).ToArray();
         NodeId[] learners = bootstrap.Members.Where(m => !voters.Contains(m.Id)).Select(m => m.Id).ToArray();
-        int target = bootstrap.Members.Count == 1 ? Math.Max(DefaultControlVoters, bootstrap.ControlVoters.Count) : bootstrap.ControlVoters.Count;
+        int target = bootstrap.ControlVoterTarget is { } requested
+            ? Math.Max(Math.Max(1, requested), bootstrap.ControlVoters.Count)
+            : bootstrap.Members.Count == 1 ? Math.Max(DefaultControlVoters, bootstrap.ControlVoters.Count) : bootstrap.ControlVoters.Count;
 
         var principals = new List<PrincipalData>();
         foreach (BootstrapPrincipal p in bootstrap.Principals ?? [])

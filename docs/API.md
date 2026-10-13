@@ -885,7 +885,8 @@ public sealed record NodeTimings(TimeSpan Tick, int HeartbeatTicks, int Election
     int ChunkSize, int MaxObjectSize, TimeSpan PinDuration, TimeSpan EnumerationPinDuration, long RepairBytesPerSecond)
 { public static NodeTimings Production { get; } public static NodeTimings Fast { get; } }
 public sealed record ClusterBootstrap(Guid ClusterId, string ClusterName, IReadOnlyList<BootstrapMember> Members,
-    IReadOnlyList<string> ControlVoters, IReadOnlyList<BootstrapPrincipal> Principals);
+    IReadOnlyList<string> ControlVoters, IReadOnlyList<BootstrapPrincipal> Principals)
+{ public int? ControlVoterTarget { get; init; } }   // voters to promote learners to (seed join); null = ControlVoters.Count (single seed: 3)
 public sealed record BootstrapMember(NodeId Id, string Name, DfsTopologyLabels Labels, IReadOnlyList<string> Endpoints);
 public sealed record BootstrapPrincipal(string Name, string Secret, bool ClusterAdmin);
 

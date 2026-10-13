@@ -229,7 +229,10 @@ public sealed partial class RaftNode
                 }
 
                 foreach (RaftProgress pr in _progress.Values)
+                {
+                    pr.ActiveInPreviousInterval = pr.RecentActive;
                     pr.RecentActive = false;
+                }
             }
 
             if (_leadTransferee is not null)

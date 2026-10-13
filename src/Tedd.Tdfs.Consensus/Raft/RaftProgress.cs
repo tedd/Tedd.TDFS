@@ -39,6 +39,9 @@ internal sealed class RaftProgress
     /// <summary>The peer responded since the last CheckQuorum interval started.</summary>
     public bool RecentActive { get; set; }
 
+    /// <summary>The peer responded during the previous CheckQuorum interval (reporting only, see <see cref="ToPublic"/>).</summary>
+    public bool ActiveInPreviousInterval { get; set; }
+
     public int InflightCount => _inflights.Count;
 
     public bool InflightsFull => _inflights.Count >= _maxInflight;
@@ -136,7 +139,11 @@ internal sealed class RaftProgress
             _inflights.Dequeue();
     }
 
-    public RaftPeerProgress ToPublic(bool isLearner) => new(Peer, Match, Next, State, RecentActive, isLearner);
+    /// <summary>
+    /// The public view. Activity covers the current and the previous CheckQuorum interval, so a peer that answers every
+    /// heartbeat is never reported inactive merely because the interval was just reset.
+    /// </summary>
+    public RaftPeerProgress ToPublic(bool isLearner) => new(Peer, Match, Next, State, RecentActive || ActiveInPreviousInterval, isLearner);
 
     private void ResetState(RaftProgressState state)
     {
