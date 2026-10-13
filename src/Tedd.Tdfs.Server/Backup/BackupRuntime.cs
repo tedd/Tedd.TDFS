@@ -88,9 +88,10 @@ internal sealed class BackupRuntime
 
     /// <summary>
     /// Completes start-up work that needs the data key after a recovery key unlocked a node started without its secret:
-    /// opens the object store and decrypts the retained manifests. Concurrent callers share one run.
+    /// opens the object store and loads the catalog (sealed with the data key) with its manifests. Concurrent callers share
+    /// one run, which no single caller can cancel (each caller bounds its own wait).
     /// </summary>
-    public static Task OnUnlockedAsync(BackupServices s, CancellationToken ct)
+    public static Task OnUnlockedAsync(BackupServices s)
     {
         if (s.UnlockCompletion is { IsFaulted: false, IsCanceled: false } running)
             return running;
@@ -99,9 +100,13 @@ internal sealed class BackupRuntime
 
         async Task RunAsync()
         {
+            CancellationToken ct = CancellationToken.None;
             if (s.Store is null)
                 await OpenStoreAsync(s, ct);
-            await s.Catalog.LoadManifestsAsync(ct);
+            if (s.Catalog.IsLoaded)
+                await s.Catalog.LoadManifestsAsync(ct);
+            else
+                await s.Catalog.LoadAsync(ct);
             s.Catalog.Touch();
             s.Info("backup", BackupServices.Inv($"Backup node {s.Name} unlocked with recovery key material."));
         }

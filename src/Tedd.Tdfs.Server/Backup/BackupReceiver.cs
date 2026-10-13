@@ -42,7 +42,7 @@ internal sealed class BackupReceiver
             throw new ArgumentException("A transfer names its volume and snapshot.");
         if (m.Boundary.IsNone || m.Boundary.ClusterId != m.Key.SourceClusterId || m.Boundary.VolumeId != m.Key.Volume || m.Boundary.VolumeEpoch != m.Key.Epoch)
             throw new ArgumentException("The snapshot boundary does not belong to the transfer's volume and epoch.");
-        _s.Keys.RequireUnlocked("receiving a transfer");
+        Catalog.RequireLoaded("receiving a transfer");
         BackupVolume volume = Catalog.GetOrAdd(m.VolumeName);
         using IDisposable held = await Catalog.Locks.AcquireAsync(volume.Name, ct);
         var authority = new BackupAuthority(m.Key.Volume, m.Key.Epoch);
@@ -121,6 +121,7 @@ internal sealed class BackupReceiver
     {
         _s.Principals.RequireExport(principal);
         CheckKey(m.Key);
+        Catalog.RequireLoaded("answering an inventory");
         RequireCurrent(m.Key);
         var missing = m.Objects.Where(id => !Catalog.Holds(id)).Distinct().ToArray();
         return new BackupInventoryResultMessage(missing);
@@ -134,6 +135,7 @@ internal sealed class BackupReceiver
         _s.Principals.RequireExport(principal);
         CheckKey(m.Key);
         ObjectStore store = _s.RequireStore("receiving objects");
+        Catalog.RequireLoaded("receiving objects");
         (BackupVolume volume, StagedTransfer? staged) = RequireCurrent(m.Key);
         if (staged is null && volume.FindById(m.Key.Snapshot) is null)
             throw new ArgumentException("No transfer is staged for this transfer key; send BackupBegin first.");
@@ -166,11 +168,21 @@ internal sealed class BackupReceiver
         {
             // Another payload is stored under this id (an earlier delivery was mislabelled). It is replaced only when the staged,
             // authenticated manifest vouches for the arriving bytes and no retained snapshot describes the stored ones.
-            if (staged?.Manifest is null || DescribedByRetained(m.Object, existing))
+            if (staged?.Manifest is null)
                 throw new DfsIntegrityException(m.Object, $"Object {m.Object} is already stored with different content.");
-            await store.DeleteAsync(m.Object, ct);
-            Catalog.ForgetStored(m.Object);
-            _s.Warn("backup", BackupServices.Inv($"Volume '{volume.Name}': replaced a stored copy of object {m.Object} that did not match the snapshot's manifest."));
+            using (await Catalog.AcquireStoreGateAsync(ct))
+            {
+                // Decided under the store gate: no publication verifies a closure against the stored copy meanwhile.
+                existing = store.TryGetInfo(m.Object);
+                if (existing is not null && (existing.Length != m.Length || existing.Checksum != m.Checksum))
+                {
+                    if (DescribedByRetained(m.Object, existing))
+                        throw new DfsIntegrityException(m.Object, $"Object {m.Object} is already stored with different content.");
+                    Catalog.ForgetStored(m.Object);
+                    await store.DeleteAsync(m.Object, ct);
+                    _s.Warn("backup", BackupServices.Inv($"Volume '{volume.Name}': replaced a stored copy of object {m.Object} that did not match the snapshot's manifest."));
+                }
+            }
         }
 
         try
@@ -194,7 +206,7 @@ internal sealed class BackupReceiver
     {
         _s.Principals.RequireExport(principal);
         CheckKey(m.Key);
-        _s.Keys.RequireUnlocked("receiving a manifest");
+        Catalog.RequireLoaded("receiving a manifest");
         if (m.Offset < 0 || m.TotalLength <= 0 || m.TotalLength > MaxManifestBytes || m.Offset > m.TotalLength || m.Data.Length > m.TotalLength - m.Offset)
             throw new ArgumentException("The manifest chunk is out of range.");
         (BackupVolume volume, _) = RequireCurrent(m.Key);
@@ -273,7 +285,7 @@ internal sealed class BackupReceiver
     {
         _s.Principals.RequireExport(principal);
         CheckKey(m.Key);
-        _s.Keys.RequireUnlocked("publishing a snapshot");
+        Catalog.RequireLoaded("publishing a snapshot");
         (BackupVolume volume, _) = RequireCurrent(m.Key);
         using IDisposable held = await Catalog.Locks.AcquireAsync(volume.Name, ct);
         if (volume.FindById(m.Key.Snapshot) is { Condemned: false } done && done.Authority == new BackupAuthority(m.Key.Volume, m.Key.Epoch))
@@ -285,29 +297,35 @@ internal sealed class BackupReceiver
 
         // F18: the destination is about to verify the dependency closure itself.
         await _s.HitAsync(FaultStage.F18, FaultSites.BackupBeforeClosureVerify, volume.Name, DfsOperationKind.BackupPublish, ct: ct);
-        List<ObjectId> missing = _s.Mutations.PublishBackupBeforeClosure ? [] : VerifyClosure(manifest);
-        if (missing.Count > 0)
-        {
-            foreach (ObjectId id in missing)
-                staged.Durable.Remove(id);
-            return new BackupPublishResultMessage(false, missing, false, CommitToken.None, null, false);
-        }
-
-        staged.Verified = true;
-        DfsRetention retention = Combine(m.RequestedRetention, _s.Options.DefaultRetention);
-        string snapKey = BackupCatalog.SnapshotKey(manifest.SnapshotId);
         BackupSnapshot snapshot;
-        try
-        {
-            await Catalog.WriteSnapshotFilesAsync(volume, snapKey, manifest, retention, ct);
 
-            // F19: everything is durable; the published pointer still names the previous snapshot.
-            await _s.HitAsync(FaultStage.F19, FaultSites.BackupBeforePointer, volume.Name, DfsOperationKind.BackupPublish, ct: ct);
-            snapshot = await Catalog.PublishPointerAsync(volume, snapKey, manifest, retention, ct);
-        }
-        catch (IOException ex) when (StorageErrors.IsDiskFull(ex) && ex is not DfsException)
+        // From the verification until the pointer lists the snapshot no stored object is deleted (store gate): a running
+        // garbage collection finishes first, and the verification then sees what it removed.
+        using (await Catalog.AcquireStoreGateAsync(ct))
         {
-            throw new DfsCapacityException($"Backup node {_s.Name} is full.", ex);
+            List<ObjectId> missing = _s.Mutations.PublishBackupBeforeClosure ? [] : VerifyClosure(manifest);
+            if (missing.Count > 0)
+            {
+                foreach (ObjectId id in missing)
+                    staged.Durable.Remove(id);
+                return new BackupPublishResultMessage(false, missing, false, CommitToken.None, null, false);
+            }
+
+            staged.Verified = true;
+            DfsRetention retention = Combine(m.RequestedRetention, _s.Options.DefaultRetention);
+            string snapKey = BackupCatalog.NewSnapshotKey(volume, manifest.SnapshotId);
+            try
+            {
+                await Catalog.WriteSnapshotFilesAsync(volume, snapKey, manifest, retention, ct);
+
+                // F19: everything is durable; the published pointer still names the previous snapshot.
+                await _s.HitAsync(FaultStage.F19, FaultSites.BackupBeforePointer, volume.Name, DfsOperationKind.BackupPublish, ct: ct);
+                snapshot = await Catalog.PublishPointerAsync(volume, snapKey, manifest, retention, ct);
+            }
+            catch (IOException ex) when (StorageErrors.IsDiskFull(ex) && ex is not DfsException)
+            {
+                throw new DfsCapacityException($"Backup node {_s.Name} is full.", ex);
+            }
         }
 
         // F19: the pointer replacement is durable.
@@ -361,6 +379,7 @@ internal sealed class BackupReceiver
     public async Task<IWireMessage> RetentionAsync(string principal, BackupRetentionMessage m, CancellationToken ct)
     {
         _s.Principals.RequireRead(principal, "query retention");
+        Catalog.RequireLoaded("querying retention");
         if (m.SourceClusterId != _s.Options.SourceClusterId)
             throw new DfsClusterIdentityException($"This backup host serves cluster {_s.Options.SourceClusterId}, not {m.SourceClusterId}.");
         if (Catalog.Find(m.VolumeName) is not { } volume)
@@ -375,7 +394,7 @@ internal sealed class BackupReceiver
         }
 
         var result = new List<BackupRetainedSnapshotData>();
-        foreach (BackupSnapshot snapshot in volume.Visible)
+        foreach (BackupSnapshot snapshot in volume.Ranked())
         {
             if (m.SnapshotName is null || string.Equals(snapshot.Name, m.SnapshotName, StringComparison.Ordinal))
                 result.Add(new BackupRetainedSnapshotData(snapshot.Id, snapshot.Name, snapshot.Covered, snapshot.Retention, true));

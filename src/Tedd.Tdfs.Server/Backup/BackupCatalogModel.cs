@@ -46,8 +46,26 @@ internal sealed class BackupVolume(string name, string key)
     /// <summary>Snapshots visible to clients (published, not condemned), ascending publication sequence.</summary>
     public IEnumerable<BackupSnapshot> Visible => Snapshots.Where(s => !s.Condemned);
 
-    /// <summary>The published pointer: the most recently published visible snapshot.</summary>
-    public BackupSnapshot? Pointer => Visible.LastOrDefault();
+    /// <summary>
+    /// Visible snapshots from the oldest to the newest recovery point: by source authority in the order this node adopted
+    /// them (a superseded authority never publishes again, so all its publications precede the next authority's), then by
+    /// covered commit (comparable within one authority, across its lineages), then by publication. A later publication of an
+    /// older snapshot (an explicit sync of it) therefore never becomes the newest recovery point.
+    /// </summary>
+    public List<BackupSnapshot> Ranked()
+    {
+        var adopted = new Dictionary<BackupAuthority, ulong>();
+        foreach (BackupSnapshot s in Snapshots)
+        {
+            if (!adopted.TryGetValue(s.Authority, out ulong first) || s.Sequence < first)
+                adopted[s.Authority] = s.Sequence;
+        }
+
+        return [.. Visible.OrderBy(s => adopted[s.Authority]).ThenBy(s => s.Covered.Sequence).ThenBy(s => s.Sequence)];
+    }
+
+    /// <summary>The published pointer: the newest visible recovery point (see <see cref="Ranked"/>).</summary>
+    public BackupSnapshot? Pointer => Ranked().LastOrDefault();
 
     /// <summary>The visible snapshot named <paramref name="name"/> (the most recent one when several authorities used the name).</summary>
     public BackupSnapshot? FindVisible(string name) => Visible.LastOrDefault(s => string.Equals(s.Name, name, StringComparison.Ordinal));

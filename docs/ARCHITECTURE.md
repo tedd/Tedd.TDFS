@@ -526,9 +526,17 @@ implements partitions, asymmetric cuts, black holes, reply drops, duplication an
   checkpoint with same epoch and covered index ≥ token; `AwaitBackupSnapshotAsync(target, snapshot)` requires that
   exact snapshot to be durably retained. Timeouts never roll back live commits.
 * Budgets exceeded while a target is offline → `AbandonTransferLineage` (release pins, mark reseed). The destination
-  keeps its last complete snapshots; next sync is a full reseed under a new lineage.
+  keeps its last complete snapshots; next sync is a full reseed under a new lineage. A transfer pin records the leader
+  time it was taken, so its age budget runs on across leadership changes.
 * Backup retention is enforced by the backup node with its own authorization (export credentials cannot delete or
-  shorten protected retention — BAK-022).
+  shorten protected retention — BAK-022). The published pointer (and `KeepLastSnapshots`) ranks snapshots as recovery
+  points — source authority in adoption order, then covered commit — so a re-export of an older snapshot never displaces
+  the newest one.
+* Backup node storage safety: garbage collection deletes objects only under a node-wide store gate that a publication
+  holds from its closure verification to its pointer replacement, and never runs while a transfer is staged or a retained
+  manifest is not decrypted; each publication owns its snapshot files (a re-publication of a condemned, still pinned
+  snapshot gets its own file key). The whole catalog (volume, pointer, retention and transfer records) is sealed with
+  the node's data key: a node started without key material loads no catalog until a recovery key unlocks it.
 * Backup nodes serve `DfsClient` connections read-only: `GetVolume(name).Snapshots.ListAsync/OpenAsync` work; every
   mutation is rejected with `DfsReadOnlyException` (BAK-015). Readers pin one published snapshot (BAK-013).
 * Restore (`DfsAdminClient.RestoreFromBackupAsync`) pulls a published snapshot from a backup node into a **new**

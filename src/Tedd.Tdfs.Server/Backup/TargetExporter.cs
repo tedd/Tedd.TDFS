@@ -28,10 +28,17 @@ internal sealed class TargetExporter
     private const int ManifestChunk = 256 * 1024;
     private const int MaxPublishRounds = 8;
     private const long MinPutBytesPerSecond = 16 * 1024;
+
+    /// <summary>Longest snapshot name (UTF-8 bytes) an export snapshot may get.</summary>
+    private const int MaxExportNameBytes = 255;
+
     private static readonly TimeSpan MinBackoff = TimeSpan.FromMilliseconds(200);
     private static readonly TimeSpan MaxBackoff = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan PublishTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan PinnedBytesInterval = TimeSpan.FromSeconds(1);
+
+    /// <summary>Upper bound of a pin age carried over from the time it was taken (keeps timestamp arithmetic in range).</summary>
+    private static readonly TimeSpan MaxCarriedPinAge = TimeSpan.FromDays(365);
 
     /// <summary>Shortest delay (Task.Delay has millisecond resolution; a zero delay would not let the clock advance).</summary>
     private static readonly TimeSpan MinWait = TimeSpan.FromMilliseconds(1);
@@ -303,11 +310,31 @@ internal sealed class TargetExporter
             .ThenBy(p => p.Id)
             .ToList();
 
+    /// <summary>
+    /// Records when each transfer pin was taken (the start of its age budget). The pin carries the leader time it was taken,
+    /// so a new leader continues the age of a pin taken under an earlier one instead of restarting it (leadership changes must
+    /// not let an unreachable target keep source history beyond its budget); pins recorded without it age from first sight.
+    /// </summary>
     private void TrackPins(List<PinRecord> pins)
     {
         long now = _s.Time.GetTimestamp();
         foreach (PinRecord pin in pins)
-            _pinSeen.TryAdd(pin.Id, now);
+        {
+            if (_pinSeen.ContainsKey(pin.Id))
+                continue;
+            long taken = now;
+            if (VolumeStateMachine.TransferPinnedUtc(pin) is { } pinnedUtc)
+            {
+                TimeSpan age = _s.Time.GetUtcNow() - pinnedUtc;
+                if (age > MaxCarriedPinAge)
+                    age = MaxCarriedPinAge;
+                if (age > TimeSpan.Zero)
+                    taken = now - (long)(age.Ticks * ((double)_s.Time.TimestampFrequency / TimeSpan.TicksPerSecond));
+            }
+
+            _pinSeen[pin.Id] = taken;
+        }
+
         foreach (ulong id in _pinSeen.Keys.ToArray())
         {
             if (!pins.Any(p => p.Id == id))
@@ -465,9 +492,24 @@ internal sealed class TargetExporter
         return false;
     }
 
-    /// <summary>Name of an export snapshot created for a target without a named snapshot.</summary>
+    /// <summary>
+    /// Name of an export snapshot created for a target without a named snapshot. Always a valid snapshot name: characters a
+    /// snapshot name may not contain ('/', '\', ':', control characters) are replaced, and a target name too long to fit is
+    /// replaced by a digest of it (target names may use those characters and be up to 255 bytes long).
+    /// </summary>
     public static string ExportName(string target, DateTimeOffset now)
-        => "export-" + target + "-" + now.UtcDateTime.ToString("yyyyMMdd'T'HHmmss'.'fffffff", CultureInfo.InvariantCulture);
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        string stamp = now.UtcDateTime.ToString("yyyyMMdd'T'HHmmss'.'fffffff", CultureInfo.InvariantCulture);
+        var safe = new System.Text.StringBuilder(target.Length);
+        foreach (char ch in target)
+            safe.Append(char.IsControl(ch) || ch is '/' or '\\' or ':' ? '_' : ch);
+        string name = "export-" + safe + "-" + stamp;
+        if (System.Text.Encoding.UTF8.GetByteCount(name) <= MaxExportNameBytes)
+            return name;
+        byte[] digest = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(target));
+        return "export-" + Convert.ToHexStringLower(digest.AsSpan(0, 16)) + "-" + stamp;
+    }
 
     // ------------------------------------------------------------------------------------------------- transfer
 

@@ -233,6 +233,7 @@ internal sealed class BackupReader
     {
         _s.Principals.RequireRead(principal, "list snapshots");
         CheckHeader(m.Header);
+        _s.Catalog.RequireLoaded("listing snapshots");
         BackupVolume? volume = _s.Catalog.Find(m.Header.Volume);
         SnapshotInfoData[] snapshots = volume is null
             ? []
@@ -247,9 +248,9 @@ internal sealed class BackupReader
         ReaderSession session = RequireSession(principal, m.Header);
         if (TryReplay(session, m.Header, out IWireMessage replay))
             return replay;
+        _s.Catalog.RequireLoaded($"reading snapshot '{m.Name}'");
         BackupVolume volume = _s.Catalog.Find(m.Header.Volume) ?? throw SnapshotNotFound(m.Name, m.Header.Volume);
         BackupSnapshot snapshot = volume.FindVisible(m.Name) ?? throw SnapshotNotFound(m.Name, volume.Name);
-        _s.Keys.RequireUnlocked($"reading snapshot '{m.Name}'");
         var pin = new ReaderPin(_nextPin++, session.Id, principal, volume, snapshot) { LastRenewal = _s.Time.GetTimestamp() };
         _pins[pin.Id] = pin;
         snapshot.ReaderPins++;
@@ -295,6 +296,7 @@ internal sealed class BackupReader
         if (!admin && !_s.Principals.IsExporter(principal))
             throw new UnauthorizedAccessException($"Principal '{principal}' may not change retention on this backup host.");
         ArgumentNullException.ThrowIfNull(m.Retention);
+        _s.Catalog.RequireLoaded("changing retention");
         BackupVolume volume = _s.Catalog.Find(m.Header.Volume) ?? throw SnapshotNotFound(m.Name, m.Header.Volume);
         using IDisposable held = await _s.Catalog.Locks.AcquireAsync(volume.Name, ct);
         BackupSnapshot snapshot = volume.FindVisible(m.Name) ?? throw SnapshotNotFound(m.Name, volume.Name);
@@ -319,6 +321,7 @@ internal sealed class BackupReader
             return replay;
         if (!_s.Principals.IsRetentionAdmin(principal))
             throw new UnauthorizedAccessException($"Principal '{principal}' may not delete snapshots on this backup host.");
+        _s.Catalog.RequireLoaded("deleting a snapshot");
         BackupVolume volume = _s.Catalog.Find(m.Header.Volume) ?? throw SnapshotNotFound(m.Name, m.Header.Volume);
         using IDisposable held = await _s.Catalog.Locks.AcquireAsync(volume.Name, ct);
         BackupSnapshot snapshot = volume.FindVisible(m.Name) ?? throw SnapshotNotFound(m.Name, volume.Name);
@@ -629,15 +632,19 @@ internal sealed class BackupReader
         {
             if (!_s.Keys.TryUnlock(m.RecoveryKey.Span))
                 throw new DfsRecoveryKeyMissingException("The supplied recovery key does not unlock this backup node's data.");
-            await BackupRuntime.OnUnlockedAsync(_s, ct);
         }
+
+        // An unlock (this request's or an earlier one's) completes before anything is served: the store opens and the catalog,
+        // sealed with the data key, loads; a failed earlier completion is retried.
+        if (_s.Keys.IsUnlocked && (!_s.Catalog.IsLoaded || _s.UnlockCompletion is { IsCompleted: false }))
+            await BackupRuntime.OnUnlockedAsync(_s).WaitAsync(ct);
 
         int max = m.MaxBytes <= 0 ? MaxRestoreChunk : Math.Min(m.MaxBytes, MaxRestoreChunk);
         switch (m.Part)
         {
             case BackupRestorePart.Describe:
             {
-                _s.Keys.RequireUnlocked("restoring a snapshot");
+                _s.Catalog.RequireLoaded("restoring a snapshot");
                 BackupVolume volume = _s.Catalog.Find(m.SourceVolume) ?? throw SnapshotNotFound(m.SnapshotName, m.SourceVolume);
                 BackupSnapshot snapshot = volume.FindVisible(m.SnapshotName) ?? throw SnapshotNotFound(m.SnapshotName, m.SourceVolume);
                 BackupManifest manifest = snapshot.Manifest ?? throw new DfsRecoveryKeyMissingException("The snapshot's manifest cannot be decrypted.");

@@ -20,9 +20,12 @@ namespace Tedd.Tdfs.Server.Backup;
 /// key) and the enforced retention of a snapshot;</description></item>
 /// <item><description><c>staging/v-{key}/transfer</c> / <c>manifest</c> — the staged transfer's description and its verified manifest.</description></item>
 /// </list>
-/// A snapshot exists for clients only when a pointer lists it; files no pointer references are left-overs of an interrupted
-/// publication and are removed at start-up. Objects live in the node's object store; the in-memory inventory hint
-/// (<see cref="Holds"/>) is never trusted for completeness — publication verifies the closure against the store itself.
+/// Every catalog file is sealed with the node's data key and bound to its role and location (names of volumes, snapshots and
+/// adapters are never stored in plaintext, FSD §14): a node started without its key material does not load its catalog
+/// until a recovery key unlocks it (<see cref="IsLoaded"/>). A snapshot exists for clients only when a pointer lists it; files
+/// no pointer references are left-overs of an interrupted publication and are removed when the catalog loads. Objects live
+/// in the node's object store; the in-memory inventory hint (<see cref="Holds"/>) is never trusted for completeness —
+/// publication verifies the closure against the store itself.
 /// </summary>
 internal sealed class BackupCatalog
 {
@@ -35,13 +38,14 @@ internal sealed class BackupCatalog
     private const uint PointerMagic = 0x50424454;   // "TDBP"
     private const uint RetentionMagic = 0x52424454; // "TDBR"
     private const uint TransferMagic = 0x54424454;  // "TDBT"
-    private const ushort FormatVersion = 1;
+    private const ushort FormatVersion = 2;
 
     private static readonly WireLimits CatalogLimits = new(MaxStringBytes: 1 << 20, MaxBytesLength: 64 << 20, MaxCollectionCount: 1 << 24);
 
     private readonly BackupServices _s;
     private readonly SortedDictionary<string, BackupVolume> _volumes = new(StringComparer.Ordinal);
     private readonly HashSet<ObjectId> _hint = [];
+    private readonly KeyedAsyncLock<int> _storeGate = new();
 
     public BackupCatalog(BackupServices services)
     {
@@ -52,8 +56,34 @@ internal sealed class BackupCatalog
     /// <summary>Per-volume serialization of catalog changes.</summary>
     public KeyedAsyncLock<string> Locks { get; } = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// Node-wide gate between object deletion and publication: garbage collection (and the replacement of a mislabelled stored
+    /// copy) deletes stored objects only while holding it, and a publication holds it from its closure verification until its
+    /// snapshot is listed by the published pointer (from then on the snapshot references the objects). An object verified for
+    /// a publication can therefore never be deleted before the publication point. Acquired after a volume lock, never the
+    /// other way round.
+    /// </summary>
+    public Task<IDisposable> AcquireStoreGateAsync(CancellationToken ct) => _storeGate.AcquireAsync(0, ct);
+
     /// <summary>Monotonic change counter (reported as the configuration index of the backup node's cluster map).</summary>
     public ulong Version { get; private set; } = 1;
+
+    /// <summary>
+    /// True once the catalog was loaded. A node without its key material cannot decrypt its catalog: until a recovery key unlocks
+    /// it the catalog is empty and requests that need it fail (<see cref="RequireLoaded"/>).
+    /// </summary>
+    public bool IsLoaded { get; private set; }
+
+    /// <summary>
+    /// Requires the loaded catalog: <see cref="DfsRecoveryKeyMissingException"/> while the node has no key material, a retryable
+    /// <see cref="DfsUnavailableException"/> while a recovery key's unlock is still loading it.
+    /// </summary>
+    public void RequireLoaded(string what)
+    {
+        _s.Keys.RequireUnlocked(what);
+        if (!IsLoaded)
+            throw new DfsUnavailableException(DfsErrorCode.Unavailable, $"The catalog of backup node {_s.Name} is still being loaded ({what}).");
+    }
 
     /// <summary>Every volume the node knows (ordinal name order).</summary>
     public IReadOnlyCollection<BackupVolume> Volumes => _volumes.Values;
@@ -90,9 +120,16 @@ internal sealed class BackupCatalog
 
     // ------------------------------------------------------------------------------------------------- load
 
-    /// <summary>Loads the catalog from the medium: volumes, pointers, retention, staged transfers (manifests when unlocked).</summary>
+    /// <summary>
+    /// Loads the catalog from the medium: volumes, pointers, retention, staged transfers, then the manifests. Needs the data key
+    /// (the catalog is sealed with it): a locked node loads nothing (start-up without key material); the unlock by a recovery key
+    /// loads it then.
+    /// </summary>
     public async Task LoadAsync(CancellationToken ct)
     {
+        if (IsLoaded || !_s.Keys.IsUnlocked)
+            return;
+        _volumes.Clear();
         IStorageMedium medium = _s.Medium;
         string catalog = _s.DataPath(CatalogDirectory);
         if (await medium.ExistsAsync(catalog, ct))
@@ -111,7 +148,7 @@ internal sealed class BackupCatalog
             foreach (string dir in await medium.ListAsync(staging, ct))
             {
                 if (dir.StartsWith("v-", StringComparison.Ordinal))
-                    await LoadStagedAsync(StoragePath.Combine(staging, dir), ct);
+                    await LoadStagedAsync(StoragePath.Combine(staging, dir), dir[2..], ct);
             }
         }
 
@@ -121,16 +158,22 @@ internal sealed class BackupCatalog
                 _hint.Add(info.Id);
         }
 
-        if (_s.Keys.IsUnlocked)
-            await LoadManifestsAsync(ct);
+        IsLoaded = true;
+        Touch();
+        await LoadManifestsAsync(ct);
     }
 
-    /// <summary>Decrypts and loads every retained and staged manifest (start-up when unlocked, or after a recovery key unlocked the node).</summary>
+    /// <summary>
+    /// Decrypts and loads every retained and staged manifest (start-up when unlocked, or after a recovery key unlocked the node
+    /// while it serves). Each volume is loaded under its lock, so deletions and publications of that volume wait; until every
+    /// manifest is loaded garbage collection does not run (<see cref="CollectGarbageAsync"/>).
+    /// </summary>
     public async Task LoadManifestsAsync(CancellationToken ct)
     {
-        foreach (BackupVolume volume in _volumes.Values)
+        foreach (BackupVolume volume in _volumes.Values.ToArray())
         {
-            foreach (BackupSnapshot snapshot in volume.Snapshots)
+            using IDisposable held = await Locks.AcquireAsync(volume.Name, ct);
+            foreach (BackupSnapshot snapshot in volume.Snapshots.ToArray())
                 snapshot.Manifest ??= await ReadManifestAsync(volume, snapshot.Key, ct);
             if (volume.Staged is { Manifest: null } staged)
             {
@@ -157,7 +200,7 @@ internal sealed class BackupCatalog
         var retired = new List<BackupAuthority>();
         if (raw is not null)
         {
-            var r = new WireReader(raw, CatalogLimits);
+            var r = new WireReader(Open(raw, VolumeContext(key), directory), CatalogLimits);
             Expect(ref r, VolumeMagic, directory);
             name = r.ReadString();
             if (r.ReadBool())
@@ -174,12 +217,19 @@ internal sealed class BackupCatalog
         IReadOnlyList<string> files = await medium.ListAsync(directory, ct);
         foreach (string file in files)
         {
-            if (!file.StartsWith("p-", StringComparison.Ordinal) || AtomicFile.IsTempName(file))
+            if (!file.StartsWith("p-", StringComparison.Ordinal) || AtomicFile.IsTempName(file)
+                || !Guid.TryParseExact(file.AsSpan(2), "N", out Guid fileLineage))
+            {
                 continue;
+            }
+
             byte[]? pointer = await AtomicFile.ReadAsync(medium, StoragePath.Combine(directory, file), ct);
             if (pointer is null)
                 continue;
-            (string pointerName, Guid pointerLineage, List<PointerEntry> list) = ReadPointer(pointer, directory);
+            (string pointerName, Guid pointerLineage, List<PointerEntry> list) =
+                ReadPointer(Open(pointer, PointerContext(key, fileLineage), directory), directory);
+            if (pointerLineage != fileLineage)
+                throw new DfsIntegrityException($"Backup catalog pointer '{file}' in '{directory}' names lineage {pointerLineage}.");
             name ??= pointerName;
             foreach (PointerEntry entry in list)
             {
@@ -201,7 +251,7 @@ internal sealed class BackupCatalog
             };
             byte[]? retention = await AtomicFile.ReadAsync(medium, SnapshotPath(volume, entry.Key, "retention"), ct);
             if (retention is not null)
-                snapshot.Retention = ReadRetention(retention, directory);
+                snapshot.Retention = ReadRetention(Open(retention, RetentionContext(key, entry.Key), directory), directory);
             volume.Snapshots.Add(snapshot);
             volume.NextSequence = Math.Max(volume.NextSequence, entry.Sequence + 1);
         }
@@ -226,13 +276,15 @@ internal sealed class BackupCatalog
         _volumes[name] = volume;
     }
 
-    private async Task LoadStagedAsync(string directory, CancellationToken ct)
+    private async Task LoadStagedAsync(string directory, string key, CancellationToken ct)
     {
         byte[]? raw = await AtomicFile.ReadAsync(_s.Medium, StoragePath.Combine(directory, TransferFile), ct);
         if (raw is null)
             return;
-        StagedTransfer staged = ReadTransfer(raw, directory);
+        StagedTransfer staged = ReadTransfer(Open(raw, TransferContext(key), directory), directory);
         BackupVolume volume = GetOrAdd(staged.VolumeName);
+        if (!string.Equals(volume.Key, key, StringComparison.Ordinal))
+            throw new DfsIntegrityException($"The staged transfer in '{directory}' belongs to another volume.");
         if (volume.FindById(staged.Key.Snapshot) is { } published && published.Lineage == staged.Key.LineageId)
         {
             // Published before the crash; only the clean-up of the staging files was lost.
@@ -268,7 +320,7 @@ internal sealed class BackupCatalog
             w.WriteVarUInt(r.Epoch);
         }
 
-        await AtomicFile.WriteAsync(_s.Medium, VolumePath(volume, VolumeFile), buffer.WrittenSpan.ToArray(), ct);
+        await AtomicFile.WriteAsync(_s.Medium, VolumePath(volume, VolumeFile), Seal(buffer.WrittenSpan, VolumeContext(volume.Key)), ct);
         volume.Persisted = true;
         Touch();
     }
@@ -278,7 +330,8 @@ internal sealed class BackupCatalog
     {
         byte[] sealedManifest = _s.Keys.SealAtRest(manifest.Encode(), ManifestContext(volume, snapKey));
         await AtomicFile.WriteAsync(_s.Medium, SnapshotPath(volume, snapKey, "manifest"), sealedManifest, ct);
-        await AtomicFile.WriteAsync(_s.Medium, SnapshotPath(volume, snapKey, "retention"), EncodeRetention(retention), ct);
+        await AtomicFile.WriteAsync(_s.Medium, SnapshotPath(volume, snapKey, "retention"),
+            Seal(EncodeRetention(retention), RetentionContext(volume.Key, snapKey)), ct);
     }
 
     /// <summary>
@@ -304,7 +357,8 @@ internal sealed class BackupCatalog
     /// <summary>Durably changes a snapshot's enforced retention.</summary>
     public async Task SetRetentionAsync(BackupVolume volume, BackupSnapshot snapshot, DfsRetention retention, CancellationToken ct)
     {
-        await AtomicFile.WriteAsync(_s.Medium, SnapshotPath(volume, snapshot.Key, "retention"), EncodeRetention(retention), ct);
+        await AtomicFile.WriteAsync(_s.Medium, SnapshotPath(volume, snapshot.Key, "retention"),
+            Seal(EncodeRetention(retention), RetentionContext(volume.Key, snapshot.Key)), ct);
         snapshot.Retention = retention;
         Touch();
     }
@@ -367,7 +421,7 @@ internal sealed class BackupCatalog
                 w.WriteRecord(a);
         }
 
-        await AtomicFile.WriteAsync(_s.Medium, path, buffer.WrittenSpan.ToArray(), ct);
+        await AtomicFile.WriteAsync(_s.Medium, path, Seal(buffer.WrittenSpan, PointerContext(volume.Key, lineage)), ct);
     }
 
     /// <summary>Durably records a staged transfer's description (resumable across restarts).</summary>
@@ -389,7 +443,7 @@ internal sealed class BackupCatalog
             w.WriteRecord(a);
         w.WriteRetention(staged.RequestedRetention);
         w.WriteString(staged.Exporter);
-        await AtomicFile.WriteAsync(_s.Medium, StagingPath(volume, TransferFile), buffer.WrittenSpan.ToArray(), ct);
+        await AtomicFile.WriteAsync(_s.Medium, StagingPath(volume, TransferFile), Seal(buffer.WrittenSpan, TransferContext(volume.Key)), ct);
     }
 
     /// <summary>Durably stages a verified manifest of the staged transfer (sealed with the node's data key).</summary>
@@ -433,13 +487,15 @@ internal sealed class BackupCatalog
     /// </summary>
     public async Task EnforceRetentionAsync(CancellationToken ct)
     {
+        if (!IsLoaded)
+            return;
         DateTimeOffset now = _s.Time.GetUtcNow();
         int keep = Math.Max(1, _s.Options.KeepLastSnapshots);
         bool pruned = false;
         foreach (BackupVolume volume in _volumes.Values.ToArray())
         {
             using IDisposable held = await Locks.AcquireAsync(volume.Name, ct);
-            List<BackupSnapshot> visible = [.. volume.Visible];
+            List<BackupSnapshot> visible = volume.Ranked();
             for (int i = 0; i < visible.Count - keep; i++)
             {
                 BackupSnapshot snapshot = visible[i];
@@ -459,11 +515,18 @@ internal sealed class BackupCatalog
 
     /// <summary>
     /// Deletes stored objects no retained snapshot and no staged manifest references. Skipped while any transfer is staged
-    /// (objects it received before its manifest arrived are referenced by nothing yet but must survive for the resume).
+    /// (objects it received before its manifest arrived are referenced by nothing yet but must survive for the resume), and
+    /// stopped as soon as one is staged meanwhile (its exporter may skip objects the inventory hint still lists). Skipped while
+    /// any retained snapshot's manifest is not decrypted (after a recovery key unlocked the node, manifests load one by one):
+    /// a snapshot without its manifest would look as if it referenced nothing. Runs under the store gate, so no publication
+    /// verifies its closure against an object this collection is about to delete.
     /// </summary>
     public async Task CollectGarbageAsync(CancellationToken ct)
     {
-        if (_s.Store is not { } store || !_s.Keys.IsUnlocked || _volumes.Values.Any(v => v.Staged is not null))
+        if (_s.Store is not { } store || !_s.Keys.IsUnlocked || AnyStaged() || AnyManifestMissing())
+            return;
+        using IDisposable gate = await AcquireStoreGateAsync(ct);
+        if (AnyStaged() || AnyManifestMissing())
             return;
         HashSet<ObjectId> referenced = ReferencedObjects();
         long deleted = 0;
@@ -471,14 +534,22 @@ internal sealed class BackupCatalog
         {
             if (referenced.Contains(info.Id))
                 continue;
-            await store.DeleteAsync(info.Id, ct);
+            if (AnyStaged())
+                break;
+
+            // Forgotten by the hint first: from now on the inventory reports the object missing.
             _hint.Remove(info.Id);
+            await store.DeleteAsync(info.Id, ct);
             deleted++;
         }
 
         if (deleted > 0)
             _s.Debug("backup", BackupServices.Inv($"Garbage collection removed {deleted} unreferenced object(s)."));
     }
+
+    private bool AnyStaged() => _volumes.Values.Any(v => v.Staged is not null);
+
+    private bool AnyManifestMissing() => _volumes.Values.Any(v => v.Snapshots.Any(s => s.Manifest is null));
 
     /// <summary>Objects referenced by retained snapshots (condemned ones still pinned included) and staged manifests.</summary>
     public HashSet<ObjectId> ReferencedObjects()
@@ -562,6 +633,21 @@ internal sealed class BackupCatalog
     /// <summary>The file key of a snapshot.</summary>
     public static string SnapshotKey(SnapshotId id) => id.Value.ToString("N");
 
+    /// <summary>
+    /// The file key of a new publication of <paramref name="id"/> in <paramref name="volume"/>: the snapshot id, or — while a
+    /// retained snapshot of the volume already uses that key (a deleted publication of the same snapshot that a reader still
+    /// pins) — the id qualified by the publication sequence. Every retained snapshot owns its files alone, so removing a
+    /// condemned predecessor never deletes the manifest or retention of a later publication of the same snapshot.
+    /// </summary>
+    public static string NewSnapshotKey(BackupVolume volume, SnapshotId id)
+    {
+        ArgumentNullException.ThrowIfNull(volume);
+        string key = SnapshotKey(id);
+        for (ulong suffix = volume.NextSequence; volume.Snapshots.Any(s => string.Equals(s.Key, key, StringComparison.Ordinal)); suffix++)
+            key = SnapshotKey(id) + "-" + suffix.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return key;
+    }
+
     private static string KeyOf(string name) => Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(name)).AsSpan(0, 16));
 
     private string VolumeDirectory(BackupVolume volume) => _s.DataPath(StoragePath.Combine(CatalogDirectory, "v-" + volume.Key));
@@ -575,6 +661,30 @@ internal sealed class BackupCatalog
     private static string ManifestContext(BackupVolume volume, string snapKey) => "manifest/" + volume.Key + "/" + snapKey;
 
     private static string StagedContext(BackupVolume volume) => "staged-manifest/" + volume.Key;
+
+    private static string VolumeContext(string key) => "catalog-volume/" + key;
+
+    private static string PointerContext(string key, Guid lineage) => "catalog-pointer/" + key + "/" + lineage.ToString("N");
+
+    private static string RetentionContext(string key, string snapKey) => "catalog-retention/" + key + "/" + snapKey;
+
+    private static string TransferContext(string key) => "catalog-transfer/" + key;
+
+    /// <summary>Seals a catalog record with the node's data key, bound to <paramref name="context"/>.</summary>
+    private byte[] Seal(ReadOnlySpan<byte> plain, string context) => _s.Keys.SealAtRest(plain, context);
+
+    /// <summary>Opens a sealed catalog record; a foreign, moved or altered record fails with <see cref="DfsIntegrityException"/>.</summary>
+    private byte[] Open(byte[] sealedBytes, string context, string where)
+    {
+        try
+        {
+            return _s.Keys.OpenAtRest(sealedBytes, context);
+        }
+        catch (DfsIntegrityException ex)
+        {
+            throw new DfsIntegrityException($"Backup catalog record in '{where}' cannot be authenticated: {ex.Message}", ex);
+        }
+    }
 
     private static void Expect(ref WireReader r, uint magic, string where)
     {
