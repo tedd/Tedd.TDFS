@@ -14,10 +14,13 @@ internal sealed class ClientConnection
     private int _poisoned;
     private int _closed;
     private long _lastReply;
+    private long _roundTripTicks;
 
-    private ClientConnection(IRpcConnection raw, string endpoint, HelloChallengeMessage challenge, HelloResultMessage result, long openedAt)
+    private ClientConnection(IRpcConnection raw, string endpoint, HelloChallengeMessage challenge, HelloResultMessage result, long openedAt,
+        TimeSpan handshakeRoundTrip)
     {
         _lastReply = openedAt;
+        _roundTripTicks = handshakeRoundTrip.Ticks > 0 ? handshakeRoundTrip.Ticks : 0;
         Raw = raw;
         Endpoint = endpoint;
         Challenge = challenge;
@@ -49,6 +52,12 @@ internal sealed class ClientConnection
     /// <summary>Time-provider timestamp of the last reply received on this connection (initially its handshake).</summary>
     public long LastReply => Volatile.Read(ref _lastReply);
 
+    /// <summary>
+    /// Smoothed round-trip time of the requests answered on this connection, starting from the handshake's: how long a slow
+    /// but answering server takes, so that short attempts (keep-alives) are not cut below it.
+    /// </summary>
+    public TimeSpan RoundTrip => TimeSpan.FromTicks(Volatile.Read(ref _roundTripTicks));
+
     /// <summary>Records that a reply arrived on this connection at <paramref name="timestamp"/>.</summary>
     public void NoteReply(long timestamp)
     {
@@ -56,6 +65,25 @@ internal sealed class ClientConnection
         while (timestamp > current)
         {
             long seen = Interlocked.CompareExchange(ref _lastReply, timestamp, current);
+            if (seen == current)
+                return;
+            current = seen;
+        }
+    }
+
+    /// <summary>Records a reply at <paramref name="timestamp"/> to a request sent at <paramref name="sentAt"/> (both time-provider timestamps).</summary>
+    public void NoteReply(long timestamp, long sentAt, TimeProvider time)
+    {
+        ArgumentNullException.ThrowIfNull(time);
+        NoteReply(timestamp);
+        long sample = time.GetElapsedTime(sentAt, timestamp).Ticks;
+        if (sample < 0)
+            return;
+        long current = Volatile.Read(ref _roundTripTicks);
+        while (true)
+        {
+            long smoothed = current == 0 ? sample : current + ((sample - current) / 4);
+            long seen = Interlocked.CompareExchange(ref _roundTripTicks, smoothed, current);
             if (seen == current)
                 return;
             current = seen;
@@ -162,7 +190,9 @@ internal sealed class ClientConnection
         ClientKeys keys = runtime.GetClientKeys(challenge.PrincipalSalt.Span, challenge.Pbkdf2Iterations);
         byte[] proof = HandshakeAuth.ComputeClientProof(keys, transcript);
         await HitAsync(runtime, FaultStage.F03, FaultSites.ClientRequestSend, endpoint, 1, ct).ConfigureAwait(false);
+        long proofSentAt = runtime.Time.GetTimestamp();
         ReadOnlyMemory<byte> resultReply = await raw.CallAsync(MessageCodec.Encode(new HelloProofMessage(proof)), timeout, ct).ConfigureAwait(false);
+        TimeSpan handshakeRoundTrip = runtime.Time.GetElapsedTime(proofSentAt);
         await HitAsync(runtime, FaultStage.F14, FaultSites.ClientReplyReceived, endpoint, 1, ct).ConfigureAwait(false);
         CryptographicOperations.ZeroMemory(proof);
         IWireMessage resultMessage = MessageCodec.Decode(resultReply.Span);
@@ -182,6 +212,6 @@ internal sealed class ClientConnection
 
         raw.Identity = new RpcPeerIdentity(challenge.ServerName, challenge.ServerNodeId, challenge.ServerIncarnation, null,
             IsNode: challenge.ServerRole == PeerRole.Node, IsBackup: challenge.ServerRole == PeerRole.Backup);
-        return new ClientConnection(raw, endpoint, challenge, result, runtime.Time.GetTimestamp());
+        return new ClientConnection(raw, endpoint, challenge, result, runtime.Time.GetTimestamp(), handshakeRoundTrip);
     }
 }

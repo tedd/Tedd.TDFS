@@ -162,6 +162,7 @@ internal sealed class RpcInvoker
                 break;
 
             byte[] frame = MessageCodec.Encode(message);
+            long sentAt = _runtime.Time.GetTimestamp();
             Task<ReadOnlyMemory<byte>> pending = connection.StartCall(frame, attemptTimeout, scope.Token);
 
             // A call refused before sending (connection closed, token already cancelled) transmitted nothing.
@@ -177,7 +178,7 @@ internal sealed class RpcInvoker
             try
             {
                 raw = await pending.ConfigureAwait(false);
-                connection.NoteReply(_runtime.Time.GetTimestamp());
+                connection.NoteReply(_runtime.Time.GetTimestamp(), sentAt, _runtime.Time);
             }
             catch (OperationCanceledException) when (scope.Token.IsCancellationRequested)
             {
@@ -374,10 +375,11 @@ internal sealed class RpcInvoker
         await scope.HitAsync(FaultStage.F03, FaultSites.ClientRequestSend, kind, null, occurrence, obj).ConfigureAwait(false);
         ct.ThrowIfCancellationRequested();
         ReadOnlyMemory<byte> raw;
+        long sentAt = _runtime.Time.GetTimestamp();
         try
         {
             raw = await connection.StartCall(MessageCodec.Encode(message), ClientRuntime.Positive(timeout), ct).ConfigureAwait(false);
-            connection.NoteReply(_runtime.Time.GetTimestamp());
+            connection.NoteReply(_runtime.Time.GetTimestamp(), sentAt, _runtime.Time);
         }
         catch (Exception ex) when (ex is TimeoutException or RpcConnectionException or IOException)
         {

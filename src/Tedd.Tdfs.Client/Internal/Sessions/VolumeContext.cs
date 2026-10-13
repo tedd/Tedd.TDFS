@@ -48,6 +48,7 @@ internal sealed class VolumeContext : IRpcRouter
     private VolumeId _volumeId;
     private ulong _epoch;
     private string? _leader;
+    private string? _lastLeader;   // the last endpoint known as leader (kept while the route is being rediscovered)
     private VolumeSession? _session;
     private StagingLease? _helperStaging;
     private ITimer? _timer;
@@ -127,6 +128,7 @@ internal sealed class VolumeContext : IRpcRouter
             if (hint is { Length: > 0 } && !string.Equals(hint, endpoint, StringComparison.Ordinal))
             {
                 _leader = hint;
+                _lastLeader = hint;
                 return;
             }
 
@@ -251,6 +253,7 @@ internal sealed class VolumeContext : IRpcRouter
                             lock (_sync)
                             {
                                 _leader = leader;
+                                _lastLeader = leader;
                                 _suspects.Remove(leader);
                             }
 
@@ -1313,13 +1316,26 @@ internal sealed class VolumeContext : IRpcRouter
         }
     }
 
+    /// <summary>
+    /// Half a renewal period (at least 50 ms), so that several attempts fit in one renewal; but never below three round trips
+    /// of the current leader's connection: a leader that answers slowly (high-latency link) is still renewed with, while a
+    /// silent one (paused, partitioned) is left for its successor within the lease.
+    /// </summary>
     private TimeSpan KeepAliveAttemptTimeout()
     {
         TimeSpan period;
+        string? leader;
         lock (_sync)
+        {
             period = _timerPeriod;
+            leader = _leader ?? _lastLeader;
+        }
+
         TimeSpan half = period / 2;
-        return half > TimeSpan.FromMilliseconds(50) ? half : TimeSpan.FromMilliseconds(50);
+        TimeSpan attempt = half > TimeSpan.FromMilliseconds(50) ? half : TimeSpan.FromMilliseconds(50);
+        if (leader is not null && Runtime.Pool.TryGetOpen(leader, out ClientConnection connection) && connection.RoundTrip * 3 > attempt)
+            attempt = connection.RoundTrip * 3;
+        return attempt;
     }
 
     private TimeSpan KeepAliveTimeout()

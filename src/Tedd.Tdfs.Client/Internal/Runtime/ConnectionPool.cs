@@ -6,7 +6,7 @@ namespace Tedd.Tdfs.Client.Internal.Runtime;
 /// Authenticated connections of one client, pooled per endpoint (ARCHITECTURE §9.1). Concurrent callers share one
 /// connection per endpoint and one in-progress connect; dead pooled connections (closed by either side, or declared dead
 /// after a timeout on a silently dead link) are detected and replaced, and a connect stuck on a lost handshake message is
-/// abandoned once it outlived a caller's wait. Thread-safe.
+/// abandoned once it outlived a patient caller's wait. Thread-safe.
 /// </summary>
 internal sealed class ConnectionPool
 {
@@ -119,19 +119,21 @@ internal sealed class ConnectionPool
     }
 
     /// <summary>
-    /// A shared connect that outlived a caller's whole wait (and a tenth of the connect timeout) is presumably stuck on a
-    /// lost handshake message (a black-holed or partitioned link that may have healed since): it is abandoned so the next
-    /// caller starts a fresh connect instead of waiting for the stuck one until the connect timeout.
+    /// A shared connect that outlived the whole wait of a patient caller (one willing to wait at least a tenth of the
+    /// connect timeout) is presumably stuck on a lost handshake message (a black-holed or partitioned link that may have
+    /// healed since): it is abandoned so the next caller starts a fresh connect instead of waiting for the stuck one until
+    /// the connect timeout. Impatient callers (keep-alives with sub-second attempts) never abandon a connect, so a slow but
+    /// progressing handshake over a high-latency link is not restarted over and over.
     /// </summary>
     private void AbandonIfStuck(string endpoint, Task<ClientConnection> pending, TimeSpan waited)
     {
-        TimeSpan tenth = _runtime.Options.ConnectTimeout / 10;
-        TimeSpan threshold = waited > tenth ? waited : tenth;
+        if (waited < _runtime.Options.ConnectTimeout / 10)
+            return;
         CancellationTokenSource? abandon = null;
         lock (_sync)
         {
             if (_slots.TryGetValue(endpoint, out Slot? slot) && ReferenceEquals(slot.Pending, pending)
-                && _runtime.Time.GetElapsedTime(slot.PendingStarted) >= threshold)
+                && _runtime.Time.GetElapsedTime(slot.PendingStarted) >= waited)
             {
                 abandon = slot.PendingAbandon;
                 slot.Pending = null;

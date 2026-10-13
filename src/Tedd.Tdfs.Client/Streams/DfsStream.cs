@@ -1239,8 +1239,13 @@ public sealed class DfsStream : Stream, ILeaseHolder
             ExceptionDispatchInfo.Throw(failure);
     }
 
-    /// <summary>Closes the handle on the server (best effort) and stops renewing its lease.</summary>
-    private async Task ReleaseHandleAsync(CancellationToken ct)
+    /// <summary>
+    /// Closes the handle on the server (best effort) and stops renewing its lease. For a public close (dispose, abort) the
+    /// close is an SDK operation of its own: a cancellation before it was transmitted surfaces as
+    /// <see cref="OperationCanceledException"/> (the handle then expires with its lease); other close failures stay best
+    /// effort.
+    /// </summary>
+    private async Task ReleaseHandleAsync(CancellationToken ct, bool publicOperation = true)
     {
         _transaction?.Unregister(this);
         if (Interlocked.Exchange(ref _released, 1) != 0)
@@ -1248,9 +1253,25 @@ public sealed class DfsStream : Stream, ILeaseHolder
         _volume.UnregisterHandle(_handle);
         if (_runtime.IsDisposed)
             return;
+        OperationScope scope;
         try
         {
-            using OperationScope scope = Begin(DfsOperationKind.CloseHandle, ct);
+            scope = Begin(DfsOperationKind.CloseHandle, ct);
+        }
+        catch (ObjectDisposedException)
+        {
+            return; // the client is being disposed: the handle expires with its lease
+        }
+
+        using OperationScope owned = scope;
+        if (publicOperation)
+        {
+            await scope.HitAsync(FaultStage.F00, FaultSites.ClientOperationStart).ConfigureAwait(false);
+            await scope.HitAsync(FaultStage.F01, FaultSites.ClientValidated).ConfigureAwait(false);
+        }
+
+        try
+        {
             await _volume.CloseHandleAsync(_handle, WriterGeneration, _transaction?.Id, scope, _binding).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
@@ -1279,7 +1300,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
         _gate.Close();
-        await ReleaseHandleAsync(CancellationToken.None).ConfigureAwait(false);
+        await ReleaseHandleAsync(CancellationToken.None, publicOperation: false).ConfigureAwait(false);
     }
 
     /// <summary>
