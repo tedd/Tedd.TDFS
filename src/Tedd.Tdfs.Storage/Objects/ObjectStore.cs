@@ -166,8 +166,9 @@ public sealed partial class ObjectStore : IAsyncDisposable
     /// <param name="plaintext">Payload.</param>
     /// <param name="operation">Operation kind reported by the object write fault sites (for example a restore's server-side copy).</param>
     /// <param name="ct">Cancellation.</param>
+    /// <param name="volumeName">Name of the owning volume, reported by the object write fault sites (F06/F07) like every other volume-scoped site.</param>
     public async ValueTask<ObjectRecordInfo> PutAsync(ObjectId id, VolumeId volume, StagingId staging, ReadOnlyMemory<byte> plaintext, DfsOperationKind operation,
-        CancellationToken ct = default)
+        CancellationToken ct = default, string? volumeName = null)
     {
         if (id.IsEmpty)
             throw new ArgumentException("The object id must not be empty.", nameof(id));
@@ -176,7 +177,7 @@ public sealed partial class ObjectStore : IAsyncDisposable
         ThrowIfDisposed();
         UInt128 checksum = ObjectChecksum.Compute(plaintext.Span);
         if (_faults.IsEnabled)
-            await _faults.HitAsync(new FaultContext(FaultStage.F06, FaultSites.ObjectWrite, _options.NodeName, Operation: operation, Object: id), ct);
+            await _faults.HitAsync(new FaultContext(FaultStage.F06, FaultSites.ObjectWrite, _options.NodeName, volumeName, Operation: operation, Object: id), ct);
 
         SegmentFile segment;
         IndexEntry entry;
@@ -241,7 +242,7 @@ public sealed partial class ObjectStore : IAsyncDisposable
         try
         {
             if (_faults.IsEnabled)
-                await _faults.HitAsync(new FaultContext(FaultStage.F07, FaultSites.ObjectBeforeFlush, _options.NodeName, Operation: operation, Object: id), ct);
+                await _faults.HitAsync(new FaultContext(FaultStage.F07, FaultSites.ObjectBeforeFlush, _options.NodeName, volumeName, Operation: operation, Object: id), ct);
             try
             {
                 await FlushSegmentAsync(segment, ct);

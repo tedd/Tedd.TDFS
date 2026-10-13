@@ -411,6 +411,7 @@ public sealed class SnpUnitTests
     private static async Task<(CommitToken Own, CommitToken Foreign, DfsSnapshotInfo Baseline)> PrepareForeignTokenAsync(
         DfsVolume vol, DfsClient client, ForeignToken kind, CancellationToken ct)
     {
+        await vol.Directories.CreateDirectoryAsync("/f", ct);
         CommitToken own = await vol.Files.WriteAllBytesAsync("/f/own", TestData.Bytes(0x5_010_001, 2000), ct);
         Assert.False(own.IsNone);
         DfsSnapshotInfo baseline = await vol.Snapshots.CreateAsync("baseline", null, ct);
@@ -420,6 +421,7 @@ public sealed class SnpUnitTests
         switch (kind)
         {
             case ForeignToken.OtherVolume:
+                await client.GetVolume("vol2").Directories.CreateDirectoryAsync("/f", ct);
                 foreign = await client.GetVolume("vol2").Files.WriteAllBytesAsync("/f/other", TestData.Bytes(0x5_010_002, 2000), ct);
                 Assert.NotEqual(own.VolumeId, foreign.VolumeId);
                 Assert.Equal(own.ClusterId, foreign.ClusterId);

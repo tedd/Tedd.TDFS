@@ -5,8 +5,8 @@ namespace Tedd.Tdfs.Testing;
 /// <summary>Records every fault-point hit so tests can prove intended points were reached.</summary>
 /// <remarks>
 /// Hits are recorded in the order the injector observed them, under the same lock that counts the hits of every armed
-/// fault, so the <c>Occurrence</c>-th recorded hit matching an arm's <see cref="FaultMatch"/> is the hit its action ran on
-/// (HAR-013).
+/// fault, so the <c>Occurrence</c>-th hit matching an arm's <see cref="FaultMatch"/> recorded after the arm was armed is the
+/// hit its action ran on (HAR-013); hits recorded before arming are never counted by the arm.
 /// </remarks>
 public sealed class FaultCoverageRegistry
 {

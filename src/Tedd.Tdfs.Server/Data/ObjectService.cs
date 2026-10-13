@@ -65,7 +65,7 @@ internal sealed class ObjectService
 
         bool alreadyPresent = Store.TryGetInfo(obj) is { } existing && existing.Volume == volume.Id && existing.Staging == staging
             && existing.Checksum == checksum && existing.Length == length;
-        await Store.PutAsync(obj, volume.Id, staging, data, operation, ct);
+        await Store.PutAsync(obj, volume.Id, staging, data, operation, ct, volume.Name);
         await _s.HitAsync(FaultStage.F08, FaultSites.ObjectAfterFlushBeforeReceipt, volume.Name, operation, obj: obj, ct: ct);
         _s.Metrics.ObjectPut(data.Length);
         _s.Metrics.SetStored(Store.ObjectCount, Store.LiveBytes);

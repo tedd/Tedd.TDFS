@@ -13,6 +13,8 @@ internal sealed class Capabilities
     private readonly KeyHierarchy _keys;
     private readonly Func<Guid> _clusterId;
     private readonly TimeProvider _time;
+    private readonly DateTimeOffset _wallAnchor;
+    private readonly long _monotonicAnchor;
 
     public Capabilities(KeyHierarchy keys, Func<Guid> clusterId, TimeProvider time)
     {
@@ -22,13 +24,22 @@ internal sealed class Capabilities
         _keys = keys;
         _clusterId = clusterId;
         _time = time;
+        _wallAnchor = time.GetUtcNow();
+        _monotonicAnchor = time.GetTimestamp();
     }
+
+    /// <summary>
+    /// Capability time: this node's wall clock when it started, advanced by its monotonic clock. Expiries are issued and
+    /// verified on it, so a later wall-clock step on the issuing leader or on a verifying storage node neither expires valid
+    /// capabilities early nor revives expired ones (SEC-017, HAR-003); the nodes' wall clocks only need to agree at start.
+    /// </summary>
+    private DateTimeOffset Now => _wallAnchor + _time.GetElapsedTime(_monotonicAnchor);
 
     /// <summary>A signed staging capability for one open staging session.</summary>
     public byte[] IssueStaging(VolumeRecord volume, string principal, StagingId staging, TimeSpan lifetime, out DateTimeOffset expires)
     {
         ArgumentNullException.ThrowIfNull(volume);
-        expires = _time.GetUtcNow() + lifetime;
+        expires = Now + lifetime;
         return DataCapability.ForStaging(_clusterId(), volume.Id, volume.Epoch, principal, staging, expires).Sign(_keys.CapabilityKey).Encode();
     }
 
@@ -36,7 +47,7 @@ internal sealed class Capabilities
     public byte[] IssueRead(VolumeRecord volume, string principal, IEnumerable<ObjectId> objects, TimeSpan lifetime, out DateTimeOffset expires)
     {
         ArgumentNullException.ThrowIfNull(volume);
-        expires = _time.GetUtcNow() + lifetime;
+        expires = Now + lifetime;
         return DataCapability.ForRead(_clusterId(), volume.Id, volume.Epoch, principal, objects, expires).Sign(_keys.CapabilityKey).Encode();
     }
 
@@ -63,7 +74,7 @@ internal sealed class Capabilities
             throw Denied("the capability is for another volume epoch");
         if (!string.Equals(capability.Principal, principal, StringComparison.Ordinal))
             throw Denied("the capability was issued to another principal");
-        if (capability.IsExpired(_time.GetUtcNow()))
+        if (capability.IsExpired(Now))
             throw Denied("the capability expired");
         if (staging is { } s && capability.Staging != s)
             throw Denied("the capability is for another staging session");

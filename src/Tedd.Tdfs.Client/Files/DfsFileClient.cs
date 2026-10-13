@@ -57,7 +57,7 @@ public sealed partial class DfsFileClient
     /// <summary>Opens a stream with FileStream-like semantics (FSD §6.1).</summary>
     public async Task<DfsStream> OpenAsync(string path, DfsOpenOptions options, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Open, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Open, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.FilePath(path);
         Validation.OpenOptions(options, IsTransactionBound);
@@ -156,7 +156,7 @@ public sealed partial class DfsFileClient
     /// <summary>Reads a whole file from one pinned revision (bounded by <see cref="DfsClientOptions.MaxMaterializeBytes"/>).</summary>
     public async Task<byte[]> ReadAllBytesAsync(string path, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Read, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Read, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.FilePath(path);
         using DfsTransaction.TransactionOperation? txOperation = EnterTransaction();
@@ -335,7 +335,7 @@ public sealed partial class DfsFileClient
     /// <summary>Atomically replaces the contents of a file with options (operation id, storage policy, commit-and-snapshot).</summary>
     public async Task<CommitToken> WriteAllBytesAsync(string path, ReadOnlyMemory<byte> bytes, DfsMutationOptions options, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.WriteAll, ct);
+        using OperationScope scope = Begin(DfsOperationKind.WriteAll, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.FilePath(path);
         Validation.MutationOptions(options);
@@ -386,7 +386,7 @@ public sealed partial class DfsFileClient
     /// <summary>Atomically appends bytes with options.</summary>
     public async Task<CommitToken> AppendAllBytesAsync(string path, ReadOnlyMemory<byte> bytes, DfsMutationOptions options, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Append, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Append, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.FilePath(path);
         Validation.MutationOptions(options);
@@ -407,7 +407,7 @@ public sealed partial class DfsFileClient
     public async Task<CommitToken> AppendAllTextAsync(string path, string contents, Encoding? encoding = null, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(contents);
-        using OperationScope scope = Begin(DfsOperationKind.Append, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Append, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.FilePath(path);
         EnsureWritable();
@@ -659,7 +659,7 @@ public sealed partial class DfsFileClient
     /// <summary>Copies a file atomically with options.</summary>
     public async Task<CommitToken> CopyAsync(string sourcePath, string destinationPath, bool overwrite, DfsMutationOptions options, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Copy, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Copy, sourcePath, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string source = Validation.FilePath(sourcePath, nameof(sourcePath));
         string destination = Validation.FilePath(destinationPath, nameof(destinationPath));
@@ -689,7 +689,7 @@ public sealed partial class DfsFileClient
     /// <summary>Renames a file atomically with options.</summary>
     public async Task<CommitToken> MoveAsync(string sourcePath, string destinationPath, bool overwrite, DfsMutationOptions options, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Move, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Move, sourcePath, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string source = Validation.FilePath(sourcePath, nameof(sourcePath));
         string destination = Validation.FilePath(destinationPath, nameof(destinationPath));
@@ -719,7 +719,7 @@ public sealed partial class DfsFileClient
     /// <summary>Deletes a file with options.</summary>
     public async Task<CommitToken> DeleteAsync(string path, DfsMutationOptions options, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Delete, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Delete, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.FilePath(path);
         Validation.MutationOptions(options);
@@ -739,7 +739,7 @@ public sealed partial class DfsFileClient
     /// <summary>True when a file exists at <paramref name="path"/> (false only for genuine absence).</summary>
     public async Task<bool> ExistsAsync(string path, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Exists, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Exists, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.Path(path);
         using DfsTransaction.TransactionOperation? txOperation = EnterTransaction();
@@ -758,7 +758,7 @@ public sealed partial class DfsFileClient
     /// <summary>Metadata of a file (<see cref="FileNotFoundException"/> when absent).</summary>
     public async Task<DfsFileInfo> GetInfoAsync(string path, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.GetInfo, ct);
+        using OperationScope scope = Begin(DfsOperationKind.GetInfo, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.FilePath(path);
         using DfsTransaction.TransactionOperation? txOperation = EnterTransaction();
@@ -775,7 +775,7 @@ public sealed partial class DfsFileClient
     /// <summary>Changes the storage policy of a file (existing data migrates in the background).</summary>
     public async Task<CommitToken> SetStoragePolicyAsync(string path, string policyName, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.PolicyChange, ct);
+        using OperationScope scope = Begin(DfsOperationKind.PolicyChange, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.Path(path);
         Validation.Name(policyName, nameof(policyName));
@@ -795,7 +795,7 @@ public sealed partial class DfsFileClient
     /// <summary>Changes the owner-only / read-only-for-others access flags of a file.</summary>
     public async Task<CommitToken> SetAccessAsync(string path, DfsInodeAccess access, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Admin, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Admin, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.Path(path);
         ArgumentNullException.ThrowIfNull(access);
@@ -817,6 +817,10 @@ public sealed partial class DfsFileClient
     /// <summary>Starts an operation; transaction-bound operations are <see cref="DfsOperationKind.TxOp"/> operations.</summary>
     private OperationScope Begin(DfsOperationKind kind, CancellationToken ct) =>
         Runtime.BeginOperation(Transaction is not null ? DfsOperationKind.TxOp : kind, Volume.Name, null, ct);
+
+    /// <summary>Begins an operation addressing <paramref name="path"/> (the raw argument: fault sites hit before validation carry it too).</summary>
+    private OperationScope Begin(DfsOperationKind kind, string? path, CancellationToken ct) =>
+        Runtime.BeginOperation(Transaction is not null ? DfsOperationKind.TxOp : kind, Volume.Name, path, ct);
 
     private void EnsureWritable()
     {
