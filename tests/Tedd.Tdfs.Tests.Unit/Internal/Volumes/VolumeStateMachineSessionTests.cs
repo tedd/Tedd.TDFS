@@ -201,7 +201,9 @@ public sealed class VolumeStateMachineSessionTests
 
         // Many later operations: the window (2 outcomes) retires the oldest sequences, and with them the reserved, never used
         // sequence 2 (OUT-012: an id below the retired watermark is expired and never executes as a new request).
-        for (ulong seq = 10; seq < 16; seq++)
+        var third = d.Ok<ReserveOperationIdsResultMessage>(new ReserveOperationIdsCommand(session, 10) { Op = Op(session: session) });
+        Assert.Equal(7UL, third.FirstSequence);
+        for (ulong seq = third.FirstSequence; seq < third.FirstSequence + 6; seq++)
         {
             d.Ok<CreateDirectoryResultMessage>(new CreateDirectoryCommand("/r" + seq, false, null)
             {
@@ -209,7 +211,7 @@ public sealed class VolumeStateMachineSessionTests
             });
         }
 
-        Assert.True(d.State.Sessions[session].RetiredWatermark >= 13);
+        Assert.True(d.State.Sessions[session].RetiredWatermark >= 10);
         Assert.Equal(2, d.State.Sessions[session].Outcomes.Count);
         d.Fails(DfsErrorCode.OperationExpired, new CreateDirectoryCommand("/reserved", false, null)
         {

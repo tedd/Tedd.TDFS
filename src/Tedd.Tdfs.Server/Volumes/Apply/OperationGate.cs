@@ -69,8 +69,9 @@ internal static class OperationGate
 
             // A session that obtains its sequences from this volume's leader (ReserveOperationIds; the SDK always does) uses
             // reserved sequences only: an unused sequence outside every reservation was never handed out here — for example
-            // an id of the same principal's session on another volume — and must not execute as a new request (OUT-004).
-            if (!session.Reserved.IsEmpty && !session.Reserved.Exists(r => r.Contains(id.Sequence)))
+            // an id of the same principal's session on another volume — and must not execute as a new request (OUT-004). (A
+            // sequence with an outcome was issued; it only gets here when dedup is disabled, and its range may be used up.)
+            if (!session.Reserved.IsEmpty && !session.Outcomes.ContainsKey(id.Sequence) && !session.Reserved.Exists(r => r.Contains(id.Sequence)))
                 return new GateDecision(GateKind.Invalid, $"Operation {id} was not issued by this volume (session {session.Id} never reserved sequence {id.Sequence}).", null);
         }
 
