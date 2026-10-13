@@ -1169,10 +1169,15 @@ public sealed class RsySimulationTests
             {
                 await using (kClient)
                 {
+                    // The window retires the lowest sequences, and the SDK draws its internal operation ids from blocks
+                    // reserved in advance: operations issued after id2 (an application id, reserved on its own) may use
+                    // sequences below it. Write until the window has moved past id2 (at least MaxOutcomesPerSession + 50
+                    // operations; bounded).
                     int count = Timings.MaxOutcomesPerSession + 50;
-                    for (int i = 0; i < count; i += 10)
+                    int bound = Timings.MaxOutcomesPerSession * 4;
+                    for (int i = 0; i < bound && (i < count || !await RetiredThroughAsync(cluster, id2)); i += 10)
                     {
-                        await Task.WhenAll(Enumerable.Range(i, Math.Min(10, count - i)).Select(n =>
+                        await Task.WhenAll(Enumerable.Range(i, 10).Select(n =>
                             k.Files.WriteAllBytesAsync($"/r/other{n:D4}", TestData.Bytes(10_100 + (ulong)n, 8), Ct)));
                     }
                 }
@@ -1211,6 +1216,13 @@ public sealed class RsySimulationTests
             Assert.Equal(t1.Sequence, (await z.Files.GetInfoAsync("/r/log", Ct)).Revision);
             Assert.Equal(t2.Sequence, (await z.Files.GetInfoAsync("/r/w", Ct)).Revision);
         });
+
+    /// <summary>True when the leader has retired <paramref name="id"/> and every earlier sequence of its session.</summary>
+    private static async Task<bool> RetiredThroughAsync(TestCluster cluster, DfsOperationId id)
+    {
+        VolumeStateInspection state = await cluster.Inspect.GetVolumeStateAsync(Volume);
+        return state.Sessions.SingleOrDefault(s => s.Id == id.Session) is { } session && (session.Expired || session.RetiredWatermark >= id.Sequence);
+    }
 
     // ------------------------------------------------------------------------------------------------------------
     // RSY-011
