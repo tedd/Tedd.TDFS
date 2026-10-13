@@ -831,6 +831,7 @@ public sealed class SnpSimulationTests
             await using DfsClient client = await cluster.ConnectAsync(new TestClientOptions { Name = "c0", OperationTimeout = TimeSpan.FromSeconds(3) }, ct);
             DfsVolume vol = client.GetVolume(Volume);
             byte[] v1 = TestData.Bytes(0x5006_0001, (2 * Chunk) + 3);
+            await vol.Directories.CreateDirectoryAsync("/s", ct);
             await vol.Files.WriteAllBytesAsync("/s/f", v1, ct);
             IReadOnlyList<ObjectId> v1Objects = await ObjectsOfAsync(cluster, "/s/f");
             const string name = "s1";
@@ -859,11 +860,16 @@ public sealed class SnpSimulationTests
                     {
                         DfsOperationId opId = await vol.NewOperationIdAsync(ct);
                         MessageRule rule = cluster.Network.DropReplies(new MessageFilter(Type: MessageType.CreateSnapshot), 10_000);
+
+                        // The replies to the outcome queries the SDK sends to resolve the creation itself are lost too
+                        // (PROTOCOL.md §5.1): otherwise it learns the committed outcome and the uncertainty never surfaces.
+                        MessageRule lostQueries = cluster.Network.DropReplies(new MessageFilter(From: "client:c0", Type: MessageType.QueryOperation), 10_000);
                         DfsCommitOutcomeUnknownException unknown = await AssertEx.ThrowsDfsAsync<DfsCommitOutcomeUnknownException>(
                             () => vol.Snapshots.CreateAsync(name, new DfsSnapshotOptions { OperationId = opId }, ct), DfsErrorCode.OutcomeUnknown);
                         Assert.Equal(opId, unknown.OperationId);
                         Assert.True(rule.Matched >= 1, "the reply drop must have been reached");
                         rule.Cancel();
+                        lostQueries.Cancel();
 
                         // While uncertain, there is never more than one record for the name.
                         Assert.True((await vol.Snapshots.ListAsync(ct)).Count(s => s.Name == name) <= 1);
@@ -967,6 +973,7 @@ public sealed class SnpSimulationTests
         {
             await using DfsClient writerClient = await cluster.ConnectAsync(new TestClientOptions { Name = "writer" }, ct);
             DfsVolume writer = writerClient.GetVolume(Volume);
+            await writer.Directories.CreateDirectoryAsync("/m", ct);
             for (int i = 0; i < 20; i++)
                 await writer.Files.WriteAllBytesAsync($"/m/noise{i % 4}", TestData.Bytes(0x5007_0000UL + (ulong)i, 300), ct);
 
@@ -1116,6 +1123,7 @@ public sealed class SnpSimulationTests
             DfsVolume otherVol = other.GetVolume(Volume);
             byte[] v1 = TestData.Bytes(0x5008_0001, Chunk + 100);
             byte[] v2 = TestData.Bytes(0x5008_0002, 700);
+            await vol.Directories.CreateDirectoryAsync("/h", ct);
             CommitToken t = await vol.Files.WriteAllBytesAsync("/h/f", v1, ct);
 
             CommitToken t2;
@@ -1397,6 +1405,7 @@ public sealed class SnpSimulationTests
             await using DfsClient client = await cluster.ConnectAsync(null, ct);
             DfsVolume vol = client.GetVolume(Volume);
             byte[] f0 = TestData.Bytes(0x5009_1001, Chunk + 3);
+            await vol.Directories.CreateDirectoryAsync("/x", ct);
             await vol.Files.WriteAllBytesAsync("/x/f", f0, ct);
             DfsSnapshotInfo taken = await vol.Snapshots.CreateAsync("taken", null, ct);
             DfsFileInfo before = await vol.Files.GetInfoAsync("/x/f", ct);
@@ -1467,6 +1476,7 @@ public sealed class SnpSimulationTests
             DfsVolume vol = client.GetVolume(Volume);
 
             // Positive control: objects only referenced by s0.
+            await vol.Directories.CreateDirectoryAsync("/ref", ct);
             await vol.Files.WriteAllBytesAsync("/ref/ctl", TestData.Bytes(0x5011_0001, (2 * Chunk) + 3), ct);
             IReadOnlyList<ObjectId> ctlObjects = await ObjectsOfAsync(cluster, "/ref/ctl");
             await vol.Snapshots.CreateAsync("s0", null, ct);
@@ -1597,6 +1607,7 @@ public sealed class SnpSimulationTests
             DfsVolume vol = owner.GetVolume(Volume);
             byte[] v1 = TestData.Bytes(0x5012_0001, (4 * Chunk) + 9);
             byte[] side = TestData.Bytes(0x5012_0002, 333);
+            await vol.Directories.CreateDirectoryAsync("/r/d", ct);
             await vol.Files.WriteAllBytesAsync("/r/f", v1, ct);
             await vol.Files.WriteAllBytesAsync("/r/d/side", side, ct);
             IReadOnlyList<ObjectId> v1Objects = await ObjectsOfAsync(cluster, "/r/f");
@@ -1687,6 +1698,7 @@ public sealed class SnpSimulationTests
             await using DfsClient client = await cluster.ConnectAsync(new TestClientOptions { Name = "c0", OperationTimeout = TimeSpan.FromSeconds(3) }, ct);
             DfsVolume vol = client.GetVolume(Volume);
             byte[] v1 = TestData.Bytes(0x5013_0001, (2 * Chunk) + 7);
+            await vol.Directories.CreateDirectoryAsync("/d", ct);
             await vol.Files.WriteAllBytesAsync("/d/f", v1, ct);
             IReadOnlyList<ObjectId> v1Objects = await ObjectsOfAsync(cluster, "/d/f");
             DfsSnapshotInfo s1 = await vol.Snapshots.CreateAsync("s1", null, ct);
@@ -1715,9 +1727,13 @@ public sealed class SnpSimulationTests
                 case DeleteReplyLoss.UnknownOutcomeThenQuery:
                     {
                         MessageRule rule = cluster.Network.DropReplies(new MessageFilter(Type: MessageType.DeleteSnapshot), 10_000);
+
+                        // The replies to the SDK's own resolving outcome queries are lost too (PROTOCOL.md §5.1).
+                        MessageRule lostQueries = cluster.Network.DropReplies(new MessageFilter(From: "client:c0", Type: MessageType.QueryOperation), 10_000);
                         DfsCommitOutcomeUnknownException unknown = await AssertEx.ThrowsDfsAsync<DfsCommitOutcomeUnknownException>(
                             () => vol.Snapshots.DeleteAsync("s1", ct), DfsErrorCode.OutcomeUnknown);
                         rule.Cancel();
+                        lostQueries.Cancel();
                         DfsOperationOutcome outcome = await vol.QueryOperationAsync(unknown.OperationId, true, ct);
                         Assert.Equal(DfsOutcomeStatus.Committed, outcome.Status);
                         // A new delete is a new operation on an absent name: it either reports absence or is a no-op
@@ -1924,6 +1940,8 @@ public sealed class SnpSimulationTests
             await using DfsClient client = await cluster.ConnectAsync(null, ct);
             DfsVolume small = client.GetVolume("small");
             DfsVolume large = client.GetVolume("large");
+            await small.Directories.CreateDirectoryAsync("/s", ct);
+            await large.Directories.CreateDirectoryAsync("/s", ct);
             for (int i = 0; i < 20; i++)
             {
                 await small.Files.WriteAllBytesAsync($"/s/{i}", TestData.Bytes(0x5015_0000UL + (ulong)i, 1024), ct);
@@ -1931,6 +1949,7 @@ public sealed class SnpSimulationTests
             }
 
             long largePayload = 0;
+            await large.Directories.CreateDirectoryAsync("/big", ct);
             for (int i = 0; i < 8; i++)
             {
                 byte[] data = TestData.Bytes(0x5015_2000UL + (ulong)i, 8 * Chunk);
@@ -2066,6 +2085,7 @@ public sealed class SnpSimulationTests
                 await vol.Directories.DeleteAsync("/cow/dir", true, ct);
                 if (kind == RestartKind.CrashAfterLogCompaction)
                 {
+                    await vol.Directories.CreateDirectoryAsync("/churn", ct);
                     for (int i = 0; i < Timings.RaftSnapshotThreshold + 50; i++)
                         await vol.Files.WriteAllBytesAsync($"/churn/{i % 5}", TestData.Bytes(0x5016_1000UL + (ulong)i, 40), ct);
                     await cluster.WaitUntilAsync(async () =>

@@ -1854,7 +1854,9 @@ public sealed class LockSimulationTests
             for (int i = 0; i < targets.Length; i++)
             {
                 int index = i;
-                await CaptureAsync(MessageType.TxOp, () => tx.Files.WriteAllBytesAsync(targets[index], TestData.Bytes(18_100 + (ulong)index, 1800), ct));
+                // A transaction-bound helper is sent as its ordinary request type carrying the transaction in its header
+                // (PROTOCOL.md: TxOp is only an optional batching envelope), so the WriteAll requests are what a replay reuses.
+                await CaptureAsync(MessageType.WriteAll, () => tx.Files.WriteAllBytesAsync(targets[index], TestData.Bytes(18_100 + (ulong)index, 1800), ct));
             }
 
             foreach (string target in targets)

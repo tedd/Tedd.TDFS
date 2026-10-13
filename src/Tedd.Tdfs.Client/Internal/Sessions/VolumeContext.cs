@@ -617,7 +617,11 @@ internal sealed class VolumeContext : IRpcRouter
         DfsOperationId? queryTarget = null, bool queryAsTransaction = false, VolumeBinding? binding = null, bool keepProtected = false)
         where TReply : IWireMessage<TReply>
     {
-        VolumeSession session = await EnsureSessionAsync(scope).ConfigureAwait(false);
+        // An application-supplied id of a request that refers to nothing a session owns needs no session of this client: the
+        // id carries its own session, and another process may retry an id it persisted (FSD §13, OUT-002). Such a request is
+        // sent without opening a session first, so a retry is never held up behind an OpenSession entry that must commit.
+        bool sessionFree = applicationId is not null && rebindable && transaction is null && binding is null;
+        VolumeSession? session = sessionFree ? CurrentSession : await EnsureSessionAsync(scope).ConfigureAwait(false);
         bool sdkAllocated = applicationId is null;
         DfsOperationId operation;
 
@@ -627,7 +631,7 @@ internal sealed class VolumeContext : IRpcRouter
         if (applicationId is { } supplied)
         {
             operation = supplied;
-            session.Protect(supplied);
+            session?.Protect(supplied);
         }
         else
         {
@@ -650,8 +654,8 @@ internal sealed class VolumeContext : IRpcRouter
             Operation = operation,
             Build = async s =>
             {
-                VolumeSession current = await EnsureSessionAsync(s).ConfigureAwait(false);
-                pinned ??= current.Binding;
+                VolumeSession? current = sessionFree ? CurrentSession : await EnsureSessionAsync(s).ConfigureAwait(false);
+                pinned ??= current?.Binding ?? CurrentBinding;
                 sent = current;
                 return build(Header(current, request.Operation.GetValueOrDefault(), transaction, pinned));
             },

@@ -407,6 +407,8 @@ future issuer can add restrictions as required extensions that old verifiers rej
 checks: MAC (constant time); cluster; volume and epoch (older epoch → rejected, SEC-007); principal equals the
 connection principal; not expired on the verifier's clock; kind matches the request; for `PutObject` the staging id
 matches the request; for `GetObject` the object is listed (`AllowsRead`, binary search). Failures → `AccessDenied`.
+A staging capability is also accepted by `GetObject` for objects stored under **its own** staging session (a writer reading
+back its staged, unpublished data that it uploaded early to bound memory); any other object → `AccessDenied`.
 Node peers may omit capabilities on `GetObject` (repair pulls) — clients never may (SEC-004/005).
 
 ### 7.4 Reads
@@ -446,10 +448,10 @@ zeroes; missing objects never do (STR, DSK-016).
   rejects an inline append because the file grew meanwhile, with a new operation id) as objects.
 * **Extents → inline**: when a publication whose result is stored inline leaves bytes of objects inside the result —
   base bytes of an extent-based file (for example a truncation to below the threshold followed by small writes), or
-  `Data` changes of objects a write-only stream uploaded early and then truncated below the threshold — the leader
+  `Data` changes of objects a stream uploaded early and then truncated below the threshold — the leader
   materializes those bytes from the objects into the inline image before proposing; the client never reads the base
-  (or its own staged objects) to rewrite it. Staging capabilities never authorize `GetObject`, so the SDK uploads
-  staged data early (bounded memory) only for write-only streams; readable writers keep their staged bytes in memory.
+  (or its own staged objects) to rewrite it. The SDK uploads staged data early (bounded memory, PUB-002) for every
+  writable stream; a readable writer reads those ranges back with its staging capability (§7.3).
 * **Inline → extents**: when a publication turns an inline file into an extent-based one, bytes of the new content not
   covered by the change set are taken from the old inline bytes; the leader materializes them as an object written
   under the request's staging session with receipts meeting the file's policy, before proposing. (The client never
