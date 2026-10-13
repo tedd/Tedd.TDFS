@@ -241,8 +241,11 @@ internal sealed partial class VolumeStateMachine
     internal static QueryOperationResultMessage QueryTransaction(VolumeState s, DfsOperationId target, string principal, out bool fenceable)
     {
         fenceable = false;
+
+        // No transaction record: its begin never executed (or the record is retired). The begin's operation id is then
+        // answered like any operation id, and a resolving query fences it (ARCHITECTURE 7: NotFound only without resolve).
         if (!s.Transactions.TryGetValue(target, out TxRecord? tx))
-            return QueryOutcome(s, target, principal, out _, out _);
+            return QueryOutcome(s, target, principal, out _, out fenceable);
         if (!string.Equals(tx.Principal, principal, StringComparison.Ordinal))
             throw Fail(DfsErrorCode.OperationIdMismatch, $"Transaction {target} belongs to another principal.");
         switch (tx.State)

@@ -1211,6 +1211,10 @@ internal sealed class VolumeContext : IRpcRouter
                     ReplyType = MessageType.KeepAliveResult,
                     Kind = CallKind.Idempotent,
                     Router = this,
+
+                    // Several attempts fit in one renewal: a leader that stopped answering (paused, partitioned) is left
+                    // for its successor well within the lease, instead of spending the whole renewal waiting on it.
+                    AttemptTimeout = KeepAliveAttemptTimeout(),
                     Build = _ => ValueTask.FromResult<IWireMessage>(new KeepAliveMessage(Header(session), handles, updates, pins)),
                 };
                 try
@@ -1239,6 +1243,15 @@ internal sealed class VolumeContext : IRpcRouter
         {
             Volatile.Write(ref _keepAliveRunning, 0);
         }
+    }
+
+    private TimeSpan KeepAliveAttemptTimeout()
+    {
+        TimeSpan period;
+        lock (_sync)
+            period = _timerPeriod;
+        TimeSpan half = period / 2;
+        return half > TimeSpan.FromMilliseconds(50) ? half : TimeSpan.FromMilliseconds(50);
     }
 
     private TimeSpan KeepAliveTimeout()

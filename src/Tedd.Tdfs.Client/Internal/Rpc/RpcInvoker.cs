@@ -179,6 +179,10 @@ internal sealed class RpcInvoker
             }
             catch (OperationCanceledException) when (scope.Token.IsCancellationRequested)
             {
+                // The deadline ended the attempt before the node answered: later requests (keep-alives, the next
+                // operation) must not keep waiting on it as the presumed leader (a paused or partitioned old leader).
+                if (!scope.IsAbortedByCaller)
+                    request.Router.OnUnreachable(endpoint);
                 break;
             }
             catch (Exception ex) when (ex is TimeoutException or RpcConnectionException or IOException or ObjectDisposedException)

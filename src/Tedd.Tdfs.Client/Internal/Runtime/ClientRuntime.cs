@@ -477,7 +477,9 @@ internal sealed class ClientRuntime
 
     private static async Task<ClusterMapData?> FetchMapAsync(ClientConnection connection, OperationScope scope, TimeSpan timeout)
     {
+        await scope.HitAsync(FaultStage.F03, FaultSites.ClientRequestSend, DfsOperationKind.Discover, detail: connection.Endpoint).ConfigureAwait(false);
         IWireMessage reply = await connection.CallAsync(MessageCodec.Encode(new GetClusterMapMessage(0)), Positive(timeout), scope.Token).ConfigureAwait(false);
+        await scope.HitAsync(FaultStage.F14, FaultSites.ClientReplyReceived, DfsOperationKind.Discover, detail: connection.Endpoint).ConfigureAwait(false);
         return reply switch
         {
             ClusterMapResultMessage result => result.Map,

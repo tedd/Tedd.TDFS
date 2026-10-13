@@ -292,10 +292,27 @@ internal sealed partial class RpcDispatcher : IRpcHandler
         {
             if (!expectsReply || state.Outbound)
                 return null;
-            IWireMessage reply = type == MessageType.Hello
-                ? HandleHello(state, (HelloMessage)message, frame)
-                : HandleProof(state, (HelloProofMessage)message);
-            return MessageCodec.Encode(reply);
+
+            // Request-path stages of the handshake (operation Authenticate): F04 once the complete request is accepted,
+            // F13 before the reply leaves (a dropped reply leaves the peer's handshake unanswered).
+            int step = type == MessageType.Hello ? 0 : 1;
+            try
+            {
+                await _s.HitAsync(FaultStage.F04, FaultSites.RpcRequestAccepted, operation: DfsOperationKind.Authenticate, occurrence: step, ct: ct);
+                IWireMessage reply = type == MessageType.Hello
+                    ? HandleHello(state, (HelloMessage)message, frame)
+                    : HandleProof(state, (HelloProofMessage)message);
+                await _s.HitAsync(FaultStage.F13, FaultSites.RpcReplySend, operation: DfsOperationKind.Authenticate, occurrence: step, ct: ct);
+                return MessageCodec.Encode(reply);
+            }
+            catch (FaultReplyDroppedException)
+            {
+                return null;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return null;
+            }
         }
 
         if (state.Phase != HandshakePhase.Authenticated || state.Identity is null)

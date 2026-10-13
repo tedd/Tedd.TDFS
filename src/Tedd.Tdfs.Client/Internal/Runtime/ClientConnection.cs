@@ -121,6 +121,13 @@ internal sealed class ClientConnection
         }
     }
 
+    /// <summary>Client wire stages of the handshake (F03/F14, operation <c>Authenticate</c>; occurrence 0 = Hello, 1 = proof).</summary>
+    private static ValueTask HitAsync(ClientRuntime runtime, FaultStage stage, string site, string endpoint, int occurrence, CancellationToken ct) =>
+        runtime.Faults.IsEnabled
+            ? runtime.Faults.HitAsync(new FaultContext(stage, site, runtime.NetworkName, null, DfsOperationKind.Authenticate, Occurrence: occurrence,
+                Detail: endpoint), ct)
+            : ValueTask.CompletedTask;
+
     private static async Task<ClientConnection> AuthenticateAsync(ClientRuntime runtime, IRpcConnection raw, string endpoint, Guid expectedClusterId,
         TimeSpan timeout, CancellationToken ct)
     {
@@ -128,7 +135,9 @@ internal sealed class ClientConnection
         var hello = new HelloMessage(expectedClusterId, ProtocolInfo.MinSupportedVersion, ProtocolInfo.CurrentVersion, ClientRuntime.SupportedFeatures,
             PeerRole.Client, runtime.Options.ClientName, null, 0, credentials.Principal, runtime.Random.NextBytes(ProtocolInfo.NonceSize));
         byte[] helloFrame = MessageCodec.Encode(hello);
+        await HitAsync(runtime, FaultStage.F03, FaultSites.ClientRequestSend, endpoint, 0, ct).ConfigureAwait(false);
         ReadOnlyMemory<byte> challengeReply = await raw.CallAsync(helloFrame, timeout, ct).ConfigureAwait(false);
+        await HitAsync(runtime, FaultStage.F14, FaultSites.ClientReplyReceived, endpoint, 0, ct).ConfigureAwait(false);
         IWireMessage challengeMessage = MessageCodec.Decode(challengeReply.Span);
         if (challengeMessage is ErrorReplyMessage error)
             throw error.ToException();
@@ -152,7 +161,9 @@ internal sealed class ClientConnection
         byte[] transcript = HandshakeAuth.ComputeTranscript(helloFrame, challengeReply.Span);
         ClientKeys keys = runtime.GetClientKeys(challenge.PrincipalSalt.Span, challenge.Pbkdf2Iterations);
         byte[] proof = HandshakeAuth.ComputeClientProof(keys, transcript);
+        await HitAsync(runtime, FaultStage.F03, FaultSites.ClientRequestSend, endpoint, 1, ct).ConfigureAwait(false);
         ReadOnlyMemory<byte> resultReply = await raw.CallAsync(MessageCodec.Encode(new HelloProofMessage(proof)), timeout, ct).ConfigureAwait(false);
+        await HitAsync(runtime, FaultStage.F14, FaultSites.ClientReplyReceived, endpoint, 1, ct).ConfigureAwait(false);
         CryptographicOperations.ZeroMemory(proof);
         IWireMessage resultMessage = MessageCodec.Decode(resultReply.Span);
         if (resultMessage is ErrorReplyMessage resultError)

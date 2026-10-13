@@ -195,12 +195,20 @@ public sealed record TestClusterOptions
         };
     }
 
-    /// <summary>The seed to use: <see cref="Seed"/> when nonzero, otherwise a stable nonzero hash of <paramref name="testName"/>.</summary>
+    /// <summary>
+    /// The seed to use: <see cref="Seed"/> when nonzero, otherwise the hexadecimal seed in the environment variable
+    /// <c>TDFS_TEST_SEED</c> when set (replaying a reported failure from a scratch test whose name differs), otherwise a
+    /// stable nonzero hash of <paramref name="testName"/>.
+    /// </summary>
     public ulong ResolveSeed(string testName)
     {
         ArgumentNullException.ThrowIfNull(testName);
         if (Seed != 0)
             return Seed;
+        string? replay = Environment.GetEnvironmentVariable("TDFS_TEST_SEED");
+        if (!string.IsNullOrWhiteSpace(replay) && ulong.TryParse(replay.Trim().Replace("0x", string.Empty, StringComparison.OrdinalIgnoreCase),
+                System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out ulong forced) && forced != 0)
+            return forced;
         ulong derived = SeededRandom.DeriveSeed(0x7D_F5_7E_57_0000_0001UL, testName);
         return derived == 0 ? 1 : derived;
     }
