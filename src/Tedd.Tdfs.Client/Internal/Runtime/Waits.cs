@@ -67,8 +67,16 @@ internal static class Waits
         using var timer = new CancellationTokenSource();
         using CancellationTokenRegistration link = ct.CanBeCanceled ? ct.UnsafeRegister(static s => ContextFree.Cancel((CancellationTokenSource)s!), timer) : default;
         Task delay = DelayAsync(time, timeout, timer.Token);
-        Task winner = await Task.WhenAny(task, delay).ConfigureAwait(false);
-        if (!ReferenceEquals(winner, task))
+
+        // The race is decided by continuations that complete a promise with no synchronization context installed (never
+        // Task.WhenAny: when the task completes on an application or simulation context, a ConfigureAwait(false)
+        // continuation of the WhenAny promise is queued to the thread pool).
+        var race = new TaskCompletionSource<bool>(TaskCreationOptions.None);
+        _ = task.ContinueWith(static (_, s) => ContextFree.Run(static r => r.TrySetResult(true), (TaskCompletionSource<bool>)s!), race, CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        _ = delay.ContinueWith(static (_, s) => ContextFree.Run(static r => r.TrySetResult(false), (TaskCompletionSource<bool>)s!), race, CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        if (!await race.Task.ConfigureAwait(false))
         {
             ct.ThrowIfCancellationRequested();
             return task.IsCompleted;

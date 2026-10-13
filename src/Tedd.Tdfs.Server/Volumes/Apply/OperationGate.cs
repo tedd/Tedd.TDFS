@@ -37,7 +37,7 @@ internal static class OperationGate
         DfsOperationId id = op.Id;
         if (!state.Sessions.TryGetValue(id.Session, out SessionRecord? session))
         {
-            return id.Session < state.NextSessionId
+            return state.ExpiredSession(id.Session)
                 ? new GateDecision(GateKind.Expired, $"Operation {id} belongs to a retired session.", null)
                 : new GateDecision(GateKind.Invalid, $"Operation {id} names a session this volume never issued.", null);
         }

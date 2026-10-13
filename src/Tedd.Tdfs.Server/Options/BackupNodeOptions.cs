@@ -35,4 +35,7 @@ public sealed record BackupNodeOptions
 
     /// <summary>Timing parameters.</summary>
     public NodeTimings Timings { get; init; } = NodeTimings.Production;
+
+    /// <summary>Deliberate safety mutations (mutation testing only; <see cref="SafetyMutations.None"/> in production).</summary>
+    public SafetyMutations Mutations { get; init; } = SafetyMutations.None;
 }

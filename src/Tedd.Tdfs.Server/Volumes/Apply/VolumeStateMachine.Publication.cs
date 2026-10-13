@@ -13,7 +13,7 @@ internal sealed partial class VolumeStateMachine
         string principal = ctx.Op?.Principal ?? string.Empty;
         if (!s.Handles.TryGetValue(handleId, out HandleRecord? h))
         {
-            throw handleId == 0 || handleId >= s.NextHandleId
+            throw !s.IssuedHandle(handleId)
                 ? Fail(DfsErrorCode.InvalidHandle, $"Handle {handleId} was never issued by this volume.")
                 : Fail(DfsErrorCode.LeaseLost, $"Handle {handleId} is no longer active (closed or its lease expired).");
         }

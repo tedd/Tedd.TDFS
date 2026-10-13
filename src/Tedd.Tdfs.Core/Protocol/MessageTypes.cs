@@ -110,7 +110,8 @@ public static class MessageTypes
         MessageType.AdminRequest or MessageType.AdminResult => DfsOperationKind.Admin,
 
         MessageType.BackupRegister or MessageType.BackupRegisterResult or MessageType.BackupStatus or MessageType.BackupStatusResult or
-        MessageType.BackupRequestSync or MessageType.BackupRequestSyncResult or MessageType.BackupRetention or MessageType.BackupRetentionResult
+        MessageType.BackupRequestSync or MessageType.BackupRequestSyncResult or MessageType.BackupRetention or MessageType.BackupRetentionResult or
+        MessageType.BackupTargetUpdate or MessageType.BackupTargetUpdateResult
             => DfsOperationKind.Admin,
         MessageType.BackupAwait or MessageType.BackupAwaitResult => DfsOperationKind.BackupAwait,
         MessageType.BackupBegin or MessageType.BackupBeginResult or MessageType.BackupInventory or MessageType.BackupInventoryResult or

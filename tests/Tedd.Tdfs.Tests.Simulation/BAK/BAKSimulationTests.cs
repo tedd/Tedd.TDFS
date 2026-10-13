@@ -155,7 +155,8 @@ public sealed class BAKSimulationTests
         DfsVolumeStatus volumeStatus = await client.Admin.GetVolumeStatusAsync(Volume, Ct);
         Assert.All(volumeStatus.Group.Voters.Concat(volumeStatus.Group.Learners),
             m => Assert.False(backupNames.Contains(m), $"{because}: volume group member {m}"));
-        Assert.Equal(backupNames.Count, volumeStatus.Backups.Count);
+        IReadOnlyList<string> registered = await client.GetVolume(Volume).Backups.ListTargetsAsync(Ct);
+        Assert.Equal(registered.Order(StringComparer.Ordinal), volumeStatus.Backups.Select(b => b.Target).Order(StringComparer.Ordinal));
     }
 
     // ------------------------------------------------------------------------------------------------------------
@@ -1184,7 +1185,25 @@ public sealed class BAKSimulationTests
         }
         else
         {
-            await AssertNotSelectableAsync(probe, next, because);
+            Xunit.Sdk.XunitException? selectable = null;
+            try
+            {
+                await AssertNotSelectableAsync(probe, next, because);
+            }
+            catch (Xunit.Sdk.XunitException ex)
+            {
+                selectable = ex;
+            }
+
+            if (selectable is not null)
+            {
+                // The interrupted transfer may resume and finish while these checks run (a new source leader resumes it on its
+                // own): the next snapshot must then be published, and only complete.
+                IReadOnlyList<string> now = await backup.Inspect.GetPublishedSnapshotsAsync(Volume);
+                Assert.True(now.Contains(next, StringComparer.Ordinal), $"{because}: {selectable.Message}");
+                Assert.Empty(await backup.Inspect.VerifyClosureAsync(Volume, next));
+                await AssertBackupSnapshotAsync(probe, next, nextModel, $"{because}: {next} may only be published complete");
+            }
         }
     }
 
@@ -2992,20 +3011,33 @@ public sealed class BAKSimulationTests
             await PutAsync(vol, model, "/old/x.bin", TestData.Bytes(290, 150 * 1024));
             await SnapshotAsync(vol, "s2");
             HashSet<ObjectId> oldOnlyObjects = await FileObjectsAsync(cluster, ["/old/x.bin"]);
-            List<CapturedMessage> oldFrames;
-            using (MessageHold transfer = cluster.Network.Hold(new MessageFilter(To: b0.Name, Operation: DfsOperationKind.BackupTransfer, Direction: Transport.LinkDirection.Request)))
-            using (MessageHold publish = cluster.Network.Hold(new MessageFilter(To: b0.Name, Operation: DfsOperationKind.BackupPublish, Direction: Transport.LinkDirection.Request)))
+            List<CapturedMessage> oldFrames = [];
+            var transferFilter = new MessageFilter(To: b0.Name, Operation: DfsOperationKind.BackupTransfer, Direction: Transport.LinkDirection.Request);
+            MessageHold transfer = cluster.Network.Hold(transferFilter);
+            try
             {
+                using MessageHold publish = cluster.Network.Hold(new MessageFilter(To: b0.Name, Operation: DfsOperationKind.BackupPublish, Direction: Transport.LinkDirection.Request));
                 await vol.Backups.RequestSyncAsync(b0.TargetName, "s2", Ct);
                 await cluster.WaitUntilAsync(() =>
                 {
-                    transfer.ReleaseAll();
+                    // ReleaseAll ends a hold: keep capturing the transfer stream with a fresh hold after each release.
+                    if (transfer.Count > 0)
+                    {
+                        oldFrames.AddRange(transfer.Captured);
+                        transfer.ReleaseAll();
+                        transfer = cluster.Network.Hold(transferFilter);
+                    }
+
                     return Task.FromResult(publish.Count > 0);
                 }, SyncTimeout, "the old-epoch export reaches its publish request", Ct);
                 CutFromSources(cluster, b0.Name);
                 publish.DropAll();
                 transfer.DropAll();
-                oldFrames = [.. transfer.Captured, .. publish.Captured];
+                oldFrames = [.. oldFrames, .. transfer.Captured, .. publish.Captured];
+            }
+            finally
+            {
+                transfer.Dispose();
             }
 
             Assert.Contains(oldFrames, f => f.Type == MessageType.BackupBegin);
@@ -3210,6 +3242,7 @@ public sealed class BAKSimulationTests
                 model.Put($"/bulk/f{i}.bin", TestData.Bytes(310 + (ulong)i, 512 * 1024));
             await WriteTreeAsync(vol, model);
             await vol.Directories.CreateDirectoryAsync("/unrelated", Ct);
+            model.AddDirectory("/unrelated");
             DfsSnapshotInfo s1 = await SnapshotAsync(vol, "s1");
             TestNode leader = await cluster.GetLeaderAsync(Volume, Ct);
             long leaderStagedBaseline = await leader.Inspect.GetStagedBytesAsync();

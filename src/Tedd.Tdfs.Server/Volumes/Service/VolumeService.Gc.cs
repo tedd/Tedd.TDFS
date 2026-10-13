@@ -199,7 +199,7 @@ internal sealed partial class VolumeService
     {
         RequireVolumeAdmin(context.Principal ?? string.Empty);
         ulong applied = await ReadBarrierAsync(context.Cancellation);
-        var body = new AdminVolumeStatusBody(_s.Control.ToVolumeEntry(Record), Token(applied), _s.Admin.GroupStatus(Group, Name), ReplicaHealth(), []);
+        var body = new AdminVolumeStatusBody(_s.Control.ToVolumeEntry(Record), Token(applied), _s.Admin.GroupStatus(Group, Name), ReplicaHealth(), BackupStatuses());
         return AdminResultMessage.Create(request.Op, body);
     }
 

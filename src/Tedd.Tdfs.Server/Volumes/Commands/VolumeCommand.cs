@@ -51,6 +51,8 @@ internal enum VolumeCommandKind : ushort
 
     RecordBackupProgress = 600,
     AbandonTransferLineage = 601,
+    RequestBackupSync = 602,
+    RemoveBackupTargetState = 603,
 
     SetPolicy = 700,
     SetAcl = 701,

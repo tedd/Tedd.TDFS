@@ -328,6 +328,11 @@ partial void StartDataJobs(NodeServices services);
 partial void StartBackupJobs(NodeServices services);
 ```
 
+The backup exporter reconciliation is started on demand rather than from `StartBackupJobs`: the volume service's
+leadership and control-record hooks call `BackupExporters.OnVolumeChanged`, which starts the periodic job the first time
+the node hosts a volume with a registered target or leftover backup state, so nodes of clusters without backups run no
+backup job (and their deterministic schedules are unchanged).
+
 Handlers resolve the volume with `services.Volumes.TryGet(VolumeId)` / `TryGet(string name)` / `TryGetByGroup(group)`,
 throw `host.Group.NotLeader()` when not leading, and check permissions with
 `services.Control.State.GetPermissions(context.Principal!, volumeId)`. `BackgroundTasks.StartPeriodic` jobs stop with

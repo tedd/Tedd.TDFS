@@ -186,6 +186,7 @@ peer                                         server (live node or backup node)
 | `PutObject`, `GetObject`, `LocateObject` | any storage node (live node), backup node for its own objects | Client, Node |
 | `ReplicateObject`, `DeleteObjects`, `CopyObjects` | storage node | Node (volume leader / restore coordinator) |
 | `RestoreVolume` | control leader | Node (restore coordinator) |
+| `BackupTargetUpdate` | control leader | Node (volume leader serving `BackupRegister`) |
 | `RestoreInstall` | leader of the restoring volume | Node (restore coordinator) |
 | `InventoryReport` | volume leader | Node |
 | `RaftBatch`, `RaftSnapshotChunk` | group members | Node |
@@ -319,6 +320,7 @@ carry an operation id; **opt** = may carry one (then retries are deduplicated); 
 | `InventoryReport` | — | — (report id, page) | Idempotent per page; the GC answer is only given on the last page. |
 | `CopyObjects` | durable local writes | — (from, to) | Idempotent per pair. |
 | `RestoreVolume` | `CreateRestoringVolume` / `FinishRestoringVolume` (control) | `RequestId` | Deduplicated by the control group's administrative outcomes. |
+| `BackupTargetUpdate` | `RegisterBackupTarget` / `RemoveBackupTarget` (control) | `RequestId` | Deduplicated by the control group's administrative outcomes. |
 | `RestoreInstall` | `RestoreChunk` / `RestoreComplete` | — (source tag) | Idempotent per restore source. |
 | `RaftBatch`, `RaftSnapshotChunk` | Raft | — | Raft tolerates duplicates/reordering. |
 | `AdminRequest` | control/volume entries | `RequestId` | Deduplicated while the leader retains the id; otherwise natural idempotence (for example `AlreadyExists`). |
@@ -531,7 +533,13 @@ created or copied.
 
 * **Client → live volume leader**: `BackupRegister` (register/remove/configure/list), `BackupStatus`,
   `BackupRequestSync`, `BackupAwait` (commit-boundary or exact-snapshot barrier; bounded wait; a timeout never rolls
-  back the live commit).
+  back the live commit). Registrations live in the volume's control record: the volume leader authorizes the caller,
+  wraps the export secret with the cluster key-encryption key and forwards the change to the control leader with
+  `BackupTargetUpdate` (request id derived from the volume and the operation id, so retries are deduplicated), then
+  waits until its own control replica applied it. Removing a target also releases its transfer pins and drops its
+  progress from the volume state. `BackupRequestSync` commits a volume entry that pins the snapshot for the target
+  (creating an export snapshot when none is named and the volume changed since the latest one); when that pin is the
+  target's next transfer, the reply waits (at most 1 s) until the exporter sent the transfer's first requests.
 * **Exporter (volume leader) → backup node**, authenticated with the target's export credentials:
   `BackupBegin` (transfer key = source cluster, volume, epoch, lineage, snapshot; older epochs rejected — BAK-026;
   `ReseedRequired` when the lineage cannot continue) → `BackupInventory` batches (hint only) → `BackupPutObject` for
@@ -2046,6 +2054,34 @@ Reply to `BackupAwaitMessage`.
 | 2 | `Checkpoint` | `BackupCheckpoint?` | The satisfying checkpoint (actual snapshot, covered commit, retention). |
 | 3 | `LastPublished` | `BackupCheckpoint?` | Latest published checkpoint (reported when not reached). |
 | 4 | — | `extensions` | Terminal extension block. |
+
+#### `BackupTargetUpdate` = 158 (`BackupTargetUpdateMessage`)
+
+Applies a backup target registration change of a volume to the control state (volume leader serving `BackupRegister` → control leader; node peers only, §8.6). The volume leader authorized the requesting principal (BackupAdmin on the volume) and wrapped the export secret with the cluster key-encryption key before sending; the control leader re-checks the grant on its own state. `Register` and `Configure` store the complete registration (`Configure` requires an existing target); `Remove` removes it; `List` is not allowed. Deduplicated by `RequestId` through the control group's administrative outcomes. Errors: VolumeNotFound, BackupTargetNotFound, InvalidArgument, AccessDenied, NotLeader.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `RequestId` | `u128` | Deduplication id (derived by the volume leader from the volume and the request's operation id). |
+| 2 | `Volume` | `VolumeId` | The volume. |
+| 3 | `Action` | `enum BackupTargetAction` | Change to apply (`List` is not allowed). |
+| 4 | `Principal` | `string` | Principal that requested the change. |
+| 5 | `Target` | `string` | Target name. |
+| 6 | `Endpoints` | `list<string>` | Target endpoints (Register, Configure). |
+| 7 | `ExportPrincipal` | `string` | Principal the exporter authenticates as on the target (Register, Configure). |
+| 8 | `WrappedExportSecret` | `bytes` | The export principal's secret wrapped with the cluster key-encryption key (Register, Configure). |
+| 9 | `Schedule` | `BackupScheduleData?` | Schedule (Register, Configure). |
+| 10 | `Budgets` | `BackupBudgetsData?` | Budgets (Register, Configure). |
+| 11 | — | `extensions` | Terminal extension block. |
+
+#### `BackupTargetUpdateResult` = 159 (`BackupTargetUpdateResultMessage`)
+
+Reply to `BackupTargetUpdateMessage`.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Targets` | `list<string>` | Registered target names of the volume after the change. |
+| 2 | `ControlIndex` | `varuint` | Control-log index of the change (the volume leader waits until its own control replica applied it). |
+| 3 | — | `extensions` | Terminal extension block. |
 
 #### `BackupBegin` = 160 (`BackupBeginMessage`)
 

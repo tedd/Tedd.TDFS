@@ -316,6 +316,9 @@ public sealed class RstSimulationTests
                 {
                     CommitToken oldCommit = await oldWriter.CommitAsync(Ct);
                     Assert.True(oldCommit.IsComparableWith(oldToken) && oldCommit.IsAtOrAfter(oldToken), "the old volume remains its own authority");
+
+                    // The old writer holds FileShare.None (LOCK-02): close it before reading the file back.
+                    await oldWriter.DisposeAsync();
                     await RecoveryScenario.AssertFileBytesAsync(oldVolume.Files, "/docs/one.bin", staged, "the old volume keeps its own writer", Ct);
                     await RecoveryScenario.AssertFileBytesAsync(newVolume.Files, "/docs/one.bin", fresher, "the old writer's commit does not reach the new volume", Ct);
                 }

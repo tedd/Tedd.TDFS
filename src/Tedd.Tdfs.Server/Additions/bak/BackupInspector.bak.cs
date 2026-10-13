@@ -1,3 +1,8 @@
+using Tedd.Tdfs.Data;
+using Tedd.Tdfs.Protocol.Messages;
+using Tedd.Tdfs.Server.Backup;
+using Tedd.Tdfs.Storage;
+
 namespace Tedd.Tdfs.Server;
 
 // Test-visible additions requested by the BAK suite (docs/api-additions/bak.md). All members are read-only
@@ -14,7 +19,19 @@ public sealed partial class BackupInspector
     /// BAK-026, BAK-027.
     /// </summary>
     public Task<IReadOnlyList<BackupSnapshotInspection>> GetSnapshotsAsync(string volume)
-        => throw new NotImplementedException("BackupInspector.GetSnapshotsAsync: implemented in a later phase");
+    {
+        ArgumentNullException.ThrowIfNull(volume);
+        return _loop.InvokeAsync<IReadOnlyList<BackupSnapshotInspection>>(() =>
+        {
+            if (S.Catalog.Find(volume) is not { } v)
+                return [];
+            BackupSnapshot? pointer = v.Pointer;
+            return v.Snapshots
+                .Select(s => new BackupSnapshotInspection(s.Name, s.Id, s.Covered, s.Lineage, ReferenceEquals(s, pointer), s.Retention,
+                    s.Closure.Distinct().OrderBy(o => o.Value).ToArray(), s.ReaderPins))
+                .ToArray();
+        });
+    }
 
     /// <summary>
     /// Returns the state of the in-progress (not yet published) incoming transfer for <paramref name="volume"/>, or
@@ -25,7 +42,29 @@ public sealed partial class BackupInspector
     /// BAK-006, BAK-007, BAK-009, BAK-016.
     /// </summary>
     public Task<BackupReceiveInspection?> GetReceiveStateAsync(string volume)
-        => throw new NotImplementedException("BackupInspector.GetReceiveStateAsync: implemented in a later phase");
+    {
+        ArgumentNullException.ThrowIfNull(volume);
+        return _loop.InvokeAsync(() =>
+        {
+            if (S.Catalog.Find(volume)?.Staged is not { } staged)
+                return null;
+            var missing = new HashSet<ObjectId>();
+            if (staged.Manifest is { } manifest)
+            {
+                foreach (BackupObjectRef obj in manifest.Closure)
+                {
+                    if (!staged.Durable.Contains(obj.Id) || S.Store?.TryGetInfo(obj.Id) is not { } info || info.Length != obj.Length
+                        || info.Checksum != obj.Checksum)
+                    {
+                        missing.Add(obj.Id);
+                    }
+                }
+            }
+
+            return new BackupReceiveInspection(staged.SnapshotName, staged.Key.LineageId, staged.Key.Epoch, staged.Manifest is not null,
+                new HashSet<ObjectId>(staged.Received), new HashSet<ObjectId>(staged.Durable), missing, staged.ReceivedBytes);
+        });
+    }
 
     /// <summary>
     /// Returns, for every object stored on this backup node, the number of retained snapshots (all volumes and
@@ -34,8 +73,7 @@ public sealed partial class BackupInspector
     /// by nothing reports 0. Duplicate deliveries of the same immutable object must never change the count. Used by
     /// BAK-009, BAK-027.
     /// </summary>
-    public Task<IReadOnlyDictionary<ObjectId, int>> GetObjectReferenceCountsAsync()
-        => throw new NotImplementedException("BackupInspector.GetObjectReferenceCountsAsync: implemented in a later phase");
+    public Task<IReadOnlyDictionary<ObjectId, int>> GetObjectReferenceCountsAsync() => _loop.InvokeAsync(() => S.Catalog.ReferenceCounts());
 
     /// <summary>
     /// Independently re-reads and verifies (identity, length, encoding and checksum) every object in the dependency
@@ -45,7 +83,42 @@ public sealed partial class BackupInspector
     /// Used by BAK-006, BAK-008, BAK-010, BAK-012, BAK-020, BAK-024.
     /// </summary>
     public Task<IReadOnlyList<ObjectId>> VerifyClosureAsync(string volume, string snapshotName)
-        => throw new NotImplementedException("BackupInspector.VerifyClosureAsync: implemented in a later phase");
+    {
+        ArgumentNullException.ThrowIfNull(volume);
+        ArgumentNullException.ThrowIfNull(snapshotName);
+        return _loop.InvokeAsync<IReadOnlyList<ObjectId>>(async () =>
+        {
+            BackupSnapshot snapshot = S.Catalog.Find(volume)?.Snapshots.LastOrDefault(s => string.Equals(s.Name, snapshotName, StringComparison.Ordinal))
+                ?? throw new DfsException(DfsErrorCode.SnapshotNotFound, $"Snapshot '{snapshotName}' of volume '{volume}' is not retained on {S.Name}.");
+            BackupManifest manifest = snapshot.Manifest
+                ?? throw new DfsRecoveryKeyMissingException($"The manifest of snapshot '{snapshotName}' cannot be decrypted without the recovery key.");
+            ObjectStore store = S.RequireStore("verifying a closure");
+            var failed = new List<ObjectId>();
+            foreach (BackupObjectRef obj in manifest.Closure)
+            {
+                if (!await VerifyObjectAsync(store, obj))
+                    failed.Add(obj.Id);
+            }
+
+            return failed;
+        });
+    }
+
+    private static async Task<bool> VerifyObjectAsync(ObjectStore store, BackupObjectRef obj)
+    {
+        if (store.TryGetInfo(obj.Id) is not { } info || info.Length != obj.Length || info.Checksum != obj.Checksum || obj.Encoding != ObjectEncodings.Plain)
+            return false;
+        try
+        {
+            var data = new byte[info.Length];
+            int read = data.Length == 0 ? 0 : await store.ReadAsync(obj.Id, 0, data, CancellationToken.None);
+            return read == data.Length && ObjectChecksum.Compute(data) == obj.Checksum;
+        }
+        catch (Exception ex) when (ex is DfsException or IOException or ObjectDisposedException)
+        {
+            return false;
+        }
+    }
 }
 
 /// <summary>A snapshot retained by a backup node (BAK additions).</summary>

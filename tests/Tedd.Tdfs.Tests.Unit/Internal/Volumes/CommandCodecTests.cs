@@ -83,6 +83,8 @@ public sealed class CommandCodecTests
             VolumeCommandKind.SetOwner => new SetOwnerCommand("/a", DfsIdentity.Group("g")),
             VolumeCommandKind.RotateDataKey => new RotateDataKeyCommand(2),
             VolumeCommandKind.MigratePolicy => new MigratePolicyCommand(DfsStoragePolicy.Default),
+            VolumeCommandKind.RequestBackupSync => new RequestBackupSyncCommand("t", null, "export-t-1"),
+            VolumeCommandKind.RemoveBackupTargetState => new RemoveBackupTargetStateCommand("t"),
             _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "no sample"),
         };
         return command with { LeaderTime = Epoch0.AddTicks(12345), Op = Op("p", 3, 9, DfsOperationKind.Copy, new UInt128(7, 8), groups: "g") };

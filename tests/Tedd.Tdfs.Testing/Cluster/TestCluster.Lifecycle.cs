@@ -511,6 +511,7 @@ public sealed partial class TestCluster
             },
             CapacityBytes = Options.NodeCapacityBytes,
             Timings = Options.Timings,
+            Mutations = Options.Mutations,
         };
 
         lock (_gate)

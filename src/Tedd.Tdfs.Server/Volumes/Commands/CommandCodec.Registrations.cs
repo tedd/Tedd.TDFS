@@ -46,6 +46,8 @@ internal static partial class CommandCodec
 
         readers.Add(VolumeCommandKind.RecordBackupProgress, RecordBackupProgressCommand.ReadBody);
         readers.Add(VolumeCommandKind.AbandonTransferLineage, AbandonTransferLineageCommand.ReadBody);
+        readers.Add(VolumeCommandKind.RequestBackupSync, RequestBackupSyncCommand.ReadBody);
+        readers.Add(VolumeCommandKind.RemoveBackupTargetState, RemoveBackupTargetStateCommand.ReadBody);
 
         readers.Add(VolumeCommandKind.SetPolicy, SetPolicyCommand.ReadBody);
         readers.Add(VolumeCommandKind.SetAcl, SetAclCommand.ReadBody);

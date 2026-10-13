@@ -191,7 +191,7 @@ internal sealed partial class VolumeStateMachine
         string principal = ctx.Op?.Principal ?? string.Empty;
         if (!s.Handles.TryGetValue(c.Handle, out HandleRecord? h))
         {
-            if (c.Handle == 0 || c.Handle >= s.NextHandleId)
+            if (!s.IssuedHandle(c.Handle))
                 throw Fail(DfsErrorCode.InvalidHandle, $"Handle {c.Handle} was never issued by this volume.");
             return (s, VolumeApplyResult.Ok(new CloseHandleResultMessage(false, s.TokenAt(ctx.Index))));
         }
@@ -215,7 +215,7 @@ internal sealed partial class VolumeStateMachine
         if (c.Handle != 0)
         {
             if (!s.Handles.TryGetValue(c.Handle, out HandleRecord? h))
-                throw Fail(c.Handle >= s.NextHandleId ? DfsErrorCode.InvalidHandle : DfsErrorCode.LeaseLost, $"Handle {c.Handle} is not active.");
+                throw Fail(!s.IssuedHandle(c.Handle) ? DfsErrorCode.InvalidHandle : DfsErrorCode.LeaseLost, $"Handle {c.Handle} is not active.");
             if (!string.Equals(h.Principal, principal, StringComparison.Ordinal))
                 throw Fail(DfsErrorCode.InvalidHandle, $"Handle {c.Handle} belongs to another principal.");
             if (!h.IsWriter)

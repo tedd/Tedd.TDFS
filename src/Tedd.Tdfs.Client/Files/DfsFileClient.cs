@@ -60,10 +60,13 @@ public sealed partial class DfsFileClient
         using OperationScope scope = Begin(DfsOperationKind.Open, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.FilePath(path);
-        Validation.OpenOptions(options, IsTransactionBound);
+        ArgumentNullException.ThrowIfNull(options);
+
+        // A read-only facade (snapshot view, backup host) refuses every writer open as such, whatever else is wrong with it.
         bool writable = (options.Access & FileAccess.Write) != 0;
         if (writable)
             EnsureWritable();
+        Validation.OpenOptions(options, IsTransactionBound);
         using DfsTransaction.TransactionOperation? txOperation = EnterTransaction();
         scope.Path = p;
         await scope.ValidatedAsync().ConfigureAwait(false);

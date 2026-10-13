@@ -588,18 +588,18 @@ internal sealed partial class VolumeService
         return [.. result.Values];
     }
 
-    private static (DfsStoragePolicy Policy, string Pool) PolicyOf(VolumeRecord volume, string? name)
+    internal static (DfsStoragePolicy Policy, string Pool) PolicyOf(VolumeRecord volume, string? name)
     {
         DfsStoragePolicy policy = name is { Length: > 0 } && volume.NamedPolicies.TryGetValue(name, out DfsStoragePolicy? named) ? named : volume.DefaultPolicy;
         return (policy, policy.Pool ?? volume.StoragePool);
     }
 
-    private static bool Stronger(DfsStoragePolicy candidate, DfsStoragePolicy current)
+    internal static bool Stronger(DfsStoragePolicy candidate, DfsStoragePolicy current)
         => (candidate.DurableCopiesBeforeAck, candidate.DurableZonesBeforeAck, candidate.TargetCopies)
             .CompareTo((current.DurableCopiesBeforeAck, current.DurableZonesBeforeAck, current.TargetCopies)) > 0;
 
     /// <summary>Encodes the restored inodes into stage requests (format byte, then the records).</summary>
-    private static List<(ReadOnlyMemory<byte> Records, int Count)> EncodeRestoreChunks(IReadOnlyList<InodeRecord> inodes)
+    internal static List<(ReadOnlyMemory<byte> Records, int Count)> EncodeRestoreChunks(IReadOnlyList<InodeRecord> inodes)
     {
         var chunks = new List<(ReadOnlyMemory<byte>, int)>();
         var buffer = new ArrayBufferWriter<byte>();
