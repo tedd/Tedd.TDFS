@@ -15,6 +15,7 @@ internal sealed partial class VolumeService
     public async Task<IWireMessage> GetAccessControlAsync(RpcContext context, GetAccessControlMessage request)
     {
         string principal = context.Principal ?? string.Empty;
+        BindTransaction(request, principal);
         (ImmutableSortedDictionary<ulong, InodeRecord> root, Resolution res, string path, CommitToken observed) =
             await ResolveForReadAsync(context, request, request.Path, request.SnapshotPin, "read permissions");
         (IReadOnlySet<DfsIdentity> ids, bool admin) = IdentitySetOf(principal);
@@ -59,6 +60,7 @@ internal sealed partial class VolumeService
     public async Task<IWireMessage> GetEffectiveRightsAsync(RpcContext context, GetEffectiveRightsMessage request)
     {
         string principal = context.Principal ?? string.Empty;
+        BindTransaction(request, principal);
         (_, Resolution res, string path, CommitToken observed) = await ResolveForReadAsync(context, request, request.Path, request.SnapshotPin, "effective rights");
         IReadOnlyList<InodeRecord> chain = res.ChainNearestFirst();
         (IReadOnlySet<DfsIdentity> callerIds, bool callerAdmin) = IdentitySetOf(principal);
@@ -98,6 +100,7 @@ internal sealed partial class VolumeService
     public async Task<IWireMessage> ListStreamsAsync(RpcContext context, ListStreamsMessage request)
     {
         string principal = context.Principal ?? string.Empty;
+        BindTransaction(request, principal);
         string normalized = NormalizePath(request.Path);
         if (DfsStreamPath.HasStream(normalized))
             throw new ArgumentException($"'{normalized}' addresses a stream; list the streams of its file.", "path");
@@ -122,8 +125,8 @@ internal sealed partial class VolumeService
         RpcContext context, IVolumeRequest request, string rawPath, ulong snapshotPin, string what)
     {
         CancellationToken ct = context.Cancellation;
-        RejectTransaction(request);
         string principal = context.Principal ?? string.Empty;
+        BindTransaction(request, principal);
         RequireGrant(principal, DfsPermissions.Read, what);
         string path = NormalizePath(rawPath);
         ulong applied = await ReadBarrierAsync(ct);

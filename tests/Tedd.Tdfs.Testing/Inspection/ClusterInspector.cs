@@ -78,6 +78,23 @@ public sealed partial class ClusterInspector
         return holders.TryGetValue(id, out List<TestNode>? nodes) ? Domains(nodes) : (0, 0);
     }
 
+    /// <summary>The policy an object is measured against: the strongest named policy referencing it, else the volume default.</summary>
+    private static DfsStoragePolicy PolicyOf(HarnessVolumeSummary summary, IReadOnlySet<string>? names)
+    {
+        DfsStoragePolicy? strongest = null;
+        foreach (string name in names ?? (IReadOnlySet<string>)new HashSet<string>())
+        {
+            DfsStoragePolicy candidate = name.Length > 0 && summary.NamedPolicies.TryGetValue(name, out DfsStoragePolicy? named) ? named : summary.DefaultPolicy;
+            if (strongest is null || candidate.TargetCopies > strongest.TargetCopies
+                || (candidate.TargetCopies == strongest.TargetCopies && candidate.TargetDistinctZones > strongest.TargetDistinctZones))
+            {
+                strongest = candidate;
+            }
+        }
+
+        return strongest ?? summary.DefaultPolicy;
+    }
+
     /// <summary>Replica health of a volume, computed by the harness (not read from the product).</summary>
     /// <remarks>
     /// Objects: those reachable from the leader's applied state (current root, snapshots, transactions, pins). Each is
@@ -99,7 +116,7 @@ public sealed partial class ClusterInspector
         HarnessControlSummary control = await leaderInspector.GetControlSummaryAsync();
         HarnessVolumeSummary summary = control.FindVolume(volume) ?? throw new ArgumentException($"Volume '{volume}' does not exist.", nameof(volume));
         IReadOnlySet<ObjectId> reachable = state.ReachableObjects();
-        DfsStoragePolicy policy = summary.DefaultPolicy;
+        IReadOnlyDictionary<ObjectId, IReadOnlySet<string>> objectPolicies = state.ObjectPolicies();
         IReadOnlySet<string> poolNodes = PoolMembers(control, summary.StoragePool);
 
         var lengths = new Dictionary<ObjectId, long>();
@@ -129,6 +146,9 @@ public sealed partial class ClusterInspector
         {
             List<TestNode> nodes = holders.TryGetValue(id, out List<TestNode>? h) ? h : [];
             (int copies, int zones) = Domains(nodes);
+
+            // Each object is measured against the policy of the file(s) referencing it (the strongest when shared).
+            DfsStoragePolicy policy = PolicyOf(summary, objectPolicies.GetValueOrDefault(id));
             if (copies == 0)
                 missing++;
             if (copies < policy.TargetCopies)

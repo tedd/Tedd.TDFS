@@ -113,7 +113,7 @@ internal sealed partial class VolumeStateMachine
     /// The implicit, instantaneous writer reservation of WriteAll/Append/Copy by path (ARCHITECTURE §9.4): no writer may hold
     /// the stream and every reader must grant <see cref="FileShare.Write"/>.
     /// </summary>
-    internal static void RequireImplicitWriter(VolumeState s, StreamKey key, string what)
+    internal static void RequireImplicitWriter(VolumeState s, ApplyContext ctx, StreamKey key, string what)
     {
         foreach (HandleRecord h in HandlesOf(s, key))
         {
@@ -122,6 +122,24 @@ internal sealed partial class VolumeStateMachine
             if ((h.Share & FileShare.Write) == 0)
                 throw Fail(DfsErrorCode.SharingViolation, $"{what}: handle {h.Id} does not grant FileShare.Write.");
         }
+
+        if (ReservationHolder(s, ctx, key) is { } holder)
+            throw Fail(DfsErrorCode.SharingViolation, $"{what}: transaction {holder.Id} holds the writer reservation.");
+    }
+
+    /// <summary>
+    /// The active transaction, other than the command's own (<see cref="ApplyContext.Transaction"/>), that holds the writer
+    /// reservation of <paramref name="key"/> (LOCK-01, LOCK-019), or null.
+    /// </summary>
+    internal static TxRecord? ReservationHolder(VolumeState s, ApplyContext ctx, StreamKey key)
+    {
+        foreach (TxRecord tx in s.Transactions.Values)
+        {
+            if (tx.State == TxState.Active && tx.Id != ctx.Transaction && tx.Reservations.Contains(key))
+                return tx;
+        }
+
+        return null;
     }
 
     // ------------------------------------------------------------------------------------------------- inodes

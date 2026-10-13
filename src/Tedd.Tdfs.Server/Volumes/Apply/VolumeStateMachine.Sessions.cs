@@ -156,6 +156,17 @@ internal sealed partial class VolumeStateMachine
     private static (VolumeState, VolumeApplyResult) ApplyFence(VolumeState s, ApplyContext ctx, FenceOperationCommand c)
     {
         string principal = ctx.Op?.Principal ?? string.Empty;
+        if (c.IsTransaction && s.Transactions.TryGetValue(c.Target, out TxRecord? tx))
+        {
+            // A resolving query of a transaction's commit: an active transaction is aborted, so its commit can never apply
+            // later and the answer is definite (OUT-013).
+            QueryOperationResultMessage status = QueryTransaction(s, c.Target, principal, out bool active);
+            if (!active)
+                return (s, VolumeApplyResult.Ok(status));
+            s = EndTransaction(s, tx, TxState.Aborted, ctx.Index);
+            return (s, VolumeApplyResult.Ok(QueryTransaction(s, c.Target, principal, out _)));
+        }
+
         QueryOperationResultMessage reply = QueryOutcome(s, c.Target, principal, out SessionRecord? session, out bool fenceable);
         if (!fenceable || session is null)
             return (s, VolumeApplyResult.Ok(reply));
@@ -198,6 +209,10 @@ internal sealed partial class VolumeStateMachine
                 ReadOnlyMemory<byte>.Empty);
         }
 
+        // An accepted restore runs in steps after its intent was committed and records its outcome when it finishes: it is in
+        // flight and must never be fenced (a fence would report Aborted for a restore that later creates its volume).
+        if (s.Restores.ContainsKey(target))
+            return Status(target, WireOutcomeStatus.Pending, "The restore was accepted and is still running.");
         if (session.State != SessionState.Active || target.Sequence <= session.RetiredWatermark)
             return Status(target, WireOutcomeStatus.Expired, "The operation id is outside the retained outcome window.");
         fenceable = true;

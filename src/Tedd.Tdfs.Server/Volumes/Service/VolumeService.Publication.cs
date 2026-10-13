@@ -41,7 +41,7 @@ internal sealed partial class VolumeService
                 StreamRecord stream = inode.GetStream(h.Stream) ?? throw new DfsLeaseLostException($"The stream of handle {h.Id} no longer exists.");
                 (DfsStoragePolicy policy, string pool) = PolicyOf(inode.PolicyName);
                 string path = PathForFaults(s, h.Inode, h.Stream);
-                ImmutableArray<StreamChange> changes = await ValidateChangesAsync(request.Changes, request.Receipts, request.Staging, policy, pool,
+                ImmutableArray<StreamChange> changes = await ValidateChangesAsync(request.Changes, request.NewLength, request.Receipts, request.Staging, policy, pool,
                     DfsOperationKind.CommitFile, op.Id, path, ct);
                 if (h.IsAppend && VolumeStateMachine.AppendHandleError(stream.Length, request.TruncateTo, request.NewLength, changes) is { } appendError)
                 {
@@ -93,7 +93,7 @@ internal sealed partial class VolumeService
                     ?? (request.CreateParents && res.Status == ResolveStatus.AncestorMissing && res.Ancestors.Count > 0 ? res.Ancestors[^1].PolicyName : null)
                     ?? string.Empty;
                 (DfsStoragePolicy policy, string pool) = PolicyOf(policyName);
-                ImmutableArray<StreamChange> changes = await ValidateChangesAsync(request.Changes, request.Receipts, request.Staging, policy, pool,
+                ImmutableArray<StreamChange> changes = await ValidateChangesAsync(request.Changes, request.Length, request.Receipts, request.Staging, policy, pool,
                     DfsOperationKind.WriteAll, op.Id, path, ct);
                 PublishPlan plan = await PlanAsync(null, 0, changes, request.Length, policy, pool, request.Staging, op, ct);
                 var spec = new PublishSpec(0, request.Length, plan.Changes, plan.FinalInline, 0, request.Staging.Value, plan.LeaderStaging) { Policy = policyName };
@@ -145,7 +145,7 @@ internal sealed partial class VolumeService
                 string policyName = inode?.PolicyName ?? request.StoragePolicy ?? parent?.PolicyName ?? string.Empty;
                 (DfsStoragePolicy policy, string pool) = PolicyOf(policyName);
                 string faultPath = path.Length > 0 ? path : PathForFaults(State, key?.Inode ?? 0, key?.Stream ?? string.Empty);
-                ImmutableArray<StreamChange> relative = await ValidateChangesAsync(request.Changes, request.Receipts, request.Staging, policy, pool,
+                ImmutableArray<StreamChange> relative = await ValidateChangesAsync(request.Changes, request.AppendLength, request.Receipts, request.Staging, policy, pool,
                     DfsOperationKind.Append, op.Id, faultPath, ct);
                 long oldLength = stream?.Length ?? 0;
                 if (oldLength > long.MaxValue - request.AppendLength)
@@ -323,9 +323,10 @@ internal sealed partial class VolumeService
     /// §7.1 step 4): structure, receipt MAC/binding/incarnation/epoch/pool and the policy's durable copies and zones (F09 per
     /// object). The result carries the receipt holders as location hints.
     /// </summary>
-    private async Task<ImmutableArray<StreamChange>> ValidateChangesAsync(IReadOnlyList<RangeChange> changes, IReadOnlyList<ObjectReceipt> receipts,
+    private async Task<ImmutableArray<StreamChange>> ValidateChangesAsync(IReadOnlyList<RangeChange> changes, long length, IReadOnlyList<ObjectReceipt> receipts,
         StagingId staging, DfsStoragePolicy policy, string pool, DfsOperationKind kind, DfsOperationId opId, string path, CancellationToken ct)
     {
+        ValidateChangeLayout(changes, length);
         var result = ImmutableArray.CreateBuilder<StreamChange>(changes.Count);
         var objects = new SortedDictionary<ObjectId, RangeChange>(ObjectIdComparer.Instance);
         foreach (RangeChange c in changes)
@@ -344,12 +345,24 @@ internal sealed partial class VolumeService
             }
         }
 
+        // Receipts grouped by object once: evaluation stays linear in the request size (LAY-017: many small objects).
+        var receiptsByObject = new Dictionary<ObjectId, List<ObjectReceipt>>();
+        foreach (ObjectReceipt receipt in receipts)
+        {
+            if (!objects.ContainsKey(receipt.Object))
+                continue;
+            if (!receiptsByObject.TryGetValue(receipt.Object, out List<ObjectReceipt>? list))
+                receiptsByObject[receipt.Object] = list = [];
+            list.Add(receipt);
+        }
+
         var holders = new Dictionary<ObjectId, (ImmutableArray<NodeId> Holders, ulong Epoch)>();
         int occurrence = 0;
         ControlState control = _s.Control.State;
         foreach ((ObjectId obj, RangeChange c) in objects)
         {
-            ReceiptEvaluation evaluation = Receipts.Evaluate(receipts, _s.Keys.ReceiptKey, control, obj, c.Checksum, c.ObjectLength, c.Encoding, Record.Id,
+            List<ObjectReceipt> own = receiptsByObject.TryGetValue(obj, out List<ObjectReceipt>? found) ? found : [];
+            ReceiptEvaluation evaluation = Receipts.Evaluate(own, _s.Keys.ReceiptKey, control, obj, c.Checksum, c.ObjectLength, c.Encoding, Record.Id,
                 staging, pool);
             await _s.HitAsync(FaultStage.F09, FaultSites.CommitReceiptValidated, Name, kind, opId.IsEmpty ? null : opId, path, obj, occurrence++, ct: ct);
             if (!_s.Mutations.CommitMetadataBeforeData
@@ -360,7 +373,7 @@ internal sealed partial class VolumeService
                     policy.DurableCopiesBeforeAck, evaluation.Copies, policy.DurableZonesBeforeAck, evaluation.Zones);
             }
 
-            ulong epoch = receipts.FirstOrDefault(r => r.Object == obj && evaluation.Holders.Contains(r.Node))?.PlacementEpoch ?? control.PlacementEpoch;
+            ulong epoch = own.FirstOrDefault(r => evaluation.Holders.Contains(r.Node))?.PlacementEpoch ?? control.PlacementEpoch;
             holders[obj] = ([.. evaluation.Holders], epoch);
         }
 
@@ -381,6 +394,33 @@ internal sealed partial class VolumeService
         }
 
         return result.MoveToImmutable();
+    }
+
+    /// <summary>
+    /// Structural validation of a client's change list (LAY-018, PROTOCOL.md §8.1): every range lies inside
+    /// <c>[0, length)</c> of the published result and no two ranges overlap. Overlapping or out-of-file ranges are an
+    /// inconsistent encoding (InvalidArgument), never silently clipped or overridden.
+    /// </summary>
+    internal static void ValidateChangeLayout(IReadOnlyList<RangeChange> changes, long length)
+    {
+        if (length < 0)
+            throw new ArgumentException($"The published length {length} is negative.");
+        var ranges = new List<(long Start, long End)>(changes.Count);
+        foreach (RangeChange c in changes)
+        {
+            if (c.Offset < 0 || c.Length <= 0)
+                throw new ArgumentException($"Change [{c.Offset}, +{c.Length}) has a negative offset or a non-positive length.");
+            if (c.Offset > length - c.Length)
+                throw new ArgumentException($"Change [{c.Offset}, +{c.Length}) extends beyond the published length {length}.");
+            ranges.Add((c.Offset, c.Offset + c.Length));
+        }
+
+        ranges.Sort((a, b) => a.Start.CompareTo(b.Start));
+        for (int i = 1; i < ranges.Count; i++)
+        {
+            if (ranges[i].Start < ranges[i - 1].End)
+                throw new ArgumentException($"Changes [{ranges[i - 1].Start}, {ranges[i - 1].End}) and [{ranges[i].Start}, {ranges[i].End}) overlap.");
+        }
     }
 
     /// <summary>
@@ -504,9 +544,13 @@ internal sealed partial class VolumeService
     private async Task<ulong> CreateLeaderStagingAsync(OperationHeader op, CancellationToken ct)
     {
         OperationHeader header = op with { Id = default, PayloadHash = UInt128.Zero, Operation = DfsOperationKind.CreateStaging };
-        VolumeApplyResult result = await ProposeAsync(Stamp(new CreateStagingCommand(0, 0, default), header), ct);
+
+        // Always a real entry, also for a transaction-bound publication: the objects stored under it must be protected by a
+        // committed staging session (the transaction closes it when it ends without committing).
+        VolumeApplyResult result = await ProposeAsync(Stamp(new CreateStagingCommand(0, 0, default), header), ct, bypassTransaction: true);
         if (!result.IsSuccess || result.Value is not StagingRecord staging)
             throw DfsErrors.ToException(result.Code, result.Message);
+        CurrentTransaction?.LeaderStagings.Add(staging.Id);
         return staging.Id;
     }
 

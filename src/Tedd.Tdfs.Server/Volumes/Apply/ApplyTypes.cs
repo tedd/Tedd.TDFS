@@ -16,6 +16,19 @@ internal sealed record ApplyContext(ulong Index, ulong Term, VolumeCommand Comma
 
     /// <summary>The operation header (null for leader housekeeping commands).</summary>
     public OperationHeader? Op => Command.Op;
+
+    /// <summary>
+    /// The transaction a command executes for (its private working view on the leader, or the replay inside its commit):
+    /// that transaction's own writer reservations never conflict with the command. Empty for ordinary commands.
+    /// </summary>
+    public DfsOperationId Transaction { get; init; }
+
+    /// <summary>
+    /// True while a transaction's commit re-executes its writes: they run in the order and on the content the transaction's
+    /// working view had (the read set was validated first), so checks that guard a leader's plan against concurrent changes
+    /// between planning and apply (a derived base revision) do not apply — the plan's revisions are those of the view.
+    /// </summary>
+    public bool Replay { get; init; }
 }
 
 /// <summary>

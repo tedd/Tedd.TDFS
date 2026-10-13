@@ -71,7 +71,7 @@ internal sealed partial class VolumeStateMachine
         long truncateTo, IReadOnlyList<StreamChange> changes, long newLength, PublishSpec spec)
     {
         StreamRecord? before = inode.GetStream(stream);
-        if (spec.DerivedFromRevision != 0 && (before?.Revision ?? 0) != spec.DerivedFromRevision)
+        if (spec.DerivedFromRevision != 0 && !ctx.Replay && (before?.Revision ?? 0) != spec.DerivedFromRevision)
         {
             throw Fail(DfsErrorCode.WriterConflict,
                 $"The stream changed (revision {before?.Revision ?? 0}) after the leader prepared the publication from revision {spec.DerivedFromRevision}; retry.");
@@ -106,7 +106,18 @@ internal sealed partial class VolumeStateMachine
         try
         {
             (VolumeState next, VolumeApplyResult result) = body(s);
-            return (CloseLeaderStaging(next, spec, ctx.Index), result);
+            next = CloseLeaderStaging(next, spec, ctx.Index);
+
+            // The staging-to-live transition (FSD §10.3 step 4): a path publication consumes the unbound staging session its
+            // objects were uploaded under (a whole-file helper's), so nothing it staged stays protected after the commit.
+            // Sessions bound to a handle or a transaction live on with their owner.
+            if (result.IsSuccess && spec.Staging != 0 && next.Staging.TryGetValue(spec.Staging, out StagingRecord? request)
+                && request is { IsOpen: true, Handle: 0, Transaction.IsEmpty: true })
+            {
+                next = CloseStaging(next, request, ctx.Index);
+            }
+
+            return (next, result);
         }
         catch (ApplyFailure failure) when (spec.LeaderStaging != 0)
         {
@@ -182,7 +193,7 @@ internal sealed partial class VolumeStateMachine
                 throw Fail(DfsErrorCode.WriterConflict, $"'{path}' is at revision {current}, not {c.ExpectedRevision}.");
         }
 
-        RequireImplicitWriter(s, new StreamKey(inode.Id, stream), $"write '{path}'");
+        RequireImplicitWriter(s, ctx, new StreamKey(inode.Id, stream), $"write '{path}'");
         (s, InodeRecord updated, StreamRecord after) = Publish(s, ctx, inode, stream, 0, c.Spec.Changes, c.Spec.NewLength, c.Spec);
         (s, SnapshotInfoData? snapshot) = SnapshotInSameEntry(s, ctx, c.SnapshotName);
         return (s, VolumeApplyResult.Ok(new WriteAllResultMessage(new InodeId(updated.Id), updated.RevisionOf(stream), after.Length, created, s.TokenAt(ctx.Index),
@@ -212,7 +223,7 @@ internal sealed partial class VolumeStateMachine
             (string filePath, string? streamName) = DfsStreamPath.Split(path);
             stream = streamName ?? DfsStreamPath.DefaultStreamName;
             (s, inode, created) = ResolveOrCreateFile(s, ctx, path, filePath, stream, c.CreateIfMissing, createParents: false, c.StoragePolicy, append: true);
-            RequireImplicitWriter(s, new StreamKey(inode.Id, stream), $"append to '{path}'");
+            RequireImplicitWriter(s, ctx, new StreamKey(inode.Id, stream), $"append to '{path}'");
         }
 
         StreamRecord? before = inode.GetStream(stream);
@@ -362,12 +373,12 @@ internal sealed partial class VolumeStateMachine
     /// pool — provided the source is still at the materialized revision; other streams are returned unchanged.
     /// </summary>
     internal static StreamRecord MaterializedStream(VolumeState s, ImmutableArray<StreamMaterialization> materialized, ulong leaderStaging, string name,
-        StreamRecord source)
+        StreamRecord source, bool replay = false)
     {
         StreamMaterialization? m = materialized.IsDefault ? null : materialized.FirstOrDefault(x => string.Equals(x.Stream, name, StringComparison.Ordinal));
         if (m is null)
             return source;
-        if (source.Revision != m.SourceRevision)
+        if (!replay && source.Revision != m.SourceRevision)
             throw Fail(DfsErrorCode.WriterConflict, $"Stream '{name}' changed after the leader stored its bytes as objects; retry.");
         if (!s.Staging.TryGetValue(leaderStaging, out StagingRecord? staging) || !staging.IsOpen)
             throw Fail(DfsErrorCode.InvalidArgument, $"The leader staging session {leaderStaging} is not open.");
@@ -455,7 +466,7 @@ internal sealed partial class VolumeStateMachine
             throw Fail(DfsErrorCode.SharingViolation, $"'{source}' is open by handle {exclusive.Id} without FileShare.Read.");
 
         StreamRecord CopyOf(string name, StreamRecord stream, StreamRecord? replaced)
-            => MaterializedStream(s, c.Materialized, c.LeaderStaging, name, stream) with
+            => MaterializedStream(s, c.Materialized, c.LeaderStaging, name, stream, ctx.Replay) with
             {
                 Revision = ctx.Index,
                 CreatedIndex = replaced?.CreatedIndex ?? ctx.Index,
@@ -483,7 +494,7 @@ internal sealed partial class VolumeStateMachine
                     LimitDetail("MaxStreamsPerInode", DfsStreamPath.MaxStreamsPerInode, to.NamedStreamCount + 1));
             }
 
-            RequireImplicitWriter(s, new StreamKey(to.Id, destinationStream), $"copy onto '{destination}'");
+            RequireImplicitWriter(s, ctx, new StreamKey(to.Id, destinationStream), $"copy onto '{destination}'");
 
             // Only the addressed destination stream is replaced; a copy source's named streams are not merged (ADS-011).
             StreamRecord copy = CopyOf(sourceStream, from.Streams[sourceStream], replaced);

@@ -84,12 +84,11 @@ public sealed partial class DfsDirectoryClient
     {
         using OperationScope scope = Begin(DfsOperationKind.Exists, ct);
         await scope.StartedAsync().ConfigureAwait(false);
-        string p = Validation.Path(path);
+        // Stream syntax in a directory operation is an invalid path (Addendum ADS-06).
+        string p = Validation.DirectoryPath(path);
         using DfsTransaction.TransactionOperation? txOperation = EnterTransaction();
         scope.Path = p;
         await scope.ValidatedAsync().ConfigureAwait(false);
-        if (DfsStreamPath.HasStream(p))
-            return false;
         GetInfoResultMessage info = await InfoAsync(p, scope).ConfigureAwait(false);
         return info is { Exists: true, Info.Kind: WireEntryKind.Directory };
     }

@@ -37,8 +37,13 @@ namespace Tedd.Tdfs.Testing.Simulation;
 /// continuations on a thread with a custom context and would queue them to the thread pool instead).
 /// </para>
 /// <para>
-/// Not supported inside the simulation: blocking waits (<c>.Result</c>, <c>Wait()</c>, the SDK's synchronous wrappers)
-/// on work that the simulation itself must run — the single simulation thread would block forever.
+/// <b>Blocking waits.</b> A <see cref="WaitHandle"/> wait on the simulation thread inside a simulated context (the SDK's
+/// synchronous wrappers wait this way, including the synchronous <c>Stream.Length</c> that <c>Stream.CopyToAsync</c>
+/// reads) is forwarded by <see cref="SimSynchronizationContext"/> to <see cref="PumpWhileBlocked"/>: the blocked lane is
+/// held and every other lane keeps running in schedule order until the wait is satisfied, so it stays deterministic. A
+/// wait only the blocked lane itself could satisfy fails with <see cref="SimulationStalledException"/>. Other blocking
+/// waits (<c>.Result</c>, <c>Wait()</c>, monitors) on work that the simulation itself must run are not supported — the
+/// single simulation thread would block forever.
 /// </para>
 /// </remarks>
 public sealed class SimScheduler
@@ -74,6 +79,12 @@ public sealed class SimScheduler
     private SimLane? _currentLane;
     private ExecutionContext? _driverExecutionContext;
     private Exception? _pendingFailure;
+
+    /// <summary>Lanes whose executing work item is blocked in a synchronous wait (innermost last); they cannot run.</summary>
+    private readonly List<SimLane> _blockedLanes = [];
+
+    /// <summary>Virtual-time deadline of the current drive (nested pumping respects it).</summary>
+    private long _driveDeadline = long.MaxValue;
 
     /// <summary>Creates a scheduler for <paramref name="seed"/>.</summary>
     /// <exception cref="ArgumentException">The options are invalid.</exception>
@@ -1119,12 +1130,9 @@ public sealed class SimScheduler
         SimWorkItem item;
         lock (_lock)
         {
-            int count = _runnable.Count;
-            if (count == 0)
+            int index = PickRunnableLocked();
+            if (index < 0)
                 return false;
-            int index = Options.Mode == SimScheduleMode.Random
-                ? count == 1 ? 0 : _choices.Next(count)
-                : OldestRunnableIndexLocked();
             lane = _runnable[index];
             item = lane.Items.Dequeue();
             if (lane.Items.Count == 0)
@@ -1149,6 +1157,151 @@ public sealed class SimScheduler
         }
 
         return true;
+    }
+
+    /// <summary>Index in <see cref="_runnable"/> of the lane to run next, or -1 (lanes blocked in a synchronous wait are skipped).</summary>
+    private int PickRunnableLocked()
+    {
+        int count = _runnable.Count;
+        if (_blockedLanes.Count == 0)
+        {
+            if (count == 0)
+                return -1;
+            return Options.Mode == SimScheduleMode.Random
+                ? count == 1 ? 0 : _choices.Next(count)
+                : OldestRunnableIndexLocked();
+        }
+
+        var eligible = new List<int>(count);
+        for (int i = 0; i < count; i++)
+        {
+            if (!_blockedLanes.Contains(_runnable[i]))
+                eligible.Add(i);
+        }
+
+        if (eligible.Count == 0)
+            return -1;
+        if (Options.Mode == SimScheduleMode.Random)
+            return eligible.Count == 1 ? eligible[0] : eligible[_choices.Next(eligible.Count)];
+        int best = eligible[0];
+        long bestSeq = _runnable[best].Items.Peek().Seq;
+        foreach (int i in eligible)
+        {
+            long seq = _runnable[i].Items.Peek().Seq;
+            if (seq < bestSeq)
+            {
+                bestSeq = seq;
+                best = i;
+            }
+        }
+
+        return best;
+    }
+
+    /// <summary>
+    /// Keeps the simulation running while the executing work item blocks the simulation thread in a synchronous wait
+    /// (forwarded by <see cref="SimSynchronizationContext.Wait"/>): the blocked lane — and every lane blocked further out —
+    /// is held, everything else (deliveries, timers, other processes and lanes) runs in schedule order until
+    /// <paramref name="wait"/> reports the wait satisfied. Virtual time advances as usual within the current drive's
+    /// deadline.
+    /// </summary>
+    /// <param name="wait">Waits on the blocked handles for the given real milliseconds (0 = poll); returns the wait result.</param>
+    /// <param name="millisecondsTimeout">The blocked call's real-time timeout (-1 = infinite).</param>
+    /// <param name="timeoutResult">The wait result meaning "not signaled".</param>
+    /// <returns>
+    /// The wait result (<paramref name="timeoutResult"/> when the real-time timeout elapsed), or null when the caller is not
+    /// a work item executing on the simulation thread (it then waits normally).
+    /// </returns>
+    /// <exception cref="SimulationStalledException">Nothing but the blocked lane could still satisfy the wait.</exception>
+    /// <exception cref="SimulationTimeoutException">The drive's virtual-time deadline passed while waiting.</exception>
+    internal int? PumpWhileBlocked(Func<int, int> wait, int millisecondsTimeout, int timeoutResult)
+    {
+        ArgumentNullException.ThrowIfNull(wait);
+        if (!IsOnSimulationThread || _currentLane is not { } blocked)
+            return null;
+
+        SynchronizationContext? context = SynchronizationContext.Current;
+        ExecutionContext? execution = ExecutionContext.Capture();
+        long realStart = Stopwatch.GetTimestamp();
+        lock (_lock)
+        {
+            _blockedLanes.Add(blocked);
+            TraceLocked($"{blocked.Name}: blocked in a synchronous wait, running other lanes");
+        }
+
+        try
+        {
+            while (true)
+            {
+                int result = wait(0);
+                if (result != timeoutResult)
+                    return result;
+                if (millisecondsTimeout >= 0 && Stopwatch.GetElapsedTime(realStart).TotalMilliseconds >= millisecondsTimeout)
+                    return timeoutResult;
+                lock (_lock)
+                {
+                    if (_pendingFailure is { } failure)
+                        throw new SimulationException($"The simulation failed while {blocked.Name} was blocked in a synchronous wait.", failure);
+                }
+
+                bool ran;
+                try
+                {
+                    ran = TryRunOne();
+                }
+                finally
+                {
+                    // Execute resets the lane, context and execution context of the outer (blocked) item: restore them.
+                    _currentLane = blocked;
+                    SynchronizationContext.SetSynchronizationContext(context);
+                    if (execution is not null)
+                        ExecutionContext.Restore(execution);
+                }
+
+                if (ran)
+                    continue;
+                AdvanceResult advance;
+                _currentLane = null; // timer expiry runs outside any work item, as in Drive
+                SynchronizationContext.SetSynchronizationContext(null);
+                try
+                {
+                    advance = TryAdvanceTime(_driveDeadline);
+                }
+                finally
+                {
+                    _currentLane = blocked;
+                    SynchronizationContext.SetSynchronizationContext(context);
+                }
+
+                if (advance == AdvanceResult.Advanced)
+                    continue;
+                if (advance == AdvanceResult.PastDeadline)
+                {
+                    throw new SimulationTimeoutException(
+                        $"Virtual time ran out while {blocked.Name} was blocked in a synchronous wait.{Environment.NewLine}{DescribeState()}", Now);
+                }
+
+                // Nothing else can run: only a real (foreign) signal could still satisfy the wait.
+                result = wait(Math.Max(0, (int)Math.Min(int.MaxValue, Options.StallGracePeriod.TotalMilliseconds)));
+                if (result != timeoutResult)
+                    return result;
+                lock (_lock)
+                {
+                    PurgeCancelledHeadsLocked();
+                    if (PickRunnableLocked() >= 0 || _timed.Count > 0 || _pendingFailure is not null)
+                        continue;
+                }
+
+                throw new SimulationStalledException(
+                    $"{blocked.Name} is blocked in a synchronous wait that nothing else in the simulation can satisfy (deadlock: no other lane is runnable and no timer is pending).{Environment.NewLine}{DescribeState()}");
+            }
+        }
+        finally
+        {
+            lock (_lock)
+                _blockedLanes.RemoveAt(_blockedLanes.LastIndexOf(blocked));
+            _currentLane = blocked;
+        }
     }
 
     private void Execute(SimLane lane, in SimWorkItem item)
@@ -1293,6 +1446,7 @@ public sealed class SimScheduler
     {
         _driverExecutionContext = null;
         _currentLane = null;
+        _driveDeadline = long.MaxValue;
         lock (_lock)
             _driverThreadId = 0;
     }
@@ -1337,6 +1491,7 @@ public sealed class SimScheduler
     private DriveResult Drive(Func<bool>? condition, long deadline, bool stopWhenIdle, bool waitForForeignWork)
     {
         EnterDriver();
+        _driveDeadline = deadline;
         try
         {
             long realStart = Stopwatch.GetTimestamp();

@@ -123,7 +123,7 @@ public sealed partial class DfsAdminClient
     /// <summary>Names of the cluster's volumes.</summary>
     public async Task<IReadOnlyList<string>> ListVolumesAsync(CancellationToken ct = default)
     {
-        AdminNameListBody body = await CallAsync<AdminEmptyBody, AdminNameListBody>(AdminOp.ListVolumes, () => new AdminEmptyBody(), Runtime.AnyNodeRouter,
+        AdminNameListBody body = await CallAsync<AdminEmptyBody, AdminNameListBody>(AdminOp.ListVolumes, () => new AdminEmptyBody(), Runtime.ControlRouter,
             DfsOperationKind.Admin, ct).ConfigureAwait(false);
         return body.Names;
     }
@@ -271,7 +271,7 @@ public sealed partial class DfsAdminClient
         {
             ArgumentOutOfRangeException.ThrowIfNegativeOrZero(max);
             return new AdminAuditLogRequestBody(max);
-        }, Runtime.AnyNodeRouter, DfsOperationKind.Admin, ct).ConfigureAwait(false);
+        }, Runtime.ControlRouter, DfsOperationKind.Admin, ct).ConfigureAwait(false);
         return body.Names;
     }
 

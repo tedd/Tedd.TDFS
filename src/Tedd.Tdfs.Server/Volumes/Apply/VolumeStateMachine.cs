@@ -19,6 +19,13 @@ internal sealed partial class VolumeStateMachine : IReplicatedStateMachine, ICom
 {
     private VolumeState _state;
 
+    /// <summary>
+    /// Derived, non-replicated: the state right after each active transaction's begin (its read version R), retained while
+    /// the transaction is active so the leader can serve the transaction's private view (ARCHITECTURE §5.6). Lost on restart
+    /// or checkpoint restore — such transactions are aborted by the leader.
+    /// </summary>
+    private readonly Dictionary<DfsOperationId, VolumeState> _transactionRoots = [];
+
     public VolumeStateMachine(VolumeCreation creation, Guid clusterId)
     {
         ArgumentNullException.ThrowIfNull(creation);
@@ -66,6 +73,7 @@ internal sealed partial class VolumeStateMachine : IReplicatedStateMachine, ICom
         var ctx = new ApplyContext(index, term, decoded);
         (VolumeState next, VolumeApplyResult result) = ApplyCommand(_state with { AppliedIndex = index, LeaderTime = decoded.LeaderTime }, ctx);
         _state = next;
+        RetainTransactionRoots(decoded, result);
         Changed?.Invoke(_state);
         return result.IsSuccess ? ApplyOutcome.Success(result) : ApplyOutcome.Failure(result.Code, result.Message, result);
     }
@@ -156,7 +164,10 @@ internal sealed partial class VolumeStateMachine : IReplicatedStateMachine, ICom
         CopyCommand c => ApplyCopy(s, ctx, c),
         ReclaimDetachedCommand c => ApplyReclaimDetached(s, ctx, c),
 
-        TxBeginCommand or TxCommitCommand or TxAbortCommand or TxAcquireReservationCommand => ApplyTransaction(s, ctx),
+        TxBeginCommand c => ApplyTxBegin(s, ctx, c),
+        TxCommitCommand c => ApplyTxCommit(s, ctx, c),
+        TxAbortCommand c => ApplyTxAbort(s, ctx, c),
+        TxAcquireReservationCommand c => ApplyTxAcquireReservation(s, ctx, c),
 
         CreateSnapshotCommand c => ApplyCreateSnapshot(s, ctx, c),
         DeleteSnapshotCommand c => ApplyDeleteSnapshot(s, ctx, c),
@@ -192,7 +203,24 @@ internal sealed partial class VolumeStateMachine : IReplicatedStateMachine, ICom
         if (restored.Config.Id != Creation.Id)
             throw new DfsIntegrityException($"The checkpoint belongs to volume {restored.Config.Id}, not {Creation.Id}.");
         _state = restored with { AppliedIndex = index };
+        _transactionRoots.Clear();
         Changed?.Invoke(_state);
+    }
+
+    /// <summary>The state at the read version of active transaction <paramref name="transaction"/>, when this replica applied its begin.</summary>
+    public VolumeState? TransactionRoot(DfsOperationId transaction) => _transactionRoots.GetValueOrDefault(transaction);
+
+    private void RetainTransactionRoots(VolumeCommand command, VolumeApplyResult result)
+    {
+        if (command is TxBeginCommand && result is { IsSuccess: true, Replayed: false, Value: TxRecord begun })
+            _transactionRoots[begun.Id] = _state;
+        if (_transactionRoots.Count == 0)
+            return;
+        foreach (DfsOperationId id in _transactionRoots.Keys.ToArray())
+        {
+            if (!_state.Transactions.TryGetValue(id, out TxRecord? tx) || tx.State != TxState.Active)
+                _transactionRoots.Remove(id);
+        }
     }
 
     /// <inheritdoc />

@@ -85,8 +85,8 @@ internal sealed partial class VolumeService
     public async Task<IWireMessage> GetInfoAsync(RpcContext context, GetInfoMessage request)
     {
         CancellationToken ct = context.Cancellation;
-        RejectTransaction(request);
         string principal = context.Principal ?? string.Empty;
+        BindTransaction(request, principal);
         RequireGrant(principal, DfsPermissions.Read, "get info");
         (IReadOnlySet<DfsIdentity> ids, bool admin) = IdentitySetOf(principal);
         if (!request.Handle.IsEmpty)
@@ -177,8 +177,8 @@ internal sealed partial class VolumeService
     public async Task<IWireMessage> ListDirectoryAsync(RpcContext context, ListDirectoryMessage request)
     {
         CancellationToken ct = context.Cancellation;
-        RejectTransaction(request);
         string principal = context.Principal ?? string.Empty;
+        BindTransaction(request, principal);
         RequireGrant(principal, DfsPermissions.Read, "enumerate");
         if (request.PageSize is < 1 or > 10000)
             throw new ArgumentException("The page size must be between 1 and 10000.");

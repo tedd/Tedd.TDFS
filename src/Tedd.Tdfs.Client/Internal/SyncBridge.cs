@@ -3,7 +3,10 @@ namespace Tedd.Tdfs.Client.Internal;
 /// <summary>
 /// Runs the SDK's asynchronous implementations for the synchronous API surface (SDK-010, ARCHITECTURE §9.6): the
 /// operation is started with no <see cref="SynchronizationContext"/> so none of its continuations can be posted back
-/// to the (blocked) calling context, and the caller then blocks on the result. Exceptions propagate unwrapped.
+/// to the (blocked) calling context, and the caller then blocks on the result. Exceptions propagate unwrapped. When the
+/// calling context asks for wait notifications (<see cref="SynchronizationContext.IsWaitNotificationRequired"/>: a pumping
+/// or simulated context) the block is a wait-handle wait, which the runtime forwards to that context's
+/// <see cref="SynchronizationContext.Wait(IntPtr[], bool, int)"/>, instead of an uninterruptible monitor wait.
 /// </summary>
 internal static class SyncBridge
 {
@@ -12,6 +15,7 @@ internal static class SyncBridge
     {
         ArgumentNullException.ThrowIfNull(operation);
         Task task = Start(operation);
+        Block(task);
         task.ConfigureAwait(false).GetAwaiter().GetResult();
     }
 
@@ -20,6 +24,7 @@ internal static class SyncBridge
     {
         ArgumentNullException.ThrowIfNull(operation);
         Task<T> task = Start(operation);
+        Block(task);
         return task.ConfigureAwait(false).GetAwaiter().GetResult();
     }
 
@@ -36,7 +41,9 @@ internal static class SyncBridge
         }
 
         // A pending ValueTask may be backed by an IValueTaskSource, which does not support blocking: go via Task.
-        task.AsTask().ConfigureAwait(false).GetAwaiter().GetResult();
+        Task pending = task.AsTask();
+        Block(pending);
+        pending.ConfigureAwait(false).GetAwaiter().GetResult();
     }
 
     /// <summary>Runs a <see cref="ValueTask{TResult}"/>-returning <paramref name="operation"/> and blocks until it completes.</summary>
@@ -48,7 +55,19 @@ internal static class SyncBridge
         if (task.IsCompleted)
             return task.GetAwaiter().GetResult();
 
-        return task.AsTask().ConfigureAwait(false).GetAwaiter().GetResult();
+        Task<T> pending = task.AsTask();
+        Block(pending);
+        return pending.ConfigureAwait(false).GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// Waits for <paramref name="task"/> through its wait handle when the calling context asks for wait notifications (so
+    /// that context sees the wait); otherwise leaves the blocking to <c>GetResult</c>.
+    /// </summary>
+    private static void Block(Task task)
+    {
+        if (!task.IsCompleted && SynchronizationContext.Current is { } context && context.IsWaitNotificationRequired())
+            ((IAsyncResult)task).AsyncWaitHandle.WaitOne();
     }
 
     /// <summary>

@@ -217,19 +217,13 @@ public sealed class DfsTransaction : IAsyncDisposable, IDisposable
     public void Dispose() =>
         SyncBridge.RunValueTask(DisposeAsync);
 
-    private async Task<TxAbortResultMessage> SendAbortAsync(OperationScope scope)
-    {
-        var request = new RpcRequest
-        {
-            Name = "TxAbort",
-            ReplyType = MessageType.TxAbortResult,
-            Kind = CallKind.Idempotent,
-            Router = Volume.Context,
-            Transaction = Id,
-            Build = _ => ValueTask.FromResult<IWireMessage>(new TxAbortMessage(Volume.Context.Header(Volume.Context.CurrentSession, default, Id, Binding))),
-        };
-        return (TxAbortResultMessage)await Runtime.Rpc.InvokeAsync(request, scope).ConfigureAwait(false);
-    }
+    /// <summary>
+    /// Sends <c>TxAbort</c>. The abort is a mutation of its own: it carries an operation id from its first transmission
+    /// (OUT-001), so a lost reply is answered from the stored outcome.
+    /// </summary>
+    private Task<TxAbortResultMessage> SendAbortAsync(OperationScope scope) =>
+        Volume.Context.MutateAsync<TxAbortResultMessage>(scope, "TxAbort", null, header => new TxAbortMessage(header), null, Id, rebindable: false,
+            binding: Binding);
 
     /// <summary>Registers an open transaction-bound stream (its staged changes join the transaction at commit).</summary>
     internal void Register(DfsStream stream)

@@ -576,8 +576,25 @@ public sealed record CreateStagingMessage(
     HandleId Handle,
     StagingId Renew) : IWireMessage<CreateStagingMessage>, IVolumeRequest
 {
-    /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
+    /// <summary>
+    /// Extension field id of the <b>close</b> request (required, empty value): instead of creating or renewing, close the
+    /// caller's unbound staging session named by <see cref="Renew"/> (a whole-file helper that will not publish what it
+    /// staged; FILE-016). A closed staging session is the authoritative "no further publication" decision.
+    /// </summary>
+    public const uint CloseExtension = 1;
+
+    private static readonly System.Collections.Frozen.FrozenSet<uint> UnderstoodExtensions =
+        System.Collections.Frozen.FrozenSet.ToFrozenSet([CloseExtension]);
+
+    /// <summary>Extensions preserved from the wire (re-emitted on encode), including <see cref="CloseExtension"/>.</summary>
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
+
+    /// <summary>True when the request closes the staging session named by <see cref="Renew"/> (<see cref="CloseExtension"/>).</summary>
+    public bool Close => Extensions.Any(e => e.FieldId == CloseExtension);
+
+    /// <summary>A request that closes the caller's unbound staging session <paramref name="staging"/>.</summary>
+    public static CreateStagingMessage CloseRequest(RequestHeader header, StagingId staging) =>
+        new(header, default, staging) { Extensions = [new WireExtension(CloseExtension, Required: true, ReadOnlyMemory<byte>.Empty)] };
 
     /// <inheritdoc />
     public MessageType Type => WireType;
@@ -603,7 +620,9 @@ public sealed record CreateStagingMessage(
         RequestHeader header = reader.ReadRecord<RequestHeader>();
         HandleId handle = reader.ReadHandleId();
         StagingId renew = reader.ReadStagingId();
-        IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
+        List<WireExtension>? list = null;
+        reader.ReadExtensions(UnderstoodExtensions, e => (list ??= []).Add(e));
+        IReadOnlyList<WireExtension> extensions = list is null ? [] : list.ToArray();
         return new CreateStagingMessage(header, handle, renew) { Extensions = extensions };
     }
 }

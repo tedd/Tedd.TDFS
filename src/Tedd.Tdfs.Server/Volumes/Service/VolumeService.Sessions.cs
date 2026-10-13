@@ -35,8 +35,17 @@ internal sealed partial class VolumeService
         RejectTransaction(request);
         await EnsureLeaderReadyAsync(ct);
         OperationHeader op = Header(context, request, DfsOperationKind.KeepAlive, default);
-        var command = Stamp(new KeepAliveCommand(request.Header.Session, [.. request.Handles.Select(h => h.Value)],
-            [.. request.PinUpdates.Select(p => new PinAdvance(p.Handle.Value, p.PinIndex))], [.. request.ReaderPins]), op);
+
+        // Handles and pins of transactions' private views are not in the replicated state: they live as long as their
+        // transaction's view on this leader (the transaction itself expires at its deadline).
+        HashSet<ulong> privateHandles = [.. _transactions.Values.SelectMany(t => t.Handles.Keys)];
+        HashSet<ulong> privatePins = [.. _transactions.Values.SelectMany(t => t.Pins.Keys)];
+        var command = Stamp(new KeepAliveCommand(request.Header.Session,
+            [.. request.Handles.Select(h => h.Value).Where(h => h < VolumeStateMachine.TransactionHandleBase)],
+            [.. request.PinUpdates.Where(p => p.Handle.Value < VolumeStateMachine.TransactionHandleBase).Select(p => new PinAdvance(p.Handle.Value, p.PinIndex))],
+            [.. request.ReaderPins.Where(p => p < VolumeStateMachine.TransactionPinBase)]), op);
+        HandleId[] lostPrivateHandles = [.. request.Handles.Where(h => h.Value >= VolumeStateMachine.TransactionHandleBase && !privateHandles.Contains(h.Value))];
+        ulong[] lostPrivatePins = [.. request.ReaderPins.Where(p => p >= VolumeStateMachine.TransactionPinBase && !privatePins.Contains(p))];
 
         // Renew the leases before the entry commits: a renewal that arrives in time must not lose the race with an expiry
         // proposed meanwhile by this leader (the reply reports what the committed state says).
@@ -67,7 +76,15 @@ internal sealed partial class VolumeService
                 RenewPin(pin);
         }
 
-        return Finish(result, reply => reply.Reply is KeepAliveResultMessage k ? k with { LeaseDuration = _s.Timings.LeaseDuration, ServerWallClock = _s.Time.GetUtcNow() } : reply.Reply!);
+        return Finish(result, reply => reply.Reply is KeepAliveResultMessage k
+            ? k with
+            {
+                LeaseDuration = _s.Timings.LeaseDuration,
+                ServerWallClock = _s.Time.GetUtcNow(),
+                ExpiredHandles = [.. k.ExpiredHandles, .. lostPrivateHandles],
+                ExpiredPins = [.. k.ExpiredPins, .. lostPrivatePins],
+            }
+            : reply.Reply!);
     }
 
     /// <summary>
@@ -95,9 +112,14 @@ internal sealed partial class VolumeService
         QueryOperationResultMessage answer;
         try
         {
-            answer = VolumeStateMachine.QueryOutcome(State, target, principal, out _, out bool fenceable);
+            bool fenceable;
+            answer = request.IsTransaction
+                ? VolumeStateMachine.QueryTransaction(State, target, principal, out fenceable)
+                : VolumeStateMachine.QueryOutcome(State, target, principal, out _, out fenceable);
             if (!request.Resolve || !fenceable)
                 return answer;
+            if (request.IsTransaction)
+                DropTransaction(target);
         }
         catch (ApplyFailure failure)
         {

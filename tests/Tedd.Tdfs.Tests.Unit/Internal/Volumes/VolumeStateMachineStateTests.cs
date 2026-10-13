@@ -215,11 +215,25 @@ public sealed class VolumeStateMachineStateTests
     }
 
     [Fact]
-    public void Transactions_AreUnsupportedUntilTheirPhase()
+    public void Transactions_BeginRecordsAndAbortEnds()
     {
+        // Transactions are implemented (integration wave B2): a begin needs its session, records an active transaction with its
+        // own staging session, and an abort ends it (idempotent, never reversing a commit).
         var d = new SmDriver();
-        VolumeApplyResult result = d.Fails(DfsErrorCode.Unsupported, new TxBeginCommand(1, SmDriver.Epoch0) { Op = Op() });
-        Assert.Contains("NOT IMPLEMENTED", result.Message, StringComparison.Ordinal);
+        ulong s = d.OpenSession();
+        var begin = d.Ok<TxBeginResultMessage>(new TxBeginCommand(s, SmDriver.Epoch0.AddMinutes(5))
+        {
+            Op = Op(session: s, sequence: 1, kind: DfsOperationKind.TxBegin, payload: Hash("begin")),
+        });
+        DfsOperationId tx = begin.Transaction.Operation;
+        Assert.Equal(new DfsOperationId(s, 1), tx);
+        Assert.Equal(TxState.Active, d.State.Transactions[tx].State);
+        Assert.True(d.State.Staging[begin.Staging.Value].IsOpen);
+        var aborted = d.Ok<TxAbortResultMessage>(new TxAbortCommand(tx) { Op = Op() });
+        Assert.Equal(WireOutcomeStatus.Aborted, aborted.FinalStatus);
+        Assert.Equal(TxState.Aborted, d.State.Transactions[tx].State);
+        Assert.False(d.State.Staging[begin.Staging.Value].IsOpen);
+        Assert.Equal(WireOutcomeStatus.Aborted, d.Ok<TxAbortResultMessage>(new TxAbortCommand(tx) { Op = Op() }).FinalStatus);
     }
 
     // ------------------------------------------------------------------------------------------------- determinism and checkpoints

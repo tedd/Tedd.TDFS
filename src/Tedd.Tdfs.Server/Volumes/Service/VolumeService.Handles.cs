@@ -31,6 +31,7 @@ internal sealed partial class VolumeService
         _locations.Clear();
         _inventories.Clear();
         _staged.Clear();
+        _transactions.Clear();
         CancelRestores();
     }
 
@@ -44,6 +45,7 @@ internal sealed partial class VolumeService
         _locations.Clear();
         _inventories.Clear();
         _staged.Clear();
+        _transactions.Clear();
         CancelRestores();
     }
 
@@ -173,6 +175,8 @@ internal sealed partial class VolumeService
         if (prunable && DerefPruneDue(now))
             await ProposeHousekeepingAsync(new PruneDerefLogCommand(watermark));
 
+        await MaintainTransactionsAsync(wall);
+
         if (IsLeader && _readyTerm == Group.Term)
             ResumeRestores();
     }
@@ -240,7 +244,7 @@ internal sealed partial class VolumeService
     public async Task<IWireMessage> ReadRangeAsync(RpcContext context, ReadRangeMessage request)
     {
         CancellationToken ct = context.Cancellation;
-        RejectTransaction(request);
+        BindTransaction(request, context.Principal ?? string.Empty);
         string principal = context.Principal ?? string.Empty;
         RequireGrant(principal, DfsPermissions.Read, "read");
         if (request.Offset < 0 || request.Length < 0 || request.Offset > long.MaxValue - request.Length)
@@ -381,9 +385,20 @@ internal sealed partial class VolumeService
         CancellationToken ct = context.Cancellation;
         string principal = context.Principal ?? string.Empty;
         RequireGrant(principal, DfsPermissions.Write, "stage uploads");
+        if (request.Close)
+        {
+            // A whole-file helper abandons what it staged (cancelled, failed): close its unbound staging session so the
+            // uploads become garbage (FILE-016). Idempotent; only the owner's unbound sessions can be closed this way.
+            if (request.Renew.IsEmpty)
+                throw new ArgumentException("A staging close names the staging session to close.");
+            return await MutateAsync(context, request, DfsOperationKind.CreateStaging,
+                (op, _) => Task.FromResult<VolumeCommand>(Stamp(new CloseStagingCommand([request.Renew.Value]), op)),
+                requireOperation: false);
+        }
+
         if (!request.Renew.IsEmpty)
         {
-            RejectTransaction(request);
+            // Renewing the capability of an open staging session (a transaction's included): no log entry.
             await ReadBarrierAsync(ct);
             if (!State.Staging.TryGetValue(request.Renew.Value, out StagingRecord? staging) || !staging.IsOpen)
                 throw new DfsLeaseLostException($"Staging session {request.Renew.Value} is closed.");

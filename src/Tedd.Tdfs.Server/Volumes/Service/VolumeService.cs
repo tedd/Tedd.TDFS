@@ -41,8 +41,11 @@ internal sealed partial class VolumeService
         Io = new ObjectIo(services);
     }
 
-    /// <summary>The applied state of this replica.</summary>
-    public VolumeState State => _sm.State;
+    /// <summary>
+    /// The state the current request works on: the applied state of this replica, or for a transaction-bound request the
+    /// transaction's private working view.
+    /// </summary>
+    public VolumeState State => CurrentTransaction is { } tx ? WorkingView(tx) : _sm.State;
 
     /// <summary>The volume's control record.</summary>
     public VolumeRecord Record => _host.Record;
@@ -93,7 +96,16 @@ internal sealed partial class VolumeService
             return;
         await Group.ReadIndexAsync(ct);
         if (Group.Term == term)
-            _readyTerm = term;
+            MarkReady(term);
+    }
+
+    /// <summary>Records that this leader applied everything committed before its term (transactions begun until now are not its own).</summary>
+    private void MarkReady(ulong term)
+    {
+        if (_readyTerm == term)
+            return;
+        _readyTerm = term;
+        _transactionsSince = _sm.State.AppliedIndex;
     }
 
     /// <summary>A linearizable read barrier (CON-008); returns the applied index the read observes.</summary>
@@ -104,18 +116,8 @@ internal sealed partial class VolumeService
         if (_s.Mutations.AllowStaleLiveReads)
             return Group.AppliedIndex;
         ulong index = await Group.ReadIndexAsync(ct);
-        _readyTerm = Group.Term;
+        MarkReady(Group.Term);
         return index;
-    }
-
-    /// <summary>Transaction-bound requests are the next phase.</summary>
-    private static void RejectTransaction(IVolumeRequest request)
-    {
-        if (request.Header.Transaction is not null)
-        {
-            throw new NotSupportedException(
-                "NOT IMPLEMENTED (next phase): transaction-bound requests are not supported by this volume service yet.");
-        }
     }
 
     /// <summary>The caller's volume grants (control state).</summary>
@@ -209,7 +211,7 @@ internal sealed partial class VolumeService
     {
         VolumeState state = State;
         ulong index = Math.Max(state.AppliedIndex, Group.LastIndex) + 1;
-        var ctx = new ApplyContext(index, Group.Term, command);
+        var ctx = new ApplyContext(index, Group.Term, command) { Transaction = CurrentTransaction?.Id ?? default };
         (_, VolumeApplyResult result) = VolumeStateMachine.ApplyCommand(state with { AppliedIndex = index, LeaderTime = command.LeaderTime },
             ctx with { Command = command with { Op = command.Op is { } op ? op with { Id = default } : null } });
         return result;
@@ -220,8 +222,10 @@ internal sealed partial class VolumeService
     /// are re-resolved and the command is validated again, so authorization revoked while the request waited is honoured at
     /// the authoritative decision (SEC-006, ACL-026).
     /// </summary>
-    private async Task<VolumeApplyResult> ProposeAsync(VolumeCommand command, CancellationToken ct)
+    private async Task<VolumeApplyResult> ProposeAsync(VolumeCommand command, CancellationToken ct, bool bypassTransaction = false)
     {
+        if (!bypassTransaction && CurrentTransaction is { } tx)
+            return await ApplyInTransactionAsync(tx, command, ct);
         var context = new ProposalContext(command.OperationKind, command.Op is { HasOperation: true } op ? op.Id : null, command.Path);
         VolumeCommand final = command;
         ApplyOutcome outcome = await Group.ProposeAsync(async token =>
@@ -254,26 +258,41 @@ internal sealed partial class VolumeService
     /// </summary>
     private Task<IWireMessage> MutateAsync(RpcContext context, IVolumeRequest request, DfsOperationKind kind,
         Func<OperationHeader, CancellationToken, Task<VolumeCommand>> prepare, Func<VolumeApplyResult, IWireMessage>? finish = null, bool requireOperation = true,
-        bool cleanup = false)
-        => MutateAsync(context, request, kind, async (op, ct) => new Prepared(await prepare(op, ct)), finish, requireOperation, cleanup);
+        bool cleanup = false, bool bindTransaction = true)
+        => MutateAsync(context, request, kind, async (op, ct) => new Prepared(await prepare(op, ct)), finish, requireOperation, cleanup, bindTransaction);
 
     /// <summary>A prepared command and an optional hold (for example a per-stream publication lock) released after its proposal.</summary>
     private readonly record struct Prepared(VolumeCommand Command, IDisposable? Hold = null);
 
-    /// <inheritdoc cref="MutateAsync(RpcContext, IVolumeRequest, DfsOperationKind, Func{OperationHeader, CancellationToken, Task{VolumeCommand}}, Func{VolumeApplyResult, IWireMessage}?, bool, bool)"/>
+    /// <inheritdoc cref="MutateAsync(RpcContext, IVolumeRequest, DfsOperationKind, Func{OperationHeader, CancellationToken, Task{VolumeCommand}}, Func{VolumeApplyResult, IWireMessage}?, bool, bool, bool)"/>
     private async Task<IWireMessage> MutateAsync(RpcContext context, IVolumeRequest request, DfsOperationKind kind,
         Func<OperationHeader, CancellationToken, Task<Prepared>> prepare, Func<VolumeApplyResult, IWireMessage>? finish = null, bool requireOperation = true,
-        bool cleanup = false)
+        bool cleanup = false, bool bindTransaction = true)
     {
         CancellationToken ct = context.Cancellation;
         string? cleanupPath = cleanup ? RequestFaultInfo.PathOf(request) : null;
-        RejectTransaction(request);
+        TxWork? tx = bindTransaction ? BindTransaction(request, context.Principal ?? string.Empty) : null;
+        if (!bindTransaction && CurrentTransaction is not null)
+            Ambient.Value = null;
         await EnsureLeaderReadyAsync(ct);
         OperationHeader op = Header(context, request, kind);
         if (requireOperation && !op.HasOperation)
             throw new ArgumentException($"{kind} requests must carry an operation id (OUT-001).");
         if (!op.HasOperation)
             return Finish(await ExecuteAsync(op, prepare, ct, cleanup, cleanupPath), finish);
+
+        if (tx is not null)
+        {
+            // A transaction-bound operation id is answered from the transaction's own results (it never reaches the log).
+            if (tx.Results.TryGetValue(op.Id, out VolumeApplyResult? prior))
+                return Finish(prior, finish);
+            VolumeApplyResult done = await ExecuteAsync(op, prepare, ct, cleanup, cleanupPath);
+            if (!done.IsSuccess && done.Reply is ErrorReplyMessage { OperationId: null } bare)
+                done = done with { Reply = bare with { OperationId = op.Id } };
+            if (done.IsSuccess || !DfsErrors.IsRetryableByDefault(done.Code))
+                tx.Results[op.Id] = done;
+            return Finish(done, finish);
+        }
 
         GateDecision gate = OperationGate.Check(State, op);
         switch (gate.Kind)
@@ -332,8 +351,10 @@ internal sealed partial class VolumeService
             // (OUT-013), retries get the same answer and QueryOperation reports it instead of NotFound. A retryable refusal
             // (SharingViolation, WriterConflict: "retrying the same operation may succeed", PROTOCOL.md §11.1) and any
             // refusal of a request without an id are answered from the pre-check without a log entry.
+            // A transaction's commit always goes through the log: a refused commit ends the transaction (its reservations
+            // are released) in the replicated state, whatever the refusal.
             VolumeApplyResult check = DryRun(prepared.Command);
-            if (!check.IsSuccess && (!op.HasOperation || DfsErrors.IsRetryableByDefault(check.Code)))
+            if (!check.IsSuccess && prepared.Command is not TxCommitCommand && (!op.HasOperation || DfsErrors.IsRetryableByDefault(check.Code)))
             {
                 ErrorReplyMessage error = check.Reply as ErrorReplyMessage ?? new ErrorReplyMessage(check.Code, check.Message);
                 return check with { Reply = op.HasOperation ? error with { OperationId = op.Id } : error };

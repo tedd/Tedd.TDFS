@@ -888,20 +888,16 @@ internal sealed class VolumeContext : IRpcRouter
         return (QueryOperationResultMessage)await Runtime.Rpc.InvokeAsync(request, scope).ConfigureAwait(false);
     }
 
-    /// <summary>Closes a handle (idempotent; releases sharing, writer authority, pin and bound staging).</summary>
+    /// <summary>
+    /// Closes a handle (idempotent; releases sharing, writer authority, pin and bound staging). The release is a mutation
+    /// of its own: it carries an operation id from its first transmission (OUT-001), so a lost reply is answered from the
+    /// stored outcome.
+    /// </summary>
     public async Task<CloseHandleResultMessage> CloseHandleAsync(HandleId handle, ulong generation, DfsTransactionId? transaction, OperationScope scope,
         VolumeBinding? binding)
     {
-        var request = new RpcRequest
-        {
-            Name = "CloseHandle",
-            ReplyType = MessageType.CloseHandleResult,
-            Kind = CallKind.Idempotent,
-            Router = this,
-            Transaction = transaction,
-            Build = _ => ValueTask.FromResult<IWireMessage>(new CloseHandleMessage(Header(CurrentSession, default, transaction, binding), handle, generation)),
-        };
-        return (CloseHandleResultMessage)await Runtime.Rpc.InvokeAsync(request, scope).ConfigureAwait(false);
+        return await MutateAsync<CloseHandleResultMessage>(scope, "CloseHandle", null,
+            header => new CloseHandleMessage(header, handle, generation), null, transaction, rebindable: false, binding: binding).ConfigureAwait(false);
     }
 
     // ------------------------------------------------------------------------------------------------ staging
@@ -940,16 +936,82 @@ internal sealed class VolumeContext : IRpcRouter
         return lease;
     }
 
+    /// <summary>
+    /// Opens a fresh unbound staging session for one whole-file helper call. The publication that references it closes it
+    /// (the staging-to-live transition); a helper that does not publish closes it with <see cref="CloseUnboundStagingAsync"/>,
+    /// so nothing a finished or abandoned helper staged stays protected from GC (FILE-016).
+    /// </summary>
+    public async Task<StagingLease> CreateUnboundStagingAsync(OperationScope scope)
+    {
+        VolumeSession session = await EnsureSessionAsync(scope).ConfigureAwait(false);
+        Bound<CreateStagingResultMessage> bound;
+        try
+        {
+            bound = await MutateBoundAsync<CreateStagingResultMessage>(scope, "CreateStaging", null,
+                header => new CreateStagingMessage(header, default, default)).ConfigureAwait(false);
+        }
+        catch (DfsCommitOutcomeUnknownException unknown)
+        {
+            throw StagingNotCreated(scope, unknown);
+        }
+
+        CreateStagingResultMessage created = bound.Reply;
+        ulong owner = bound.Session?.Id ?? session.Id;
+        return new StagingLease(created.Staging, default, null, owner, created.Capability, created.CapabilityExpiry, created.PlacementEpoch, bound.Binding);
+    }
+
+    /// <summary>
+    /// Best-effort close of an unbound staging session a helper will not publish (cancelled or failed): runs on its own
+    /// short background scope (the caller's token may be cancelled) and never throws. A closed session is the authoritative
+    /// "no further publication" decision: an uncertain publication that still arrives fails without effect.
+    /// </summary>
+    public async Task CloseUnboundStagingAsync(StagingLease lease)
+    {
+        try
+        {
+            using OperationScope scope = Runtime.BeginBackground(DfsOperationKind.CreateStaging, Name, Runtime.Options.ShutdownTimeout);
+            await MutateAsync<CreateStagingResultMessage>(scope, "CreateStaging(close)", null,
+                header => CreateStagingMessage.CloseRequest(header, lease.Id), rebindable: false, binding: lease.Binding).ConfigureAwait(false);
+        }
+#pragma warning disable CA1031 // Cleanup is best effort: the session also closes with its client session.
+        catch (Exception ex)
+#pragma warning restore CA1031
+        {
+            Runtime.Emit("staging.close-failed", $"Closing staging session {lease.Id} failed ({ex.GetType().Name}); it closes with its session.", volume: Name,
+                exception: ex);
+        }
+    }
+
     /// <summary>Creates a staging session bound to a writable handle (of <paramref name="binding"/>'s volume).</summary>
     public async Task<StagingLease> CreateHandleStagingAsync(HandleId handle, OperationScope scope, VolumeBinding? binding)
     {
         VolumeSession session = await EnsureSessionAsync(scope).ConfigureAwait(false);
-        Bound<CreateStagingResultMessage> bound = await MutateBoundAsync<CreateStagingResultMessage>(scope, "CreateStaging", null,
-            header => new CreateStagingMessage(header, handle, default), rebindable: false, binding: binding).ConfigureAwait(false);
+        Bound<CreateStagingResultMessage> bound;
+        try
+        {
+            bound = await MutateBoundAsync<CreateStagingResultMessage>(scope, "CreateStaging", null,
+                header => new CreateStagingMessage(header, handle, default), rebindable: false, binding: binding).ConfigureAwait(false);
+        }
+        catch (DfsCommitOutcomeUnknownException unknown)
+        {
+            throw StagingNotCreated(scope, unknown);
+        }
+
         CreateStagingResultMessage created = bound.Reply;
         return new StagingLease(created.Staging, handle, null, bound.Session?.Id ?? session.Id, created.Capability, created.CapabilityExpiry,
             created.PlacementEpoch, bound.Binding);
     }
+
+    /// <summary>
+    /// A staging session has no namespace effect, so an unanswered <c>CreateStaging</c> is not an unknown outcome of the
+    /// public operation (whose own request was never sent): it is the caller's cancellation (or the client's disposal), or
+    /// an availability failure. A session it may still have created holds nothing and closes with its client session.
+    /// </summary>
+    private static Exception StagingNotCreated(OperationScope scope, DfsCommitOutcomeUnknownException unknown)
+        => scope.IsAbortedByCaller
+            ? scope.NotTransmittedFailure(unknown.InnerException ?? unknown)
+            : new DfsUnavailableException(DfsErrorCode.Unavailable, "A staging session could not be created: the request was not answered.",
+                unknown.InnerException ?? unknown);
 
     /// <summary>Renews the capability of <paramref name="lease"/> (<c>CreateStaging</c> with <c>Renew</c>; no log entry).</summary>
     public async Task RenewStagingAsync(StagingLease lease, OperationScope scope)

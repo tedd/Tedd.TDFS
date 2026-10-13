@@ -33,7 +33,7 @@ internal sealed partial class VolumeStateMachine
         ImmutableSortedDictionary<string, StreamRecord> streams = inode.Streams;
         foreach (KeyValuePair<string, StreamRecord> pair in inode.Streams)
         {
-            StreamRecord stored = MaterializedStream(s, c.Materialized, c.LeaderStaging, pair.Key, pair.Value);
+            StreamRecord stored = MaterializedStream(s, c.Materialized, c.LeaderStaging, pair.Key, pair.Value, ctx.Replay);
             if (!ReferenceEquals(stored, pair.Value))
                 streams = streams.SetItem(pair.Key, stored with { Revision = ctx.Index });
         }

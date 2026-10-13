@@ -21,6 +21,8 @@ tables in §9–§10 are generated from those records (wire order and wire types
   sent one-way (no reply); every other request expects exactly one reply.
 * `MessageTypes.OperationOf(type)` maps every type to a `DfsOperationKind` (used by fault injection and message
   filters).
+  The node-internal restore steps `RestoreVolume`/`RestoreInstall` map to `Admin` (their committed entries and object
+  writes are tagged `RestoreSnapshot`), so `RestoreSnapshot` identifies the client's request at the RPC fault sites.
 * A reply never changes meaning with the connection it arrives on: correlation is the transport's job and a late reply
   to an abandoned request is discarded by the transport (NET-009).
 
@@ -424,8 +426,9 @@ zeroes; missing objects never do (STR, DSK-016).
 * `RangeChange` kinds: `Data` maps `[Offset, Offset + Length)` to object bytes `[ObjectOffset, ObjectOffset + Length)`
   (`ObjectLength`/`Checksum`/`Encoding` describe the whole object and must match a receipt); `Zero` makes the range a
   hole; `Inline` carries the bytes and is only valid when the resulting file is stored inline (length ≤ the volume's
-  `InlineThreshold` and the metadata group's durability satisfies the file's policy — LAY-002). Changes apply in order;
-  later changes override earlier ones.
+  `InlineThreshold` and the metadata group's durability satisfies the file's policy — LAY-002). The changes of one request
+  must not overlap and must lie inside `[0, NewLength)` (for `Append`: `[0, AppendLength)`); the leader rejects other
+  layouts with `InvalidArgument` before proposing (LAY-018).
 * `CommitFile`: clip the base revision at `TruncateTo` (when ≥ 0; the lowest length the staged view reached), apply the
   changes, then set `NewLength` (growth creates a hole). This preserves STR-011: truncation followed by extension never
   reveals discarded bytes. `BaseRevision` (non-zero) must equal the inode's revision (`WriterConflict` otherwise).
@@ -1745,7 +1748,7 @@ Reads a byte range of an object (client or node → storage node). Requires a re
 
 #### `GetObjectResult` = 113 (`GetObjectResultMessage`)
 
-Reply to `GetObjectMessage`. When `UnitSize` is positive, `Offset` is aligned down to a unit boundary, `Data` covers the requested range extended to unit boundaries (clipped to the object end), and `UnitChecksums[i]` is the CRC32C of unit i of `Data`, letting the client verify a partial range; a whole-object read is verified against `Checksum`. When `UnitSize` is 0, `Offset` is the requested offset and no unit checksums are supplied.
+Reply to `GetObjectMessage`. When `UnitSize` is positive, `Offset` is aligned down to a unit boundary, `Data` covers the requested range extended to unit boundaries (clipped to the object end), and `UnitChecksums[i]` is the CRC32C of unit i of `Data`, letting the client verify a partial range; a whole-object read is verified against `Checksum`. Only the last unit of `Data` may be shorter than `UnitSize` (the object end, or a verified short result that covers a prefix of the requested range, FSD §6.2); its checksum covers exactly the bytes present, and the client continues from the first byte not returned. When `UnitSize` is 0, `Offset` is the requested offset and no unit checksums are supplied.
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|

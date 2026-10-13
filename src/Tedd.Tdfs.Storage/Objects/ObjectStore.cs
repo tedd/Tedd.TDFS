@@ -309,6 +309,8 @@ public sealed partial class ObjectStore : IAsyncDisposable
                 return 0;
 
             bool verify = !_options.Mutations.SkipChecksumVerification;
+            if (verify)
+                await VerifyStoredHeaderAsync(e, ct);
             int unitSize = e.Header.UnitSize;
             int firstUnit = (int)(offset / unitSize);
             int lastUnit = (int)((offset + count - 1) / unitSize);
@@ -357,6 +359,45 @@ public sealed partial class ObjectStore : IAsyncDisposable
         finally
         {
             await ReleaseAsync(e.Segment);
+        }
+    }
+
+    /// <summary>
+    /// Re-reads and validates the durable record header of an indexed object before its payload is served (LAY-018,
+    /// DSK-016): header CRC and identity/length/checksum metadata must still match the index. A damaged header is an
+    /// integrity failure of this copy (the reader fails over to another replica), never a reason to trust the index alone.
+    /// </summary>
+    private async ValueTask VerifyStoredHeaderAsync(IndexEntry e, CancellationToken ct)
+    {
+        int headerLength = e.Header.HeaderLength;
+        var raw = new byte[headerLength];
+        try
+        {
+            await e.Segment.File!.ReadFullyAsync(e.Offset, raw, ct);
+        }
+        catch (EndOfStreamException ex)
+        {
+            CountFailure();
+            throw new DfsIntegrityException(e.Info.Id, $"Object {e.Info.Id} has a truncated record header in '{e.Segment.Path}'.", ex);
+        }
+
+        bool valid;
+        try
+        {
+            valid = TryParseHeader(raw, e.Segment.Path, e.Offset, out RecordHeader h)
+                && h.Kind == KindObject && h.Id == e.Info.Id && h.Volume == e.Header.Volume && h.Checksum == e.Info.Checksum
+                && h.PlaintextLength == e.Header.PlaintextLength && h.StoredLength == e.Header.StoredLength && h.UnitSize == e.Header.UnitSize
+                && h.Encoding == e.Header.Encoding;
+        }
+        catch (DfsProtocolException)
+        {
+            valid = false;
+        }
+
+        if (!valid)
+        {
+            CountFailure();
+            throw new DfsIntegrityException(e.Info.Id, $"Object {e.Info.Id} has a damaged record header in '{e.Segment.Path}' at offset {e.Offset}.");
         }
     }
 

@@ -105,11 +105,17 @@ internal sealed record VolumeState
     public ImmutableSortedDictionary<DfsOperationId, RestoreIntentRecord> Restores { get; init; } =
         ImmutableSortedDictionary.Create<DfsOperationId, RestoreIntentRecord>(OperationIdComparer.Instance);
 
+    /// <summary>
+    /// True for a transaction's private working view on the leader (never replicated or checkpointed): nothing in it is
+    /// committed, so its replies carry <see cref="CommitToken.None"/> (PROTOCOL.md §8.4).
+    /// </summary>
+    public bool TransactionView { get; init; }
+
     /// <summary>The root directory.</summary>
     public InodeRecord Root => Inodes[InodeRecord.RootId];
 
-    /// <summary>The commit token of <paramref name="index"/> in this volume.</summary>
-    public CommitToken TokenAt(ulong index) => new(Config.ClusterId, Config.Id, Config.Epoch, index);
+    /// <summary>The commit token of <paramref name="index"/> in this volume (none inside a transaction's working view).</summary>
+    public CommitToken TokenAt(ulong index) => TransactionView ? CommitToken.None : new(Config.ClusterId, Config.Id, Config.Epoch, index);
 
     /// <summary>The inode with <paramref name="id"/>, or null.</summary>
     public InodeRecord? Find(ulong id) => Inodes.GetValueOrDefault(id);

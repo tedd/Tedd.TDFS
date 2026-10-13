@@ -264,6 +264,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
     {
         int want = Math.Min(destination.Length, MaxReadRequest);
         long position = _position;
+
+        // No stream reaches long.MaxValue: a range that would end beyond it is clipped, never wrapped (PATH-013).
+        if (position > long.MaxValue - want)
+            want = (int)(long.MaxValue - position);
+        if (want == 0)
+            return 0;
         byte[] temp;
         int got;
         try
@@ -1031,13 +1037,46 @@ public sealed class DfsStream : Stream, ILeaseHolder
             }
         }
 
+        // Consecutive dirty ranges smaller than a chunk are packed into one object of at most a chunk (each range maps to its
+        // own object offset): a fragmented overlay costs one upload per chunk of data, not one per range (LAY-017).
         int ordinal = 0;
-        foreach ((long offset, ReadOnlyMemory<byte> bytes) in pieces)
+        for (int first = 0; first < pieces.Count;)
         {
+            int last = first + 1;
+            long size = pieces[first].Bytes.Length;
+            while (last < pieces.Count && size + pieces[last].Bytes.Length <= chunk)
+                size += pieces[last++].Bytes.Length;
+
+            ReadOnlyMemory<byte> bytes;
+            if (last == first + 1)
+            {
+                bytes = pieces[first].Bytes;
+            }
+            else
+            {
+                var packed = new byte[size];
+                int at = 0;
+                for (int i = first; i < last; i++)
+                {
+                    pieces[i].Bytes.Span.CopyTo(packed.AsSpan(at));
+                    at += pieces[i].Bytes.Length;
+                }
+
+                bytes = packed;
+            }
+
             (ObjectId id, UInt128 checksum) = _runtime.Data.Describe(bytes.Span);
             IReadOnlyList<ObjectReceipt> receipts = await _runtime.Data.UploadAsync(scope, _volume, staging, id, bytes, checksum, policy, pool,
                 scope.OperationId, ordinal++).ConfigureAwait(false);
-            overlay.ReplaceWithUploaded(offset, bytes.Length, new UploadedObject(id, checksum, bytes.Length, receipts));
+            var uploaded = new UploadedObject(id, checksum, bytes.Length, receipts);
+            long objectOffset = 0;
+            for (int i = first; i < last; i++)
+            {
+                overlay.ReplaceWithUploaded(pieces[i].Offset, pieces[i].Bytes.Length, uploaded, objectOffset);
+                objectOffset += pieces[i].Bytes.Length;
+            }
+
+            first = last;
         }
     }
 

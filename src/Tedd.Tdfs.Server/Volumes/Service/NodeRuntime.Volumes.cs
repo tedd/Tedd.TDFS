@@ -41,10 +41,10 @@ internal sealed partial class NodeRuntime
         router.Register<GetEffectiveRightsMessage>((svc, ctx, m) => svc.GetEffectiveRightsAsync(ctx, m));
         router.Register<ListStreamsMessage>((svc, ctx, m) => svc.ListStreamsAsync(ctx, m));
 
-        router.Register<TxBeginMessage>((svc, ctx, m) => svc.TransactionAsync(ctx, m).AsTask());
-        router.Register<TxOpMessage>((svc, ctx, m) => svc.TransactionAsync(ctx, m).AsTask());
-        router.Register<TxCommitMessage>((svc, ctx, m) => svc.TransactionAsync(ctx, m).AsTask());
-        router.Register<TxAbortMessage>((svc, ctx, m) => svc.TransactionAsync(ctx, m).AsTask());
+        router.Register<TxBeginMessage>((svc, ctx, m) => svc.TxBeginAsync(ctx, m));
+        router.Register<TxOpMessage>((svc, ctx, m) => svc.TxOpAsync(ctx, m));
+        router.Register<TxCommitMessage>((svc, ctx, m) => svc.TxCommitAsync(ctx, m));
+        router.Register<TxAbortMessage>((svc, ctx, m) => svc.TxAbortAsync(ctx, m));
 
         router.Register<CreateSnapshotMessage>((svc, ctx, m) => svc.CreateSnapshotAsync(ctx, m));
         router.Register<ListSnapshotsMessage>((svc, ctx, m) => svc.ListSnapshotsAsync(ctx, m));
@@ -53,6 +53,7 @@ internal sealed partial class NodeRuntime
         router.Register<CloseSnapshotMessage>((svc, ctx, m) => svc.CloseSnapshotAsync(ctx, m));
         router.Register<SetRetentionMessage>((svc, ctx, m) => svc.SetRetentionAsync(ctx, m));
         router.Register<RestoreSnapshotMessage>((svc, ctx, m) => svc.RestoreSnapshotAsync(ctx, m));
+        router.Register<BackupRegisterMessage>((svc, ctx, m) => svc.BackupRegisterAsync(ctx, m));
 
         services.Rpc.Register<InventoryReportMessage>(router.InventoryAsync, RpcAccess.Node);
         services.Rpc.Register<RestoreInstallMessage>(router.RestoreInstallAsync, RpcAccess.Node);

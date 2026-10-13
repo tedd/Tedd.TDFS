@@ -52,12 +52,14 @@ internal sealed class DataPlane
     /// acknowledgement requirement (plus whatever additional copies completed within the grace period).
     /// </summary>
     /// <exception cref="DfsPlacementUnavailableException">Too few distinct hosts or zones accepted the object.</exception>
-    /// <remarks>The <see cref="FaultSites.ClientUploadChunk"/> site is hit once per object (payload chunk) with the
-    /// <see cref="DfsOperationKind.PutObject"/> kind and the chunk's ordinal as occurrence.</remarks>
+    /// <remarks>The <see cref="FaultSites.ClientUploadChunk"/> site is hit once per object (payload chunk) with the chunk's
+    /// ordinal as occurrence and <paramref name="faultKind"/> as operation: the public operation the chunk belongs to (a
+    /// whole-file helper's WriteAll/Append), or <see cref="DfsOperationKind.PutObject"/> for a stream's staged chunks.</remarks>
     public async Task<IReadOnlyList<ObjectReceipt>> UploadAsync(OperationScope scope, VolumeContext volume, StagingLease lease, ObjectId obj,
-        ReadOnlyMemory<byte> data, UInt128 checksum, DfsStoragePolicy policy, string pool, DfsOperationId? operation, int chunkIndex)
+        ReadOnlyMemory<byte> data, UInt128 checksum, DfsStoragePolicy policy, string pool, DfsOperationId? operation, int chunkIndex,
+        DfsOperationKind faultKind = DfsOperationKind.PutObject)
     {
-        await scope.HitAsync(FaultStage.F03, FaultSites.ClientUploadChunk, DfsOperationKind.PutObject, operation, chunkIndex, obj).ConfigureAwait(false);
+        await scope.HitAsync(FaultStage.F03, FaultSites.ClientUploadChunk, faultKind, operation, chunkIndex, obj).ConfigureAwait(false);
         scope.ThrowIfCancelled();
         if (lease.NeedsRenewal(_runtime.Time.GetUtcNow()))
             await volume.RenewStagingAsync(lease, scope).ConfigureAwait(false);
@@ -499,11 +501,10 @@ internal sealed class DataPlane
                 throw new DfsIntegrityException(obj, $"Object {obj}: {result.UnitChecksums.Count} unit checksums for {units} units.");
             for (int i = 0; i < units; i++)
             {
+                // Only the last unit of a result may be partial: at the object end, or in a verified short result (FSD §6.2,
+                // PROTOCOL.md GetObjectResult), where its checksum covers exactly the bytes returned.
                 int at = i * unit;
                 int length = Math.Min(unit, data.Length - at);
-                bool lastUnitOfObject = start + at + length == objectLength;
-                if (length != unit && !lastUnitOfObject)
-                    throw new DfsIntegrityException(obj, $"Object {obj}: a partial unit in the middle of the object.");
                 if (ObjectChecksum.Crc32C(data.Slice(at, length)) != result.UnitChecksums[i])
                     throw new DfsIntegrityException(obj, $"Object {obj}: unit {(start + at) / unit} does not match its checksum.");
             }

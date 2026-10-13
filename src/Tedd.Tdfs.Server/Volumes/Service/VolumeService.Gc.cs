@@ -41,13 +41,26 @@ internal sealed partial class VolumeService
     /// </summary>
     public async Task<IWireMessage> InventoryReportAsync(RpcContext context, InventoryReportMessage request)
     {
-        if (!IsLeader)
-            throw Group.NotLeader();
         if (context.PeerNode != request.Node)
             throw new UnauthorizedAccessException("A node can only report its own inventory.");
+        return await InventoryReportCoreAsync(request, context.Cancellation);
+    }
+
+    /// <summary>The inventory of the leader's own node (no RPC; same rules).</summary>
+    public Task<InventoryReportResultMessage> InventoryReportLocalAsync(InventoryReportMessage request, CancellationToken ct)
+    {
+        if (request.Node != _s.NodeId)
+            throw new UnauthorizedAccessException("A node can only report its own inventory.");
+        return InventoryReportCoreAsync(request, ct);
+    }
+
+    private async Task<InventoryReportResultMessage> InventoryReportCoreAsync(InventoryReportMessage request, CancellationToken ct)
+    {
+        if (!IsLeader)
+            throw Group.NotLeader();
         if (_s.Control.State.FindMember(request.Node) is not { IsLive: true } member || member.Incarnation != request.Incarnation)
             throw new DfsException(DfsErrorCode.StaleIncarnation, $"Inventory of node {request.Node} incarnation {request.Incarnation} is not current.");
-        await EnsureLeaderReadyAsync(context.Cancellation);
+        await EnsureLeaderReadyAsync(ct);
         var key = (request.Node, request.ReportId);
         if (!_inventories.TryGetValue(key, out InventoryAccumulator? accumulator) || request.Page == 0)
         {
@@ -90,7 +103,7 @@ internal sealed partial class VolumeService
         _staged[request.Node] = staged;
         _pendingGc[request.Node] = delete.Count;
         if (delete.Count > 0)
-            await _s.HitAsync(FaultStage.F20, FaultSites.GcSweep, Name, DfsOperationKind.Gc, detail: _s.Control.NameOf(request.Node), ct: context.Cancellation);
+            await _s.HitAsync(FaultStage.F20, FaultSites.GcSweep, Name, DfsOperationKind.Gc, detail: _s.Control.NameOf(request.Node), ct: ct);
         return new InventoryReportResultMessage(delete, unknown, delete.Count > 0 ? s.AppliedIndex : 0, Record.Epoch);
     }
 

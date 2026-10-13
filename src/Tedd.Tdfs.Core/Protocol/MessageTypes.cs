@@ -88,8 +88,13 @@ public static class MessageTypes
         MessageType.OpenSnapshot or MessageType.OpenSnapshotResult or MessageType.CloseSnapshot or MessageType.CloseSnapshotResult
             => DfsOperationKind.OpenSnapshot,
         MessageType.SetRetention or MessageType.SetRetentionResult => DfsOperationKind.Admin,
-        MessageType.RestoreSnapshot or MessageType.RestoreSnapshotResult or MessageType.RestoreVolume or MessageType.RestoreVolumeResult
-            or MessageType.RestoreInstall or MessageType.RestoreInstallResult => DfsOperationKind.RestoreSnapshot,
+        MessageType.RestoreSnapshot or MessageType.RestoreSnapshotResult => DfsOperationKind.RestoreSnapshot,
+
+        // Node-internal control and install steps of a restore: reported as administrative traffic at the request-path fault
+        // sites, so a RestoreSnapshot match addresses the client's request (OUT-001); their committed entries and object
+        // writes are still tagged RestoreSnapshot (RST-007).
+        MessageType.RestoreVolume or MessageType.RestoreVolumeResult or MessageType.RestoreInstall or MessageType.RestoreInstallResult
+            => DfsOperationKind.Admin,
 
         MessageType.PutObject or MessageType.PutObjectResult => DfsOperationKind.PutObject,
         MessageType.GetObject or MessageType.GetObjectResult or MessageType.LocateObject or MessageType.LocateObjectResult

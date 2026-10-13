@@ -183,6 +183,26 @@ internal sealed class ControlHost
             _ = DrainAuditsAsync();
     }
 
+    /// <summary>
+    /// Like <see cref="ReportSecurityEvent"/>, but returns once the audit record is applied (or dropped): an administrative
+    /// denial is answered only after it is visible in the audit log (read-your-writes for the denied caller's auditor).
+    /// Same flood bound; never throws.
+    /// </summary>
+    public async Task ReportSecurityEventAndWaitAsync(string operation, string outcome, string scope, string principal = "-")
+    {
+        if (!IsLeader || _pendingAudits.Count >= MaxPendingAudits || !TakeAuditToken())
+            return;
+        try
+        {
+            using CancellationTokenSource deadline = _s.CreateDeadline();
+            await ProposeAsync(new AppendAuditCommand(NewHeader(default, string.IsNullOrEmpty(principal) ? "-" : principal), operation, outcome, scope),
+                deadline.Token);
+        }
+        catch (Exception ex) when (ex is DfsException or OperationCanceledException)
+        {
+        }
+    }
+
     /// <summary>Token bucket (20 events burst, 10 per second) so floods of failed handshakes cannot flood the log.</summary>
     private bool TakeAuditToken()
     {

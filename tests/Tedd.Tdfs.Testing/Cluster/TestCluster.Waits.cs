@@ -69,15 +69,23 @@ public sealed partial class TestCluster
     }
 
     /// <summary>Waits until a volume has no under-replicated objects (and no zone deficits), per <see cref="ClusterInspector.GetReplicaHealthAsync"/>.</summary>
-    public Task WaitForRepairAsync(string volume, TimeSpan? timeout = null, CancellationToken ct = default)
+    public async Task WaitForRepairAsync(string volume, TimeSpan? timeout = null, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(volume);
         DfsReplicaHealth? last = null;
-        return WaitUntilCoreAsync(async () =>
+        try
         {
-            last = await Inspect.GetReplicaHealthAsync(volume);
-            return last.UnderReplicatedObjects == 0 && last.ZoneDeficitObjects == 0;
-        }, timeout ?? TimeSpan.FromSeconds(120), $"volume {volume} has no under-replicated objects (last health: {last})", ct);
+            await WaitUntilCoreAsync(async () =>
+            {
+                last = await Inspect.GetReplicaHealthAsync(volume);
+                return last.UnderReplicatedObjects == 0 && last.ZoneDeficitObjects == 0;
+            }, timeout ?? TimeSpan.FromSeconds(120), $"volume {volume} has no under-replicated objects", ct);
+        }
+        catch (TimeoutException ex)
+        {
+            // The last observation is only known once the wait gave up.
+            throw new TimeoutException($"{ex.Message} (last health: {last})", ex);
+        }
     }
 
     /// <summary>Polls a condition; throws <see cref="TimeoutException"/> naming <paramref name="because"/>.</summary>

@@ -35,7 +35,7 @@ public sealed partial class DfsAdminClient
     /// <summary>Lists the groups and their members.</summary>
     public async Task<IReadOnlyList<DfsGroupInfo>> ListGroupsAsync(CancellationToken ct = default)
     {
-        AdminGroupListBody body = await CallAsync<AdminEmptyBody, AdminGroupListBody>(AdminOp.ListGroups, () => new AdminEmptyBody(), Runtime.AnyNodeRouter,
+        AdminGroupListBody body = await CallAsync<AdminEmptyBody, AdminGroupListBody>(AdminOp.ListGroups, () => new AdminEmptyBody(), Runtime.ControlRouter,
             DfsOperationKind.Admin, ct).ConfigureAwait(false);
         return body.Groups.Select(g => new DfsGroupInfo(g.Name, g.Members)).ToArray();
     }
@@ -60,7 +60,7 @@ public sealed partial class DfsAdminClient
     /// <summary>Lists the storage pools.</summary>
     public async Task<IReadOnlyList<DfsPoolInfo>> ListPoolsAsync(CancellationToken ct = default)
     {
-        AdminPoolListBody body = await CallAsync<AdminEmptyBody, AdminPoolListBody>(AdminOp.ListPools, () => new AdminEmptyBody(), Runtime.AnyNodeRouter,
+        AdminPoolListBody body = await CallAsync<AdminEmptyBody, AdminPoolListBody>(AdminOp.ListPools, () => new AdminEmptyBody(), Runtime.ControlRouter,
             DfsOperationKind.Admin, ct).ConfigureAwait(false);
         return body.Pools.Select(WireConvert.ToPoolInfo).ToArray();
     }
@@ -69,7 +69,7 @@ public sealed partial class DfsAdminClient
     public async Task<DfsPoolStatus> GetPoolStatusAsync(string pool, CancellationToken ct = default)
     {
         AdminPoolStatusBody body = await CallAsync<AdminPoolNameBody, AdminPoolStatusBody>(AdminOp.PoolStatus,
-            () => new AdminPoolNameBody(Validation.Name(pool, nameof(pool))), Runtime.AnyNodeRouter, DfsOperationKind.Admin, ct).ConfigureAwait(false);
+            () => new AdminPoolNameBody(Validation.Name(pool, nameof(pool))), Runtime.ControlRouter, DfsOperationKind.Admin, ct).ConfigureAwait(false);
         return new DfsPoolStatus(WireConvert.ToPoolInfo(body.Info), WireConvert.ToReplicaHealth(body.Replicas), body.DrainingNodes);
     }
 

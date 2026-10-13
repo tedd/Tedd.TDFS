@@ -57,11 +57,26 @@ internal static class PortAllocator
             await runtime.DelayAsync(TimeSpan.FromMilliseconds(20));
     }
 
+    /// <summary>
+    /// Whether a QUIC listener can bind <paramref name="port"/>. The QUIC stack binds the port on the wildcard address (it
+    /// filters by local address itself), so a port some other program holds on 0.0.0.0 or [::] is busy even though a plain
+    /// non-exclusive bind of 127.0.0.1 succeeds next to it (Windows allows that, e.g. next to Steam's UDP 27036).
+    /// </summary>
     private static bool IsFree(int port)
+        => CanBind(IPAddress.Loopback, port, dualMode: false)
+           && CanBind(IPAddress.Any, port, dualMode: false)
+           && (!Socket.OSSupportsIPv6 || CanBind(IPAddress.IPv6Any, port, dualMode: true));
+
+    private static bool CanBind(IPAddress address, int port, bool dualMode)
     {
         try
         {
-            using var probe = new UdpClient(new IPEndPoint(IPAddress.Loopback, port));
+            using var probe = new Socket(address.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+            if (OperatingSystem.IsWindows())
+                probe.ExclusiveAddressUse = true; // fail next to any other binding of the port instead of sharing it
+            if (dualMode)
+                probe.DualMode = true;
+            probe.Bind(new IPEndPoint(address, port));
             return true;
         }
         catch (SocketException)

@@ -168,7 +168,10 @@ public sealed class DfsSnapshotClient
         }
         catch (DfsCommitOutcomeUnknownException unknown)
         {
-            // Opening a view changes nothing visible: an unanswered open is an availability failure (an orphan pin expires).
+            // Opening a view changes nothing visible: an unanswered open is an availability failure, or the caller's
+            // cancellation when the caller cancelled (an orphan pin expires).
+            if (scope.IsAbortedByCaller)
+                throw scope.NotTransmittedFailure(unknown.InnerException ?? unknown);
             throw new DfsUnavailableException(DfsErrorCode.Unavailable, $"Opening snapshot '{name}' did not complete.", unknown.InnerException ?? unknown);
         }
 

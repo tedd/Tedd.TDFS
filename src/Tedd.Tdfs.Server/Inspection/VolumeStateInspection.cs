@@ -23,6 +23,9 @@ public sealed record VolumeStateInspection(VolumeId Id, ulong Epoch, ulong Appli
     /// <summary>Computes the reachable object set of the inspected (immutable) state; set by the volume state machine.</summary>
     internal Func<IReadOnlySet<ObjectId>>? ReachableResolver { get; init; }
 
+    /// <summary>Computes the storage policy names of the reachable objects; set by the volume state machine.</summary>
+    internal Func<IReadOnlyDictionary<ObjectId, IReadOnlySet<string>>>? PolicyResolver { get; init; }
+
     /// <summary>
     /// The file at <paramref name="path"/> in the current root (a stream path inspects its file), or null when absent (or a
     /// directory).
@@ -38,4 +41,12 @@ public sealed record VolumeStateInspection(VolumeId Id, ulong Epoch, ulong Appli
     /// <exception cref="InvalidOperationException">The inspected state machine does not provide reachability.</exception>
     public IReadOnlySet<ObjectId> ReachableObjects()
         => (ReachableResolver ?? throw new InvalidOperationException("This volume state machine does not provide reachability."))();
+
+    /// <summary>
+    /// The storage policy names (empty = the volume default) of the inodes referencing each reachable object — the current
+    /// root, snapshot roots and pinned versions; an object shared by several inodes lists each policy.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">The inspected state machine does not provide policy information.</exception>
+    public IReadOnlyDictionary<ObjectId, IReadOnlySet<string>> ObjectPolicies()
+        => (PolicyResolver ?? throw new InvalidOperationException("This volume state machine does not provide object policies."))();
 }

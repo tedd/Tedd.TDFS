@@ -38,7 +38,51 @@ internal sealed partial class VolumeStateMachine
         {
             FileResolver = path => InspectFile(s, path),
             ReachableResolver = () => Reachable(s),
+            PolicyResolver = () => ObjectPolicies(s),
         };
+    }
+
+    /// <summary>The name under which the volume default storage policy is reported (an inode with no named policy).</summary>
+    public const string DefaultPolicyName = "default";
+
+    /// <summary>The policy names of the inodes referencing each object of the current root, snapshots and pinned versions.</summary>
+    private static IReadOnlyDictionary<ObjectId, IReadOnlySet<string>> ObjectPolicies(VolumeState s)
+    {
+        var result = new Dictionary<ObjectId, HashSet<string>>();
+        void Add(InodeRecord n)
+        {
+            foreach (ObjectId o in n.Objects())
+            {
+                if (!result.TryGetValue(o, out HashSet<string>? names))
+                    result[o] = names = new HashSet<string>(StringComparer.Ordinal);
+                names.Add(n.PolicyName);
+            }
+        }
+
+        foreach (InodeRecord n in s.Inodes.Values)
+            Add(n);
+        foreach (SnapshotRecord snapshot in s.Snapshots.Values)
+        {
+            foreach (InodeRecord n in snapshot.Root.Values)
+                Add(n);
+        }
+
+        foreach (PinRecord pin in s.Pins.Values)
+        {
+            if (pin.Root is { } root)
+            {
+                foreach (InodeRecord n in root.Values)
+                    Add(n);
+            }
+        }
+
+        foreach (HandleRecord h in s.Handles.Values)
+        {
+            if (h.PinnedInode is { } pinned)
+                Add(pinned);
+        }
+
+        return result.ToDictionary(p => p.Key, p => (IReadOnlySet<string>)p.Value);
     }
 
     /// <summary>The applied metadata of the file at <paramref name="path"/> (a stream path inspects its file), or null.</summary>
@@ -57,7 +101,8 @@ internal sealed partial class VolumeStateMachine
             .Select(p => new StreamInspection(p.Key, p.Value.Length, p.Value.Revision, Extents(p.Value)))
             .ToArray();
         return new FileInspection(filePath, new InodeId(inode.Id), inode.ReportedRevision, main.Length, main.IsInline,
-            s.WriterGenerationOf(new StreamKey(inode.Id, DfsStreamPath.DefaultStreamName)), inode.PolicyName, Extents(main), streams);
+            s.WriterGenerationOf(new StreamKey(inode.Id, DfsStreamPath.DefaultStreamName)), inode.PolicyName.Length == 0 ? DefaultPolicyName : inode.PolicyName,
+            Extents(main), streams);
     }
 
     private static IReadOnlyList<ExtentInspection> Extents(StreamRecord stream)

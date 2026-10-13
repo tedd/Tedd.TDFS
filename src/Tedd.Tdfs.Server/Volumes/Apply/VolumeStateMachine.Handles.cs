@@ -139,6 +139,14 @@ internal sealed partial class VolumeStateMachine
                 }
             }
 
+            // A transaction's writer reservation acts like a writer that shares reading (LOCK-01): no other writer, and
+            // readers must let it write.
+            if (ReservationHolder(s, ctx, key) is { } holder && (writable || (c.Share & FileShare.Write) == 0))
+            {
+                throw Fail(writable ? DfsErrorCode.WriterConflict : DfsErrorCode.SharingViolation,
+                    $"'{path}' is reserved for writing by transaction {holder.Id}.");
+            }
+
             if (!streamExists)
             {
                 inode = Touch(inode with { Streams = inode.Streams.Add(stream, StreamRecord.Empty(ctx.Index)) }, ctx);
@@ -223,13 +231,31 @@ internal sealed partial class VolumeStateMachine
 
     private static (VolumeState, VolumeApplyResult) ApplyCloseStaging(VolumeState s, ApplyContext ctx, CloseStagingCommand c)
     {
+        if (ctx.Op is { } op)
+        {
+            // A client's close of its own unbound staging session (CreateStaging with Close): sessions bound to a handle or a
+            // transaction close with their owner.
+            foreach (ulong id in OrEmpty(c.Staging))
+            {
+                if (!s.Staging.TryGetValue(id, out StagingRecord? owned))
+                    continue;
+                if (!string.Equals(owned.Principal, op.Principal, StringComparison.Ordinal))
+                    throw Fail(DfsErrorCode.AccessDenied, $"Staging session {id} belongs to another principal.");
+                if (owned.Handle != 0 || !owned.Transaction.IsEmpty)
+                    throw Fail(DfsErrorCode.InvalidArgument, $"Staging session {id} is bound to a handle or a transaction and closes with it.");
+            }
+        }
+
         foreach (ulong id in OrEmpty(c.Staging).Order())
         {
             if (s.Staging.TryGetValue(id, out StagingRecord? staging))
                 s = CloseStaging(s, staging, ctx.Index);
         }
 
-        return (s, VolumeApplyResult.Ok(null));
+        Protocol.IWireMessage? reply = ctx.Op is not null && OrEmpty(c.Staging).Length == 1
+            ? new CreateStagingResultMessage(new StagingId(c.Staging[0]), ReadOnlyMemory<byte>.Empty, default, 0, s.TokenAt(ctx.Index))
+            : null;
+        return (s, VolumeApplyResult.Ok(reply));
     }
 
     private static (VolumeState, VolumeApplyResult) ApplyReclaimDetached(VolumeState s, ApplyContext ctx, ReclaimDetachedCommand c)

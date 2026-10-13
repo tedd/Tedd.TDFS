@@ -624,7 +624,7 @@ internal sealed class HarnessHandler : IRpcHandler
             IWireMessage? shortened = replyMessage switch
             {
                 ReadRangeResultMessage range => ShortenRange(range, rule.MaxBytesPerResult),
-                GetObjectResultMessage obj => ShortenObject(obj, rule.MaxBytesPerResult),
+                GetObjectResultMessage obj when requestMessage is GetObjectMessage get => ShortenObject(obj, get.Offset, rule.MaxBytesPerResult),
                 _ => null,
             };
             if (shortened is null)
@@ -665,19 +665,27 @@ internal sealed class HarnessHandler : IRpcHandler
         return range with { InlineData = range.InlineData[..max], Length = max };
     }
 
-    private static GetObjectResultMessage? ShortenObject(GetObjectResultMessage result, int max)
+    private static GetObjectResultMessage? ShortenObject(GetObjectResultMessage result, long requestedOffset, int max)
     {
-        if (result.Data.Length <= max)
+        // The reply may start before the requested offset (aligned down to a verification unit): keep the bytes up to
+        // `max` bytes past the requested offset, so the result is a prefix of the *requested* range (plus the alignment
+        // bytes in front of it) and every call makes progress.
+        long lead = requestedOffset - result.Offset;
+        if (lead < 0 || lead > result.Data.Length)
             return null;
-        ReadOnlyMemory<byte> data = result.Data[..max];
+        long keepLong = lead + max;
+        if (result.Data.Length <= keepLong)
+            return null;
+        int keep = (int)keepLong;
+        ReadOnlyMemory<byte> data = result.Data[..keep];
         if (result.UnitSize > 0)
         {
-            int units = (max + result.UnitSize - 1) / result.UnitSize;
+            int units = (keep + result.UnitSize - 1) / result.UnitSize;
             var checksums = new uint[units];
             for (int i = 0; i < units; i++)
             {
                 int start = i * result.UnitSize;
-                int length = Math.Min(result.UnitSize, max - start);
+                int length = Math.Min(result.UnitSize, keep - start);
                 checksums[i] = length == result.UnitSize && i < result.UnitChecksums.Count
                     ? result.UnitChecksums[i]
                     : ObjectChecksum.Crc32C(data.Span.Slice(start, length));
@@ -690,7 +698,7 @@ internal sealed class HarnessHandler : IRpcHandler
         // result whose checksum covers exactly the returned bytes.
         if (result.Offset != 0)
             return null;
-        return result with { Data = data, UnitSize = max, UnitChecksums = [ObjectChecksum.Crc32C(data.Span)] };
+        return result with { Data = data, UnitSize = keep, UnitChecksums = [ObjectChecksum.Crc32C(data.Span)] };
     }
 
     private void Propagate(ValueTask<ReadOnlyMemory<byte>?> source, TaskCompletionSource<ReadOnlyMemory<byte>?> target)

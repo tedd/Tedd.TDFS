@@ -101,6 +101,12 @@ internal sealed class ConnectionState(IRpcConnection connection, bool outbound)
     public UInt128 BootId { get; set; }
 
     public int ProtocolErrors { get; set; }
+
+    /// <summary>
+    /// The answer to frames that arrive on this connection after it was rejected (until it closes): an authentication
+    /// failure, or a protocol error when the authenticated peer was rejected for malformed frames (PROTOCOL.md §11.2).
+    /// </summary>
+    public DfsErrorCode RejectedWith { get; set; } = DfsErrorCode.AuthenticationFailed;
 }
 
 /// <summary>
@@ -250,7 +256,13 @@ internal sealed partial class RpcDispatcher : IRpcHandler
 
         ConnectionState state = GetState(connection, outbound: false);
         if (state.Phase == HandshakePhase.Rejected)
-            return expectsReply ? Error(new ErrorReplyMessage(DfsErrorCode.AuthenticationFailed, "The connection is not authenticated.")) : null;
+        {
+            return expectsReply
+                ? Error(new ErrorReplyMessage(state.RejectedWith, state.RejectedWith == DfsErrorCode.ProtocolError
+                    ? "The connection was closed after repeated malformed frames."
+                    : "The connection is not authenticated."))
+                : null;
+        }
 
         IWireMessage message;
         MessageType type;
@@ -262,6 +274,8 @@ internal sealed partial class RpcDispatcher : IRpcHandler
         catch (DfsProtocolException ex)
         {
             state.ProtocolErrors++;
+            if (state.Phase == HandshakePhase.Authenticated && state.ProtocolErrors >= MaxProtocolErrors)
+                state.RejectedWith = DfsErrorCode.ProtocolError;
             if (state.Phase != HandshakePhase.Authenticated || state.ProtocolErrors >= MaxProtocolErrors)
                 Reject(state);
             return expectsReply ? Error(new ErrorReplyMessage(ex.ErrorCode, ex.Message)) : null;

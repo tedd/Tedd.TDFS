@@ -5,11 +5,14 @@ namespace Tedd.Tdfs.Client.Internal.Facades;
 /// <summary>Conversions between wire records and the public SDK records.</summary>
 internal static class WireConvert
 {
-    /// <summary>Public file metadata.</summary>
+    /// <summary>Name under which the SDK reports (and accepts) the volume's default storage policy.</summary>
+    public const string DefaultPolicyName = "default";
+
+    /// <summary>Public file metadata (the wire's empty policy name — the volume default — is reported as "default").</summary>
     public static DfsFileInfo ToFileInfo(FileInfoData info, CommitToken observedAt, long? lengthOverride = null) =>
         new(info.Path, info.Inode, info.Revision, lengthOverride ?? info.Length, info.CreatedUtc, info.ModifiedUtc, info.Owner,
-            new DfsInodeAccess(info.OwnerOnly, info.ReadOnlyForOthers), info.StoragePolicy, info.IsInline, info.IsSparse, info.ExtentCount, observedAt,
-            info.IsStream, info.StreamName, info.StreamCount);
+            new DfsInodeAccess(info.OwnerOnly, info.ReadOnlyForOthers), info.StoragePolicy.Length == 0 ? DefaultPolicyName : info.StoragePolicy,
+            info.IsInline, info.IsSparse, info.ExtentCount, observedAt, info.IsStream, info.StreamName, info.StreamCount);
 
     /// <summary>Public directory metadata.</summary>
     public static DfsDirectoryInfo ToDirectoryInfo(FileInfoData info, CommitToken observedAt) =>

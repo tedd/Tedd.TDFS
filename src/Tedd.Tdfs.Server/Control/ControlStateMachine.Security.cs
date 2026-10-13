@@ -106,6 +106,8 @@ internal sealed partial class ControlStateMachine
             {
                 if (DfsPoolNames.GetError(c.Pool) is { } nameError)
                     return Fail(DfsErrorCode.InvalidArgument, nameError);
+                if (isDefault && c.Kind == ControlCommandKind.CreatePool)
+                    return Fail(DfsErrorCode.AlreadyExists, "The default pool always exists (it implicitly contains every live node).");
                 if (isDefault)
                     return Fail(DfsErrorCode.InvalidArgument, "The default pool is implicit and always contains every live node.");
                 if (c.Kind == ControlCommandKind.CreatePool && State.Pools.ContainsKey(c.Pool))

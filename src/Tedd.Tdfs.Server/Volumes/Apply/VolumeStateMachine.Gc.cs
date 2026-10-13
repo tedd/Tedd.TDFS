@@ -139,10 +139,6 @@ internal sealed partial class VolumeStateMachine
         return (s, VolumeApplyResult.Ok(null, below));
     }
 
-    private static (VolumeState, VolumeApplyResult) ApplyTransaction(VolumeState s, ApplyContext ctx)
-        => (s, VolumeApplyResult.Fail(DfsErrorCode.Unsupported,
-            $"NOT IMPLEMENTED (next phase): transactions ({ctx.Command.Kind}) are not supported by this volume service yet."));
-
     private static (VolumeState, VolumeApplyResult) ApplyBackupProgress(VolumeState s, ApplyContext ctx, RecordBackupProgressCommand c)
     {
         BackupProgressRecord p = c.Progress with { UpdatedUtc = ctx.Now };

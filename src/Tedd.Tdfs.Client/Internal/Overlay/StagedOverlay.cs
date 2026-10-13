@@ -64,6 +64,8 @@ internal sealed class StagedOverlay
     public const int MaxCoalescedSegment = 1 << 20;
 
     private List<StagedSegment> _segments = [];
+    private long _pendingBytes;
+    private long _bufferedBytes;
 
     public StagedOverlay(long baseLength)
     {
@@ -89,25 +91,36 @@ internal sealed class StagedOverlay
 
     /// <summary>
     /// Staged, unpublished bytes (buffered and uploaded). Safe to read while the owning stream works (it backs the
-    /// ungated <see cref="DfsStream.PendingBytes"/>): it never enumerates a list another call may be changing.
+    /// ungated <see cref="DfsStream.PendingBytes"/>): a maintained total, never an enumeration of a list another call may
+    /// be changing.
     /// </summary>
-    public long PendingBytes => Sum(bufferedOnly: false);
+    public long PendingBytes => Volatile.Read(ref _pendingBytes);
 
     /// <summary>Buffered (not yet uploaded) bytes.</summary>
-    public long BufferedBytes => Sum(bufferedOnly: true);
+    public long BufferedBytes => Volatile.Read(ref _bufferedBytes);
 
-    private long Sum(bool bufferedOnly)
+    /// <summary>Adds (or with a negative sign removes) a segment's bytes to the maintained totals.</summary>
+    private void Count(StagedSegment segment, int sign)
     {
-        List<StagedSegment> segments = Volatile.Read(ref _segments);
-        long total = 0;
-        for (int i = 0; i < segments.Count; i++)
+        Volatile.Write(ref _pendingBytes, _pendingBytes + (sign * segment.Length));
+        if (segment.IsBuffered)
+            Volatile.Write(ref _bufferedBytes, _bufferedBytes + (sign * segment.Length));
+    }
+
+    /// <summary>Recomputes the maintained totals from the segment list.</summary>
+    private void Recount()
+    {
+        long pending = 0;
+        long buffered = 0;
+        foreach (StagedSegment segment in _segments)
         {
-            StagedSegment? segment = i < segments.Count ? segments[i] : null;
-            if (segment is not null && (!bufferedOnly || segment.IsBuffered))
-                total += segment.Length;
+            pending += segment.Length;
+            if (segment.IsBuffered)
+                buffered += segment.Length;
         }
 
-        return total;
+        Volatile.Write(ref _pendingBytes, pending);
+        Volatile.Write(ref _bufferedBytes, buffered);
     }
 
     /// <summary>The truncation point to publish (<c>-1</c> when the base is never clipped).</summary>
@@ -123,6 +136,7 @@ internal sealed class StagedOverlay
         Length = snapshot.Length;
         MinLength = snapshot.MinLength;
         _segments = [.. snapshot.Segments];
+        Recount();
     }
 
     /// <summary>Marks the staged view as published: it becomes the new base (of <paramref name="newBaseLength"/> bytes).</summary>
@@ -132,6 +146,7 @@ internal sealed class StagedOverlay
         Length = newBaseLength;
         MinLength = newBaseLength;
         _segments = [];
+        Recount();
     }
 
     /// <summary>Stages <paramref name="data"/> (a private copy owned by the overlay from now on) at <paramref name="offset"/>.</summary>
@@ -163,6 +178,8 @@ internal sealed class StagedOverlay
 
                 data.Span.CopyTo(buffer.AsSpan(used));
                 _segments[before] = previous with { Length = previous.Length + data.Length };
+                Volatile.Write(ref _pendingBytes, _pendingBytes + data.Length);
+                Volatile.Write(ref _bufferedBytes, _bufferedBytes + data.Length);
                 Length = Math.Max(Length, end);
                 return;
             }
@@ -192,10 +209,13 @@ internal sealed class StagedOverlay
         Length = Math.Max(Length, end);
     }
 
-    /// <summary>Replaces <c>[segment.Offset, segment.End)</c> with an uploaded object holding exactly those bytes.</summary>
-    public void ReplaceWithUploaded(long offset, long length, UploadedObject uploaded)
+    /// <summary>
+    /// Replaces <c>[offset, offset + length)</c> with the bytes of an uploaded object starting at
+    /// <paramref name="objectOffset"/> (several dirty ranges may share one packed object).
+    /// </summary>
+    public void ReplaceWithUploaded(long offset, long length, UploadedObject uploaded, long objectOffset = 0)
     {
-        Insert(new StagedSegment(offset, length, null, 0, OwnsTail: false, uploaded, 0));
+        Insert(new StagedSegment(offset, length, null, 0, OwnsTail: false, uploaded, objectOffset));
     }
 
     /// <summary>Sets the staged length (truncation clips dirty ranges; growth leaves a zero gap).</summary>
@@ -212,6 +232,7 @@ internal sealed class StagedOverlay
             }
 
             _segments = kept;
+            Recount();
             MinLength = Math.Min(MinLength, length);
         }
 
@@ -253,48 +274,42 @@ internal sealed class StagedOverlay
         return pieces;
     }
 
+    /// <summary>
+    /// Inserts <paramref name="segment"/>, replacing whatever it overlaps (the parts of overlapped segments outside its
+    /// range are kept). Binary search plus one range replacement: cost proportional to the overlapped segments, not to a
+    /// rebuild of the whole overlay (LAY-017: an adversarially fragmented stream has many thousands of ranges).
+    /// </summary>
     private void Insert(StagedSegment segment)
     {
         long start = segment.Offset;
         long end = segment.End;
-        var result = new List<StagedSegment>(_segments.Count + 2);
-        bool inserted = false;
-        foreach (StagedSegment existing in _segments)
+        int first = FindFirstEndingAfter(start);
+        int last = first;
+        while (last < _segments.Count && _segments[last].Offset < end)
+            last++;
+
+        var replacement = new List<StagedSegment>(3);
+        if (first < last)
         {
-            if (existing.End <= start)
-            {
-                result.Add(existing);
-                continue;
-            }
-
-            if (existing.Offset >= end)
-            {
-                if (!inserted)
-                {
-                    result.Add(segment);
-                    inserted = true;
-                }
-
-                result.Add(existing);
-                continue;
-            }
-
-            // Overlap: keep the parts of the existing segment outside [start, end).
-            if (existing.Offset < start)
-                result.Add(existing.Slice(existing.Offset, start, ownsTail: false));
-            if (!inserted)
-            {
-                result.Add(segment);
-                inserted = true;
-            }
-
-            if (existing.End > end)
-                result.Add(existing.Slice(end, existing.End, existing.OwnsTail));
+            StagedSegment head = _segments[first];
+            StagedSegment tail = _segments[last - 1];
+            if (head.Offset < start)
+                replacement.Add(head.Slice(head.Offset, start, ownsTail: false));
+            replacement.Add(segment);
+            if (tail.End > end)
+                replacement.Add(tail.Slice(end, tail.End, tail.OwnsTail));
+            for (int i = first; i < last; i++)
+                Count(_segments[i], -1);
+            _segments.RemoveRange(first, last - first);
+        }
+        else
+        {
+            replacement.Add(segment);
         }
 
-        if (!inserted)
-            result.Add(segment);
-        _segments = result;
+        _segments.InsertRange(first, replacement);
+        foreach (StagedSegment added in replacement)
+            Count(added, +1);
     }
 
     private int FindLastStartingBefore(long position)

@@ -112,9 +112,23 @@ public sealed partial class DfsFileClient
     {
         bool pinned = options.ReadView == DfsReadView.VersionPinned;
         bool writeThrough = options.WriteMode == DfsWriteMode.WriteThrough;
-        VolumeContext.Bound<OpenHandleResultMessage> bound = await Context.MutateBoundAsync<OpenHandleResultMessage>(scope, "OpenHandle", options.OperationId,
-            header => new OpenHandleMessage(header, path, options.Mode, options.Access, options.Share, options.Options, pinned, writeThrough, options.StoragePolicy),
-            path, TxId, binding: Bound).ConfigureAwait(false);
+        VolumeContext.Bound<OpenHandleResultMessage> bound;
+        try
+        {
+            bound = await Context.MutateBoundAsync<OpenHandleResultMessage>(scope, "OpenHandle", options.OperationId,
+                header => new OpenHandleMessage(header, path, options.Mode, options.Access, options.Share, options.Options, pinned, writeThrough,
+                    WirePolicy(options.StoragePolicy)),
+                path, TxId, binding: Bound).ConfigureAwait(false);
+        }
+        catch (DfsCommitOutcomeUnknownException unknown) when (options.Mode == FileMode.Open && (options.Access & FileAccess.Write) == 0)
+        {
+            // A read-only open of an existing file has no namespace effect: an unanswered one is the caller's cancellation
+            // (or the client's disposal) or an availability failure. A handle it may have created expires with its lease.
+            if (scope.IsAbortedByCaller)
+                throw scope.NotTransmittedFailure(unknown.InnerException ?? unknown);
+            throw new DfsUnavailableException(DfsErrorCode.Unavailable, $"Opening '{path}' for reading did not complete.", unknown.InnerException ?? unknown);
+        }
+
         OpenHandleResultMessage opened = bound.Reply;
 
         // The handle belongs to the session and volume the open was addressed to: every request through it carries that
@@ -300,8 +314,10 @@ public sealed partial class DfsFileClient
         }
         catch (DfsCommitOutcomeUnknownException unknown)
         {
-            // A read-only open has no namespace effect: an unanswered one is an availability failure (its handle, if
-            // any, expires with its lease).
+            // A read-only open has no namespace effect: an unanswered one is an availability failure, or the caller's
+            // cancellation when the caller cancelled (its handle, if any, expires with its lease).
+            if (scope.IsAbortedByCaller)
+                throw scope.NotTransmittedFailure(unknown.InnerException ?? unknown);
             throw new DfsUnavailableException(DfsErrorCode.Unavailable, $"Opening '{path}' for reading did not complete.", unknown.InnerException ?? unknown);
         }
     }
@@ -436,16 +452,21 @@ public sealed partial class DfsFileClient
             {
                 // A publication referring to a staging session never moves to another session: its uploads belong to it.
                 WriteAllResultMessage result = await Context.MutateAsync<WriteAllResultMessage>(scope, "WriteAll", options.OperationId,
-                    header => new WriteAllMessage(header, path, length, payload.Changes, payload.Receipts, payload.Staging, options.StoragePolicy,
+                    header => new WriteAllMessage(header, path, length, payload.Changes, payload.Receipts, payload.Staging, WirePolicy(options.StoragePolicy),
                         options.CommitSnapshotName, CreateParents: false, ExpectedRevision: 0), path, TxId, rebindable: payload.Staging.IsEmpty,
                     binding: Bound).ConfigureAwait(false);
                 return result.Token;
             }
             catch (DfsException ex) when (attempt == 0 && IsClosedHelperStaging(ex, payload, options))
             {
-                // The shared helper staging session was closed with its client session: nothing was applied; upload the
-                // content again under a new staging session and publish it under a new operation id.
-                Context.DropHelperStaging(payload.Lease!);
+                // The helper's staging session was closed with its client session: nothing was applied; upload the content
+                // again under a new staging session and publish it under a new operation id.
+            }
+            catch (Exception) when (payload.Lease is not null)
+            {
+                // Not published (failed, cancelled or unknown): the helper's uploads are abandoned.
+                await Context.CloseUnboundStagingAsync(payload.Lease).ConfigureAwait(false);
+                throw;
             }
         }
     }
@@ -459,12 +480,26 @@ public sealed partial class DfsFileClient
         bool stagingReplaced = false;
         while (true)
         {
-            // The current length decides the representation (and whether a text preamble is due).
-            GetInfoResultMessage info = await InfoAsync(path, scope).ConfigureAwait(false);
-            long current = info is { Exists: true, Info: { Kind: WireEntryKind.File } file } ? file.Length : 0;
-            ReadOnlyMemory<byte> bytes = content(current);
-            DfsStoragePolicy policy = await PolicyForAsync(path, options.StoragePolicy, entry, info, scope).ConfigureAwait(false);
-            bool inline = !inlineRejected && current + bytes.Length <= threshold && ContentLayout.InlinePermitted(entry, policy, LabelsOf);
+            // The current length decides the representation (and whether a text preamble is due). A principal may hold
+            // AppendData without ReadAttributes (ACL-015): it then appends blind — as objects (the leader stores the result
+            // inline when it fits) and without a preamble.
+            GetInfoResultMessage? info;
+            try
+            {
+                info = await InfoAsync(path, scope).ConfigureAwait(false);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                info = null;
+            }
+
+            bool known = info is not null;
+            long current = info is { Exists: true, Info: { } file } && (file.Kind == WireEntryKind.File || file.IsStream) ? file.Length : 0;
+            ReadOnlyMemory<byte> bytes = content(known ? current : 1);
+            DfsStoragePolicy policy = known
+                ? await PolicyForAsync(path, options.StoragePolicy, entry, info, scope).ConfigureAwait(false)
+                : ContentLayout.ResolvePolicy(entry, options.StoragePolicy) ?? entry.DefaultPolicy;
+            bool inline = known && !inlineRejected && current + bytes.Length <= threshold && ContentLayout.InlinePermitted(entry, policy, LabelsOf);
             Payload payload = inline
                 ? Payload.Inline(bytes)
                 : await UploadAsync(bytes, 0, entry, policy, scope).ConfigureAwait(false);
@@ -473,7 +508,7 @@ public sealed partial class DfsFileClient
             {
                 AppendResultMessage result = await Context.MutateAsync<AppendResultMessage>(scope, "Append", options.OperationId,
                     header => new AppendMessage(header, path, default, 0, appendLength, payload.Changes, payload.Receipts, payload.Staging,
-                        CreateIfMissing: true, options.StoragePolicy, options.CommitSnapshotName), path, TxId, rebindable: payload.Staging.IsEmpty,
+                        CreateIfMissing: true, WirePolicy(options.StoragePolicy), options.CommitSnapshotName), path, TxId, rebindable: payload.Staging.IsEmpty,
                     binding: Bound).ConfigureAwait(false);
                 return result.Token;
             }
@@ -485,9 +520,14 @@ public sealed partial class DfsFileClient
             }
             catch (DfsException ex) when (!stagingReplaced && IsClosedHelperStaging(ex, payload, options))
             {
-                // As for WriteAll: the helper staging session closed with its client session; upload again.
+                // As for WriteAll: the helper's staging session closed with its client session; upload again.
                 stagingReplaced = true;
-                Context.DropHelperStaging(payload.Lease!);
+            }
+            catch (Exception) when (payload.Lease is not null)
+            {
+                // Not published (failed, cancelled or unknown): the helper's uploads are abandoned.
+                await Context.CloseUnboundStagingAsync(payload.Lease).ConfigureAwait(false);
+                throw;
             }
         }
     }
@@ -527,7 +567,7 @@ public sealed partial class DfsFileClient
                     byte[] piece = bytes.Slice((int)offset, length).ToArray();
                     (ObjectId id, UInt128 checksum) = Runtime.Data.Describe(piece);
                     IReadOnlyList<ObjectReceipt> copies = await Runtime.Data.UploadAsync(scope, Context, staging, id, piece, checksum, policy, pool,
-                        scope.OperationId, ordinal++).ConfigureAwait(false);
+                        scope.OperationId, ordinal++, scope.Kind).ConfigureAwait(false);
                     changes.Add(ContentLayout.DataChange(baseOffset + offset, id, length, checksum));
                     receipts.AddRange(copies);
                 }
@@ -536,14 +576,23 @@ public sealed partial class DfsFileClient
             }
             catch (DfsException ex) when (attempt == 0 && Transaction is null && ex.ErrorCode is DfsErrorCode.LeaseLost)
             {
-                // The shared helper staging session was closed (session expiry): open a new one and upload again.
-                Context.DropHelperStaging(staging);
+                // The helper's staging session was closed (session expiry): open a new one and upload again.
+            }
+            catch (Exception) when (Transaction is null)
+            {
+                // The upload failed or was cancelled: what it staged is abandoned.
+                await Context.CloseUnboundStagingAsync(staging).ConfigureAwait(false);
+                throw;
             }
         }
     }
 
+    /// <summary>
+    /// The staging session of one helper call: the transaction's, or a fresh unbound session that the publication closes
+    /// (or the helper closes when it does not publish, FILE-016).
+    /// </summary>
     private Task<StagingLease> StagingAsync(OperationScope scope) =>
-        Transaction is not null ? Task.FromResult(Transaction.Staging) : Context.GetHelperStagingAsync(scope);
+        Transaction is not null ? Task.FromResult(Transaction.Staging) : Context.CreateUnboundStagingAsync(scope);
 
     /// <summary>
     /// The policy governing a write's content: the requested one, else the existing file's, else the volume default
@@ -566,6 +615,14 @@ public sealed partial class DfsFileClient
             return own;
         return entry.DefaultPolicy;
     }
+
+    /// <summary>
+    /// The wire name of a requested policy: <c>"default"</c> (how the SDK reports the volume default, unless the volume defines
+    /// a named policy called "default") is sent as no name.
+    /// </summary>
+    private string? WirePolicy(string? name) =>
+        string.Equals(name, Tedd.Tdfs.Client.Internal.Facades.WireConvert.DefaultPolicyName, StringComparison.Ordinal)
+        && Context.Entry?.NamedPolicies.ContainsKey(name!) != true ? null : name;
 
     private DfsTopologyLabels? LabelsOf(NodeId node) => Runtime.Map.Node(node)?.Labels;
 
@@ -592,7 +649,7 @@ public sealed partial class DfsFileClient
         scope.Path = source;
         await scope.ValidatedAsync().ConfigureAwait(false);
         CopyResultMessage result = await Context.MutateAsync<CopyResultMessage>(scope, "Copy", options.OperationId,
-            header => new CopyMessage(header, source, destination, overwrite, 0, options.StoragePolicy, options.CommitSnapshotName), source, TxId, binding: Bound)
+            header => new CopyMessage(header, source, destination, overwrite, 0, WirePolicy(options.StoragePolicy), options.CommitSnapshotName), source, TxId, binding: Bound)
             .ConfigureAwait(false);
         return result.Token;
     }
@@ -669,7 +726,9 @@ public sealed partial class DfsFileClient
         scope.Path = p;
         await scope.ValidatedAsync().ConfigureAwait(false);
         GetInfoResultMessage info = await InfoAsync(p, scope).ConfigureAwait(false);
-        return info is { Exists: true, Info.Kind: WireEntryKind.File };
+
+        // A named stream exists as a file-like entry whether its inode is a file or a directory (ADS-025).
+        return info is { Exists: true, Info: { } entry } && (entry.Kind == WireEntryKind.File || entry.IsStream);
     }
 
     /// <summary>Synchronous counterpart of <see cref="ExistsAsync"/>.</summary>
@@ -705,7 +764,7 @@ public sealed partial class DfsFileClient
         scope.Path = p;
         await scope.ValidatedAsync().ConfigureAwait(false);
         SetPolicyResultMessage result = await Context.MutateAsync<SetPolicyResultMessage>(scope, "SetPolicy", null,
-            header => new SetPolicyMessage(header, p, policyName), p, TxId, binding: Bound).ConfigureAwait(false);
+            header => new SetPolicyMessage(header, p, WirePolicy(policyName) ?? string.Empty), p, TxId, binding: Bound).ConfigureAwait(false);
         return result.Token;
     }
 
@@ -769,7 +828,7 @@ public sealed partial class DfsFileClient
     {
         if (!info.Exists || info.Info is null)
             throw new FileNotFoundException($"File '{Validation.Printable(path)}' does not exist.", path);
-        if (info.Info.Kind == WireEntryKind.Directory)
+        if (info.Info.Kind == WireEntryKind.Directory && !info.Info.IsStream)
             throw DfsErrors.ToException(DfsErrorCode.IsADirectory, $"'{Validation.Printable(path)}' is a directory, not a file.", path);
         return info.Info;
     }

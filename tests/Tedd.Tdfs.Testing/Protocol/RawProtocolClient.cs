@@ -539,28 +539,44 @@ public sealed partial class RawProtocolClient : IAsyncDisposable
         if (kind == DfsOperationKind.Move && rawPath2 is null && rawPathBytes is null)
             throw new ArgumentException("A move needs a destination path.", nameof(rawPath2));
 
-        (DfsErrorCode code, IWireMessage? reply) = await SendVolumeRequestAsync(volume, mutating, header =>
+        // Move and Delete name the kind of their source (ExpectDirectory, PROTOCOL.md §9.4): the raw operation addresses
+        // whatever the path is, so a file-kind refusal of an existing directory is repeated as a directory operation.
+        DfsErrorCode first = await SendCoreAsync(expectDirectory: false);
+        if (first is DfsErrorCode.FileNotFound or DfsErrorCode.IsADirectory && kind is DfsOperationKind.Move or DfsOperationKind.Delete && rawPathBytes is null
+            && (await SendVolumeRequestAsync(volume, mutating: false, header => Encode(new GetInfoMessage(header, path, default, 0), null, null))).Reply
+                is GetInfoResultMessage { Exists: true, Info.Kind: WireEntryKind.Directory })
         {
-            IWireMessage message = kind switch
-            {
-                DfsOperationKind.CreateDirectory => new CreateDirectoryMessage(header, path, Recursive: false, SnapshotName: null),
-                DfsOperationKind.Delete => new DeleteMessage(header, path, Recursive: false, ExpectDirectory: false, SnapshotName: null),
-                DfsOperationKind.Open => new OpenHandleMessage(header, path, FileMode.CreateNew, FileAccess.Write, FileShare.None, FileOptions.None,
-                    VersionPinned: false, WriteThrough: false, StoragePolicy: null),
-                DfsOperationKind.Move => new MoveMessage(header, path, rawPath2 ?? path + "-moved", Overwrite: false, ExpectDirectory: false, SnapshotName: null),
-                DfsOperationKind.GetInfo => new GetInfoMessage(header, path, default, 0),
-                DfsOperationKind.WriteAll => new WriteAllMessage(header, path, 0, [], [], default, StoragePolicy: null, SnapshotName: null, CreateParents: false,
-                    ExpectedRevision: 0),
-                _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Raw path operations support CreateDirectory, Delete, Open, Move, GetInfo and WriteAll."),
-            };
-            if (extensions is { Count: > 0 })
-                message = WithExtraExtensions(message, extensions);
-            return Encode(message, placeholder, rawPathBytes);
-        });
+            return await SendCoreAsync(expectDirectory: true);
+        }
 
-        if (kind == DfsOperationKind.Open && reply is OpenHandleResultMessage opened)
-            await SendVolumeRequestAsync(volume, mutating: true, header => Encode(new CloseHandleMessage(header, opened.Handle, opened.WriterGeneration)));
-        return code;
+        return first;
+
+        async Task<DfsErrorCode> SendCoreAsync(bool expectDirectory)
+        {
+            (DfsErrorCode code, IWireMessage? reply) = await SendVolumeRequestAsync(volume, mutating, header =>
+            {
+                IWireMessage message = kind switch
+                {
+                    DfsOperationKind.CreateDirectory => new CreateDirectoryMessage(header, path, Recursive: false, SnapshotName: null),
+                    DfsOperationKind.Delete => new DeleteMessage(header, path, Recursive: false, ExpectDirectory: expectDirectory, SnapshotName: null),
+                    DfsOperationKind.Open => new OpenHandleMessage(header, path, FileMode.CreateNew, FileAccess.Write, FileShare.None, FileOptions.None,
+                        VersionPinned: false, WriteThrough: false, StoragePolicy: null),
+                    DfsOperationKind.Move => new MoveMessage(header, path, rawPath2 ?? path + "-moved", Overwrite: false, ExpectDirectory: expectDirectory,
+                        SnapshotName: null),
+                    DfsOperationKind.GetInfo => new GetInfoMessage(header, path, default, 0),
+                    DfsOperationKind.WriteAll => new WriteAllMessage(header, path, 0, [], [], default, StoragePolicy: null, SnapshotName: null, CreateParents: false,
+                        ExpectedRevision: 0),
+                    _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Raw path operations support CreateDirectory, Delete, Open, Move, GetInfo and WriteAll."),
+                };
+                if (extensions is { Count: > 0 })
+                    message = WithExtraExtensions(message, extensions);
+                return Encode(message, placeholder, rawPathBytes);
+            });
+
+            if (kind == DfsOperationKind.Open && reply is OpenHandleResultMessage opened)
+                await SendVolumeRequestAsync(volume, mutating: true, header => Encode(new CloseHandleMessage(header, opened.Handle, opened.WriterGeneration)));
+            return code;
+        }
     }
 
     /// <summary>A volume session of this raw client.</summary>
