@@ -185,7 +185,7 @@ internal sealed partial class RpcDispatcher : IRpcHandler
     {
         try
         {
-            return await _s.Loop.InvokeAsync(() => DispatchAsync(connection, frame, expectsReply, ct)).ConfigureAwait(false);
+            return await _s.Loop.InvokeAsync(() => DispatchAsync(connection, frame, expectsReply, ct));
         }
         catch (NodeLoopStoppedException)
         {
