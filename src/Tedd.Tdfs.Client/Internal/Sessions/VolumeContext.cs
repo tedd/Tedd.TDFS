@@ -952,6 +952,10 @@ internal sealed class VolumeContext : IRpcRouter
         }
         catch (DfsCommitOutcomeUnknownException unknown)
         {
+            // The session may exist without the helper knowing its id (a cancelled or unanswered CreateStaging): resolve the
+            // request and close what it created, so nothing an abandoned helper staged stays open until its client session
+            // expires (FILE-016, PERF-013).
+            await CloseUncertainStagingAsync(unknown.OperationId).ConfigureAwait(false);
             throw StagingNotCreated(scope, unknown);
         }
 
@@ -979,6 +983,36 @@ internal sealed class VolumeContext : IRpcRouter
         {
             Runtime.Emit("staging.close-failed", $"Closing staging session {lease.Id} failed ({ex.GetType().Name}); it closes with its session.", volume: Name,
                 exception: ex);
+        }
+    }
+
+    /// <summary>
+    /// Best-effort cleanup after a <c>CreateStaging</c> whose outcome is unknown: resolves (fences) the request and closes the
+    /// unbound staging session it created, if it did. Runs on its own short background scope and never throws.
+    /// </summary>
+    private async Task CloseUncertainStagingAsync(DfsOperationId operation)
+    {
+        if (operation.IsEmpty)
+            return;
+        try
+        {
+            using OperationScope scope = Runtime.BeginBackground(DfsOperationKind.CreateStaging, Name, Runtime.Options.ShutdownTimeout);
+            QueryOperationResultMessage result = await QueryAsync(operation, isTransaction: false, resolve: true, scope).ConfigureAwait(false);
+            if (result.Status != WireOutcomeStatus.Committed || result.ResultFrame.IsEmpty
+                || MessageCodec.Decode(result.ResultFrame.Span) is not CreateStagingResultMessage created)
+            {
+                return;
+            }
+
+            await MutateAsync<CreateStagingResultMessage>(scope, "CreateStaging(close)", null,
+                header => CreateStagingMessage.CloseRequest(header, created.Staging), rebindable: false).ConfigureAwait(false);
+        }
+#pragma warning disable CA1031 // Cleanup is best effort: the session also closes with its client session.
+        catch (Exception ex)
+#pragma warning restore CA1031
+        {
+            Runtime.Emit("staging.close-failed", $"Closing the staging session of the unresolved request {operation} failed ({ex.GetType().Name}); it closes with its session.",
+                volume: Name, exception: ex);
         }
     }
 
