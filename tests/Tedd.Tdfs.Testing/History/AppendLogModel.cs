@@ -14,7 +14,7 @@ namespace Tedd.Tdfs.Testing;
 /// file read), a sequence of byte arrays must equal the entries one by one, and null means "absent", which matches only
 /// an empty log. Duplicate, lost or reordered appends are therefore rejected.
 /// </remarks>
-public sealed class AppendLogModel : ISequentialModel<ImmutableList<byte[]>>
+public sealed class AppendLogModel : IPrunableSequentialModel<ImmutableList<byte[]>>
 {
     private readonly ConditionalWeakTable<ImmutableList<byte[]>, string> _keys = new();
 
@@ -38,6 +38,49 @@ public sealed class AppendLogModel : ISequentialModel<ImmutableList<byte[]>>
                 return op.Outcome != OpOutcome.Ok || Matches(state, op);
             default:
                 throw new ArgumentException($"Operation #{op.Id}: AppendLogModel does not support kind '{op.Kind}'.");
+        }
+    }
+
+    /// <inheritdoc />
+    /// <remarks>Appends only extend the log, so a completed read can only be satisfied later if the log so far is a prefix of what it observed.</remarks>
+    public bool CanStillSatisfy(ImmutableList<byte[]> state, HistoryOp pending)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        ArgumentNullException.ThrowIfNull(pending);
+        if (!string.Equals(pending.Kind, "read", StringComparison.Ordinal) || pending.Outcome != OpOutcome.Ok)
+            return true;
+        switch (pending.Output)
+        {
+            case null:
+                return state.Count == 0;
+            case IEnumerable<byte[]> entries:
+            {
+                int i = 0;
+                foreach (byte[] observed in entries)
+                {
+                    if (i >= state.Count)
+                        return true;
+                    if (observed is null || !observed.AsSpan().SequenceEqual(state[i]))
+                        return false;
+                    i++;
+                }
+
+                return i >= state.Count;
+            }
+
+            default:
+            {
+                byte[] observed = ModelValues.ToBytes(pending.Output, pending, "read output")!;
+                int offset = 0;
+                foreach (byte[] e in state)
+                {
+                    if (offset + e.Length > observed.Length || !observed.AsSpan(offset, e.Length).SequenceEqual(e))
+                        return false;
+                    offset += e.Length;
+                }
+
+                return true;
+            }
         }
     }
 

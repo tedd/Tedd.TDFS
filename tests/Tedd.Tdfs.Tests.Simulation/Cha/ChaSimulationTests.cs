@@ -2014,6 +2014,7 @@ public sealed class ChaSimulationTests
             var ids = new DfsOperationId[clientCount];
             var historyIds = new long[clientCount];
             var originals = new List<DfsClient>();
+            var networkNames = new string[clientCount];
             var rules = new List<MessageRule>();
             var attempts = new Task<CommitToken>[clientCount];
             for (int i = 0; i < clientCount; i++)
@@ -2021,28 +2022,40 @@ public sealed class ChaSimulationTests
                 var options = new TestClientOptions { Name = $"orig{i}", OperationTimeout = TimeSpan.FromSeconds(3) };
                 DfsClient original = await cluster.ConnectAsync(options, ct);
                 originals.Add(original);
+                networkNames[i] = options.NetworkName;
                 ids[i] = await original.GetVolume(Vol).NewOperationIdAsync(ct);
                 var filter = new MessageFilter(From: options.NetworkName, Type: MessageType.Append);
                 rules.Add(i % 2 == 0 ? cluster.Network.DropReplies(filter, 10_000) : cluster.Network.DropNext(filter, 10_000));
-                historyIds[i] = cluster.History.Invoke(options.Name, "append", log, Record(i), ids[i]);
-                attempts[i] = original.GetVolume(Vol).Files.AppendAllBytesAsync(log, Record(i), new DfsMutationOptions { OperationId = ids[i] }, ct);
             }
 
+            // All appends start together, once every client is connected, so none reaches its deadline before all are sent.
             for (int i = 0; i < clientCount; i++)
             {
-                try
-                {
-                    CommitToken token = await attempts[i];
-                    cluster.History.Complete(historyIds[i], OpOutcome.Ok, token);
-                }
-                catch (Exception ex)
-                {
-                    cluster.History.Complete(historyIds[i], HistoryRecorder.Classify(ex), ex);
-                }
+                historyIds[i] = cluster.History.Invoke($"orig{i}", "append", log, Record(i), ids[i]);
+                attempts[i] = originals[i].GetVolume(Vol).Files.AppendAllBytesAsync(log, Record(i), new DfsMutationOptions { OperationId = ids[i] }, ct);
+            }
+
+            // Every client dies while its append is outstanding (transmitted; the reply lost or the request dropped): the
+            // process never learns the outcome, so it never resolves (and so never fences) the saved id its restarted
+            // incarnation retries below. Awaiting the attempts instead would let each SDK resolve its id after the deadline.
+            for (int i = 0; i < clientCount; i++)
+            {
+                var transmitted = new MessageFilter(From: networkNames[i], Type: MessageType.Append, Direction: LinkDirection.Request);
+                await cluster.WaitUntilAsync(() => Task.FromResult(cluster.Network.GetMessageAttempts(transmitted).Count > 0), TimeSpan.FromSeconds(30),
+                    $"client orig{i} transmitted its append", ct);
             }
 
             foreach (DfsClient original in originals)
                 cluster.KillClient(original);
+            for (int i = 0; i < clientCount; i++)
+            {
+                if (attempts[i].IsCompletedSuccessfully)
+                    cluster.History.Complete(historyIds[i], OpOutcome.Ok, attempts[i].Result);
+                else if (attempts[i].IsCompleted)
+                    cluster.History.Complete(historyIds[i], HistoryRecorder.Classify(attempts[i].Exception!.InnerException!), attempts[i].Exception);
+                else
+                    cluster.History.Complete(historyIds[i], OpOutcome.Unknown);
+            }
             foreach (MessageRule rule in rules)
                 rule.Cancel();
 

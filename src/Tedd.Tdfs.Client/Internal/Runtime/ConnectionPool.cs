@@ -5,7 +5,9 @@ namespace Tedd.Tdfs.Client.Internal.Runtime;
 /// <summary>
 /// Authenticated connections of one client, pooled per endpoint (ARCHITECTURE §9.1). Concurrent callers share one
 /// connection per endpoint and one in-progress connect; dead pooled connections (closed by either side, or declared dead
-/// after a timeout on a silently dead link) are detected and replaced. Thread-safe.
+/// after a timeout on a silently dead link) are detected and replaced. A connect still in progress after a caller's whole
+/// wait is presumed stuck (for example its handshake was lost to a partition that has healed since): the next caller
+/// starts a fresh one and takes whichever of the two completes first. Thread-safe.
 /// </summary>
 internal sealed class ConnectionPool
 {
@@ -56,6 +58,7 @@ internal sealed class ConnectionPool
     {
         ArgumentNullException.ThrowIfNull(endpoint);
         Task<ClientConnection>? pending = null;
+        Task<ClientConnection>? previous = null;
         bool mustStart = false;
         lock (_sync)
         {
@@ -69,12 +72,11 @@ internal sealed class ConnectionPool
                 slot.Connection = null;
             }
 
-            if (slot.Pending is { IsCompleted: true })
-                slot.Pending = null; // a finished connect either pooled its connection (now unusable) or failed: start afresh
-            if (slot.Pending is null)
+            Prune(slot);
+            if (slot.Pending is null || IsStale(slot, waitTimeout))
                 mustStart = true;
             else
-                pending = slot.Pending;
+                (pending, previous) = (slot.Pending, slot.Previous);
         }
 
         if (mustStart)
@@ -87,13 +89,20 @@ internal sealed class ConnectionPool
                 Slot slot = SlotOf(endpoint);
                 if (slot.Connection is { IsUsable: true } open)
                     return open;
-                if (slot.Pending is { IsCompleted: true })
-                    slot.Pending = null;
-                slot.Pending ??= ConnectAsync(endpoint, slot);
-                pending = slot.Pending;
+                Prune(slot);
+                if (slot.Pending is null || IsStale(slot, waitTimeout))
+                {
+                    slot.Previous = slot.Pending; // a superseded connect keeps running: whichever completes first is used
+                    slot.Pending = ConnectAsync(endpoint, slot);
+                    slot.PendingStarted = _runtime.Time.GetTimestamp();
+                }
+
+                (pending, previous) = (slot.Pending, slot.Previous);
             }
         }
 
+        if (previous is { IsCompleted: false })
+            pending = FirstSuccessfulAsync(pending!, previous);
         if (pending!.IsCompleted)
             return await pending.ConfigureAwait(false);
 
@@ -143,6 +152,59 @@ internal sealed class ConnectionPool
             connection.Poison();
     }
 
+    /// <summary>Drops finished connects (each either pooled its connection, now unusable, or failed): the next caller starts afresh.</summary>
+    private static void Prune(Slot slot)
+    {
+        if (slot.Previous is { IsCompleted: true })
+            slot.Previous = null;
+        if (slot.Pending is { IsCompleted: true })
+        {
+            slot.Pending = slot.Previous;
+            slot.Previous = null;
+        }
+    }
+
+    /// <summary>
+    /// True when the slot's connect has run for a caller's whole wait without completing and no fresh one supersedes it yet
+    /// (at most two connects per endpoint run at a time).
+    /// </summary>
+    private bool IsStale(Slot slot, TimeSpan waitTimeout)
+        => slot.Pending is { IsCompleted: false } && slot.Previous is null && waitTimeout > TimeSpan.Zero
+            && _runtime.Time.GetElapsedTime(slot.PendingStarted) >= waitTimeout;
+
+    /// <summary>
+    /// The first of two connects to succeed, or the failure of the last one to fail. Completed without a synchronization
+    /// context (<see cref="ContextFree"/>), so awaiting it never escapes the simulation.
+    /// </summary>
+    private static Task<ClientConnection> FirstSuccessfulAsync(Task<ClientConnection> a, Task<ClientConnection> b)
+    {
+        var source = new TaskCompletionSource<ClientConnection>(TaskCreationOptions.None);
+        int failed = 0;
+        void OnCompleted(Task<ClientConnection> completed)
+        {
+            if (completed.IsCompletedSuccessfully)
+            {
+                ContextFree.Run(static q => q.Source.TrySetResult(q.Connection), (Source: source, Connection: completed.Result));
+                return;
+            }
+
+            _ = completed.Exception; // observed
+            if (Interlocked.Increment(ref failed) < 2)
+                return;
+            ContextFree.Run(static q =>
+            {
+                if (q.Last.IsCanceled)
+                    q.Source.TrySetCanceled();
+                else
+                    q.Source.TrySetException(q.Last.Exception!.InnerExceptions);
+            }, (Source: source, Last: completed));
+        }
+
+        a.ContinueWith(OnCompleted, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        b.ContinueWith(OnCompleted, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        return source.Task;
+    }
+
     private Slot SlotOf(string endpoint)
     {
         if (!_slots.TryGetValue(endpoint, out Slot? slot))
@@ -182,8 +244,14 @@ internal sealed class ConnectionPool
                 throw new ObjectDisposedException(nameof(DfsClient), "The client was disposed while connecting.");
             }
 
+            if (slot.Connection is { IsUsable: true } pooled && !ReferenceEquals(pooled, opened))
+            {
+                // The other connect of this endpoint completed first: one connection per endpoint.
+                opened.Poison();
+                return pooled;
+            }
+
             slot.Connection = opened;
-            slot.Pending = null;
         }
 
         opened.Raw.Closed += (_, _) =>
@@ -201,5 +269,7 @@ internal sealed class ConnectionPool
     {
         public ClientConnection? Connection;
         public Task<ClientConnection>? Pending;
+        public long PendingStarted;
+        public Task<ClientConnection>? Previous;
     }
 }

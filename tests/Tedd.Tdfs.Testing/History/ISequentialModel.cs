@@ -23,3 +23,19 @@ public interface ISequentialModel<TState>
     /// </summary>
     string Key(TState state);
 }
+
+/// <summary>
+/// A sequential model whose states only grow in a way that lets the checker discard a partial order early: a state from
+/// which a pending completed operation can never be satisfied, whatever is applied later, is a dead end.
+/// </summary>
+/// <typeparam name="TState">State type.</typeparam>
+/// <remarks>
+/// Purely an optimisation of the search (it never changes a verdict): <see cref="CanStillSatisfy"/> must only return
+/// false when no sequence of further operations of the history can lead from <paramref name="state"/> to a state in which
+/// <paramref name="pending"/> steps successfully.
+/// </remarks>
+public interface IPrunableSequentialModel<TState> : ISequentialModel<TState>
+{
+    /// <summary>False when <paramref name="pending"/> (an <see cref="OpOutcome.Ok"/> operation not yet placed) can never step successfully after <paramref name="state"/>.</summary>
+    bool CanStillSatisfy(TState state, HistoryOp pending);
+}

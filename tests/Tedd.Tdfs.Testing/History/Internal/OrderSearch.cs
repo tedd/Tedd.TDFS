@@ -47,6 +47,8 @@ internal delegate bool OrderStep<TState>(TState state, int item, out TState next
 /// state key: (R+c, U+o, s') is dominated by (R+c, U, s'), which the parent explores itself (for example an unknown write
 /// that is overwritten before anyone observes it).</item>
 /// </list>
+/// A model may also declare states from which a pending required item can never be satisfied (optional callback, see
+/// <see cref="IPrunableSequentialModel{TState}"/>); such states are dead ends and are not explored.
 /// Candidates are tried in invocation order (required and optional interleaved), which follows the recorded real-time
 /// order. Rules 1 and 2 are always applied; rule 3 changes which branches are visited and in what order, so the search
 /// runs as a portfolio: a first pass without absorption (usually finds witnesses for legal histories fastest) on a small
@@ -68,13 +70,14 @@ internal static class OrderSearch
         TState initial,
         Func<TState, string> key,
         OrderStep<TState> step,
-        long budget)
+        long budget,
+        Func<TState, int, bool>? canStillSatisfy = null)
     {
         long firstBudget = Math.Min(budget, Math.Max(FirstPassMinimum, budget / FirstPassDivisor));
-        OrderSearchResult first = RunPass(invoke, deadline, required, initial, key, step, firstBudget, absorb: false);
+        OrderSearchResult first = RunPass(invoke, deadline, required, initial, key, step, firstBudget, absorb: false, canStillSatisfy);
         if (first.Status != OrderSearchStatus.BudgetExhausted || first.StatesExplored >= budget)
             return first;
-        OrderSearchResult second = RunPass(invoke, deadline, required, initial, key, step, budget - first.StatesExplored, absorb: true);
+        OrderSearchResult second = RunPass(invoke, deadline, required, initial, key, step, budget - first.StatesExplored, absorb: true, canStillSatisfy);
         return second with { StatesExplored = first.StatesExplored + second.StatesExplored };
     }
 
@@ -86,7 +89,8 @@ internal static class OrderSearch
         Func<TState, string> key,
         OrderStep<TState> step,
         long budget,
-        bool absorb)
+        bool absorb,
+        Func<TState, int, bool>? canStillSatisfy)
     {
         int n = invoke.Length;
         var requiredItems = new List<int>();
@@ -164,6 +168,13 @@ internal static class OrderSearch
             }
 
             Mark(c);
+            if (canStillSatisfy is not null && !Viable(next))
+            {
+                // A pending required item can never be satisfied from this state (IPrunableSequentialModel): a dead end.
+                Unmark(c);
+                continue;
+            }
+
             if (!Remember(memo, placedRequired, placedOptional, nextKey))
             {
                 Unmark(c);
@@ -245,6 +256,17 @@ internal static class OrderSearch
             }
 
             return result.ToArray();
+        }
+
+        bool Viable(TState state)
+        {
+            for (int p = 0; p < requiredTotal; p++)
+            {
+                if (!IsSet(placedRequired, p) && !canStillSatisfy!(state, requiredItems[p]))
+                    return false;
+            }
+
+            return true;
         }
 
         void Mark(int item)

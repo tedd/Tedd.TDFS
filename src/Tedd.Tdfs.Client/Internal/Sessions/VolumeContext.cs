@@ -953,9 +953,9 @@ internal sealed class VolumeContext : IRpcRouter
         catch (DfsCommitOutcomeUnknownException unknown)
         {
             // The session may exist without the helper knowing its id (a cancelled or unanswered CreateStaging): resolve the
-            // request and close what it created, so nothing an abandoned helper staged stays open until its client session
-            // expires (FILE-016, PERF-013).
-            await CloseUncertainStagingAsync(unknown.OperationId).ConfigureAwait(false);
+            // request and close what it created, in the background (the caller's failure or cancellation is not delayed), so
+            // nothing an abandoned helper staged stays open until its client session expires (FILE-016, PERF-013).
+            _ = CloseUncertainStagingAsync(unknown.OperationId);
             throw StagingNotCreated(scope, unknown);
         }
 
