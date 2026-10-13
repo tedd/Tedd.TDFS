@@ -29,6 +29,12 @@ public sealed record SimViolation(
     TimeSpan VirtualTime,
     string? StackTrace)
 {
+    /// <summary>
+    /// Name of the simulated process the interaction addressed (for example the node whose loop received a foreign post,
+    /// or the client process running the scenario), or null when it addressed the harness or the simulation as a whole.
+    /// </summary>
+    public string? Target { get; init; }
+
     /// <summary>One-line summary (without the stack trace).</summary>
     public override string ToString() =>
         $"{Kind} at t={SimScheduler.FormatTime(VirtualTime)}: {Operation} from thread {ThreadId}" +

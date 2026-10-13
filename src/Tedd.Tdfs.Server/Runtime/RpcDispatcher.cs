@@ -101,6 +101,12 @@ internal sealed class ConnectionState(IRpcConnection connection, bool outbound)
     public UInt128 BootId { get; set; }
 
     public int ProtocolErrors { get; set; }
+
+    /// <summary>
+    /// The answer to frames that arrive on this connection after it was rejected (until it closes): an authentication
+    /// failure, or a protocol error when the authenticated peer was rejected for malformed frames (PROTOCOL.md §11.2).
+    /// </summary>
+    public DfsErrorCode RejectedWith { get; set; } = DfsErrorCode.AuthenticationFailed;
 }
 
 /// <summary>
@@ -250,7 +256,13 @@ internal sealed partial class RpcDispatcher : IRpcHandler
 
         ConnectionState state = GetState(connection, outbound: false);
         if (state.Phase == HandshakePhase.Rejected)
-            return expectsReply ? Error(new ErrorReplyMessage(DfsErrorCode.AuthenticationFailed, "The connection is not authenticated.")) : null;
+        {
+            return expectsReply
+                ? Error(new ErrorReplyMessage(state.RejectedWith, state.RejectedWith == DfsErrorCode.ProtocolError
+                    ? "The connection was closed after repeated malformed frames."
+                    : "The connection is not authenticated."))
+                : null;
+        }
 
         IWireMessage message;
         MessageType type;
@@ -262,6 +274,8 @@ internal sealed partial class RpcDispatcher : IRpcHandler
         catch (DfsProtocolException ex)
         {
             state.ProtocolErrors++;
+            if (state.Phase == HandshakePhase.Authenticated && state.ProtocolErrors >= MaxProtocolErrors)
+                state.RejectedWith = DfsErrorCode.ProtocolError;
             if (state.Phase != HandshakePhase.Authenticated || state.ProtocolErrors >= MaxProtocolErrors)
                 Reject(state);
             return expectsReply ? Error(new ErrorReplyMessage(ex.ErrorCode, ex.Message)) : null;
@@ -299,13 +313,14 @@ internal sealed partial class RpcDispatcher : IRpcHandler
         _s.Metrics.RpcHandled();
         DfsOperationKind operation = MessageTypes.OperationOf(type);
         bool observed = IsObservedForFaults(type);
-        DfsOperationId? operationId = (message as IVolumeRequest)?.Header.Operation is { IsEmpty: false } op ? op : null;
+        DfsOperationId? operationId = Volumes.Service.RequestFaultInfo.OperationOf(message);
         string? volume = (message as IVolumeRequest)?.Header.Volume;
+        string? path = Volumes.Service.RequestFaultInfo.PathOf(message);
         IWireMessage result;
         try
         {
             if (observed)
-                await _s.HitAsync(FaultStage.F04, FaultSites.RpcRequestAccepted, volume, operation, operationId, ct: ct);
+                await _s.HitAsync(FaultStage.F04, FaultSites.RpcRequestAccepted, volume, operation, operationId, path, ct: ct);
             var context = new RpcContext
             {
                 Connection = connection,
@@ -330,7 +345,7 @@ internal sealed partial class RpcDispatcher : IRpcHandler
         {
             if (DfsErrors.ToCode(ex) == DfsErrorCode.Internal)
                 _s.Error("rpc", NodeServices.Inv($"{type} from {Describe(state)} failed: {ex}"));
-            result = ErrorReplyMessage.FromException(ex, operationId);
+            result = ErrorReplyMessage.FromException(ex, (message as IVolumeRequest)?.Header.Operation is { IsEmpty: false } own ? own : null);
         }
 
         if (!expectsReply)
@@ -339,7 +354,7 @@ internal sealed partial class RpcDispatcher : IRpcHandler
         {
             try
             {
-                await _s.HitAsync(FaultStage.F13, FaultSites.RpcReplySend, volume, operation, operationId, ct: ct);
+                await _s.HitAsync(FaultStage.F13, FaultSites.RpcReplySend, volume, operation, operationId, path, ct: ct);
             }
             catch (FaultReplyDroppedException)
             {

@@ -367,7 +367,9 @@ internal static class OutHelpers
             case MutatingApi.SetAccess:
             {
                 string path = root + "/acl";
-                var access = new DfsInodeAccess(OwnerOnly: true, ReadOnlyForOthers: true);
+
+                // API.md §H.2: when both flags are set OwnerOnly wins, so only a single flag round-trips through GetInfo.
+                var access = new DfsInodeAccess(OwnerOnly: true);
                 return new MutationProbe
                 {
                     Api = api,

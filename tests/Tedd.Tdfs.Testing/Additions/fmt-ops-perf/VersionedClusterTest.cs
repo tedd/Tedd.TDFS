@@ -20,7 +20,26 @@ public static class VersionedClusterTest
     /// <param name="initialRelease">The release that creates the cluster; must be a member of <see cref="SoftwareVersionProfile.SupportedWindow"/>.</param>
     /// <param name="scenario">The scenario.</param>
     /// <param name="ct">Cancellation.</param>
+    /// <remarks>
+    /// Implementation status: the node runtime has no release emulation, so only <see cref="SoftwareVersionProfile.Current"/>
+    /// can create a cluster (exactly <see cref="ClusterTest.RunAsync(TestClusterOptions, Func{TestCluster, Task}, CancellationToken)"/>);
+    /// any other member of the supported window is rejected with <see cref="NotSupportedException"/> before anything starts.
+    /// </remarks>
     /// <exception cref="ArgumentException"><paramref name="initialRelease"/> is outside the supported window.</exception>
-    public static Task RunAsync(TestClusterOptions options, SoftwareVersionProfile initialRelease, Func<TestCluster, Task> scenario, CancellationToken ct = default) =>
-        throw Stub.NotYet("VersionedClusterTest.RunAsync");
+    /// <exception cref="NotSupportedException"><paramref name="initialRelease"/> is not the build under test.</exception>
+    public static Task RunAsync(TestClusterOptions options, SoftwareVersionProfile initialRelease, Func<TestCluster, Task> scenario, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(initialRelease);
+        ArgumentNullException.ThrowIfNull(scenario);
+        if (!SoftwareVersionProfile.SupportedWindow.Contains(initialRelease))
+            throw new ArgumentException($"Release '{initialRelease.Name}' is outside the supported window.", nameof(initialRelease));
+        if (!ReferenceEquals(initialRelease, SoftwareVersionProfile.Current))
+        {
+            throw new NotSupportedException(
+                $"A cluster cannot be created by release '{initialRelease.Name}': the node runtime has no release emulation (protocol range, features and disk format are fixed by the build).");
+        }
+
+        return ClusterTest.RunAsync(options, scenario, ct);
+    }
 }

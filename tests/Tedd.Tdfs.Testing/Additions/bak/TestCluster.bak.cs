@@ -30,6 +30,10 @@ public sealed partial class TestCluster
     /// live node, so mutating path operations sent this way exercise the backup node's own server-side read-only
     /// enforcement without any SDK-side guard. Used by BAK-002, BAK-015.
     /// </summary>
-    public Task<RawProtocolClient> ConnectRawBackupAsync(int backupIndex = 0, CancellationToken ct = default) =>
-        throw Stub.NotYet("TestCluster.ConnectRawBackupAsync");
+    public Task<RawProtocolClient> ConnectRawBackupAsync(int backupIndex = 0, CancellationToken ct = default)
+    {
+        TestBackupNode backup = BackupAt(backupIndex);
+        return RawProtocolClient.ConnectAsync(this, "client:raw-b" + backupIndex.ToString(System.Globalization.CultureInfo.InvariantCulture), backup.Name,
+            backup.Endpoint, expectedClusterId: Guid.Empty, ct);
+    }
 }

@@ -482,8 +482,10 @@ public sealed record SetRetentionResultMessage(
 /// <summary>
 /// Restores a snapshot into a new volume (client → volume leader, which coordinates with the control leader): new
 /// VolumeId, epoch 1, initial state = the snapshot root, objects copied server-side to new ids owned by the new
-/// volume (<c>CopyObjects</c>). Never rolls a live volume back in place. Errors: SnapshotNotFound, AlreadyExists
-/// (volume name), PlacementUnavailable, AccessDenied (needs VolumeAdmin and ClusterAdmin).
+/// volume (<c>CopyObjects</c>, or read and re-placed when the new volume lives in another storage pool). Never rolls a
+/// live volume back in place. The new volume is not served before the restore is complete. Errors: SnapshotNotFound,
+/// AlreadyExists (volume name), PoolNotFound, InvalidPolicy (the pool cannot satisfy the restored policies),
+/// PlacementUnavailable, AccessDenied (needs VolumeAdmin and ClusterAdmin).
 /// </summary>
 /// <param name="Header">Request header; <see cref="RequestHeader.Operation"/> identifies the restore.</param>
 /// <param name="Name">Snapshot name.</param>
@@ -493,8 +495,43 @@ public sealed record RestoreSnapshotMessage(
     string Name,
     string NewVolumeName) : IWireMessage<RestoreSnapshotMessage>, IVolumeRequest
 {
-    /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
+    /// <summary>
+    /// Extension field id of the target storage pool (Addendum A, POOL-016): a <b>required</b> extension whose value is the
+    /// UTF-8 pool name; the new volume is bound to that pool. Absent: the restored volume keeps the source volume's pool.
+    /// </summary>
+    public const uint StoragePoolExtension = 1;
+
+    private static readonly System.Collections.Frozen.FrozenSet<uint> UnderstoodExtensions =
+        System.Collections.Frozen.FrozenSet.ToFrozenSet([StoragePoolExtension]);
+
+    /// <summary>Extensions preserved from the wire (re-emitted on encode), including <see cref="StoragePoolExtension"/>.</summary>
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
+
+    /// <summary>The target storage pool carried by <see cref="StoragePoolExtension"/>, or null for the source volume's pool.</summary>
+    public string? StoragePool
+    {
+        get
+        {
+            foreach (WireExtension extension in Extensions)
+            {
+                if (extension.FieldId == StoragePoolExtension)
+                    return System.Text.Encoding.UTF8.GetString(extension.Value.Span);
+            }
+
+            return null;
+        }
+    }
+
+    /// <summary>A copy that restores into <paramref name="pool"/> (sets the required <see cref="StoragePoolExtension"/>).</summary>
+    public RestoreSnapshotMessage WithStoragePool(string pool)
+    {
+        ArgumentNullException.ThrowIfNull(pool);
+        return this with
+        {
+            Extensions = [.. Extensions.Where(e => e.FieldId != StoragePoolExtension),
+                new WireExtension(StoragePoolExtension, Required: true, System.Text.Encoding.UTF8.GetBytes(pool))],
+        };
+    }
 
     /// <inheritdoc />
     public MessageType Type => WireType;
@@ -520,7 +557,9 @@ public sealed record RestoreSnapshotMessage(
         RequestHeader header = reader.ReadRecord<RequestHeader>();
         string name = reader.ReadString();
         string newVolumeName = reader.ReadString();
-        IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
+        List<WireExtension>? list = null;
+        reader.ReadExtensions(UnderstoodExtensions, e => (list ??= []).Add(e));
+        IReadOnlyList<WireExtension> extensions = list is null ? [] : list.ToArray();
         return new RestoreSnapshotMessage(header, name, newVolumeName) { Extensions = extensions };
     }
 }

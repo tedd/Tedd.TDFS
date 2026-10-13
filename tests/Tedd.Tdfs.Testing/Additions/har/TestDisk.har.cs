@@ -4,7 +4,7 @@ namespace Tedd.Tdfs.Testing;
 public sealed partial class TestDisk
 {
     /// <summary>True while the disk is dishonest (see <see cref="SetDishonestFlush"/>).</summary>
-    public bool IsDishonestFlush => throw Stub.NotYet("TestDisk.IsDishonestFlush");
+    public bool IsDishonestFlush => Faults.DishonestFlush;
 
     /// <summary>
     /// Makes the device lie about durability (HAR-018, out-of-model storage): while <paramref name="dishonest"/> is true,
@@ -15,5 +15,5 @@ public sealed partial class TestDisk
     /// records an <see cref="AssumptionViolation"/> with <see cref="AssumptionViolation.DurableFlush"/> for this node in
     /// <see cref="TestCluster.AssumptionViolations"/>. Works for simulated and real (wrapped) disks; the node may be running.
     /// </summary>
-    public void SetDishonestFlush(bool dishonest) => throw Stub.NotYet("TestDisk.SetDishonestFlush");
+    public void SetDishonestFlush(bool dishonest) => Faults.DishonestFlush = dishonest;
 }

@@ -1,3 +1,5 @@
+using Tedd.Tdfs.Server.Raft;
+
 namespace Tedd.Tdfs.Server;
 
 public sealed partial class NodeInspector
@@ -10,5 +12,27 @@ public sealed partial class NodeInspector
     /// </summary>
     /// <param name="group">"control" or a volume name.</param>
     public Task<RaftGroupStats?> GetRaftGroupStatsAsync(string group)
-        => throw new NotImplementedException("NodeInspector.GetRaftGroupStatsAsync: implemented in a later phase");
+    {
+        ArgumentNullException.ThrowIfNull(group);
+        return _loop.InvokeAsync<RaftGroupStats?>(() =>
+        {
+            GroupRuntime? runtime = FindGroup(group);
+            if (runtime is null || runtime.IsClosed)
+                return null;
+            GroupStats stats = runtime.Stats;
+            return new RaftGroupStats(
+                runtime.DisplayName,
+                stats.StartIndex,
+                runtime.AppliedIndex,
+                runtime.SnapshotIndex,
+                runtime.LogFirstIndex,
+                stats.EntriesAppended,
+                stats.EntriesApplied,
+                stats.EntriesCoveredByInstall,
+                stats.SnapshotsInstalled,
+                stats.SnapshotInstallsAborted,
+                stats.SnapshotsRejectedStale,
+                stats.SnapshotVerificationFailures);
+        });
+    }
 }

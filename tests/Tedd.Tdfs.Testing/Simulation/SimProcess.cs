@@ -142,14 +142,28 @@ public sealed class SimProcess
     }
 }
 
-/// <summary>Synchronization context of a <see cref="SimProcess"/>: posts to its main lane.</summary>
+/// <summary>
+/// Synchronization context of a <see cref="SimProcess"/>: posts to its main lane. It asks for wait notifications, so a
+/// blocking <see cref="WaitHandle"/> wait of simulated work (the SDK's synchronous wrappers) keeps the simulation running
+/// instead of blocking its only thread (<see cref="SimScheduler.PumpWhileBlocked"/>).
+/// </summary>
 internal sealed class SimSynchronizationContext : SynchronizationContext
 {
+    private const int WaitTimeout = 0x102;
+
     private readonly SimProcess _process;
 
     public SimSynchronizationContext(SimProcess process)
     {
         _process = process;
+        SetWaitNotificationRequired();
+    }
+
+    public override int Wait(IntPtr[] waitHandles, bool waitAll, int millisecondsTimeout)
+    {
+        ArgumentNullException.ThrowIfNull(waitHandles);
+        return _process.Scheduler.PumpWhileBlocked(ms => WaitHelper(waitHandles, waitAll, ms), millisecondsTimeout, WaitTimeout)
+               ?? WaitHelper(waitHandles, waitAll, millisecondsTimeout);
     }
 
     public SimProcess Process => _process;

@@ -8,6 +8,7 @@ namespace Tedd.Tdfs.Storage;
 public sealed class SimulatedMediumFaults
 {
     private volatile bool _readOnly;
+    private volatile bool _dishonestFlush;
     private long _capacityOverride = -1;
     private int _failNextFlushes;
     private int _failNextWrites;
@@ -83,6 +84,18 @@ public sealed class SimulatedMediumFaults
         }
     }
 
+    /// <summary>
+    /// Out-of-model storage (HAR-018): while true, every file flush and directory flush reports success immediately but leaves
+    /// the affected writes and namespace changes volatile, so a later crash loses them exactly as if they had never been
+    /// flushed. Turning it off persists nothing retroactively; only later flushes are honest again. Not restricted by
+    /// <see cref="PathFilter"/> (the whole device lies). Successful dishonest flushes are not counted as durability barriers.
+    /// </summary>
+    public bool DishonestFlush
+    {
+        get => _dishonestFlush;
+        set => _dishonestFlush = value;
+    }
+
     /// <summary>Restricts faults to paths for which the predicate returns true (null = all paths).</summary>
     public Func<string, bool>? PathFilter
     {
@@ -94,6 +107,7 @@ public sealed class SimulatedMediumFaults
     public void Reset()
     {
         ReadOnly = false;
+        DishonestFlush = false;
         CapacityOverride = null;
         FailNextFlushes = 0;
         FailNextWrites = 0;

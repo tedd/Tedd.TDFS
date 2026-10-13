@@ -1197,6 +1197,12 @@ public sealed class SdkUnitTests
             return DfsStoragePolicy.Default;
         if (t == typeof(DfsPermissions))
             return DfsPermissions.Read;
+        if (t == typeof(DfsIdentity?))
+            return null; // GetEffectiveRightsAsync: the caller
+        if (t == typeof(DfsIdentity))
+            return DfsIdentity.User("sdk013-principal");
+        if (t == typeof(DfsSecurityDescriptor))
+            return new DfsSecurityDescriptor(DfsIdentity.User("sdk013-principal"), []);
         if (t == typeof(DfsRestoreFromBackupRequest))
             return new DfsRestoreFromBackupRequest(["mem://b0"], new DfsCredentials("sdk013-reader", "sdk013-reader-secret"), Volume, "sdk013-snap", "sdk013-restored-2");
         if (t == typeof(DfsClientOptions))

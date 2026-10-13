@@ -45,7 +45,176 @@ public static class TraceMinimizer
     /// </param>
     /// <param name="maxRuns">Execution budget (at least 1).</param>
     /// <param name="ct">Cancellation.</param>
-    public static Task<TraceMinimizationResult<TStep>> MinimizeAsync<TStep>(IReadOnlyList<TStep> failingTrace,
-        Func<IReadOnlyList<TStep>, Task<string?>> run, int maxRuns, CancellationToken ct = default) =>
-        throw Stub.NotYet("TraceMinimizer.MinimizeAsync");
+    public static async Task<TraceMinimizationResult<TStep>> MinimizeAsync<TStep>(IReadOnlyList<TStep> failingTrace,
+        Func<IReadOnlyList<TStep>, Task<string?>> run, int maxRuns, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(failingTrace);
+        ArgumentNullException.ThrowIfNull(run);
+        if (failingTrace.Count == 0)
+            throw new ArgumentException("A trace to minimize needs at least one step.", nameof(failingTrace));
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxRuns, 1);
+        TStep[] original = [.. failingTrace];
+
+        ct.ThrowIfCancellationRequested();
+        string? invariant;
+        try
+        {
+            invariant = await run(original);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new ArgumentException("The run of the original trace threw instead of reporting an invariant; there is nothing to minimize.",
+                nameof(failingTrace), ex);
+        }
+
+        if (invariant is null)
+            throw new ArgumentException("The original trace passes; a passing trace cannot be minimized.", nameof(failingTrace));
+
+        var search = new Search<TStep>(original, run, maxRuns, invariant, ct);
+        search.Remember(Enumerable.Range(0, original.Length).ToArray(), sameFailure: true);
+        int[] current = Enumerable.Range(0, original.Length).ToArray();
+
+        // ddmin: complements first, then subsets, refining the granularity.
+        int granularity = 2;
+        while (current.Length >= 2 && !search.Exhausted)
+        {
+            int[][] chunks = Split(current, granularity);
+            int[]? reduced = null;
+            foreach (int[] chunk in chunks)
+            {
+                int[] complement = current.Except(chunk).ToArray();
+                if (complement.Length == 0)
+                    continue;
+                if (await search.FailsSameWayAsync(complement))
+                {
+                    reduced = complement;
+                    granularity = Math.Max(granularity - 1, 2);
+                    break;
+                }
+
+                if (search.Exhausted)
+                    break;
+            }
+
+            if (reduced is null && !search.Exhausted)
+            {
+                foreach (int[] chunk in chunks)
+                {
+                    if (chunk.Length == current.Length)
+                        continue;
+                    if (await search.FailsSameWayAsync(chunk))
+                    {
+                        reduced = chunk;
+                        granularity = 2;
+                        break;
+                    }
+
+                    if (search.Exhausted)
+                        break;
+                }
+            }
+
+            if (reduced is not null)
+            {
+                current = reduced;
+                continue;
+            }
+
+            if (search.Exhausted || granularity >= current.Length)
+                break;
+            granularity = Math.Min(granularity * 2, current.Length);
+        }
+
+        // Verify 1-minimality: every single-step removal must not reproduce the invariant (a removal that does is taken and
+        // the verification restarts on the smaller trace).
+        bool oneMinimal = false;
+        while (!search.Exhausted)
+        {
+            int[]? smaller = null;
+            for (int i = 0; i < current.Length && !search.Exhausted; i++)
+            {
+                int[] candidate = [.. current[..i], .. current[(i + 1)..]];
+                if (await search.FailsSameWayAsync(candidate))
+                {
+                    smaller = candidate;
+                    break;
+                }
+            }
+
+            if (search.Exhausted)
+                break;
+            if (smaller is null)
+            {
+                oneMinimal = true;
+                break;
+            }
+
+            current = smaller;
+        }
+
+        TStep[] minimal = current.Select(i => original[i]).ToArray();
+        return new TraceMinimizationResult<TStep>(original, minimal, invariant, search.Runs, oneMinimal, search.Exhausted);
+    }
+
+    /// <summary>Splits <paramref name="indices"/> into <paramref name="parts"/> contiguous chunks whose sizes differ by at most one.</summary>
+    private static int[][] Split(int[] indices, int parts)
+    {
+        parts = Math.Min(parts, indices.Length);
+        var chunks = new int[parts][];
+        int start = 0;
+        for (int i = 0; i < parts; i++)
+        {
+            int size = (indices.Length - start) / (parts - i);
+            chunks[i] = indices[start..(start + size)];
+            start += size;
+        }
+
+        return chunks;
+    }
+
+    /// <summary>Executes candidates within the budget, caching each candidate's verdict by its index set.</summary>
+    private sealed class Search<TStep>(TStep[] original, Func<IReadOnlyList<TStep>, Task<string?>> run, int maxRuns, string invariant,
+        CancellationToken ct)
+    {
+        private readonly Dictionary<string, bool> _verdicts = new(StringComparer.Ordinal);
+
+        /// <summary>Executions of the run delegate so far (the initial confirmation included).</summary>
+        public int Runs { get; private set; } = 1;
+
+        /// <summary>True once a candidate could not be executed because the budget was used up.</summary>
+        public bool Exhausted { get; private set; }
+
+        public void Remember(int[] candidate, bool sameFailure) => _verdicts[Key(candidate)] = sameFailure;
+
+        /// <summary>True when the candidate's run reports the same invariant (cached; never executed twice).</summary>
+        public async Task<bool> FailsSameWayAsync(int[] candidate)
+        {
+            string key = Key(candidate);
+            if (_verdicts.TryGetValue(key, out bool known))
+                return known;
+            if (Runs >= maxRuns)
+            {
+                Exhausted = true;
+                return false;
+            }
+
+            ct.ThrowIfCancellationRequested();
+            Runs++;
+            string? reported;
+            try
+            {
+                reported = await run(candidate.Select(i => original[i]).ToArray());
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                reported = null; // a candidate that throws is a different failure, never the same one
+            }
+
+            bool same = string.Equals(reported, invariant, StringComparison.Ordinal);
+            _verdicts[key] = same;
+            return same;
+        }
+
+        private static string Key(int[] candidate) => string.Join(',', candidate);
+    }
 }

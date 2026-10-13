@@ -33,6 +33,7 @@ public sealed class SimulatedMedium : IStorageMedium
     private long _writeSequence;
     private long _flushCount;
     private long _crashCount;
+    private SimulatedLossReport _lastCrashLoss = SimulatedLossReport.None;
 
     /// <summary>Creates an empty medium.</summary>
     /// <param name="name">Diagnostic name.</param>
@@ -82,6 +83,56 @@ public sealed class SimulatedMedium : IStorageMedium
     /// <summary>Number of <see cref="Crash"/> calls so far.</summary>
     public long CrashCount => Interlocked.Read(ref _crashCount);
 
+    /// <summary>
+    /// Acknowledged-but-volatile changes the most recent <see cref="Crash"/> discarded: changes a dishonest flush
+    /// (<see cref="SimulatedMediumFaults.DishonestFlush"/>) reported durable that did not survive. Empty after an honest crash.
+    /// </summary>
+    public SimulatedLossReport LastCrashLoss
+    {
+        get
+        {
+            lock (_gate)
+                return _lastCrashLoss;
+        }
+    }
+
+    /// <summary>Changes a dishonest flush reported durable that are still volatile (a crash or disk loss now would lose them).</summary>
+    public SimulatedLossReport GetAcknowledgedVolatileState()
+    {
+        lock (_gate)
+        {
+            Dictionary<SimulatedNode, string> nodePaths = NodePathMapLocked();
+            var paths = new SortedSet<string>(StringComparer.Ordinal);
+            int writes = 0;
+            long bytes = 0;
+            foreach (SimulatedNode node in AllNodesLocked())
+            {
+                foreach (PendingWrite w in node.Pending)
+                {
+                    if (!w.Acknowledged)
+                        continue;
+                    writes++;
+                    bytes += w.Data?.Length ?? 0;
+                    if (nodePaths.TryGetValue(node, out string? path))
+                        paths.Add(path);
+                }
+            }
+
+            int namespaceChanges = 0;
+            foreach (NamespaceOp op in _pendingNamespace)
+            {
+                if (!op.Acknowledged)
+                    continue;
+                namespaceChanges++;
+                paths.Add(op.Path);
+            }
+
+            return writes == 0 && namespaceChanges == 0
+                ? SimulatedLossReport.None
+                : new SimulatedLossReport(writes, bytes, namespaceChanges, [.. paths]);
+        }
+    }
+
     /// <summary>Number of unflushed file changes plus unflushed namespace changes (diagnostics).</summary>
     public int UnflushedOperationCount
     {
@@ -110,6 +161,13 @@ public sealed class SimulatedMedium : IStorageMedium
 
         lock (_gate)
         {
+            // Acknowledged-but-volatile changes (dishonest flushes) that this crash discards are reported (HAR-018).
+            Dictionary<SimulatedNode, string> nodePaths = NodePathMapLocked();
+            var lostPaths = new SortedSet<string>(StringComparer.Ordinal);
+            int lostWrites = 0;
+            long lostBytes = 0;
+            int lostNamespace = 0;
+
             // 1. Namespace: a prefix of the ordered unflushed changes survives.
             int namespaceCount = _pendingNamespace.Count;
             int keepNamespace = mode switch
@@ -120,6 +178,15 @@ public sealed class SimulatedMedium : IStorageMedium
             };
             for (int i = 0; i < keepNamespace; i++)
                 ApplyNamespaceOp(_pendingNamespace[i], _durableFiles, _durableDirs);
+            for (int i = keepNamespace; i < namespaceCount; i++)
+            {
+                if (_pendingNamespace[i].Acknowledged)
+                {
+                    lostNamespace++;
+                    lostPaths.Add(_pendingNamespace[i].Path);
+                }
+            }
+
             _pendingNamespace.Clear();
             RemoveOrphans(_durableFiles, _durableDirs);
 
@@ -138,6 +205,7 @@ public sealed class SimulatedMedium : IStorageMedium
             }
 
             var processed = new HashSet<SimulatedNode>();
+            var keptWrites = new HashSet<long>();
             foreach (KeyValuePair<string, SimulatedNode> entry in _durableFiles)
             {
                 SimulatedNode node = entry.Value;
@@ -146,20 +214,27 @@ public sealed class SimulatedMedium : IStorageMedium
 
                 foreach (PendingWrite w in node.Pending)
                 {
+                    bool kept = true;
                     switch (mode)
                     {
+                        case CrashMode.LoseUnflushed:
+                            kept = false;
+                            break;
                         case CrashMode.KeepUnflushed:
                             SimulatedNode.Apply(node.Durable, w);
                             break;
                         case CrashMode.RandomSubset:
                             if (_random.Next(2) == 1)
                                 SimulatedNode.Apply(node.Durable, w);
+                            else
+                                kept = false;
                             break;
                         case CrashMode.TearLastWrite:
                             if (w.Sequence == tornSequence && w.Data is not null)
                             {
                                 int keep = _random.Next(w.Data.Length); // strict prefix: 0 .. Length-1 bytes
                                 node.Durable.Write(w.Offset, w.Data.AsSpan(0, keep));
+                                kept = false;
                             }
                             else
                             {
@@ -168,15 +243,33 @@ public sealed class SimulatedMedium : IStorageMedium
 
                             break;
                     }
+
+                    if (kept)
+                        keptWrites.Add(w.Sequence);
                 }
             }
 
             // Every node (reachable or not) loses its volatile state; unreachable nodes are simply dropped.
             foreach (SimulatedNode node in AllNodesLocked())
             {
+                foreach (PendingWrite w in node.Pending)
+                {
+                    if (w.Acknowledged && !keptWrites.Contains(w.Sequence))
+                    {
+                        lostWrites++;
+                        lostBytes += w.Data?.Length ?? 0;
+                        if (nodePaths.TryGetValue(node, out string? path))
+                            lostPaths.Add(path);
+                    }
+                }
+
                 node.Pending.Clear();
                 node.OpenHandles = 0;
             }
+
+            _lastCrashLoss = lostWrites == 0 && lostNamespace == 0
+                ? SimulatedLossReport.None
+                : new SimulatedLossReport(lostWrites, lostBytes, lostNamespace, [.. lostPaths]);
 
             foreach (SimulatedNode node in processed)
                 node.Current = node.Durable.Clone();
@@ -501,6 +594,14 @@ public sealed class SimulatedMedium : IStorageMedium
                 throw StorageErrors.ReadOnlyDevice(d);
             if (Faults.TryConsumeFailFlush(d))
                 throw StorageErrors.DeviceError("directory flush", d);
+            if (Faults.DishonestFlush)
+            {
+                // Out-of-model device: report success, persist nothing.
+                for (int i = 0; i <= last; i++)
+                    _pendingNamespace[i].Acknowledged = true;
+                return;
+            }
+
             for (int i = 0; i <= last; i++)
                 ApplyNamespaceOp(_pendingNamespace[i], _durableFiles, _durableDirs);
             if (last >= 0)
@@ -604,6 +705,14 @@ public sealed class SimulatedMedium : IStorageMedium
                 throw StorageErrors.ReadOnlyDevice(handle.Path);
             if (Faults.TryConsumeFailFlush(handle.Path))
                 throw StorageErrors.DeviceError("flush", handle.Path);
+            if (Faults.DishonestFlush)
+            {
+                // Out-of-model device: report success, keep the changes volatile.
+                for (int i = 0; i < node.Pending.Count; i++)
+                    node.Pending[i] = node.Pending[i] with { Acknowledged = true };
+                return;
+            }
+
             foreach (PendingWrite w in node.Pending)
                 SimulatedNode.Apply(node.Durable, w);
             node.Pending.Clear();
@@ -773,8 +882,28 @@ public sealed class SimulatedMedium : IStorageMedium
         Rename,
     }
 
+    /// <summary>Maps every known file node to one path naming it (current view first, then durable view, then pending operations).</summary>
+    private Dictionary<SimulatedNode, string> NodePathMapLocked()
+    {
+        var map = new Dictionary<SimulatedNode, string>();
+        foreach (KeyValuePair<string, SimulatedNode> entry in _files)
+            map.TryAdd(entry.Value, entry.Key);
+        foreach (KeyValuePair<string, SimulatedNode> entry in _durableFiles)
+            map.TryAdd(entry.Value, entry.Key);
+        foreach (NamespaceOp op in _pendingNamespace)
+        {
+            if (op.Node is not null)
+                map.TryAdd(op.Node, op.Target ?? op.Path);
+        }
+
+        return map;
+    }
+
     private sealed record NamespaceOp(NamespaceOpKind Kind, string Path, string? Target, SimulatedNode? Node)
     {
+        /// <summary>True once a dishonest directory flush reported this change durable although it is still volatile.</summary>
+        public bool Acknowledged { get; set; }
+
         public bool Touches(string directory)
             => (Path.Length != 0 && string.Equals(StoragePath.GetParent(Path), directory, StringComparison.Ordinal))
             || (Target is not null && string.Equals(StoragePath.GetParent(Target), directory, StringComparison.Ordinal));

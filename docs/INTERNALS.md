@@ -26,7 +26,8 @@ Volumes/
                 .Snapshots.cs, .Gc.cs, .Backup.cs, .Policy.cs, .Security.cs
   Service/      VolumeService (leader-side RPC handlers) + partials per feature: VolumeService.Files.cs,
                 .Namespace.cs, .Handles.cs (lease tracking/expiry proposals), .Transactions.cs (working roots),
-                .Snapshots.cs, .Enumeration.cs (continuation cache), .Gc.cs, .Repair.cs, .Backup.cs, .Outcomes.cs
+                .Snapshots.cs, .Enumeration.cs (continuation cache), .Gc.cs, .Repair.cs, .Backup.cs, .Outcomes.cs,
+                .Restore.cs (snapshot restore coordinator + install target); RestoreControl (control-leader restore steps)
   VolumeHost    per-volume composition: group runtime + state machine + service + leader-only jobs
 Data/           ObjectService (PutObject/GetObject/Locate/Replicate/Delete/Copy handlers), Receipts (MAC),
                 Capabilities (staging + per-object read capabilities), InventoryReporter, Scrubber, RepairWorker
@@ -245,7 +246,17 @@ internal sealed partial class AdminService
   `ApplyResult Apply<Feature>(VolumeState s, Cmd c, ApplyContext ctx, out VolumeState next)` → outcome stored.
 * Leader-only, non-replicated state (lease timers, tx working roots, enumeration cache, in-flight op coalescing,
   inventory/location maps, repair queues, exporter state) lives in `VolumeService` partials and is rebuilt after
-  leadership changes.
+  leadership changes. A lease the leader has not seen yet counts as renewed when first seen (never measured from the
+  election: a handle granted by an applied entry whose reply path is still held must not expire).
+* Revisions: `InodeRecord.Revision` advances for every change of the record (it is the checkpoint version key
+  `(Id, Revision)`, so every change must advance it); `MetadataRevision` only for the inode's own metadata (creation,
+  owner, ACL, policy, name/parent). The revision reported for a file (`FileInfoData.Revision`, listings, inspection,
+  conditional writes) is `ReportedRevision` = max(default-stream revision, metadata revision): named-stream writes do not
+  change it (ADS-011). `CommitFile.BaseRevision` conflicts only when the stream's content changed after the base.
+* The leader pre-checks a command by running apply without committing (`DryRun`). A definitely (non-retryably) refused
+  request **with** an operation id is still proposed, so apply records the refusal as the id's outcome (an answered id
+  never executes later); retryable refusals and id-less refusals are answered from the pre-check. Apply catches every
+  exception (except OOM) as a deterministic `Internal` failure of the entry.
 
 ### 1.3 Runtime plug-in points (how feature areas attach)
 
@@ -340,29 +351,49 @@ installed/aborted/rejected, verification failures, checkpoints written) for suit
 ## 2. Client (`src/Tedd.Tdfs.Client`)
 
 ```
-Internal/Runtime/   ClientRuntime (options, transport, time, random, faults, mutations), ConnectionPool,
-                    ClientConnection (handshake, reconnect), ClusterMapCache
-Internal/Rpc/       RpcInvoker (leader routing, NotLeader reroute, retries with same op id, deadline, unknown-outcome
-                    classification), RequestFactory
-Internal/Sessions/  VolumeSession (session id, sequence allocator, ack watermark, keepalive timer, handle registry)
-Internal/Data/      DataPlane (object upload to placement targets with fallback and receipts; verified range reads with
-                    replica failover; read capability handling), ChunkPlanner
-Internal/Overlay/   StagedOverlay (sorted ranges of buffered bytes / staged object ranges, truncation watermark)
-Files/              DfsFileClient (+ partials per helper family), Directories/, Streams/DfsStream (+ partials: .Read.cs,
-                    .Write.cs, .Publish.cs, .Lifecycle.cs), Transactions/, Snapshots/, Backups/, Admin/
+Internal/Runtime/   ClientRuntime (options, transport, time, random, faults, mutations, lifecycle: in-flight tracking,
+                    shutdown, Abandon), OperationScope (deadline, caller/kill tokens, F00/F01 hits, classification of
+                    never-transmitted failures), ConnectionPool, ClientConnection (handshake, cluster identity, protocol
+                    version, poisoning of stale connections), ClusterMapCache (map, pools, discovery order), Waits
+                    (TimeProvider delays/waits without sync context), LockedRandom
+Internal/Rpc/       RpcInvoker (routing, NotLeader redirects, retries with the same op id, per-attempt and per-operation
+                    deadlines, unknown-outcome resolution via QueryOperation(resolve)), RpcRequest, Routers (control
+                    leader, any node)
+Internal/Sessions/  VolumeContext (volume binding id/epoch, leader routing via GetVolumeRoute, session open, sequence
+                    blocks, Read/Mutate helpers, keep-alive timer, weak handle/pin registries, helper staging session),
+                    VolumeSession (session id, reserved sequence blocks, ack watermark, the session's volume binding),
+                    VolumeBinding (expected volume id/epoch carried by every request about something a session owns,
+                    and by every transmission of one operation id)
+Internal/Data/      DataPlane (HRW upload with fallback, receipts until the ack policy is met, grace for extra copies;
+                    verified range reads with replica failover and LocateObject; never zero-fill), ContentLayout (chunking
+                    at ChunkSize boundaries, inline-permission from the voters' failure domains), StagingLease
+Internal/Overlay/   StagedOverlay (sorted buffered / uploaded ranges, staged length, truncation point, snapshot/restore)
+Internal/Text/      TextCodec (UTF-8 without BOM by default, BOM detection, incremental line splitting)
+Internal/Facades/   WireConvert (wire records <-> SDK records), SnapshotAdapters (prepare/abort/resume bounded by timeouts)
+Internal/           Validation (paths and options, before any request), AsyncGate, AsyncLock, SyncBridge, ContextFree
+Files/              DfsFileClient (+ .Security.cs), Directories/, Streams/DfsStream, Transactions/, Snapshots/, Backups/, Admin/
 ```
 
 ## 3. Harness (`tests/Tedd.Tdfs.Testing`)
 
 ```
-Cluster/       TestCluster (+ partials: .Lifecycle.cs, .Clients.cs, .Waits.cs), ClusterTest, ClusterBuilder (bootstrap,
-               per-node environments), TestClusterOptions
-Nodes/         TestNode, TestBackupNode, TestDisk (SimulatedMedium or FaultingFileSystemMedium), node environments
-Network/       TestNetwork -> HarnessLinkPolicy (implements ILinkPolicy; partitions, cuts, black holes, rules, holds, log)
+Cluster/       TestCluster (+ partials: .Lifecycle.cs = bootstrap/static+seed-join, nodes, per-node NodeEnvironment,
+               recovery/foreign clusters, disposal; .Clients.cs = SDK/raw/admin clients, principals; .Waits.cs = leaders,
+               stability, replication, repair, digest, leadership transfer; .Invariants.cs = leadership history/split
+               brain, assumption violations, uncontrolled dependencies), ClusterTest (realtime runs; deterministic runs on a
+               driver thread in four SimScheduler phases), HarnessAdmin (raw admin channel to the control leader),
+               HarnessStartOptions (internal start settings), TestClusterOptions
+Nodes/         TestNode, TestBackupNode, TestDisk (SimulatedMedium or FaultingFileSystemMedium), FencedMedium (per-incarnation
+               view fenced at crash/stop)
+Network/       TestNetwork -> NetworkFabric (sim/in-memory/QUIC transports wrapped by HarnessTransport: holds, reply drops,
+               truncation, tampering, silent death, read limits, replay, attempt/connection accounting) and HarnessLinkPolicy
+               (implements ILinkPolicy; partitions, cuts, black holes, mesh, latency, rules, message log)
 Faults/        TestFaults -> HarnessFaultInjector (implements IFaultInjector; arms, coverage registry)
 Simulation/    SimScheduler, SimNodeLoop, SimTimeProvider, SimNetwork (deterministic mode)
-Inspection/    ClusterInspector
+Inspection/    ClusterInspector (harness ground truth from node inspectors)
 Protocol/      RawProtocolClient
+Internal/      ClusterRuntime (realtime vs deterministic execution context), out-of-process launcher (HostProcess runs
+               src/Tedd.Tdfs.Host), PortAllocator, HarnessNodeLog
 Raft/          RaftSimulation
 History/, Models/, Catalog/, Data/   (implemented)
 Additions/     suite-requested additions (partials), one folder per suite group

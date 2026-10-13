@@ -62,8 +62,32 @@ internal sealed partial class AdminService
         }
         catch (UnauthorizedAccessException)
         {
-            Control.ReportSecurityEvent("admin:" + message.Op, "denied", "op=" + message.Op, principal);
+            await Control.ReportSecurityEventAndWaitAsync("admin:" + message.Op, "denied", DenialScope(message), principal);
             throw;
+        }
+    }
+
+    /// <summary>The audit scope of a denied request: the operation and, where the body names one, its target object.</summary>
+    private static string DenialScope(AdminRequestMessage message)
+    {
+        string op = "op=" + message.Op;
+        try
+        {
+            return message.Op switch
+            {
+                AdminOp.CreateGroup or AdminOp.DeleteGroup => op + " group=" + message.ReadBody<AdminGroupNameBody>().Group,
+                AdminOp.AddGroupMember or AdminOp.RemoveGroupMember => op + " group=" + message.ReadBody<AdminGroupMemberBody>().Group
+                    + " principal=" + message.ReadBody<AdminGroupMemberBody>().Principal,
+                AdminOp.ListGroups => op + " group=*",
+                AdminOp.PoolStatus or AdminOp.DeletePool => op + " pool=" + message.ReadBody<AdminPoolNameBody>().Pool,
+                AdminOp.CreatePool or AdminOp.SetPoolMembers => op + " pool=" + message.ReadBody<AdminPoolMembersBody>().Pool,
+                AdminOp.ListPools => op + " pool=*",
+                _ => op,
+            };
+        }
+        catch (Exception ex) when (ex is DfsProtocolException or ArgumentException or FormatException)
+        {
+            return op;
         }
     }
 

@@ -42,9 +42,8 @@ internal sealed partial class ControlStateMachine
         return null;
     }
 
-    private ApplyOutcome ApplyCreateVolume(CreateVolumeCommand c, ulong index)
+    private ApplyOutcome ApplyCreateVolume(VolumeCreation creation, ReadOnlyMemory<byte> wrappedDataKey, WireVolumeState initialState, ulong index)
     {
-        VolumeCreation creation = c.Creation;
         string? nameError = GetVolumeNameError(creation.Name);
         if (nameError is not null)
             return Fail(DfsErrorCode.InvalidArgument, nameError);
@@ -67,8 +66,8 @@ internal sealed partial class ControlStateMachine
             CreatedIndex = index,
             NamedPolicies = Sorted(creation.NamedPolicies),
         };
-        var record = new VolumeRecord(stamped, WireVolumeState.Active, stamped.InitialVoters.ToArray(), [], stamped.DefaultPolicy, stamped.NamedPolicies,
-            null, [new DataKeyVersion(1, c.WrappedDataKey, index)], new SortedDictionary<string, BackupTargetRecord>(StringComparer.Ordinal));
+        var record = new VolumeRecord(stamped, initialState, stamped.InitialVoters.ToArray(), [], stamped.DefaultPolicy, stamped.NamedPolicies,
+            null, [new DataKeyVersion(1, wrappedDataKey, index)], new SortedDictionary<string, BackupTargetRecord>(StringComparer.Ordinal));
         State.Volumes[record.Id] = record;
         if (State.Principals.TryGetValue(creation.Creator, out PrincipalRecord? creator))
         {
@@ -97,17 +96,48 @@ internal sealed partial class ControlStateMachine
 
     private ApplyOutcome ApplyDeleteVolume(DeleteVolumeCommand c)
     {
-        if (!State.Volumes.Remove(c.Volume, out VolumeRecord? removed))
+        if (!State.Volumes.ContainsKey(c.Volume))
             return Fail(DfsErrorCode.VolumeNotFound, $"Volume {c.Volume} does not exist.");
+        return ApplyOutcome.Success(RemoveVolume(c.Volume));
+    }
+
+    /// <summary>
+    /// Activates a restored volume, or removes a volume whose restore cannot complete. Both are idempotent: activating an
+    /// active volume and abandoning a volume that no longer exists succeed; an active volume is never removed this way.
+    /// </summary>
+    private ApplyOutcome ApplyFinishRestoringVolume(FinishRestoringVolumeCommand c)
+    {
+        if (!State.Volumes.TryGetValue(c.Volume, out VolumeRecord? v))
+            return c.Activate ? Fail(DfsErrorCode.VolumeNotFound, $"Volume {c.Volume} does not exist.") : ApplyOutcome.Success();
+        if (c.Activate)
+        {
+            if (v.State == WireVolumeState.Active)
+                return ApplyOutcome.Success(v);
+            if (v.State != WireVolumeState.Restoring)
+                return Fail(DfsErrorCode.InvalidArgument, $"Volume '{v.Name}' is {v.State}, not restoring.");
+            VolumeRecord active = v with { State = WireVolumeState.Active };
+            State.Volumes[v.Id] = active;
+            return ApplyOutcome.Success(active);
+        }
+
+        if (v.State != WireVolumeState.Restoring)
+            return Fail(DfsErrorCode.InvalidArgument, $"Volume '{v.Name}' is {v.State}; only a restoring volume can be abandoned.");
+        RemoveVolume(v.Id);
+        return ApplyOutcome.Success();
+    }
+
+    private VolumeRecord RemoveVolume(VolumeId id)
+    {
+        State.Volumes.Remove(id, out VolumeRecord? removed);
         foreach (PrincipalRecord p in State.Principals.Values.ToArray())
         {
-            if (!p.Grants.ContainsKey(c.Volume))
+            if (!p.Grants.ContainsKey(id))
                 continue;
-            var grants = new SortedDictionary<VolumeId, DfsPermissions>(p.Grants.Where(g => g.Key != c.Volume).ToDictionary(), VolumeIdComparer.Instance);
+            var grants = new SortedDictionary<VolumeId, DfsPermissions>(p.Grants.Where(g => g.Key != id).ToDictionary(), VolumeIdComparer.Instance);
             State.Principals[p.Name] = p with { Grants = grants };
         }
 
-        return ApplyOutcome.Success(removed);
+        return removed!;
     }
 
     private ApplyOutcome ApplySetVolumeVoters(SetVolumeVotersCommand c)

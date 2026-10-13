@@ -4,7 +4,7 @@ namespace Tedd.Tdfs.Storage;
 
 /// <summary>
 /// Packed, append-only object store: objects are records in segment files with a self-describing, checksummed header;
-/// the index is rebuilt from the segments on open. Writes are durable when <see cref="PutAsync"/> returns.
+/// the index is rebuilt from the segments on open. Writes are durable when <see cref="PutAsync(ObjectId, VolumeId, StagingId, ReadOnlyMemory{byte}, CancellationToken)"/> returns.
 /// </summary>
 /// <remarks>
 /// <para><b>Records.</b> Each record header carries the object identity (id, volume, staging session), plaintext and
@@ -156,7 +156,18 @@ public sealed partial class ObjectStore : IAsyncDisposable
     /// <exception cref="DfsLimitExceededException">The object exceeds <see cref="ObjectStoreOptions.MaxObjectSize"/>.</exception>
     /// <exception cref="DfsIntegrityException">The id is stored with different content or volume.</exception>
     /// <exception cref="DfsCapacityException">Admission would consume the reserved capacity, or the device is full.</exception>
-    public async ValueTask<ObjectRecordInfo> PutAsync(ObjectId id, VolumeId volume, StagingId staging, ReadOnlyMemory<byte> plaintext, CancellationToken ct = default)
+    public ValueTask<ObjectRecordInfo> PutAsync(ObjectId id, VolumeId volume, StagingId staging, ReadOnlyMemory<byte> plaintext, CancellationToken ct = default)
+        => PutAsync(id, volume, staging, plaintext, DfsOperationKind.PutObject, ct);
+
+    /// <inheritdoc cref="PutAsync(ObjectId, VolumeId, StagingId, ReadOnlyMemory{byte}, CancellationToken)"/>
+    /// <param name="id">Object id.</param>
+    /// <param name="volume">Owning volume.</param>
+    /// <param name="staging">Staging session the copy is bound to.</param>
+    /// <param name="plaintext">Payload.</param>
+    /// <param name="operation">Operation kind reported by the object write fault sites (for example a restore's server-side copy).</param>
+    /// <param name="ct">Cancellation.</param>
+    public async ValueTask<ObjectRecordInfo> PutAsync(ObjectId id, VolumeId volume, StagingId staging, ReadOnlyMemory<byte> plaintext, DfsOperationKind operation,
+        CancellationToken ct = default)
     {
         if (id.IsEmpty)
             throw new ArgumentException("The object id must not be empty.", nameof(id));
@@ -165,7 +176,7 @@ public sealed partial class ObjectStore : IAsyncDisposable
         ThrowIfDisposed();
         UInt128 checksum = ObjectChecksum.Compute(plaintext.Span);
         if (_faults.IsEnabled)
-            await _faults.HitAsync(new FaultContext(FaultStage.F06, FaultSites.ObjectWrite, _options.NodeName, Operation: DfsOperationKind.PutObject, Object: id), ct);
+            await _faults.HitAsync(new FaultContext(FaultStage.F06, FaultSites.ObjectWrite, _options.NodeName, Operation: operation, Object: id), ct);
 
         SegmentFile segment;
         IndexEntry entry;
@@ -230,7 +241,7 @@ public sealed partial class ObjectStore : IAsyncDisposable
         try
         {
             if (_faults.IsEnabled)
-                await _faults.HitAsync(new FaultContext(FaultStage.F07, FaultSites.ObjectBeforeFlush, _options.NodeName, Operation: DfsOperationKind.PutObject, Object: id), ct);
+                await _faults.HitAsync(new FaultContext(FaultStage.F07, FaultSites.ObjectBeforeFlush, _options.NodeName, Operation: operation, Object: id), ct);
             try
             {
                 await FlushSegmentAsync(segment, ct);
@@ -298,6 +309,8 @@ public sealed partial class ObjectStore : IAsyncDisposable
                 return 0;
 
             bool verify = !_options.Mutations.SkipChecksumVerification;
+            if (verify)
+                await VerifyStoredHeaderAsync(e, ct);
             int unitSize = e.Header.UnitSize;
             int firstUnit = (int)(offset / unitSize);
             int lastUnit = (int)((offset + count - 1) / unitSize);
@@ -346,6 +359,45 @@ public sealed partial class ObjectStore : IAsyncDisposable
         finally
         {
             await ReleaseAsync(e.Segment);
+        }
+    }
+
+    /// <summary>
+    /// Re-reads and validates the durable record header of an indexed object before its payload is served (LAY-018,
+    /// DSK-016): header CRC and identity/length/checksum metadata must still match the index. A damaged header is an
+    /// integrity failure of this copy (the reader fails over to another replica), never a reason to trust the index alone.
+    /// </summary>
+    private async ValueTask VerifyStoredHeaderAsync(IndexEntry e, CancellationToken ct)
+    {
+        int headerLength = e.Header.HeaderLength;
+        var raw = new byte[headerLength];
+        try
+        {
+            await e.Segment.File!.ReadFullyAsync(e.Offset, raw, ct);
+        }
+        catch (EndOfStreamException ex)
+        {
+            CountFailure();
+            throw new DfsIntegrityException(e.Info.Id, $"Object {e.Info.Id} has a truncated record header in '{e.Segment.Path}'.", ex);
+        }
+
+        bool valid;
+        try
+        {
+            valid = TryParseHeader(raw, e.Segment.Path, e.Offset, out RecordHeader h)
+                && h.Kind == KindObject && h.Id == e.Info.Id && h.Volume == e.Header.Volume && h.Checksum == e.Info.Checksum
+                && h.PlaintextLength == e.Header.PlaintextLength && h.StoredLength == e.Header.StoredLength && h.UnitSize == e.Header.UnitSize
+                && h.Encoding == e.Header.Encoding;
+        }
+        catch (DfsProtocolException)
+        {
+            valid = false;
+        }
+
+        if (!valid)
+        {
+            CountFailure();
+            throw new DfsIntegrityException(e.Info.Id, $"Object {e.Info.Id} has a damaged record header in '{e.Segment.Path}' at offset {e.Offset}.");
         }
     }
 

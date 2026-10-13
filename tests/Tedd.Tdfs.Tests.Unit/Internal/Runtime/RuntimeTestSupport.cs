@@ -209,6 +209,12 @@ internal sealed class RuntimeCluster : IAsyncDisposable
     /// <summary>Fault injector handed to every node started afterwards.</summary>
     public IFaultInjector Faults { get; set; } = NoFaults.Instance;
 
+    /// <summary>
+    /// Volume state machine factory handed to every node started afterwards: the trivial test machine by default, null for the
+    /// production volume state machine and service.
+    /// </summary>
+    public IVolumeStateMachineFactory? VolumeStateMachines { get; set; } = TestVolumeStateMachineFactory.Instance;
+
     public ClusterBootstrap Bootstrap { get; }
 
     public IReadOnlyList<RuntimeNode> Nodes => _nodes;
@@ -245,7 +251,7 @@ internal sealed class RuntimeCluster : IAsyncDisposable
         TransportFactory = Network.Factory,
         Time = TimeProvider.System,
         Random = new SeededRandom(_seed * 7919 + (ulong)node.Index * 104729 + (ulong)node.Starts * 31),
-        VolumeStateMachines = TestVolumeStateMachineFactory.Instance,
+        VolumeStateMachines = VolumeStateMachines,
         Log = Log,
         Faults = Faults,
     };

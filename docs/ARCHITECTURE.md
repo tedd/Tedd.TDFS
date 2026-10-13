@@ -438,7 +438,11 @@ from an injected `IRandomSource`, all I/O from the injected transport; never use
 waiters synchronously), `Task.Delay` without the injected `TimeProvider`, or `TaskCompletionSource` with
 `RunContinuationsAsynchronously` on the request path. Synchronous wrappers (`Open`, `ReadAllBytes`, ...) run the async
 implementation with `ConfigureAwait(false)` and block (`GetAwaiter().GetResult()`), never capturing a
-synchronization context (SDK-010).
+synchronization context (SDK-010). When the caller's context asks for wait notifications
+(`SynchronizationContext.IsWaitNotificationRequired`) they block through the task's wait handle instead, so the context
+sees the wait: the simulation's contexts then keep running every other lane until the wait completes (a synchronous call
+such as the `Stream.Length` read by the BCL's `Stream.CopyToAsync` stays deterministic instead of blocking the only
+simulation thread).
 
 ---
 

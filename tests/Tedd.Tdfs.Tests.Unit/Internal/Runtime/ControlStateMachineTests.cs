@@ -78,7 +78,9 @@ public sealed class ControlStateMachineTests
         Assert.True(Apply(sm, new PoolCommand(Admin(), ControlCommandKind.CreatePool, "fast", [ids[1], ids[2]])).IsSuccess);
         ulong epoch = sm.State.PlacementEpoch;
         Assert.Equal(DfsErrorCode.InvalidArgument, Apply(sm, new PoolCommand(Admin(), ControlCommandKind.CreatePool, "empty", [])).Code);
-        Assert.Equal(DfsErrorCode.InvalidArgument, Apply(sm, new PoolCommand(Admin(), ControlCommandKind.CreatePool, "default", [ids[0]])).Code);
+        // The implicit default pool always exists: creating it is AlreadyExists (POOL-004 "CreateDefaultName").
+        Assert.Equal(DfsErrorCode.AlreadyExists, Apply(sm, new PoolCommand(Admin(), ControlCommandKind.CreatePool, "default", [ids[0]])).Code);
+        Assert.Equal(DfsErrorCode.InvalidArgument, Apply(sm, new PoolCommand(Admin(), ControlCommandKind.SetPoolMembers, "default", [ids[0]])).Code);
         var fastVolume = VolumeId.New(random);
         Assert.True(Apply(sm, new CreateVolumeCommand(Admin(), Creation(fastVolume, "fastvol", [ids[1]], "fast"), new byte[44])).IsSuccess);
         Assert.Equal(DfsErrorCode.PoolInUse, Apply(sm, new PoolCommand(Admin(), ControlCommandKind.DeletePool, "fast", [])).Code);
