@@ -147,7 +147,6 @@ internal sealed partial class VolumeService
     {
         ControlState control = _s.Control.State;
         long now = _s.Time.GetTimestamp();
-        ulong epoch = control.PlacementEpoch;
         bool migrating = Record.MigrationTarget is not null;
         ByteRateLimiter rate = _repairRate!;
         var idealNodes = new Dictionary<string, IReadOnlyList<PlacementNode>>(StringComparer.Ordinal);
@@ -170,6 +169,7 @@ internal sealed partial class VolumeService
 
             if (!idealNodes.TryGetValue(plan.Pool, out IReadOnlyList<PlacementNode>? nodes))
                 idealNodes[plan.Pool] = nodes = IdealNodes(control, plan.Pool);
+            ulong epoch = control.PoolEpoch(plan.Pool);
             IReadOnlyList<PlacementNode> targets = Placement.SelectTargets(obj, epoch, plan.Policy, nodes);
             var desired = new List<NodeId>(targets.Count);
             var copyTo = new List<NodeId>();
@@ -227,6 +227,16 @@ internal sealed partial class VolumeService
             rate.Charge(plan.Length * targets.Count);
             StartExcessDeletion(plan, [.. targets.Select(t => t.Id)], excess, epoch);
         }
+    }
+
+    /// <summary>
+    /// Placement epoch for client uploads under this volume's staging leases: the epoch of the pool of the volume's default
+    /// policy (pool.md: targets are computed with the epoch of the pool's last membership change).
+    /// </summary>
+    private ulong PlacementEpochForUploads()
+    {
+        VolumeRecord record = Record;
+        return _s.Control.State.PoolEpoch(record.DefaultPolicy.Pool ?? record.StoragePool);
     }
 
     /// <summary>The pool's members new copies may be placed on: active and admitted (fullness ignored: placement is stable).</summary>
@@ -345,7 +355,7 @@ internal sealed partial class VolumeService
                 }
 
                 ControlState control = _s.Control.State;
-                if (control.PlacementEpoch != epoch || !IsLeader || Group.Term != term)
+                if (control.PoolEpoch(plan.Pool) != epoch || !IsLeader || Group.Term != term)
                     return;
                 foreach (NodeId holder in excess)
                 {
@@ -389,6 +399,75 @@ internal sealed partial class VolumeService
                 }
             }
         });
+    }
+
+    /// <summary>
+    /// Per-file policy change (REP-014): before a file may advertise <paramref name="policy"/>, every object it references
+    /// must meet that policy's acknowledgement copies and zones inside <paramref name="pool"/>. Missing copies are made now on
+    /// the policy's deterministic targets (verified pulls from the current holders); when that is impossible (a zone is
+    /// down) the change is refused with a retryable placement error and the file keeps its current policy.
+    /// </summary>
+    /// <exception cref="DfsPlacementUnavailableException">An object cannot meet the policy now.</exception>
+    private async Task EnsurePolicyMetAsync(State.InodeRecord inode, DfsStoragePolicy policy, string pool, CancellationToken ct)
+    {
+        var objects = new List<State.ExtentRef>();
+        var seen = new HashSet<ObjectId>();
+        foreach (State.StreamRecord stream in inode.Streams.Values)
+        {
+            if (stream.IsInline)
+                continue;
+            foreach (State.ExtentRef e in stream.Extents)
+            {
+                if (seen.Add(e.Object))
+                    objects.Add(e);
+            }
+        }
+
+        foreach (State.ExtentRef extent in objects)
+        {
+            ControlState control = _s.Control.State;
+            (int copies, int zones) = CountedIn(extent.Object, control, pool);
+            if (copies >= policy.DurableCopiesBeforeAck && zones >= policy.DurableZonesBeforeAck)
+                continue;
+
+            ulong epoch = control.PoolEpoch(pool);
+            long now = _s.Time.GetTimestamp();
+            List<NodeId> up = UpHolders(extent.Object, control, now, includeDeleting: true);
+            if (up.Count == 0)
+                up.AddRange(LocationsOf(extent).Where(n => control.FindMember(n) is { IsLive: true }));
+            IReadOnlyList<PlacementNode> targets = Placement.SelectTargets(extent.Object, epoch, policy, IdealNodes(control, pool));
+            foreach (PlacementNode target in targets)
+            {
+                if (up.Contains(target.Id) || !IsUp(target.Id, control, now))
+                    continue;
+                var message = new ReplicateObjectMessage(Record.Id, extent.Object, extent.Staging, extent.Checksum, extent.ObjectLength, ObjectEncodings.Plain,
+                    epoch, [.. up]);
+                try
+                {
+                    RecordReceipt((await ReplicateOnAsync(target.Id, message)).Receipt);
+                }
+                catch (Exception ex) when (ex is DfsException or IOException or TimeoutException or OperationCanceledException or InvalidCastException)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    _s.Debug("repair", NodeServices.Inv($"Volume {Name}: copying {extent.Object} to {target.Name} for a policy change failed: {ex.Message}"));
+                }
+            }
+
+            (copies, zones) = CountedIn(extent.Object, _s.Control.State, pool);
+            if (copies < policy.DurableCopiesBeforeAck || zones < policy.DurableZonesBeforeAck)
+            {
+                throw new DfsPlacementUnavailableException(
+                    $"Object {extent.Object} has {copies} copies in {zones} zones in pool '{pool}'; the new policy requires {policy.DurableCopiesBeforeAck} in {policy.DurableZonesBeforeAck} before it can take effect.",
+                    policy.DurableCopiesBeforeAck, copies, policy.DurableZonesBeforeAck, zones);
+            }
+        }
+    }
+
+    /// <summary>Copies and zones of an object's counted holders that are members of <paramref name="pool"/>.</summary>
+    private (int Copies, int Zones) CountedIn(ObjectId obj, ControlState control, string pool)
+    {
+        HashSet<NodeId> members = PoolMemberSet(control, pool);
+        return DomainsOf(control, UpHolders(obj, control, _s.Time.GetTimestamp(), includeDeleting: true).Where(members.Contains));
     }
 
     /// <summary>Deletes copies on <paramref name="node"/>; the call waits as long as the node holds the request (no timeout).</summary>

@@ -103,7 +103,7 @@ internal sealed class ObjectIo
         CancellationToken ct, ObjectId? id = null, DfsOperationKind operation = DfsOperationKind.PutObject)
     {
         ControlState state = _s.Control.State;
-        ulong epoch = state.PlacementEpoch;
+        ulong epoch = state.PoolEpoch(pool);
         ObjectId obj = id ?? ObjectId.New(_s.Random);
         UInt128 checksum = ObjectChecksum.Compute(data.Span);
         IReadOnlyList<PlacementNode> nodes = state.PoolMembers(pool)

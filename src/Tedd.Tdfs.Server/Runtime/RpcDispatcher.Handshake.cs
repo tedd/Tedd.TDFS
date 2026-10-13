@@ -54,6 +54,14 @@ internal sealed partial class RpcDispatcher
                     return new ErrorReplyMessage(DfsErrorCode.AuthenticationFailed, "A principal is required; anonymous access is not possible.");
                 }
 
+                if (!control.IsBootstrapped)
+                {
+                    // No control state yet (a node rebuilding a replaced disk, or one still applying its bootstrap): it
+                    // cannot judge any principal, which is not a failed authentication. The client tries another node.
+                    Reject(state);
+                    return new ErrorReplyMessage(DfsErrorCode.Unavailable, $"{_s.NodeName} is catching up with the cluster.", Retryable: true);
+                }
+
                 // An unknown principal gets a fake verifier (deterministic fake salt, default iterations) that the proof is
                 // checked against like a real one: existence is disclosed neither by the challenge nor by the reply timing.
                 PrincipalRecord? principal = control.FindPrincipal(hello.Principal);

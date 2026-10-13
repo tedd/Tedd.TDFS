@@ -8,8 +8,31 @@ namespace Tedd.Tdfs;
 /// same bytes. String form is exactly 32 lowercase hexadecimal characters.
 /// </summary>
 /// <param name="Value">The 128-bit value.</param>
-public readonly record struct ObjectId(UInt128 Value)
+public readonly record struct ObjectId(UInt128 Value) : IComparable<ObjectId>, IComparable
 {
+    /// <summary>Orders ids by their 128-bit value (the order of inventories, plans and reports).</summary>
+    public int CompareTo(ObjectId other) => Value.CompareTo(other.Value);
+
+    /// <inheritdoc />
+    public int CompareTo(object? obj) => obj switch
+    {
+        null => 1,
+        ObjectId other => CompareTo(other),
+        _ => throw new ArgumentException("The object is not an ObjectId.", nameof(obj)),
+    };
+
+    /// <summary>Less-than by value.</summary>
+    public static bool operator <(ObjectId left, ObjectId right) => left.Value < right.Value;
+
+    /// <summary>Greater-than by value.</summary>
+    public static bool operator >(ObjectId left, ObjectId right) => left.Value > right.Value;
+
+    /// <summary>Less-than-or-equal by value.</summary>
+    public static bool operator <=(ObjectId left, ObjectId right) => left.Value <= right.Value;
+
+    /// <summary>Greater-than-or-equal by value.</summary>
+    public static bool operator >=(ObjectId left, ObjectId right) => left.Value >= right.Value;
+
     /// <summary>Number of characters in the string form.</summary>
     public const int StringLength = 32;
 

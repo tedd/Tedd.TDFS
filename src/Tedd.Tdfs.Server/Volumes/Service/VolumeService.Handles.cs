@@ -422,7 +422,7 @@ internal sealed partial class VolumeService
     private CreateStagingResultMessage StagingReply(CreateStagingResultMessage reply, string principal)
     {
         byte[] capability = _s.Objects.Capabilities.IssueStaging(Record, principal, reply.Staging, StagingCapabilityLifetime, out DateTimeOffset expiry);
-        return reply with { Capability = capability, CapabilityExpiry = expiry, PlacementEpoch = _s.Control.State.PlacementEpoch };
+        return reply with { Capability = capability, CapabilityExpiry = expiry, PlacementEpoch = PlacementEpochForUploads() };
     }
 
     /// <summary>Lifetime of staging capabilities (renewable with <c>CreateStaging(Renew)</c>).</summary>

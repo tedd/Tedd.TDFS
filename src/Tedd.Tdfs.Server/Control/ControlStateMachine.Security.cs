@@ -126,7 +126,7 @@ internal sealed partial class ControlStateMachine
 
                 ulong created = State.Pools.TryGetValue(c.Pool, out PoolRecord? existing) ? existing.CreatedIndex : index;
                 State.Pools[c.Pool] = new PoolRecord(c.Pool, nodes.ToArray(), created);
-                State.PlacementEpoch++;
+                State.BumpPlacement([c.Pool]);
                 return ApplyOutcome.Success();
             }
 
@@ -146,7 +146,8 @@ internal sealed partial class ControlStateMachine
                 }
 
                 State.Pools.Remove(c.Pool);
-                State.PlacementEpoch++;
+                State.BumpPlacement([]);
+                State.PoolEpochs.Remove(c.Pool);
                 return ApplyOutcome.Success();
             }
 

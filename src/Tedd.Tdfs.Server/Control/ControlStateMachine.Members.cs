@@ -34,6 +34,7 @@ internal sealed partial class ControlStateMachine
         }
 
         State.PlacementEpoch = 1;
+        State.PoolEpochs[DfsPoolNames.Default] = 1;
         return ApplyOutcome.Success();
     }
 
@@ -66,7 +67,7 @@ internal sealed partial class ControlStateMachine
             if (!Equals(existing.Labels, c.Labels))
             {
                 updated = updated with { Labels = c.Labels };
-                State.PlacementEpoch++;
+                State.BumpPlacement(State.PoolsContaining(existing.Id));
             }
 
             State.Members[c.Id] = updated;
@@ -82,7 +83,7 @@ internal sealed partial class ControlStateMachine
         var record = new MemberRecord(c.Id, c.Name, c.Labels, c.Endpoints.ToArray(), WireNodeStatus.Active, c.Incarnation, c.BootId, c.CapacityBytes, 0,
             c.ProtocolMax, features, index, PendingAdmission: false);
         State.Members[c.Id] = record;
-        State.PlacementEpoch++;
+        State.BumpPlacement(State.PoolsContaining(c.Id));
         return ApplyOutcome.Success(record);
     }
 
@@ -108,7 +109,7 @@ internal sealed partial class ControlStateMachine
         if (!Equals(m.Labels, c.Labels))
         {
             updated = updated with { Labels = c.Labels };
-            State.PlacementEpoch++;
+            State.BumpPlacement(State.PoolsContaining(m.Id));
         }
 
         State.Members[c.Id] = updated;
@@ -126,7 +127,7 @@ internal sealed partial class ControlStateMachine
         var record = new MemberRecord(c.Id, c.Name, c.Labels, c.Endpoints.ToArray(), WireNodeStatus.Active, 0, UInt128.Zero, long.MaxValue, 0,
             Protocol.ProtocolInfo.CurrentVersion, [], index, PendingAdmission: true);
         State.Members[c.Id] = record;
-        State.PlacementEpoch++;
+        State.BumpPlacement(State.PoolsContaining(c.Id));
         return ApplyOutcome.Success(record);
     }
 
@@ -147,6 +148,7 @@ internal sealed partial class ControlStateMachine
         if (m.Status == c.Status)
             return ApplyOutcome.Success(m);
         MemberRecord updated = m with { Status = c.Status };
+        string[] pools = [.. State.PoolsContaining(c.Id)];
         State.Members[c.Id] = updated;
         if (c.Status == WireNodeStatus.Removed)
         {
@@ -160,7 +162,7 @@ internal sealed partial class ControlStateMachine
         // Placement only changes when the node enters or leaves the eligible set (Draining → Drained → Removed moves an
         // already ineligible node and keeps every object's targets).
         if (m.IsPlacementEligible != updated.IsPlacementEligible)
-            State.PlacementEpoch++;
+            State.BumpPlacement(pools);
         return ApplyOutcome.Success(updated);
     }
 
@@ -173,7 +175,7 @@ internal sealed partial class ControlStateMachine
             return ApplyOutcome.Success(m);
         MemberRecord updated = m with { Labels = c.Labels };
         State.Members[c.Id] = updated;
-        State.PlacementEpoch++;
+        State.BumpPlacement(State.PoolsContaining(c.Id));
         return ApplyOutcome.Success(updated);
     }
 }

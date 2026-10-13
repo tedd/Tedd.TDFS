@@ -194,6 +194,16 @@ internal sealed class DataPlane
             if (scope.Token.IsCancellationRequested)
                 throw scope.NotTransmittedFailure(failures.LastOrDefault());
             Exception? inner = failures.Count switch { 0 => null, 1 => failures[0], _ => new AggregateException(failures) };
+            if (achievedCopies == 0 && failures.Count > 0 && failures.All(IsCapacityRefusal))
+            {
+                // Every candidate of the pool refused the object for capacity (POOL-012): the pool is full, which is a
+                // capacity condition rather than a placement (domain) shortfall.
+                var full = new DfsCapacityException(
+                    $"Object {obj} was refused for capacity by every candidate node of pool '{pool}' ({nodes.Count} candidate node(s)); the pool is full.", inner);
+                _runtime.Emit("upload.capacity-exhausted", full.Message, operation, volume: volume.Name, exception: inner);
+                throw full;
+            }
+
             var placement = new DfsPlacementUnavailableException(
                 $"Object {obj} reached {achievedCopies} host(s) in {achievedZones} zone(s) of pool '{pool}' ({nodes.Count} candidate node(s)); the storage policy requires {requiredCopies} host(s) in {requiredZones} zone(s) before acknowledgement.",
                 requiredCopies, achievedCopies, requiredZones, achievedZones, inner);
@@ -226,6 +236,9 @@ internal sealed class DataPlane
             return started > 0;
         }
     }
+
+    /// <summary>True for a storage node's refusal of an object for lack of capacity.</summary>
+    private static bool IsCapacityRefusal(Exception ex) => ex is DfsException { ErrorCode: DfsErrorCode.CapacityExhausted };
 
     /// <summary>Failure domains of the acknowledged copies (the <c>CountSameZoneTwice</c> negative control counts every host as a zone).</summary>
     private (int Copies, int Zones) CountDomains(List<DfsTopologyLabels> holders)

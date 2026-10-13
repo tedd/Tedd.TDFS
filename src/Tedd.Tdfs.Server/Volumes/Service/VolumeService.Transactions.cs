@@ -107,7 +107,7 @@ internal sealed partial class VolumeService
                 }
 
                 byte[] capability = _s.Objects.Capabilities.IssueStaging(Record, principal, begun.Staging, StagingCapabilityLifetime, out DateTimeOffset expiry);
-                return begun with { Capability = capability, CapabilityExpiry = expiry, PlacementEpoch = _s.Control.State.PlacementEpoch };
+                return begun with { Capability = capability, CapabilityExpiry = expiry, PlacementEpoch = PlacementEpochForUploads() };
             },
             bindTransaction: false);
     }

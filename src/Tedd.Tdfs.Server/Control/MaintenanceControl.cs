@@ -307,6 +307,8 @@ internal sealed class MaintenanceControl
         {
             try
             {
+                // The policy transition is a reconfiguration of the volume (fault site F21 on the control leader).
+                await _s.HitAsync(FaultStage.F21, FaultSites.Reconfiguration, record.Name, DfsOperationKind.PolicyChange, detail: "complete-policy-migration");
                 using CancellationTokenSource deadline = _s.CreateDeadline();
                 ApplyOutcome outcome = await _s.Control.ProposeAsync(new CompletePolicyMigrationCommand(_s.Control.NewHeader(), record.Id), deadline.Token);
                 if (outcome.IsSuccess)

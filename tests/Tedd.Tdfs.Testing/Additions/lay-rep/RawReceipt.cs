@@ -17,13 +17,18 @@ namespace Tedd.Tdfs.Testing;
 public sealed record RawReceipt(ObjectId Object, UInt128 Checksum, long Length, byte Encoding, NodeId Node, string NodeName,
     ulong Incarnation, ulong PlacementEpoch, ReadOnlyMemory<byte> Wire)
 {
-    /// <summary>A copy whose last wire byte (inside the MAC) is XOR-ed with 0xFF.</summary>
+    /// <summary>A copy whose last MAC byte is XOR-ed with 0xFF (the record stays decodable; only the MAC is wrong).</summary>
+    /// <remarks>
+    /// The MAC is not the last byte of the wire encoding: the record ends with its extension block, so flipping the final
+    /// byte would corrupt the record framing instead of the MAC.
+    /// </remarks>
     public RawReceipt WithTamperedMac()
     {
-        byte[] copy = Wire.ToArray();
-        if (copy.Length > 0)
-            copy[^1] ^= 0xFF;
-        return this with { Wire = copy };
+        Protocol.Messages.ObjectReceipt receipt = Protocol.WireRecordCodec.Decode<Protocol.Messages.ObjectReceipt>(Wire.Span);
+        byte[] mac = receipt.Mac.ToArray();
+        if (mac.Length > 0)
+            mac[^1] ^= 0xFF;
+        return this with { Wire = Protocol.WireRecordCodec.Encode(receipt with { Mac = mac }) };
     }
 }
 
