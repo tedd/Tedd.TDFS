@@ -23,6 +23,9 @@ internal sealed partial class VolumeService
     /// <summary>Inventory state per reporting node.</summary>
     private readonly Dictionary<NodeId, NodeInventory> _inventoryNodes = [];
 
+    /// <summary>Objects whose publication receipt holders were already taken as initial holdings in this term.</summary>
+    private readonly HashSet<ObjectId> _seeded = [];
+
     private ReplicaPlans? _plans;
 
     /// <summary>One known copy.</summary>
@@ -36,8 +39,10 @@ internal sealed partial class VolumeService
     /// <summary>Inventory state of one node.</summary>
     private sealed class NodeInventory
     {
+        /// <summary>Incarnation the knowledge below belongs to.</summary>
         public ulong Incarnation { get; set; }
 
+        /// <summary>Last proof of life under <see cref="Incarnation"/>: a complete inventory or a receipt.</summary>
         public long LastReportAt { get; set; }
     }
 
@@ -66,6 +71,7 @@ internal sealed partial class VolumeService
         _holdings.Clear();
         _heldBy.Clear();
         _inventoryNodes.Clear();
+        _seeded.Clear();
         _plans = null;
         ClearRepairState();
     }
@@ -106,13 +112,26 @@ internal sealed partial class VolumeService
         ResolveDeletesByInventory(node, listed);
     }
 
-    /// <summary>Records a copy proven by a receipt (repair result, publication).</summary>
+    /// <summary>
+    /// Records a copy proven by a receipt (repair result). The receipt is also a proof of life of its node's registered
+    /// incarnation: a node that restarted counts again from its first receipt, with only what it proved since.
+    /// </summary>
     private void RecordReceipt(ObjectReceipt receipt)
     {
         if (_s.Control.State.FindMember(receipt.Node) is not { IsLive: true } member || member.Incarnation != receipt.Incarnation)
             return;
-        AddHolding(receipt.Object, receipt.Node,
-            new Holding(receipt.Incarnation, receipt.Staging, receipt.Length, receipt.Checksum, _s.Time.GetTimestamp()));
+        long now = _s.Time.GetTimestamp();
+        if (!_inventoryNodes.TryGetValue(receipt.Node, out NodeInventory? state))
+            _inventoryNodes[receipt.Node] = state = new NodeInventory { Incarnation = receipt.Incarnation };
+        if (state.Incarnation != receipt.Incarnation)
+        {
+            ForgetNode(receipt.Node);
+            ForgetPendingDeletes(receipt.Node);
+            state.Incarnation = receipt.Incarnation;
+        }
+
+        state.LastReportAt = now;
+        AddHolding(receipt.Object, receipt.Node, new Holding(receipt.Incarnation, receipt.Staging, receipt.Length, receipt.Checksum, now));
     }
 
     private void AddHolding(ObjectId obj, NodeId node, Holding holding)
@@ -151,14 +170,18 @@ internal sealed partial class VolumeService
     }
 
     /// <summary>
-    /// True when <paramref name="node"/> is a live member whose latest complete inventory, under its registered
-    /// incarnation, is recent: its reported copies count.
+    /// True when <paramref name="node"/> is a live member whose latest complete inventory (or receipt), under its
+    /// registered incarnation, is recent: its known copies count. A node this leader has not heard from yet counts as up
+    /// during the leader's first liveness window (its publication receipts stand until its first inventory).
     /// </summary>
     private bool IsUp(NodeId node, ControlState control, long now)
-        => control.FindMember(node) is { IsLive: true } member
-            && _inventoryNodes.TryGetValue(node, out NodeInventory? state)
-            && state.Incarnation == member.Incarnation
-            && _s.Time.GetElapsedTime(state.LastReportAt, now) <= LivenessWindow;
+    {
+        if (control.FindMember(node) is not { IsLive: true } member)
+            return false;
+        if (!_inventoryNodes.TryGetValue(node, out NodeInventory? state))
+            return !ReplicaKnowledgeReady;
+        return state.Incarnation == member.Incarnation && _s.Time.GetElapsedTime(state.LastReportAt, now) <= LivenessWindow;
+    }
 
     /// <summary>Holders whose copies count now: up, the copy reported under the current incarnation, not being deleted.</summary>
     private List<NodeId> UpHolders(ObjectId obj, ControlState control, long now, bool includeDeleting = false)
@@ -216,6 +239,7 @@ internal sealed partial class VolumeService
             return cached;
 
         var objects = new SortedDictionary<UInt128, ObjectPlan>();
+        var locations = new Dictionary<ObjectId, ImmutableArray<NodeId>>();
         var seen = new HashSet<(ulong, ulong)>();
         VolumeRecord record = Record;
 
@@ -240,6 +264,8 @@ internal sealed partial class VolumeService
                     if (!objects.TryGetValue(e.Object.Value, out ObjectPlan? plan))
                     {
                         objects[e.Object.Value] = new ObjectPlan(e.Object, policy, pool, usesDefault, e.ObjectLength, e.Checksum, e.Staging);
+                        if (!e.Locations.IsDefaultOrEmpty)
+                            locations[e.Object] = e.Locations;
                         continue;
                     }
 
@@ -272,8 +298,30 @@ internal sealed partial class VolumeService
         foreach (RestoreIntentRecord intent in s.Restores.Values)
             AddRoot(intent.Root);
 
+        SeedFromReceipts(objects.Values, locations);
         _plans = new ReplicaPlans(s.AppliedIndex, controlApplied, objects);
         return _plans;
+    }
+
+    /// <summary>
+    /// Takes the receipt holders recorded at publication as the initial holdings of objects this leader knows nothing about
+    /// yet (once per object and term): a just-published object is not reported missing before the next inventories.
+    /// Inventories that start later correct them.
+    /// </summary>
+    private void SeedFromReceipts(IEnumerable<ObjectPlan> plans, Dictionary<ObjectId, ImmutableArray<NodeId>> locations)
+    {
+        ControlState control = _s.Control.State;
+        long now = _s.Time.GetTimestamp();
+        foreach (ObjectPlan plan in plans)
+        {
+            if (!_seeded.Add(plan.Object) || _holdings.ContainsKey(plan.Object) || !locations.TryGetValue(plan.Object, out ImmutableArray<NodeId> holders))
+                continue;
+            foreach (NodeId node in holders)
+            {
+                if (control.FindMember(node) is { IsLive: true } member)
+                    AddHolding(plan.Object, node, new Holding(member.Incarnation, plan.Staging, plan.Length, plan.Checksum, now));
+            }
+        }
     }
 
     /// <summary>Live members of a pool, as a set.</summary>
@@ -326,6 +374,91 @@ internal sealed partial class VolumeService
 
     /// <summary>Replica health of the volume as the leader knows it (inventories, receipts and the referenced objects).</summary>
     public ReplicaHealthData ReplicaHealth() => ComputeHealth(null);
+
+    /// <summary>Most objects one health query probes.</summary>
+    private const int MaxProbedObjects = 4096;
+
+    /// <summary>
+    /// Brings the replica knowledge of under-replicated objects up to date before a health answer: asks the pool members
+    /// that are not known to hold them (<c>LocateObject</c>, one call per node) and records the copies they confirm, so an
+    /// answer never lags behind copies that already exist (a late upload, a copy made since the last inventory).
+    /// </summary>
+    private async Task ProbeDeficitsAsync(CancellationToken ct)
+    {
+        ControlState control = _s.Control.State;
+        long now = _s.Time.GetTimestamp();
+        var perNode = new Dictionary<NodeId, List<ObjectId>>();
+        var members = new Dictionary<string, IReadOnlyList<MemberRecord>>(StringComparer.Ordinal);
+        int probed = 0;
+        foreach (ObjectPlan plan in Plans().Objects.Values)
+        {
+            if (probed >= MaxProbedObjects)
+                break;
+            if (!members.TryGetValue(plan.Pool, out IReadOnlyList<MemberRecord>? poolMembers))
+                members[plan.Pool] = poolMembers = control.PoolMembers(plan.Pool);
+            List<NodeId> up = UpHolders(plan.Object, control, now, includeDeleting: true);
+            (int copies, int zones) = DomainsOf(control, up.Where(n => poolMembers.Any(m => m.Id == n)));
+            if (copies >= plan.Policy.TargetCopies && zones >= plan.Policy.TargetDistinctZones)
+                continue;
+            probed++;
+            foreach (MemberRecord member in poolMembers)
+            {
+                if (up.Contains(member.Id) || !IsUp(member.Id, control, now) && _inventoryNodes.ContainsKey(member.Id))
+                    continue;
+                if (!perNode.TryGetValue(member.Id, out List<ObjectId>? list))
+                    perNode[member.Id] = list = [];
+                list.Add(plan.Object);
+            }
+        }
+
+        if (perNode.Count == 0)
+            return;
+        ulong term = Group.Term;
+        Task<(NodeId Node, IReadOnlyList<ObjectLocation>? Locations)>[] calls = [.. perNode.Select(p => LocateOnAsync(p.Key, p.Value, ct))];
+        foreach ((NodeId node, IReadOnlyList<ObjectLocation>? locations) in await Task.WhenAll(calls))
+        {
+            if (locations is null || !IsLeader || Group.Term != term || control.FindMember(node) is not { IsLive: true } member)
+                continue;
+            foreach (ObjectLocation location in locations)
+            {
+                if (location.Present)
+                {
+                    AddHolding(location.Object, node, new Holding(member.Incarnation, location.Staging, location.Length, location.Checksum, _s.Time.GetTimestamp()));
+                    if (_inventoryNodes.TryGetValue(node, out NodeInventory? state) && state.Incarnation == member.Incarnation)
+                        state.LastReportAt = Math.Max(state.LastReportAt, _s.Time.GetTimestamp());
+                }
+            }
+        }
+    }
+
+    /// <summary>One <c>LocateObject</c> (or a local lookup); null when the node did not answer.</summary>
+    private async Task<(NodeId Node, IReadOnlyList<ObjectLocation>? Locations)> LocateOnAsync(NodeId node, List<ObjectId> objects, CancellationToken ct)
+    {
+        if (node == _s.NodeId)
+        {
+            var local = new List<ObjectLocation>(objects.Count);
+            foreach (ObjectId obj in objects)
+            {
+                local.Add(_s.ObjectStore.TryGetInfo(obj) is { } info && info.Volume == Record.Id
+                    ? new ObjectLocation(obj, true, info.Length, info.Checksum, info.Staging)
+                    : new ObjectLocation(obj, false, 0, UInt128.Zero, default));
+            }
+
+            return (node, local);
+        }
+
+        try
+        {
+            var reply = (LocateObjectResultMessage)await _s.Peers.CallAsync(node, new LocateObjectMessage(Record.Id, objects), _s.Peers.DefaultCallTimeout / 2, ct);
+            return (node, reply.Locations);
+        }
+        catch (Exception ex) when (ex is DfsException or IOException or TimeoutException or OperationCanceledException or InvalidCastException)
+        {
+            if (ct.IsCancellationRequested)
+                throw;
+            return (node, null);
+        }
+    }
 
     /// <summary>
     /// Referenced objects that use the default policy and do not meet <paramref name="target"/> yet (copies and zones among

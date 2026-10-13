@@ -125,6 +125,7 @@ internal sealed partial class VolumeService
     {
         RequireVolumeAdmin(context.Principal ?? string.Empty);
         ulong applied = await ReadBarrierAsync(context.Cancellation);
+        await ProbeDeficitsAsync(context.Cancellation);
         var body = new AdminVolumeStatusBody(_s.Control.ToVolumeEntry(Record), Token(applied), _s.Admin.GroupStatus(Group, Name), ReplicaHealth(), []);
         return AdminResultMessage.Create(request.Op, body);
     }
@@ -134,6 +135,7 @@ internal sealed partial class VolumeService
     {
         RequireVolumeAdmin(context.Principal ?? string.Empty);
         await ReadBarrierAsync(context.Cancellation);
+        await ProbeDeficitsAsync(context.Cancellation);
         return AdminResultMessage.Create(request.Op, ReplicaHealth());
     }
 
@@ -150,7 +152,10 @@ internal sealed partial class VolumeService
         DfsStoragePolicy target = record.MigrationTarget ?? record.DefaultPolicy;
         long pending = 0;
         if (record.MigrationTarget is { } migrating)
+        {
+            await ProbeDeficitsAsync(context.Cancellation);
             pending = Math.Max(PendingMigrationObjects(migrating), ReplicaKnowledgeReady ? 0 : 1);
+        }
         return AdminResultMessage.Create(request.Op, new AdminPolicyMigrationBody(Name, target, record.MigrationTarget is null, pending));
     }
 
