@@ -32,7 +32,7 @@ internal sealed partial class NodeRuntime
         admin.PoolUsageProvider = plane.Control.PoolUsedBytes;
         admin.PoolStrayHoldersProvider = plane.Control.StrayHolders;
         admin.NodeUsageProvider = plane.Control.UsedBytesOf;
-        admin.RemovalCheck = plane.Control.CheckRemoval;
+        admin.RemovalCheck = plane.Control.CheckRemovalAsync;
         admin.RegisterVolumeOperation(AdminOp.StartScrub, admin.StartScrubAsync);
         var router = new VolumeRequestRouter(services);
         admin.RegisterVolumeOperation(AdminOp.StartRepair, router.Admin((svc, ctx, m) => svc.StartRepairAsync(ctx, m)));

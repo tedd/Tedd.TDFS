@@ -283,6 +283,20 @@ internal sealed class PeerConnections
         return message;
     }
 
+    /// <summary>
+    /// A member authenticated a connection with <paramref name="incarnation"/>: a pooled connection to an older incarnation
+    /// of it is half-open (the member restarted; a crash while the link was cut leaves the old connection looking open, and
+    /// one-way sends on it vanish), so it is dropped and the next send reconnects to the current incarnation.
+    /// </summary>
+    public void NotePeerIncarnation(NodeId peer, ulong incarnation)
+    {
+        if (_byNode.TryGetValue(peer, out Slot? slot) && slot.Connection is { } connection && connection.Identity is { IsNode: true } identity
+            && identity.Incarnation < incarnation)
+        {
+            Drop(peer, connection);
+        }
+    }
+
     private void Drop(NodeId peer, IRpcConnection connection)
     {
         if (_byNode.TryGetValue(peer, out Slot? slot) && ReferenceEquals(slot.Connection, connection))

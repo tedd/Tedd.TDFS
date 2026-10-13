@@ -107,6 +107,8 @@ public sealed record ReportUsageResultMessage(
 /// </summary>
 /// <param name="Volume">Summarized volume.</param>
 /// <param name="VolumeEpoch">Volume epoch the leader serves.</param>
+/// <param name="Term">Raft term of the volume group in which the reporting node leads it: a summary of an older term (a
+/// deposed leader that has not noticed yet) never replaces a current summary of a newer term.</param>
 /// <param name="PlacementEpoch">Placement epoch the summary was computed under.</param>
 /// <param name="CompletedMigration">The default-policy migration target every default-policy object now meets (null when no
 /// migration is pending or it is not complete yet); the control leader then makes the policy effective.</param>
@@ -116,6 +118,7 @@ public sealed record ReportUsageResultMessage(
 public sealed record VolumeUsageReport(
     VolumeId Volume,
     ulong VolumeEpoch,
+    ulong Term,
     ulong PlacementEpoch,
     DfsStoragePolicy? CompletedMigration,
     IReadOnlyList<PoolUsageReport> Pools,
@@ -125,13 +128,14 @@ public sealed record VolumeUsageReport(
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
 
     /// <inheritdoc />
-    public static int MinEncodedSize => 22;
+    public static int MinEncodedSize => 23;
 
     /// <inheritdoc />
     public void Write(ref WireWriter writer)
     {
         writer.WriteVolumeId(Volume);
         writer.WriteVarUInt(VolumeEpoch);
+        writer.WriteVarUInt(Term);
         writer.WriteVarUInt(PlacementEpoch);
         writer.WriteOptionalStoragePolicy(CompletedMigration);
         writer.WriteList(Pools);
@@ -144,12 +148,13 @@ public sealed record VolumeUsageReport(
     {
         VolumeId volume = reader.ReadVolumeId();
         ulong volumeEpoch = reader.ReadVarUInt();
+        ulong term = reader.ReadVarUInt();
         ulong placementEpoch = reader.ReadVarUInt();
         DfsStoragePolicy? completedMigration = reader.ReadOptionalStoragePolicy();
         IReadOnlyList<PoolUsageReport> pools = reader.ReadList<PoolUsageReport>();
         IReadOnlyList<NodeHoldingReport> nodes = reader.ReadList<NodeHoldingReport>();
         IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
-        return new VolumeUsageReport(volume, volumeEpoch, placementEpoch, completedMigration, pools, nodes) { Extensions = extensions };
+        return new VolumeUsageReport(volume, volumeEpoch, term, placementEpoch, completedMigration, pools, nodes) { Extensions = extensions };
     }
 }
 
@@ -201,8 +206,9 @@ public sealed record PoolUsageReport(
 /// false for the last-known holdings of a node that went silent.</param>
 /// <param name="Objects">Copies of objects the volume keeps (referenced, protected or staged) on the node.</param>
 /// <param name="Bytes">Plaintext bytes of those copies.</param>
-/// <param name="NeededForAck">Referenced objects whose copies on the other nodes that are up fall below their policy's
-/// acknowledgement copies or zones: losing this node would lose acknowledged durability.</param>
+/// <param name="NeededForAck">Referenced objects whose copies on the other nodes that are up (not counting copies whose
+/// excess-replica deletion is in flight) fall below their policy's acknowledgement copies or zones: losing this node would
+/// lose acknowledged durability.</param>
 public sealed record NodeHoldingReport(
     NodeId Node,
     bool Up,

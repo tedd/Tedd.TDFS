@@ -71,9 +71,19 @@ internal sealed class MaintenanceControl
         {
             if (State.FindVolume(volume.Volume) is not { } record || volume.VolumeEpoch < record.Epoch)
                 continue;
+
+            // A deposed volume leader that has not noticed yet may still report: its summary (possibly missing copies its
+            // successor made or deleted) never replaces a current one of a newer term, so neither a removal check nor a
+            // drain or migration decision can rest on it.
+            if (_volumes.TryGetValue(volume.Volume, out (VolumeUsageReport Report, NodeId From, long At) known)
+                && known.Report.VolumeEpoch == volume.VolumeEpoch && known.Report.Term > volume.Term && _s.Time.GetElapsedTime(known.At, now) <= Freshness)
+            {
+                continue;
+            }
+
             _volumes[volume.Volume] = (volume, report.Node, now);
             if (volume.CompletedMigration is { } completed && record.MigrationTarget is { } target && completed == target)
-                CompleteMigration(record);
+                CompleteMigration(record, target);
         }
 
         return new ReportUsageResultMessage(_scrubRequests.GetValueOrDefault(report.Node));
@@ -160,6 +170,42 @@ internal sealed class MaintenanceControl
         }
 
         return [.. stray];
+    }
+
+    /// <summary>
+    /// <see cref="CheckRemoval"/>, after waiting a bounded time (at most <see cref="Freshness"/>, and never more than ten
+    /// seconds) for the summaries of the volumes involved when this control leader has none yet (a new leader, or volume
+    /// leaders that only just took over): an unknown replica state is a reason to wait, then to refuse, never to allow.
+    /// </summary>
+    /// <exception cref="DfsException">InvalidPolicy, QuorumUnavailable or PlacementUnavailable.</exception>
+    public async Task CheckRemovalAsync(MemberRecord member, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(member);
+        TimeSpan budget = Freshness < TimeSpan.FromSeconds(10) ? Freshness : TimeSpan.FromSeconds(10);
+        long started = _s.Time.GetTimestamp();
+        while (_s.Control.IsLeader && UnknownVolume(member) is not null && _s.Time.GetElapsedTime(started) < budget)
+        {
+            // Timer-completed waits only (a delay completed by cancelling its token may resume off the node loop).
+            ct.ThrowIfCancellationRequested();
+            await Task.Delay(_s.Timings.InventoryInterval, _s.Time);
+        }
+
+        CheckRemoval(State.FindMember(member.Id) ?? member);
+    }
+
+    /// <summary>A volume the removal of <paramref name="member"/> concerns whose current replica summary is missing (null: none).</summary>
+    private string? UnknownVolume(MemberRecord member)
+    {
+        ResetIfNewTerm();
+        foreach (VolumeRecord volume in State.Volumes.Values)
+        {
+            if (volume.State == WireVolumeState.Restoring || FreshVolume(volume.Id) is not null)
+                continue;
+            if (PoolsOf(volume).Any(p => State.PoolMembers(p).Any(m => m.Id == member.Id)))
+                return volume.Name;
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -299,7 +345,7 @@ internal sealed class MaintenanceControl
         }
     }
 
-    private void CompleteMigration(VolumeRecord record)
+    private void CompleteMigration(VolumeRecord record, DfsStoragePolicy target)
     {
         if (!_completing.Add(record.Id))
             return;
@@ -310,7 +356,7 @@ internal sealed class MaintenanceControl
                 // The policy transition is a reconfiguration of the volume (fault site F21 on the control leader).
                 await _s.HitAsync(FaultStage.F21, FaultSites.Reconfiguration, record.Name, DfsOperationKind.PolicyChange, detail: "complete-policy-migration");
                 using CancellationTokenSource deadline = _s.CreateDeadline();
-                ApplyOutcome outcome = await _s.Control.ProposeAsync(new CompletePolicyMigrationCommand(_s.Control.NewHeader(), record.Id), deadline.Token);
+                ApplyOutcome outcome = await _s.Control.ProposeAsync(new CompletePolicyMigrationCommand(_s.Control.NewHeader(), record.Id, target), deadline.Token);
                 if (outcome.IsSuccess)
                     _s.Info("maintenance", NodeServices.Inv($"Volume {record.Name}: the default-policy migration is complete; the new policy is effective."));
             }

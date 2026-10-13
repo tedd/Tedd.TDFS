@@ -161,6 +161,13 @@ membership changes** with **learners** (add learner → caught up within `CatchU
 change at a time, effective on append; leadership transfer via `TimeoutNow`. Removed/unknown peers' messages are
 ignored. Messages carry `(GroupId, Term, From NodeId+Incarnation)`.
 
+**Lost durable state** (empty-disk replacement keeping its identity, OFF-020): the member opens its groups *rebuilding*
+(`RaftNodeOptions.Rebuilding`, persisted by a marker file until done). It neither votes nor campaigns until its commit
+index reached the highest commit index announced by the leader it follows **and** that leader replicated to it without
+interruption for a full maximum election timeout; a single (possibly delayed) append never ends the rebuild, and a
+leader of another term starts the count over. A leader whose follower rejects a heartbeat commit beyond the follower's
+log (or answers a probe below its recorded match) lowers that match and probes again.
+
 `IRaftStorage` (implemented by `Storage.RaftLogStore`): durable `HardState(Term, Vote, Commit)`, entries
 `[FirstIndex..LastIndex]`, `Term(index)`, `Snapshot` metadata `(Index, Term, ConfState)`. Persisting term/vote uses
 write-temp + flush + rename + directory flush. Entries are appended to segment files with per-record CRC32C and a
@@ -349,7 +356,10 @@ snapshot root as id→revision lists.
 * **Inventory/anti-entropy**: each storage node periodically reports per-volume inventories to the volume leader,
   which keeps an object-location map, computes replica/domain deficits, and schedules repair: the target node pulls
   the object from a verified holder, verifies, persists, then reports. Excess copies are deleted only after targets
-  are verified (REP-016, RCV-06). Repair is rate-limited (bytes/s, concurrency).
+  are verified (REP-016, RCV-06), and only while the decision still holds when the delete is sent (same policy, pool and
+  placement epoch, no pending default-policy migration). A copy whose deletion is in flight or just confirmed, or that is
+  only assumed from publication receipts, never counts towards a migration's completion, a per-file policy upgrade or a
+  node removal. Repair is rate-limited (bytes/s, concurrency); deletions wait at most the replication deadline.
 * **Scrub** re-reads stored objects at a bounded rate; corrupt records are quarantined and reported (DSK-016).
 
 ---

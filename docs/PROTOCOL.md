@@ -1883,7 +1883,7 @@ Reply to `CopyObjectsMessage`.
 
 #### `ReportUsage` = 124 (`ReportUsageMessage`)
 
-Periodic usage and maintenance report (storage node → control leader, node-authenticated, every `InventoryInterval`). Every node reports its device usage; a node that leads volume groups also summarizes each volume's replica state. The control leader keeps the latest report of each node in memory only (a new control leader rebuilds the picture from the next reports) and derives from it node and pool usage (`ListNodes`, `ListPools`), pool replica health (`PoolStatus`), the Draining → Drained transition (a draining node that votes in no group and that every relevant volume leader lists as up with no kept copies), the safety checks of a non-forced `RemoveNode`, and the completion of default-policy migrations (it proposes `CompletePolicyMigration` when a leader reports the pending target met). Errors: NotLeader (with a hint), StaleIncarnation, AccessDenied (a node may only report itself).
+Periodic usage and maintenance report (storage node → control leader, node-authenticated, every `InventoryInterval`). Every node reports its device usage; a node that leads volume groups also summarizes each volume's replica state. The control leader keeps the latest report of each node in memory only (a new control leader rebuilds the picture from the next reports) and derives from it node and pool usage (`ListNodes`, `ListPools`), pool replica health (`PoolStatus`), the Draining → Drained transition (a draining node that votes in no group and that every relevant volume leader lists as up with no kept copies), the safety checks of a non-forced `RemoveNode`, and the completion of default-policy migrations (it proposes `CompletePolicyMigration` bound to the target a leader reports met; the entry changes nothing if another migration started meanwhile). Errors: NotLeader (with a hint), StaleIncarnation, AccessDenied (a node may only report itself).
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
@@ -2874,7 +2874,7 @@ One node's holdings of a volume's objects, as its volume leader knows them (part
 | 2 | `Up` | `bool` | True when the node's inventory is current (it reported recently under its registered incarnation); false for the last-known holdings of a node that went silent. |
 | 3 | `Objects` | `varint` | Copies of objects the volume keeps (referenced, protected by the dereference log, or staged under an open session) on the node. |
 | 4 | `Bytes` | `varint` | Plaintext bytes of those copies. |
-| 5 | `NeededForAck` | `varint` | Referenced objects whose copies on the other nodes that are up fall below their policy's acknowledgement copies or zones: removing this node would lose acknowledged durability. |
+| 5 | `NeededForAck` | `varint` | Referenced objects whose copies on the other nodes that are up (not counting copies whose excess-replica deletion is in flight) fall below their policy's acknowledgement copies or zones: removing this node would lose acknowledged durability. |
 | 6 | — | `extensions` | Terminal extension block. |
 
 #### `ObjectCopy`
@@ -3119,11 +3119,12 @@ Replica-state summary of one volume, computed by its leader from storage-node in
 |---|---|---|---|
 | 1 | `Volume` | `VolumeId` | Summarized volume. |
 | 2 | `VolumeEpoch` | `varuint` | Volume epoch the leader serves (summaries of an older epoch are ignored). |
-| 3 | `PlacementEpoch` | `varuint` | Placement epoch the summary was computed under. |
-| 4 | `CompletedMigration` | `StoragePolicy?` | The default-policy migration target every default-policy object now meets (absent when no migration is pending or it is not complete); the control leader then makes the policy effective if it is still the pending target. |
-| 5 | `Pools` | `list<PoolUsageReport>` | Stored bytes and replica health per storage pool the volume places objects in. |
-| 6 | `Nodes` | `list<NodeHoldingReport>` | Holdings per node the leader has an inventory of (current, or last-known for a node that went silent); a pool member missing here has not reported yet. |
-| 7 | — | `extensions` | Terminal extension block. |
+| 3 | `Term` | `varuint` | Raft term in which the reporting node leads the volume group; while a summary of a newer term is current, summaries of older terms (a deposed leader that has not noticed yet) are ignored. |
+| 4 | `PlacementEpoch` | `varuint` | Placement epoch the summary was computed under. |
+| 5 | `CompletedMigration` | `StoragePolicy?` | The default-policy migration target every default-policy object now meets, counting only copies that are not being deleted (absent when no migration is pending or it is not complete); the control leader then proposes `CompletePolicyMigration` bound to that target, which takes effect only while it is still the pending target. |
+| 6 | `Pools` | `list<PoolUsageReport>` | Stored bytes and replica health per storage pool the volume places objects in. |
+| 7 | `Nodes` | `list<NodeHoldingReport>` | Holdings per node the leader has an inventory of (current, or last-known for a node that went silent); a pool member missing here has not reported yet. |
+| 8 | — | `extensions` | Terminal extension block. |
 
 
 ## 11. Errors

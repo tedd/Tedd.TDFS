@@ -34,7 +34,13 @@ internal sealed partial class VolumeService
     /// <param name="Length">Plaintext length.</param>
     /// <param name="Checksum">XxHash128 of the plaintext.</param>
     /// <param name="ObservedAt">Leader timestamp of the observation.</param>
-    private readonly record struct Holding(ulong Incarnation, StagingId Staging, long Length, UInt128 Checksum, long ObservedAt);
+    /// <param name="Seeded">
+    /// True for a copy assumed from the receipt holders recorded at publication (<see cref="SeedFromReceipts"/>), which no
+    /// report of the holder's current incarnation confirmed: a location hint and a candidate source, never a counted copy
+    /// in a safety decision (policy changes, migration completion, node removal), since the holder may have restarted with
+    /// an empty disk since the publication (RCV-07).
+    /// </param>
+    private readonly record struct Holding(ulong Incarnation, StagingId Staging, long Length, UInt128 Checksum, long ObservedAt, bool Seeded = false);
 
     /// <summary>Inventory state of one node.</summary>
     private sealed class NodeInventory
@@ -109,7 +115,14 @@ internal sealed partial class VolumeService
         }
 
         foreach (InventoryItem item in items)
+        {
+            // A copy whose deletion the holder already confirmed is listed only by an inventory taken before the deletion:
+            // it is not a copy (the holder may never report this volume again once it holds nothing of it).
+            if (_deleted.Contains((item.Object, node)))
+                continue;
             AddHolding(item.Object, node, new Holding(incarnation, item.Staging, item.Length, item.Checksum, now));
+        }
+
         ResolveDeletesByInventory(node, listed);
     }
 
@@ -132,6 +145,7 @@ internal sealed partial class VolumeService
         }
 
         state.LastReportAt = now;
+        SettleConfirmedDelete(receipt.Object, receipt.Node);
         AddHolding(receipt.Object, receipt.Node, new Holding(receipt.Incarnation, receipt.Staging, receipt.Length, receipt.Checksum, now));
     }
 
@@ -196,8 +210,12 @@ internal sealed partial class VolumeService
             && _s.Time.GetElapsedTime(state.LastReportAt, now) > LivenessWindow;
     }
 
-    /// <summary>Holders whose copies count now: up, the copy reported under the current incarnation, not being deleted.</summary>
-    private List<NodeId> UpHolders(ObjectId obj, ControlState control, long now, bool includeDeleting = false)
+    /// <summary>
+    /// Holders whose copies count now: up, the copy reported under the current incarnation, not being deleted (unless
+    /// <paramref name="includeDeleting"/>), and confirmed by the holder rather than assumed from publication receipts (unless
+    /// <paramref name="includeSeeded"/>).
+    /// </summary>
+    private List<NodeId> UpHolders(ObjectId obj, ControlState control, long now, bool includeDeleting = false, bool includeSeeded = true)
     {
         var result = new List<NodeId>();
         if (!_holdings.TryGetValue(obj, out Dictionary<NodeId, Holding>? holders))
@@ -205,6 +223,8 @@ internal sealed partial class VolumeService
         foreach ((NodeId node, Holding h) in holders)
         {
             if (control.FindMember(node) is not { IsLive: true } member || h.Incarnation != member.Incarnation || !IsUp(node, control, now))
+                continue;
+            if (!includeSeeded && h.Seeded)
                 continue;
             if (!includeDeleting && IsDeleting(obj, node))
                 continue;
@@ -325,16 +345,25 @@ internal sealed partial class VolumeService
     {
         ControlState control = _s.Control.State;
         long now = _s.Time.GetTimestamp();
+        var planned = new HashSet<ObjectId>();
         foreach (ObjectPlan plan in plans)
         {
+            planned.Add(plan.Object);
             if (!_seeded.Add(plan.Object) || _holdings.ContainsKey(plan.Object) || !locations.TryGetValue(plan.Object, out ImmutableArray<NodeId> holders))
                 continue;
             foreach (NodeId node in holders)
             {
-                if (control.FindMember(node) is { IsLive: true } member)
-                    AddHolding(plan.Object, node, new Holding(member.Incarnation, plan.Staging, plan.Length, plan.Checksum, now));
+                // A complete inventory of the holder's current incarnation is authoritative: it did not list the copy.
+                if (control.FindMember(node) is { IsLive: true } member
+                    && !(_inventoryNodes.TryGetValue(node, out NodeInventory? reported) && reported.Incarnation == member.Incarnation))
+                {
+                    AddHolding(plan.Object, node, new Holding(member.Incarnation, plan.Staging, plan.Length, plan.Checksum, now, Seeded: true));
+                }
             }
         }
+
+        // Objects no longer referenced are forgotten (bounded by the referenced set).
+        _seeded.RemoveWhere(o => !planned.Contains(o));
     }
 
     /// <summary>Live members of a pool, as a set.</summary>
@@ -360,8 +389,10 @@ internal sealed partial class VolumeService
                 continue;
             if (!members.TryGetValue(plan.Pool, out HashSet<NodeId>? poolMembers))
                 members[plan.Pool] = poolMembers = PoolMemberSet(control, plan.Pool);
+            // A copy whose excess-replica deletion is in flight no longer counts (it may be gone any moment), but it is
+            // still a placement violation while it exists outside the pool.
             List<NodeId> up = UpHolders(plan.Object, control, now, includeDeleting: true);
-            (int copies, int zones) = DomainsOf(control, up.Where(poolMembers.Contains));
+            (int copies, int zones) = DomainsOf(control, up.Where(n => poolMembers.Contains(n) && !IsDeleting(plan.Object, n)));
             objects++;
             if (copies == 0)
                 missing++;
@@ -410,7 +441,7 @@ internal sealed partial class VolumeService
             if (!members.TryGetValue(plan.Pool, out IReadOnlyList<MemberRecord>? poolMembers))
                 members[plan.Pool] = poolMembers = control.PoolMembers(plan.Pool);
             List<NodeId> up = UpHolders(plan.Object, control, now, includeDeleting: true);
-            (int copies, int zones) = DomainsOf(control, up.Where(n => poolMembers.Any(m => m.Id == n)));
+            (int copies, int zones) = DomainsOf(control, up.Where(n => !IsDeleting(plan.Object, n) && poolMembers.Any(m => m.Id == n)));
             if (copies >= plan.Policy.TargetCopies && zones >= plan.Policy.TargetDistinctZones)
                 continue;
             probed++;
@@ -434,7 +465,8 @@ internal sealed partial class VolumeService
                 continue;
             foreach (ObjectLocation location in locations)
             {
-                if (location.Present)
+                // A reply may have been computed before a deletion this leader saw confirmed meanwhile.
+                if (location.Present && !_deleted.Contains((location.Object, node)))
                 {
                     AddHolding(location.Object, node, new Holding(member.Incarnation, location.Staging, location.Length, location.Checksum, _s.Time.GetTimestamp()));
                     if (_inventoryNodes.TryGetValue(node, out NodeInventory? state) && state.Incarnation == member.Incarnation)
@@ -489,7 +521,9 @@ internal sealed partial class VolumeService
                 continue;
             if (!members.TryGetValue(plan.Pool, out HashSet<NodeId>? poolMembers))
                 members[plan.Pool] = poolMembers = PoolMemberSet(control, plan.Pool);
-            (int copies, int zones) = DomainsOf(control, UpHolders(plan.Object, control, now, includeDeleting: true).Where(poolMembers.Contains));
+            // Copies being deleted as excess replicas, or only assumed from publication receipts, do not count: a migration is
+            // never declared complete on a copy that is about to disappear or may not exist (REP-014, CHA-002).
+            (int copies, int zones) = DomainsOf(control, UpHolders(plan.Object, control, now, includeSeeded: false).Where(poolMembers.Contains));
             if (copies < target.TargetCopies || zones < target.TargetDistinctZones)
                 pending++;
         }
@@ -560,7 +594,9 @@ internal sealed partial class VolumeService
                     if (!plans.Objects.TryGetValue(obj.Value, out ObjectPlan? plan))
                         continue;
                     HashSet<NodeId> poolMembers = MembersOf(plan.Pool);
-                    (int copies, int zones) = DomainsOf(control, UpHolders(obj, control, now, includeDeleting: true).Where(n => n != node && poolMembers.Contains(n)));
+                    // Other holders whose excess-replica deletion is in flight do not count (OPS-002: a removal must
+                    // never rely on a copy that is being deleted).
+                    (int copies, int zones) = DomainsOf(control, UpHolders(obj, control, now, includeSeeded: false).Where(n => n != node && poolMembers.Contains(n)));
                     if (copies < plan.Policy.DurableCopiesBeforeAck || zones < plan.Policy.DurableZonesBeforeAck)
                         neededForAck++;
                 }
@@ -570,7 +606,7 @@ internal sealed partial class VolumeService
         }
 
         DfsStoragePolicy? completed = record.MigrationTarget is { } target && PendingMigrationObjects(target) == 0 ? target : null;
-        return new VolumeUsageReport(record.Id, record.Epoch, control.PlacementEpoch, completed, pools, nodes);
+        return new VolumeUsageReport(record.Id, record.Epoch, Group.Term, control.PlacementEpoch, completed, pools, nodes);
     }
 
     /// <summary>Every pool the volume's policies place objects in.</summary>

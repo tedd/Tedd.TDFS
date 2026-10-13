@@ -315,8 +315,13 @@ internal sealed partial class AdminService
         MemberRecord member = RequireMember(name);
         if (status == WireNodeStatus.Removed && !force && State.Members.Values.Count(m => m.IsLive) <= 1)
             throw new DfsException(DfsErrorCode.InvalidArgument, $"Node '{name}' is the last live member and cannot be removed.");
-        if (status == WireNodeStatus.Removed && !force && member.IsLive)
-            RemovalCheck?.Invoke(member);
+        if (status == WireNodeStatus.Removed && !force && member.IsLive && RemovalCheck is { } check)
+        {
+            await check(member, ct);
+            RequireLeader();
+            member = RequireMember(name);
+        }
+
         return await ProposeEmptyAsync(message, new SetMemberStatusCommand(Header(message, principal), member.Id, status, force), ct);
     }
 

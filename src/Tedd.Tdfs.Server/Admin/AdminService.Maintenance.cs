@@ -14,8 +14,8 @@ internal sealed partial class AdminService
     /// <summary>Optional provider of the non-members still holding a pool's objects (reported as draining).</summary>
     public Func<string, IReadOnlyList<string>>? PoolStrayHoldersProvider { get; set; }
 
-    /// <summary>Optional check of a non-forced node removal (throws the refusal).</summary>
-    public Action<MemberRecord>? RemovalCheck { get; set; }
+    /// <summary>Optional check of a non-forced node removal (throws the refusal; may wait briefly for the replica state).</summary>
+    public Func<MemberRecord, CancellationToken, Task>? RemovalCheck { get; set; }
 
     /// <summary>Optional provider of a node's reported device usage.</summary>
     public Func<NodeId, long?>? NodeUsageProvider { get; set; }

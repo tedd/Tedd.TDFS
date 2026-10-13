@@ -54,6 +54,10 @@ internal sealed partial class VolumeService
         var key = (request.Node, request.ReportId);
         if (!_inventories.TryGetValue(key, out InventoryAccumulator? accumulator) || request.Page == 0)
         {
+            // A node reports a volume one report at a time: a new report abandons any unfinished one (a node that crashed
+            // mid-report never finishes it), so accumulators stay bounded.
+            foreach ((NodeId Node, ulong Report) stale in _inventories.Keys.Where(k => k.Node == request.Node && k.Report != request.ReportId).ToArray())
+                _inventories.Remove(stale);
             accumulator = new InventoryAccumulator(_s.Time.GetTimestamp());
             _inventories[key] = accumulator;
         }

@@ -22,7 +22,8 @@ namespace Tedd.Tdfs.Server.Volumes.Service;
 //    default-policy migration is pending (REP-015).
 //  * Work is rate-limited (RepairBytesPerSecond) and bounded in concurrency, overall and per receiving node (a slow or
 //    congested node is not handed more transfers than it can take); one action per object at a time; a delete whose
-//    outcome is unknown keeps its holder out of every count until it is resolved.
+//    outcome is unknown, or that was just confirmed, keeps its holder out of every count until an inventory without the copy
+//    (or a new incarnation of the holder) settles it.
 internal sealed partial class VolumeService
 {
     private const int MaxRepairsInFlight = 16;
@@ -36,8 +37,15 @@ internal sealed partial class VolumeService
     /// <summary>Objects with a copy or verify/delete job in flight.</summary>
     private readonly HashSet<ObjectId> _repairing = [];
 
-    /// <summary>Excess-copy deletions whose outcome is not known yet: object → holders being deleted.</summary>
+    /// <summary>
+    /// Excess-copy deletions not settled by an inventory yet: object → holders being (or just) deleted. A holder stays here
+    /// after its deletion was confirmed until an inventory without the copy arrives, so an inventory listed before the
+    /// deletion (still in flight when the deletion was answered) cannot count the deleted copy again.
+    /// </summary>
     private readonly Dictionary<ObjectId, HashSet<NodeId>> _deleting = [];
+
+    /// <summary>(object, holder) pairs of <see cref="_deleting"/> whose deletion the holder confirmed.</summary>
+    private readonly HashSet<(ObjectId Object, NodeId Node)> _deleted = [];
 
     /// <summary>Nodes that refused a repair copy for capacity, until when (leader timestamp).</summary>
     private readonly Dictionary<NodeId, long> _refusedUntil = [];
@@ -60,6 +68,7 @@ internal sealed partial class VolumeService
         _repairing.Clear();
         _copiesTo.Clear();
         _deleting.Clear();
+        _deleted.Clear();
         _refusedUntil.Clear();
         _copyBackoff.Clear();
         _repairsInFlight = 0;
@@ -82,20 +91,35 @@ internal sealed partial class VolumeService
     private void ForgetPendingDeletes(NodeId node)
     {
         foreach ((ObjectId obj, HashSet<NodeId> nodes) in _deleting.ToArray())
-        {
-            if (nodes.Remove(node) && nodes.Count == 0)
-                _deleting.Remove(obj);
-        }
+            SettleDelete(obj, node);
     }
 
-    /// <summary>A complete inventory without the object proves an unanswered delete on <paramref name="node"/> happened.</summary>
+    /// <summary>A complete inventory without the object proves a delete on <paramref name="node"/> happened.</summary>
     private void ResolveDeletesByInventory(NodeId node, HashSet<ObjectId> listed)
     {
         foreach ((ObjectId obj, HashSet<NodeId> nodes) in _deleting.ToArray())
         {
-            if (!listed.Contains(obj) && nodes.Remove(node) && nodes.Count == 0)
-                _deleting.Remove(obj);
+            if (!listed.Contains(obj) && nodes.Contains(node))
+                SettleDelete(obj, node);
         }
+    }
+
+    /// <summary>
+    /// A copy proven by a receipt issued after its deletion was confirmed (a later repair copied the object back): the
+    /// confirmed deletion no longer describes the holder. A deletion whose outcome is still unknown stays: it may yet
+    /// remove the new copy.
+    /// </summary>
+    private void SettleConfirmedDelete(ObjectId obj, NodeId node)
+    {
+        if (_deleted.Contains((obj, node)))
+            SettleDelete(obj, node);
+    }
+
+    private void SettleDelete(ObjectId obj, NodeId node)
+    {
+        _deleted.Remove((obj, node));
+        if (_deleting.TryGetValue(obj, out HashSet<NodeId>? nodes) && nodes.Remove(node) && nodes.Count == 0)
+            _deleting.Remove(obj);
     }
 
     /// <summary>
@@ -349,9 +373,10 @@ internal sealed partial class VolumeService
     }
 
     /// <summary>
-    /// Re-verifies every target's copy, then deletes the excess copies one holder at a time. A holder stays out of every count
-    /// from the moment its deletion is sent until the outcome is known (a delete held at its fault point may complete
-    /// late); an unanswered delete is resolved by the holder's next incarnation.
+    /// Re-verifies every target's copy, then, while the decision still holds (<see cref="StillExcess"/>), deletes the excess
+    /// copies one holder at a time. A holder stays out of every count from the moment its deletion is sent until an
+    /// inventory without the copy (or the holder's next incarnation) settles it: a delete held at its fault point may
+    /// complete late, and an inventory listed before a confirmed delete must not count the copy again.
     /// </summary>
     private void StartExcessDeletion(ObjectPlan plan, NodeId[] keep, List<NodeId> excess, ulong epoch)
     {
@@ -373,33 +398,44 @@ internal sealed partial class VolumeService
                     RecordReceipt(result.Receipt);
                 }
 
-                ControlState control = _s.Control.State;
-                if (control.PoolEpoch(plan.Pool) != epoch || !IsLeader || Group.Term != term)
-                    return;
                 foreach (NodeId holder in excess)
                 {
+                    // The decision was taken before the targets were re-verified (which may have taken a while): it still
+                    // has to hold now, for this holder (copy-before-delete, REP-015/016).
+                    if (!IsLeader || Group.Term != term || !StillExcess(plan, keep, holder, epoch))
+                        return;
                     if (!_holdings.TryGetValue(plan.Object, out Dictionary<NodeId, Holding>? holders) || !holders.TryGetValue(holder, out Holding h))
                         continue;
                     if (!_deleting.TryGetValue(plan.Object, out HashSet<NodeId>? pending))
                         _deleting[plan.Object] = pending = [];
                     pending.Add(holder);
-                    bool resolved = false;
+                    var delete = new DeleteObjectsMessage(Record.Id, Record.Epoch, _sm.State.AppliedIndex, [new ObjectStagingRef(plan.Object, h.Staging)], true);
+                    DeleteObjectsResultMessage result;
                     try
                     {
-                        var delete = new DeleteObjectsMessage(Record.Id, Record.Epoch, _sm.State.AppliedIndex, [new ObjectStagingRef(plan.Object, h.Staging)], true);
-                        await DeleteOnAsync(holder, delete);
-                        resolved = true;
-                        if (IsLeader && Group.Term == term)
-                            RemoveHolding(plan.Object, holder);
+                        result = await DeleteOnAsync(holder, delete);
                     }
                     catch (DfsException ex) when (ex.ErrorCode is DfsErrorCode.EpochMismatch or DfsErrorCode.StaleIncarnation or DfsErrorCode.AccessDenied)
                     {
-                        resolved = true; // refused before anything was deleted
+                        // Refused before anything was deleted.
+                        if (Group.Term == term)
+                            SettleDelete(plan.Object, holder);
+                        continue;
                     }
-                    finally
+
+                    if (result.Deleted == 0)
                     {
-                        if (resolved && Group.Term == term && _deleting.TryGetValue(plan.Object, out HashSet<NodeId>? nodes) && nodes.Remove(holder) && nodes.Count == 0)
-                            _deleting.Remove(plan.Object);
+                        // Nothing matched (already gone, or held under another staging session): the next inventory tells.
+                        if (Group.Term == term)
+                            SettleDelete(plan.Object, holder);
+                        continue;
+                    }
+
+                    // Deleted: the holder stays out of every count until an inventory without the copy settles it.
+                    if (IsLeader && Group.Term == term)
+                    {
+                        _deleted.Add((plan.Object, holder));
+                        RemoveHolding(plan.Object, holder);
                     }
                 }
             }
@@ -418,6 +454,28 @@ internal sealed partial class VolumeService
                 }
             }
         });
+    }
+
+    /// <summary>
+    /// True when deleting <paramref name="holder"/>'s copy is still justified now: the object is still referenced under
+    /// the same policy and pool, its placement epoch is unchanged, no default-policy migration that covers it has started,
+    /// the holder is not one of the kept targets, and every kept target still holds a counted copy.
+    /// </summary>
+    private bool StillExcess(ObjectPlan decided, NodeId[] keep, NodeId holder, ulong epoch)
+    {
+        ControlState control = _s.Control.State;
+        if (control.PoolEpoch(decided.Pool) != epoch || keep.Contains(holder))
+            return false;
+        if (!Plans().Objects.TryGetValue(decided.Object.Value, out ObjectPlan? current)
+            || current.Policy != decided.Policy || !string.Equals(current.Pool, decided.Pool, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (Record.MigrationTarget is not null && current.UsesDefault)
+            return false;
+        List<NodeId> counted = UpHolders(decided.Object, control, _s.Time.GetTimestamp());
+        return keep.All(counted.Contains);
     }
 
     /// <summary>
@@ -484,22 +542,33 @@ internal sealed partial class VolumeService
         }
     }
 
-    /// <summary>Copies and zones of an object's counted holders that are members of <paramref name="pool"/>.</summary>
+    /// <summary>
+    /// Copies and zones of an object's counted holders that are members of <paramref name="pool"/> (a copy whose excess-replica
+    /// deletion is in flight, or that is only assumed from publication receipts, does not count).
+    /// </summary>
     private (int Copies, int Zones) CountedIn(ObjectId obj, ControlState control, string pool)
     {
         HashSet<NodeId> members = PoolMemberSet(control, pool);
-        return DomainsOf(control, UpHolders(obj, control, _s.Time.GetTimestamp(), includeDeleting: true).Where(members.Contains));
+        return DomainsOf(control, UpHolders(obj, control, _s.Time.GetTimestamp(), includeSeeded: false).Where(members.Contains));
     }
 
-    /// <summary>Deletes copies on <paramref name="node"/>; the call waits as long as the node holds the request (no timeout).</summary>
-    private async Task DeleteOnAsync(NodeId node, DeleteObjectsMessage message)
+    /// <summary>
+    /// Deletes copies on <paramref name="node"/> within the replication deadline. A call that does not answer in time
+    /// (a black-holed node, a request held at its fault point) throws: its outcome stays unknown, so an excess-replica
+    /// holder stays out of every count until an inventory or a new incarnation resolves it, while the repair slot and the
+    /// object are released (one unresponsive holder never stalls repair, RCV-08).
+    /// </summary>
+    private async Task<DeleteObjectsResultMessage> DeleteOnAsync(NodeId node, DeleteObjectsMessage message)
     {
+        TimeSpan timeout = _s.Peers.DefaultCallTimeout * 4;
+        using CancellationTokenSource deadline = _s.CreateDeadline(timeout);
         if (node == _s.NodeId)
         {
-            await _s.Objects.DeleteCopiesAsync(message, CancellationToken.None);
-            return;
+            // A local deletion that does not finish in time (held at its fault point) is treated like an unanswered remote
+            // one: it may still complete later, its outcome stays unknown.
+            return await _s.Objects.DeleteCopiesAsync(message, CancellationToken.None).WaitAsync(deadline.Token);
         }
 
-        await _s.Peers.CallAsync(node, message, TimeSpan.FromHours(1), CancellationToken.None);
+        return (DeleteObjectsResultMessage)await _s.Peers.CallAsync(node, message, timeout, deadline.Token);
     }
 }
