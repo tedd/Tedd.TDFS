@@ -65,6 +65,21 @@ internal sealed class PeerConnections
     /// <summary>True when an authenticated connection to <paramref name="peer"/> is open.</summary>
     public bool IsConnected(NodeId peer) => _byNode.TryGetValue(peer, out Slot? slot) && slot.Connection is { IsOpen: true };
 
+    /// <summary>
+    /// <paramref name="peer"/> authenticated an inbound connection as <paramref name="incarnation"/>. A pooled outbound
+    /// connection to an older incarnation of it leads to a process that no longer exists (its close may have been lost, for
+    /// example to a partition while the peer restarted): one-way traffic such as Raft batches would vanish on it unnoticed,
+    /// so it is dropped and the next send reconnects to the current incarnation.
+    /// </summary>
+    public void OnPeerIncarnation(NodeId peer, ulong incarnation)
+    {
+        if (_byNode.TryGetValue(peer, out Slot? slot) && slot.Connection is { } connection && slot.PeerIncarnation < incarnation)
+        {
+            _s.Debug("peers", NodeServices.Inv($"Dropping the connection to incarnation {slot.PeerIncarnation} of {peer}: incarnation {incarnation} connected."));
+            Drop(peer, connection);
+        }
+    }
+
     /// <summary>Sends a one-way message; false when no connection could be used (the message is lost).</summary>
     public async Task<bool> TrySendAsync(NodeId peer, IWireMessage message)
     {
@@ -237,6 +252,7 @@ internal sealed class PeerConnections
             }
 
             slot.Connection = opened;
+            slot.PeerIncarnation = outcome.ServerIdentity.Incarnation;
             slot.Failures = 0;
             slot.RetryAfter = 0;
             return opened;
@@ -313,6 +329,9 @@ internal sealed class PeerConnections
     private sealed class Slot
     {
         public IRpcConnection? Connection { get; set; }
+
+        /// <summary>Incarnation of the peer process <see cref="Connection"/> was authenticated with.</summary>
+        public ulong PeerIncarnation { get; set; }
 
         public Task<IRpcConnection>? Connecting { get; set; }
 
