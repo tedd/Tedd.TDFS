@@ -45,6 +45,7 @@ internal sealed class RpcInvoker
         int failures = 0;
         int redirects = 0;
         bool leaderless = false;   // a node of the group answered without being its leader (or no leader could be found)
+        bool attempted = false;    // at least one attempt started before the time ran out
         Exception? last = null;
         if (mutation)
             scope.OperationId = request.Operation;
@@ -52,6 +53,7 @@ internal sealed class RpcInvoker
 
         while (!scope.Token.IsCancellationRequested && scope.Elapsed < budget && failures <= _runtime.Options.MaxRetryAttempts)
         {
+            attempted = true;
             TimeSpan attemptTimeout = request.AttemptTimeout is { } fixedTimeout
                 ? ClientRuntime.Positive(fixedTimeout < scope.Remaining ? fixedTimeout : scope.Remaining)
                 : DefaultAttemptTimeout(scope);
@@ -313,11 +315,12 @@ internal sealed class RpcInvoker
         }
 
     Exhausted:
-        return await FinishWithoutReplyAsync(request, scope, mutation && transmitted, ClassifyExhausted(request, scope, last, leaderless)).ConfigureAwait(false);
+        return await FinishWithoutReplyAsync(request, scope, mutation && transmitted, ClassifyExhausted(request, scope, last, leaderless, attempted))
+            .ConfigureAwait(false);
     }
 
     /// <summary>
-    /// The availability failure of a request that ran out of attempts or time (FSD Â§13: quorum unavailability is reported as
+    /// The availability failure of a request that ran out of attempts or time (FSD §13: quorum unavailability is reported as
     /// a distinct typed availability error, a deadline never as a bare <see cref="TimeoutException"/>). A request served by
     /// a group leader (control or volume) that ran out of attempts or time without a leader answering it, or any request
     /// for which a node answered without being the leader, could not reach a leader with a quorum: the last availability
@@ -325,9 +328,11 @@ internal sealed class RpcInvoker
     /// deadline either), is reported as <see cref="DfsQuorumUnavailableException"/>. Caller cancellation and shutdown keep
     /// their own classification.
     /// </summary>
-    private static Exception? ClassifyExhausted(RpcRequest request, OperationScope scope, Exception? last, bool leaderless)
+    private static Exception? ClassifyExhausted(RpcRequest request, OperationScope scope, Exception? last, bool leaderless, bool attempted)
     {
-        if (scope.IsAbortedByCaller || last is DfsQuorumUnavailableException)
+        // A request issued after its operation's time already ran out (an earlier step used it up) learned nothing about
+        // the group: it is reported as the operation's deadline, never as quorum loss.
+        if (scope.IsAbortedByCaller || last is DfsQuorumUnavailableException || !attempted)
             return last;
         bool availability = last is null or TimeoutException or RpcConnectionException or IOException
             || last is DfsUnavailableException { ErrorCode: DfsErrorCode.NotLeader or DfsErrorCode.Unavailable or DfsErrorCode.NodeUnavailable or DfsErrorCode.Timeout };

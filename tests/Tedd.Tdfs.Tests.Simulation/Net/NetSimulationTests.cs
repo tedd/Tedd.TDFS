@@ -62,7 +62,7 @@ public sealed class NetSimulationTests
                 // The SDK transmitted the request and cannot know that it was lost in the network: it must not report a
                 // definite failure, only that the commit may have happened, unless it established the abort itself:
                 // QueryOperation(resolve: true) fences an identity without outcome, an authoritative decision that the
-                // operation can never commit (ARCHITECTURE Â§7/Â§9.2, FSD Â§13). Such a failure must resolve as Aborted.
+                // operation can never commit (ARCHITECTURE §7/§9.2, FSD §13). Such a failure must resolve as Aborted.
                 drop.Cancel();
                 DfsOperationOutcome seen = await m.QueryAsync(volume, id, false);
                 if (IsUnknownOutcome(error))
@@ -644,7 +644,7 @@ public sealed class NetSimulationTests
                 CapturedMessage captured = hold.Captured[0];
 
                 // DropAll ends the hold (MessageHold docs), so the SDK's retries and its outcome query (which would fence
-                // the identity, ARCHITECTURE Â§7) are dropped before delivery by rules installed first: no complete copy of
+                // the identity, ARCHITECTURE §7) are dropped before delivery by rules installed first: no complete copy of
                 // the request ever arrives and the identity stays unresolved.
                 MessageRule retries = cluster.Network.DropNext(new MessageFilter(From: ClientNet("c0"), Type: MessageType.WriteAll), 100_000);
                 MessageRule queries = cluster.Network.DropNext(new MessageFilter(From: ClientNet("c0"), Type: MessageType.QueryOperation), 100_000);

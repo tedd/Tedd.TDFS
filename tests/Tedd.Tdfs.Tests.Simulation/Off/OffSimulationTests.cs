@@ -1123,7 +1123,7 @@ public sealed class OffSimulationTests
             if (!write.Succeeded)
             {
                 DfsOperationOutcome resolved = await v.QueryOperationAsync(kWrite, resolve: true, Ct);
-                Assert.True(resolved.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Aborted);
+                Assert.True(resolved.Status is DfsOutcomeStatus.Committed or DfsOutcomeStatus.Aborted, $"{context}: the write's outcome must resolve after recovery, got {resolved.Status}");
                 if (write.Classification == OpOutcome.Unknown)
                     history.Resolve(writeOp, resolved.Status == DfsOutcomeStatus.Committed ? OpOutcome.Ok : OpOutcome.Failed);
                 else

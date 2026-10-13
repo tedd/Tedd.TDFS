@@ -323,7 +323,7 @@ public sealed partial class DfsFileClient
     }
 
     /// <summary>
-    /// The availability failure of an unanswered read-only open: a quorum failure stays a quorum failure (FSD Â§13: distinct
+    /// The availability failure of an unanswered read-only open: a quorum failure stays a quorum failure (FSD §13: distinct
     /// typed availability errors), anything else is reported as <see cref="DfsErrorCode.Unavailable"/>.
     /// </summary>
     private static DfsUnavailableException ReadOpenFailure(string path, DfsCommitOutcomeUnknownException unknown) =>

@@ -30,13 +30,15 @@ internal sealed class DataCapabilityRejectedException : Exception
 /// <summary>
 /// Object uploads and verified object reads (PROTOCOL.md §7, ARCHITECTURE §6): HRW placement over the pool's nodes from
 /// the cluster map with fallback down the HRW order, parallel <c>PutObject</c> until the policy's acknowledgement
-/// requirement (distinct hosts and zones) is met (remaining targets get a short grace), and range reads that verify
+/// requirement (distinct hosts and zones) is met (remaining targets get a short grace; a target far slower than the first
+/// acknowledgement gets a fallback started alongside it), and range reads that verify
 /// object length, whole-object XxHash128 or per-unit CRC32C, fail over across replicas and a <c>LocateObject</c>
 /// broadcast, and never substitute zeroes for missing data.
 /// </summary>
 internal sealed class DataPlane
 {
     private static readonly TimeSpan MinimumGrace = TimeSpan.FromMilliseconds(50);
+    private static readonly TimeSpan MinimumHedge = TimeSpan.FromMilliseconds(100);
     private readonly ClientRuntime _runtime;
 
     public DataPlane(ClientRuntime runtime)
@@ -75,10 +77,15 @@ internal sealed class DataPlane
         var receipts = new List<ObjectReceipt>();
         var holders = new List<DfsTopologyLabels>();
         var tried = new HashSet<NodeId>();
-        var pending = new List<(Task<IWireMessage> Task, PlacementNode Node)>();
+        var pending = new List<(Task<IWireMessage> Task, PlacementNode Node, long Started)>();
         var failures = new List<Exception>();
         bool renewed = false;
         long? satisfiedAt = null;
+        long started = _runtime.Time.GetTimestamp();
+        TimeSpan? firstAck = null;          // how long the first acknowledged put took
+        long lastProgress = started;        // the last acknowledgement or hedge
+        bool hedging = true;
+        TimeSpan silentHedge = _runtime.Rpc.DefaultAttemptTimeout(scope) / 4;
         using var cancel = CancellationTokenSource.CreateLinkedTokenSource(scope.Token);
         try
         {
@@ -104,9 +111,26 @@ internal sealed class DataPlane
                     if (satisfied)
                     {
                         satisfiedAt ??= _runtime.Time.GetTimestamp();
-                        TimeSpan grace = Grace(scope, satisfiedAt.Value);
+                        TimeSpan grace = Grace(scope, started, satisfiedAt.Value);
                         if (grace <= TimeSpan.Zero || !await Waits.CompletesWithinAsync(any, grace, _runtime.Time, scope.Token).ConfigureAwait(false))
                             break;
+                    }
+                    else if (hedging)
+                    {
+                        // More copies are needed: a target far slower than the first acknowledged put (before any, silent for a
+                        // quarter of the attempt timeout) is presumably unavailable (paused, partitioned), so a fallback starts
+                        // alongside it (the slow put is not abandoned) instead of every chunk waiting out the silent target's
+                        // whole attempt timeout (OFF-007).
+                        TimeSpan delay = firstAck is { } took ? (took * 2 > MinimumHedge ? took * 2 : MinimumHedge) : silentHedge;
+                        TimeSpan hedge = delay - _runtime.Time.GetElapsedTime(lastProgress);
+                        if (!await Waits.CompletesWithinAsync(any, hedge, _runtime.Time, scope.Token).ConfigureAwait(false))
+                        {
+                            lastProgress = _runtime.Time.GetTimestamp();
+                            if (StartFallbacks(1))
+                                continue;
+                            hedging = false;
+                            await Waits.WaitAsync(any, scope.Token).ConfigureAwait(false);
+                        }
                     }
                     else
                     {
@@ -125,7 +149,7 @@ internal sealed class DataPlane
 
                 Task<IWireMessage> finished = any.Result;
                 int index = pending.FindIndex(p => ReferenceEquals(p.Task, finished));
-                PlacementNode node = pending[index].Node;
+                (_, PlacementNode node, long putStarted) = pending[index];
                 pending.RemoveAt(index);
                 bool ok = false;
                 try
@@ -136,6 +160,8 @@ internal sealed class DataPlane
                         case PutObjectResultMessage put when Matches(put.Receipt, obj, checksum, data.Length, lease.Id):
                             receipts.Add(put.Receipt);
                             holders.Add(_runtime.Map.Node(put.Receipt.Node)?.Labels ?? node.Labels);
+                            firstAck ??= _runtime.Time.GetElapsedTime(putStarted);
+                            lastProgress = _runtime.Time.GetTimestamp();
                             ok = true;
                             break;
                         case PutObjectResultMessage put:
@@ -175,7 +201,7 @@ internal sealed class DataPlane
         finally
         {
             ContextFree.Cancel(cancel);
-            foreach ((Task<IWireMessage> task, _) in pending)
+            foreach ((Task<IWireMessage> task, _, _) in pending)
                 Waits.ObserveQuietly(task);
         }
 
@@ -211,7 +237,7 @@ internal sealed class DataPlane
 
         void Restart(PlacementNode node)
         {
-            pending.Add((SendPutAsync(scope, volume, lease, node, obj, data, checksum, chunkIndex, cancel.Token), node));
+            pending.Add((SendPutAsync(scope, volume, lease, node, obj, data, checksum, chunkIndex, cancel.Token), node, _runtime.Time.GetTimestamp()));
         }
 
         bool StartFallbacks(int count)
@@ -234,12 +260,14 @@ internal sealed class DataPlane
         return _runtime.Mutations.CountSameZoneTwice ? (copies, copies) : (copies, zones);
     }
 
-    private TimeSpan Grace(OperationScope scope, long satisfiedAt)
+    private TimeSpan Grace(OperationScope scope, long started, long satisfiedAt)
     {
-        // Remaining targets get as long again as the acknowledgement took (at least a short floor), within the deadline.
-        TimeSpan sinceStart = scope.Elapsed;
+        // Remaining targets get as long again as this object's acknowledgement took (at least a short floor), within the
+        // deadline. Measured from the object's upload, not the operation's start: a multi-chunk write must not give every
+        // later chunk's silent target an ever longer grace (OFF-007).
+        TimeSpan took = _runtime.Time.GetElapsedTime(started, satisfiedAt);
         TimeSpan waited = _runtime.Time.GetElapsedTime(satisfiedAt);
-        TimeSpan grace = (sinceStart > MinimumGrace ? sinceStart : MinimumGrace) - waited;
+        TimeSpan grace = (took > MinimumGrace ? took : MinimumGrace) - waited;
         TimeSpan remaining = scope.Remaining;
         return grace < remaining ? grace : remaining;
     }

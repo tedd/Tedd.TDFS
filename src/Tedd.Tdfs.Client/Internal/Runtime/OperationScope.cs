@@ -124,7 +124,7 @@ internal sealed class OperationScope : IDisposable
     /// <summary>
     /// The failure to report when the operation ends without a result and nothing that could take effect was transmitted:
     /// <see cref="OperationCanceledException"/> for caller cancellation, <see cref="ObjectDisposedException"/> for client
-    /// shutdown, and otherwise the last availability failure for the deadline: always a typed <see cref="DfsException"/> (FSD Â§13),
+    /// shutdown, and otherwise the last availability failure for the deadline: always a typed <see cref="DfsException"/> (FSD §13),
     /// a timeout as <see cref="DfsUnavailableException"/> with <see cref="DfsErrorCode.Timeout"/> carrying the
     /// <see cref="TimeoutException"/> as its cause, never a bare <see cref="TimeoutException"/>.
     /// </summary>
