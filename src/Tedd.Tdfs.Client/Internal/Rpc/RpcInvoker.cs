@@ -166,8 +166,10 @@ internal sealed class RpcInvoker
             byte[] frame = MessageCodec.Encode(message);
             Task<ReadOnlyMemory<byte>> pending = connection.StartCall(frame, attemptTimeout, scope.Token);
 
-            // A call refused before sending (connection closed, token already cancelled) transmitted nothing.
-            bool refused = pending.IsCanceled || (pending.IsFaulted && pending.Exception?.GetBaseException() is RpcConnectionException);
+            // A call refused before sending (connection closed) transmitted nothing. A call that completed as cancelled may
+            // already have handed its frame to the transport (the caller's token can fire while the call starts), so it
+            // counts as transmitted: its id is never reused for another request (the token was checked just above).
+            bool refused = pending.IsFaulted && pending.Exception?.GetBaseException() is RpcConnectionException;
             if (!refused)
             {
                 transmissions++;

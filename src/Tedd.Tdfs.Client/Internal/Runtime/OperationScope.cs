@@ -124,7 +124,8 @@ internal sealed class OperationScope : IDisposable
     /// <summary>
     /// The failure to report when the operation ends without a result and nothing that could take effect was transmitted:
     /// <see cref="OperationCanceledException"/> for caller cancellation, <see cref="ObjectDisposedException"/> for client
-    /// shutdown, and otherwise the last availability failure (or a <see cref="TimeoutException"/>) for the deadline.
+    /// shutdown, and otherwise a typed availability failure: quorum loss when no leader could be found, else the last
+    /// availability failure or a <see cref="DfsUnavailableException"/> for the deadline (never a bare timeout).
     /// </summary>
     public Exception NotTransmittedFailure(Exception? lastFailure)
     {

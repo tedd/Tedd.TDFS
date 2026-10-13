@@ -969,20 +969,51 @@ internal sealed class VolumeContext : IRpcRouter
     /// short background scope (the caller's token may be cancelled) and never throws. A closed session is the authoritative
     /// "no further publication" decision: an uncertain publication that still arrives fails without effect.
     /// </summary>
-    public async Task CloseUnboundStagingAsync(StagingLease lease)
+    public Task CloseUnboundStagingAsync(StagingLease lease)
+        => RunStagingCleanupAsync(
+            scope => MutateAsync<CreateStagingResultMessage>(scope, "CreateStaging(close)", null,
+                header => CreateStagingMessage.CloseRequest(header, lease.Id), rebindable: false, binding: lease.Binding),
+            ex => $"Closing staging session {lease.Id} failed ({ex.GetType().Name}); it closes with its session.");
+
+    /// <summary>Attempts of a best-effort staging cleanup (transient failures are retried).</summary>
+    private const int StagingCleanupAttempts = 8;
+
+    /// <summary>Pause between attempts of a staging cleanup.</summary>
+    private static readonly TimeSpan StagingCleanupRetryDelay = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>
+    /// Runs a best-effort staging cleanup on its own short background scopes, retrying transient failures (a reset
+    /// connection or a brief partition at that moment) for a few seconds, so an abandoned staging session does not stay open
+    /// until its client session expires. Never throws.
+    /// </summary>
+    private async Task RunStagingCleanupAsync(Func<OperationScope, Task> cleanup, Func<Exception, string> describe)
     {
-        try
+        for (int attempt = 1; ; attempt++)
         {
-            using OperationScope scope = Runtime.BeginBackground(DfsOperationKind.CreateStaging, Name, Runtime.Options.ShutdownTimeout);
-            await MutateAsync<CreateStagingResultMessage>(scope, "CreateStaging(close)", null,
-                header => CreateStagingMessage.CloseRequest(header, lease.Id), rebindable: false, binding: lease.Binding).ConfigureAwait(false);
-        }
+            try
+            {
+                using OperationScope scope = Runtime.BeginBackground(DfsOperationKind.CreateStaging, Name, Runtime.Options.ShutdownTimeout);
+                await cleanup(scope).ConfigureAwait(false);
+                return;
+            }
+            catch (Exception ex) when (attempt < StagingCleanupAttempts && RpcInvoker.IsTransient(ex) && !Runtime.KillToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await Waits.DelayAsync(Runtime.Time, StagingCleanupRetryDelay, Runtime.KillToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return; // the client is shutting down: the session closes with it
+                }
+            }
 #pragma warning disable CA1031 // Cleanup is best effort: the session also closes with its client session.
-        catch (Exception ex)
+            catch (Exception ex)
 #pragma warning restore CA1031
-        {
-            Runtime.Emit("staging.close-failed", $"Closing staging session {lease.Id} failed ({ex.GetType().Name}); it closes with its session.", volume: Name,
-                exception: ex);
+            {
+                Runtime.Emit("staging.close-failed", describe(ex), volume: Name, exception: ex);
+                return;
+            }
         }
     }
 
@@ -990,13 +1021,12 @@ internal sealed class VolumeContext : IRpcRouter
     /// Best-effort cleanup after a <c>CreateStaging</c> whose outcome is unknown: resolves (fences) the request and closes the
     /// unbound staging session it created, if it did. Runs on its own short background scope and never throws.
     /// </summary>
-    private async Task CloseUncertainStagingAsync(DfsOperationId operation)
+    private Task CloseUncertainStagingAsync(DfsOperationId operation)
     {
         if (operation.IsEmpty)
-            return;
-        try
+            return Task.CompletedTask;
+        return RunStagingCleanupAsync(async scope =>
         {
-            using OperationScope scope = Runtime.BeginBackground(DfsOperationKind.CreateStaging, Name, Runtime.Options.ShutdownTimeout);
             QueryOperationResultMessage result = await QueryAsync(operation, isTransaction: false, resolve: true, scope).ConfigureAwait(false);
             if (result.Status != WireOutcomeStatus.Committed || result.ResultFrame.IsEmpty
                 || MessageCodec.Decode(result.ResultFrame.Span) is not CreateStagingResultMessage created)
@@ -1006,14 +1036,7 @@ internal sealed class VolumeContext : IRpcRouter
 
             await MutateAsync<CreateStagingResultMessage>(scope, "CreateStaging(close)", null,
                 header => CreateStagingMessage.CloseRequest(header, created.Staging), rebindable: false).ConfigureAwait(false);
-        }
-#pragma warning disable CA1031 // Cleanup is best effort: the session also closes with its client session.
-        catch (Exception ex)
-#pragma warning restore CA1031
-        {
-            Runtime.Emit("staging.close-failed", $"Closing the staging session of the unresolved request {operation} failed ({ex.GetType().Name}); it closes with its session.",
-                volume: Name, exception: ex);
-        }
+        }, ex => $"Closing the staging session of the unresolved request {operation} failed ({ex.GetType().Name}); it closes with its session.");
     }
 
     /// <summary>Creates a staging session bound to a writable handle (of <paramref name="binding"/>'s volume).</summary>
