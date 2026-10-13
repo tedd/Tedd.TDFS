@@ -538,7 +538,8 @@ created or copied.
   `BackupTargetUpdate` (request id derived from the volume and the operation id, so retries are deduplicated), then
   waits until its own control replica applied it. Removing a target also releases its transfer pins and drops its
   progress from the volume state. `BackupRequestSync` commits a volume entry that pins the snapshot for the target
-  (creating an export snapshot when none is named and the volume changed since the latest one).
+  (creating an export snapshot when none is named and the volume changed since the latest one); when that pin is the
+  target's next transfer, the reply waits (at most 1 s) until the exporter sent the transfer's first requests.
 * **Exporter (volume leader) → backup node**, authenticated with the target's export credentials:
   `BackupBegin` (transfer key = source cluster, volume, epoch, lineage, snapshot; older epochs rejected — BAK-026;
   `ReseedRequired` when the lineage cannot continue) → `BackupInventory` batches (hint only) → `BackupPutObject` for
