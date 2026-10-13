@@ -400,7 +400,10 @@ public sealed class ClientReviewTests
         await using (client)
         {
             DfsFileClient files = client.GetVolume(Vol).Files;
-            DfsStream stream = await files.OpenAsync("/rw", new DfsOpenOptions { Mode = FileMode.CreateNew, Access = FileAccess.ReadWrite, Share = FileShare.Read });
+            // The buffer holds all written bytes, so nothing is uploaded before the flush (a writer uploads early once its
+            // buffered bytes exceed BufferSize, PUB-002).
+            DfsStream stream = await files.OpenAsync("/rw",
+                new DfsOpenOptions { Mode = FileMode.CreateNew, Access = FileAccess.ReadWrite, Share = FileShare.Read, BufferSize = 1 << 20 });
             byte[] data = Bytes(10, 200_000);
             await stream.WriteAsync(data);
 
