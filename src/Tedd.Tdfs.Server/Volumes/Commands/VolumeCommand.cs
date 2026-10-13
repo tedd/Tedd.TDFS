@@ -73,6 +73,12 @@ internal enum CommandFlags : byte
 
     /// <summary>SafetyMutations.SkipFencingCheck: accept publications with a stale writer generation.</summary>
     SkipFencing = 4,
+
+    /// <summary>
+    /// SafetyMutations.SkipPredicateValidation: a transaction commit does not validate its predicates (absent-name lookups
+    /// and directory enumerations).
+    /// </summary>
+    SkipPredicates = 8,
 }
 
 /// <summary>

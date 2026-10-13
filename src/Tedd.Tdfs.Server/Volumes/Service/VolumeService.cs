@@ -188,6 +188,8 @@ internal sealed partial class VolumeService
             flags |= CommandFlags.ForgetWatermark;
         if (_s.Mutations.SkipFencingCheck)
             flags |= CommandFlags.SkipFencing;
+        if (_s.Mutations.SkipPredicateValidation)
+            flags |= CommandFlags.SkipPredicates;
         return flags;
     }
 

@@ -674,9 +674,19 @@ internal static class MutHelpers
             v.Check(minorityAcks == 0, ViolationKind.MinorityAuthority, $"the 2-of-5 minority acknowledged {minorityAcks} writes");
 
             cluster.Network.Heal();
-            await cluster.WaitForStableAsync(TimeSpan.FromSeconds(60), Ct);
-            await RecordReadAsync(cluster, "pa", key, af);
-            await RecordReadAsync(cluster, "pb", key, bf);
+            try
+            {
+                await cluster.WaitForStableAsync(TimeSpan.FromSeconds(60), Ct);
+                await RecordReadAsync(cluster, "pa", key, af);
+                await RecordReadAsync(cluster, "pb", key, bf);
+            }
+            catch (TimeoutException ex)
+            {
+                // Two leaders of one term never step down for each other, so a split brain can outlive the partition; the
+                // history recorded so far is still checked (and the baseline still fails on the error).
+                v.Error($"the cluster did not stabilize after the partition healed: {ex.Message}");
+            }
+
             v.History(LinearizabilityChecker.Check(cluster.History.Operations.Where(o => o.Key == key).ToArray(), new RegisterModel()),
                 ViolationKind.NonLinearizableHistory, "register history across the 2/3 partition");
         });
@@ -939,6 +949,13 @@ internal static class MutHelpers
             await RecordAsync(cluster, "rb", "write", key, v1, () => bf.WriteAllBytesAsync(key, v1, Ct));
             await RecordReadAsync(cluster, "ra", key, af);
 
+            // Opening a file is a log entry (ARCHITECTURE §5.3), which a deposed leader can never commit; what it can serve
+            // is a read through a live handle opened before the partition, ordered only by the ReadIndex barrier.
+            DfsStream live = await af.OpenAsync(key, new DfsOpenOptions
+            {
+                Mode = FileMode.Open, Access = FileAccess.Read, Share = FileShare.ReadWrite | FileShare.Delete, ReadView = DfsReadView.Live,
+            }, Ct);
+
             oldLeader.Clock.Freeze();
             cluster.Network.Partition([oldLeader.Name, aOptions.NetworkName], [.. Names(rest), bOptions.NetworkName]);
             bool elected = await TryWaitUntilAsync(cluster, async () =>
@@ -954,7 +971,22 @@ internal static class MutHelpers
             }, TimeSpan.FromSeconds(30), "the majority elects a new leader");
             v.Reached(elected, "new leader elected while the old one still believes it leads");
             await RecordAsync(cluster, "rb", "write", key, v2, () => bf.WriteAllBytesAsync(key, v2, Ct));
-            byte[]? seen = await RecordReadAsync(cluster, "ra", key, af);
+            byte[]? seen = null;
+            try
+            {
+                seen = await cluster.History.RecordAsync("ra", "read", key, null, async () =>
+                {
+                    live.Seek(0, SeekOrigin.Begin);
+                    var buffer = new MemoryStream();
+                    await live.CopyToAsync(buffer, Ct);
+                    return buffer.ToArray();
+                });
+            }
+            catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)
+            {
+                // A failed live read is recorded in the history; the checker decides.
+            }
+
             if (seen is not null && seen.AsSpan().SequenceEqual(v1))
                 v.Violation(ViolationKind.StaleLiveRead, "the deposed leader served the pre-partition value as a live read after a newer write completed");
 
@@ -965,6 +997,7 @@ internal static class MutHelpers
             await RecordReadAsync(cluster, "rb", key, bf);
             v.History(LinearizabilityChecker.Check(cluster.History.Operations.Where(o => o.Key == key).ToArray(), new RegisterModel()),
                 ViolationKind.StaleLiveRead, "live-read history across the partition");
+            await CaptureAsync(() => live.DisposeAsync().AsTask());   // its lease expired during the partition
         });
 
     // ------------------------------------------------------------------------------------------------------------------

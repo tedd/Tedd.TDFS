@@ -47,9 +47,10 @@ internal sealed partial class VolumeStateMachine
     /// <summary>
     /// Objects reachable at the applied index: the current root (detached inodes included), snapshot roots, pinned roots
     /// (snapshot readers, transfers, enumerations), version-pinned handle inodes, a staged restore and the snapshot roots of
-    /// accepted restores into new volumes.
+    /// accepted restores into new volumes. <paramref name="ignorePins"/> (the IgnoreSnapshotPins negative control, MUT-009)
+    /// marks the current root only.
     /// </summary>
-    internal static HashSet<ObjectId> Reachable(VolumeState s)
+    internal static HashSet<ObjectId> Reachable(VolumeState s, bool ignorePins = false)
     {
         var result = new HashSet<ObjectId>();
         var seen = new HashSet<(ulong, ulong)>();
@@ -68,6 +69,8 @@ internal sealed partial class VolumeStateMachine
         }
 
         AddRoot(s.Inodes);
+        if (ignorePins)
+            return result;
         foreach (SnapshotRecord snap in s.Snapshots.Values)
             AddRoot(snap.Root);
         foreach (PinRecord pin in s.Pins.Values)
