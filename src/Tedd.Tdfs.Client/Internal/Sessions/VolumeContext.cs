@@ -1047,10 +1047,15 @@ internal sealed class VolumeContext : IRpcRouter
         if (scope.IsAbortedByCaller)
             return scope.NotTransmittedFailure(cause);
 
-        // A typed reason (the volume's quorum is unavailable, the deadline passed) is the publication's own failure.
-        return cause is DfsQuorumUnavailableException or TimeoutException
-            ? cause
-            : new DfsUnavailableException(DfsErrorCode.Unavailable, "A staging session could not be created: the request was not answered.", cause);
+        // A typed reason is the publication's own failure: the volume's quorum is unavailable, or the deadline passed
+        // without an answer (an availability failure with the Timeout code — never a bare transport timeout).
+        return cause switch
+        {
+            DfsQuorumUnavailableException => cause,
+            TimeoutException => new DfsUnavailableException(DfsErrorCode.Timeout,
+                "A staging session could not be created before the deadline: the request was not answered.", cause),
+            _ => new DfsUnavailableException(DfsErrorCode.Unavailable, "A staging session could not be created: the request was not answered.", cause),
+        };
     }
 
     /// <summary>Renews the capability of <paramref name="lease"/> (<c>CreateStaging</c> with <c>Renew</c>; no log entry).</summary>
