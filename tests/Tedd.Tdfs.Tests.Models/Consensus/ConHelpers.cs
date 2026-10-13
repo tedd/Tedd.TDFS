@@ -368,42 +368,118 @@ internal sealed class RaftModelCluster
     /// </summary>
     private void PruneDeadMessages()
     {
-        bool logsFixed = _proposals >= _bounds.Proposals && _confChanges >= _bounds.ConfChanges;
-        bool ticksOver = _heartbeats >= _bounds.Heartbeats; // only heartbeat actions tick a leader
-        bool termsFixed = _timeouts >= _bounds.Timeouts && _bounds.ConfChanges == 0 && !_nodes.Any(n => n is { Role: RaftRole.PreCandidate });
-        ulong maxTerm = 0;
-        for (int i = 0; i < _nodes.Length; i++)
-            maxTerm = Math.Max(maxTerm, Math.Max(_hard[i].Term, _nodes[i]?.Term ?? 0));
+        var rules = new PruneRules(
+            LogsFixed: _proposals >= _bounds.Proposals && _confChanges >= _bounds.ConfChanges,
+            TicksOver: _heartbeats >= _bounds.Heartbeats, // only heartbeat actions tick a leader
+            TermsFixed: _timeouts >= _bounds.Timeouts && _bounds.ConfChanges == 0 && !_nodes.Any(n => n is { Role: RaftRole.PreCandidate }),
+            MaxTerm: Enumerable.Range(0, _nodes.Length).Max(TermOf));
         _inflight.RemoveAll(entry =>
         {
-            RaftMessage m = entry.Message;
-            int to = _indexOf[m.To];
-            RaftNode? node = _nodes[to];
-            ulong term = Math.Max(_hard[to].Term, node?.Term ?? 0);
-            RaftRole role = node?.Role ?? RaftRole.Follower; // a crashed node restarts as a follower of its persisted term
-            return m switch
-            {
-                VoteResponse { PreVote: true, Reject: false } when termsFixed => true,
-                VoteResponse { PreVote: true } => m.Term < term || (termsFixed && m.Term <= term),
-                VoteResponse => m.Term < term || (m.Term == term && role != RaftRole.Candidate),
-                AppendResponse or HeartbeatResponse or InstallSnapshotResponse => m.Term < term || (m.Term == term && role != RaftRole.Leader)
-                    || (node is not null && node.IsSpentLeaderAnswer(m, logsFixed, ticksOver)),
-                TimeoutNow => m.Term < term,
-                VoteRequest { PreVote: true } => termsFixed && TermOf(_indexOf[m.From]) == maxTerm,
-                VoteRequest { PreVote: false } when termsFixed && _crashes >= _bounds.Crashes && node is not null && m.Term == maxTerm
-                    && node.Term == maxTerm && node.Leader is not null && node.Vote != m.From =>
-                    (_nodes[_indexOf[m.From]]?.Role ?? RaftRole.Follower) != RaftRole.Candidate,
-                AppendEntries or Heartbeat when termsFixed && logsFixed && _crashes >= _bounds.Crashes && m.Term == maxTerm && node is not null
-                    && node.IsRedundantLeaderMessage(m) =>
-                    _nodes[_indexOf[m.From]] is { } leader && leader.IsFullyReplicatedTo(m.To, maxTerm, logsFixed, ticksOver),
-                AppendEntries or Heartbeat or InstallSnapshot or VoteRequest { PreVote: false } =>
-                    termsFixed && node is not null && node.IsStale(m) && StaleAnswerIsDead(m, maxTerm, logsFixed, ticksOver),
-                _ => false,
-            };
+            if (!IsDead(entry.Message, rules))
+                return false;
+            int to = _indexOf[entry.Message.To];
+            if (_nodes[to] is { } node)
+                VerifyNoEffect(entry, to, node, rules);
+            return true;
         });
 
-        if (termsFixed)
+        if (rules.TermsFixed)
             KeepOneTermNotification();
+    }
+
+    /// <summary>What the discarding rules depend on besides the cores (see <see cref="PruneDeadMessages"/>).</summary>
+    private readonly record struct PruneRules(bool LogsFixed, bool TicksOver, bool TermsFixed, ulong MaxTerm);
+
+    /// <summary>True when delivering <paramref name="m"/> can never have an effect again (see <see cref="PruneDeadMessages"/>).</summary>
+    private bool IsDead(RaftMessage m, PruneRules r)
+    {
+        int to = _indexOf[m.To];
+        RaftNode? node = _nodes[to];
+        ulong term = TermOf(to);
+        RaftRole role = node?.Role ?? RaftRole.Follower; // a crashed node restarts as a follower of its persisted term
+        return m switch
+        {
+            VoteResponse { PreVote: true, Reject: false } when r.TermsFixed => true,
+            VoteResponse { PreVote: true } => m.Term < term || (r.TermsFixed && m.Term <= term),
+            VoteResponse => m.Term < term || (m.Term == term && role != RaftRole.Candidate),
+            AppendResponse or HeartbeatResponse or InstallSnapshotResponse => m.Term < term || (m.Term == term && role != RaftRole.Leader)
+                || (node is not null && node.IsSpentLeaderAnswer(m, r.LogsFixed, r.TicksOver)),
+            TimeoutNow => m.Term < term,
+            VoteRequest { PreVote: true } => r.TermsFixed && TermOf(_indexOf[m.From]) == r.MaxTerm,
+            VoteRequest { PreVote: false } when r.TermsFixed && _crashes >= _bounds.Crashes && node is not null && m.Term == r.MaxTerm
+                && node.Term == r.MaxTerm && node.Leader is not null && node.Vote != m.From =>
+                (_nodes[_indexOf[m.From]]?.Role ?? RaftRole.Follower) != RaftRole.Candidate,
+            AppendEntries or Heartbeat when r.TermsFixed && r.LogsFixed && _crashes >= _bounds.Crashes && m.Term == r.MaxTerm && node is not null
+                && node.IsRedundantLeaderMessage(m) =>
+                _nodes[_indexOf[m.From]] is { } leader && leader.IsFullyReplicatedTo(m.To, r.MaxTerm, r.LogsFixed, r.TicksOver),
+            AppendEntries or Heartbeat or InstallSnapshot or VoteRequest { PreVote: false } =>
+                r.TermsFixed && node is not null && node.IsStale(m) && StaleAnswerIsDead(m, r.MaxTerm, r.LogsFixed, r.TicksOver),
+            _ => false,
+        };
+    }
+
+    /// <summary>
+    /// The reduction must not hide a defect of the core it checks: its rules are derived from how a correct core handles
+    /// these messages, so every message discarded while its recipient runs is first delivered to a copy of the recipient.
+    /// The copy's complete canonical state must be unchanged afterwards, and every answer it sends must itself be one the
+    /// rules discard. A core that does react (for example one that counts a vote of an earlier term, or grants a second
+    /// vote in a term) is reported as a violation instead of having the delivery silently skipped. What the rules add
+    /// beyond this check is that the message stays without effect in later states (terms never decrease, which every
+    /// persist checks), and for answers to a crashed node, which restarts as a follower of its persisted term.
+    /// </summary>
+    private void VerifyNoEffect(Inflight entry, int to, RaftNode node, PruneRules rules)
+    {
+        if (_violation is not null)
+            return;
+        string before = node.DescribeCanonicalState(abstractElectionTimer: true, Name);
+        RaftNode copy = node.Clone(_logs[to], CreateRandom(to));
+        copy.Step(entry.Message);
+        IReadOnlyList<RaftMessage> answers = [];
+        if (copy.HasReady())
+        {
+            RaftReady ready = copy.GetReady();
+            answers = ready.Messages;
+            copy.Advance(ready);
+        }
+
+        string after = copy.DescribeCanonicalState(abstractElectionTimer: true, Name);
+        if (!string.Equals(before, after, StringComparison.Ordinal))
+        {
+            _violation = $"model reduction: '{entry.Key}' was discarded as a message that can never have an effect, but delivering it to n{to} "
+                + $"changes its state{Environment.NewLine}  before: {before}{Environment.NewLine}  after:  {after}";
+            return;
+        }
+
+        foreach (RaftMessage answer in answers)
+        {
+            if (!IsDead(answer, rules))
+            {
+                _violation = $"model reduction: '{entry.Key}' was discarded as a message that can never have an effect, but n{to} answers it with "
+                    + $"'{RaftNode.DescribeMessage(answer, Name)}', which can still have an effect";
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Checks that a term notification discarded in favour of the one kept for the same recipient and term has exactly the
+    /// same effect on its running recipient (see <see cref="PruneDeadMessages"/>).
+    /// </summary>
+    private void VerifyInterchangeable(Inflight dropped, Inflight kept, int to)
+    {
+        if (_violation is not null || _nodes[to] is not { } node)
+            return;
+        RaftNode a = node.Clone(_logs[to], CreateRandom(to));
+        a.Step(dropped.Message);
+        RaftNode b = node.Clone(_logs[to], CreateRandom(to));
+        b.Step(kept.Message);
+        string viaDropped = a.DescribeCanonicalState(abstractElectionTimer: true, Name);
+        string viaKept = b.DescribeCanonicalState(abstractElectionTimer: true, Name);
+        if (!string.Equals(viaDropped, viaKept, StringComparison.Ordinal))
+        {
+            _violation = $"model reduction: term notifications '{dropped.Key}' and '{kept.Key}' to n{to} were treated as interchangeable but have "
+                + $"different effects{Environment.NewLine}  via dropped: {viaDropped}{Environment.NewLine}  via kept:    {viaKept}";
+        }
     }
 
     /// <summary>The term of node <paramref name="i"/>: its running core's, else (crashed) its persisted one.</summary>
@@ -412,21 +488,30 @@ internal sealed class RaftModelCluster
     /// <summary>Keeps one of the interchangeable term notifications per recipient and term (see <see cref="PruneDeadMessages"/>).</summary>
     private void KeepOneTermNotification()
     {
-        Dictionary<(int To, ulong Term), string>? kept = null;
+        Dictionary<(int To, ulong Term), Inflight>? kept = null;
         foreach (Inflight entry in _inflight)
         {
             if (TermNotification(entry.Message) is not { } target)
                 continue;
             kept ??= [];
-            if (!kept.TryGetValue(target, out string? smallest) || string.CompareOrdinal(entry.Key, smallest) < 0)
-                kept[target] = entry.Key;
+            if (!kept.TryGetValue(target, out Inflight? smallest) || string.CompareOrdinal(entry.Key, smallest.Key) < 0)
+                kept[target] = entry;
         }
 
         if (kept is null)
             return;
         var keptOnce = new HashSet<(int To, ulong Term)>();
-        _inflight.RemoveAll(entry => TermNotification(entry.Message) is { } target
-            && (!string.Equals(entry.Key, kept[target], StringComparison.Ordinal) || !keptOnce.Add(target)));
+        _inflight.RemoveAll(entry =>
+        {
+            if (TermNotification(entry.Message) is not { } target)
+                return false;
+            Inflight keep = kept[target];
+            if (string.Equals(entry.Key, keep.Key, StringComparison.Ordinal) && keptOnce.Add(target))
+                return false;
+            if (!string.Equals(entry.Key, keep.Key, StringComparison.Ordinal))
+                VerifyInterchangeable(entry, keep, target.To);
+            return true;
+        });
     }
 
     /// <summary>The (recipient, term) of an answer that would raise its recipient's term, or null.</summary>

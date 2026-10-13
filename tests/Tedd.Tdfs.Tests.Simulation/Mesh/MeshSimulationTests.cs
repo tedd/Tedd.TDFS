@@ -787,7 +787,11 @@ public sealed class MeshSimulationTests
 
             await cluster.DelayAsync(s.ElectionWindow * 2 + s.Timings.LeaseDuration * 2, Ct);
             await s.AssertSafetyAsync("paused");
-            ulong termDuring = (await cluster.Inspect.GetVolumeGroupAsync(Vol)).Term;
+
+            // The term of the successor elected during the pause; only when the remaining voters can elect one (otherwise
+            // the volume group has no leader until the paused node returns, and there is nothing to compare against).
+            bool successorExpected = target == volumeLeader && quorum.Outcome == MeshTri.Must;
+            ulong termDuring = successorExpected ? (await cluster.Inspect.GetVolumeGroupAsync(Vol)).Term : 0;
             await s.ResumeAsync(target);
             await cluster.DelayAsync(s.ElectionWindow * 3, Ct);
             await cluster.Inspect.AssertNoSplitBrainAsync();
@@ -805,7 +809,7 @@ public sealed class MeshSimulationTests
                     Assert.True(why is null, "write queued at the paused node: " + why);
                 }
             }
-            if (target == volumeLeader && quorum.Outcome == MeshTri.Must)
+            if (successorExpected)
             {
                 // The remaining voters had a connected majority, so they elected a successor in a higher term while the
                 // old leader was frozen; on its return it must follow that term, never resume its own.

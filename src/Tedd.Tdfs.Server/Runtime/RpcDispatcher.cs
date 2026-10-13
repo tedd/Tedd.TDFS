@@ -448,7 +448,6 @@ internal sealed partial class RpcDispatcher : IRpcHandler
 
     private static ReadOnlyMemory<byte> Error(ErrorReplyMessage error) => MessageCodec.Encode(error);
 
-    /// <summary>Consensus and handshake traffic is not reported at request-path fault sites (it is not an operation).</summary>
     /// <summary>
     /// The operation kind of a request at the request-path fault sites, as the SDK reports it at its wire sites: a
     /// transaction-bound request (other than the transaction's own begin/commit/abort and outcome queries) is a
@@ -460,6 +459,10 @@ internal sealed partial class RpcDispatcher : IRpcHandler
             ? DfsOperationKind.TxOp
             : MessageTypes.OperationOf(type);
 
+    /// <summary>
+    /// Consensus traffic is not reported at request-path fault sites (it is not an operation, INTERNALS.md). The handshake
+    /// reports its own request-path stages (operation <see cref="DfsOperationKind.Authenticate"/>) before this check.
+    /// </summary>
     private static bool IsObservedForFaults(MessageType type)
         => type is not (MessageType.RaftBatch or MessageType.RaftSnapshotChunk);
 

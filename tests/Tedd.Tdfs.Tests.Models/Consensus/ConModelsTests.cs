@@ -47,7 +47,9 @@ public sealed class ConModelsTests
 
         // The budgets make the reachable state space finite; the depth bound is far above the longest possible schedule
         // so that only the budgets limit the exploration and the result can report completion. States are merged by an
-        // abstract, symmetry-reduced key, messages that can never have an effect again are discarded, and states are pruned
+        // abstract, symmetry-reduced key, messages that can never have an effect again are discarded (each discarded answer is
+        // first delivered to a copy of its recipient, which must not change: the reduction never hides a defect of the core
+        // in handling such messages), and states are pruned
         // when an already visited state simulates them (see RaftModelCluster): every reachable node state and history is
         // still covered. The state bound is a resource cap only (the largest row needs about 10 million states); a row
         // that reaches it fails as incomplete.
@@ -77,6 +79,44 @@ public sealed class ConModelsTests
         // Configuration rows must actually reach a configuration change: an elected leader accepts the proposal.
         if (confChanges > 0)
             Assert.True(ContainsConfigurationChange(bounds, seed), $"Model {model}: no explored schedule proposed a configuration change; the bounds are vacuous.");
+    }
+
+    /// <summary>
+    /// The bounded exploration above merges states by <c>RaftNode.DescribeCanonicalState</c> and branches them with
+    /// <c>RaftNode.Clone</c> (RaftNode.Canonical.cs): a field of the core that neither describes nor copies would silently
+    /// merge states that behave differently, and the exploration would report completion without covering them. This
+    /// guard lists every instance field of the core's state types as reviewed for both; a new field fails it until it is
+    /// added to the description and the copy (or documented here as configuration that never differs between the states
+    /// of one node).
+    /// </summary>
+    [Fact, Catalog("CON-001", "M", "INV-03", "INV-18")]
+    public void CON_001_ElectionSafety_CanonicalStateCoversEveryCoreField()
+    {
+        // Configuration and identity, equal in every state of one node (the model builds every core of a node alike):
+        // _cfg, _options, _random (abstracted, see DescribeCanonicalState), _self, _reachableQuorum, RaftLog._stable (the
+        // host's durable log, described by the host), RaftProgress._maxInflight and Peer.
+        AssertFields(typeof(RaftNode),
+            "_cfg", "_options", "_random", "_log", "_self", "_reachableQuorum", "_term", "_vote", "_lead", "_state", "_electionElapsed",
+            "_heartbeatElapsed", "_randomizedElectionTimeout", "_tickCount", "_confBase", "_confBaseIndex", "_confHistory", "_conf", "_progress",
+            "_pendingConfIndex", "_leadTransferee", "_votes", "_readQueue", "_deferredReads", "_readSeq", "_readStates", "_lastHeard", "_incoming",
+            "_msgs", "_prevHardState", "_prevRole", "_prevLeader", "_outstanding");
+        AssertFields(typeof(RaftNode).Assembly.GetType("Tedd.Tdfs.Consensus.RaftLog", throwOnError: true)!,
+            "_stable", "_unstable", "_offset", "_pendingSnapshot", "Committed", "Applied");
+        AssertFields(typeof(RaftNode).Assembly.GetType("Tedd.Tdfs.Consensus.RaftProgress", throwOnError: true)!,
+            "_maxInflight", "_inflights", "Peer", "Match", "Next", "State", "ProbeSent", "PendingSnapshot", "Snapshot", "SnapshotOffset", "RecentActive");
+        AssertFields(typeof(RaftNode).GetNestedType("ReadRequest", System.Reflection.BindingFlags.NonPublic)!, "Seq", "Index", "Context", "Acks");
+        AssertFields(typeof(RaftNode).GetNestedType("IncomingSnapshot", System.Reflection.BindingFlags.NonPublic)!, "Term", "Meta", "Buffer");
+
+        static void AssertFields(Type type, params string[] reviewed)
+        {
+            const System.Reflection.BindingFlags Instance = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public
+                | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.DeclaredOnly;
+            string[] actual = type.GetFields(Instance)
+                .Select(f => f.Name.StartsWith('<') ? f.Name[1..f.Name.IndexOf('>', StringComparison.Ordinal)] : f.Name)
+                .Order(StringComparer.Ordinal).ToArray();
+            Assert.True(actual.SequenceEqual(reviewed.Order(StringComparer.Ordinal), StringComparer.Ordinal),
+                $"{type.Name} fields changed: [{string.Join(", ", actual)}]; review RaftNode.DescribeCanonicalState/Clone (CON-001) and update this list");
+        }
     }
 
     public static TheoryData<int, ulong> RandomizedSeeds()

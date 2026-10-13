@@ -15,7 +15,9 @@ namespace Tedd.Tdfs.Server.Volumes.Service;
 /// <remarks>
 /// Availability: when no control leader is known (no control decision can commit) or it cannot be reached within the
 /// barrier timeout, the local state is used as is: a revocation the local replica cannot learn of could only have been
-/// committed by a quorum this node is cut off from.
+/// committed by a quorum this node is cut off from. After such a timeout, later barriers proceed at once for at most one
+/// barrier timeout, but only while the local control replica still hears nothing from that leader: once its messages
+/// arrive again, every barrier asks it again.
 /// </remarks>
 internal sealed class ControlBarrier
 {
@@ -80,10 +82,13 @@ internal sealed class ControlBarrier
         if (control.Group is not { IsClosed: false } group || control.IsLeader || control.Leader is not { } leader || leader == _s.NodeId)
             return;
 
-        // The same control leader could not be reached by a barrier that just ran: proceed with the local state at once for
-        // one barrier timeout instead of making every request wait for the same unreachable leader again (a volume leader
-        // cut off from the control leader would otherwise add a whole barrier timeout to each of its proposals).
-        if (leader == _unreachableLeader && _s.Time.GetTimestamp() < _unreachableUntil)
+        // The same control leader could not be reached by a barrier that just ran and this node's control replica has not
+        // heard from it since (no append or heartbeat within the minimum election timeout): it is still cut off, so proceed
+        // with the local state at once for one barrier timeout instead of making every request wait for the same unreachable
+        // leader again (a volume leader cut off from the control leader would otherwise add a whole barrier timeout to each
+        // of its proposals). As soon as the control leader's messages arrive again the barrier runs again: a revocation it
+        // committed meanwhile must be seen before the next decision (SEC-006), not only after the cool-down elapsed.
+        if (leader == _unreachableLeader && _s.Time.GetTimestamp() < _unreachableUntil && !group.Node.HasRecentLeaderContact)
             return;
         ulong local = control.State.AppliedIndex;
         using CancellationTokenSource deadline = _s.CreateDeadline(Timeout);

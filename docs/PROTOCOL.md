@@ -443,7 +443,10 @@ zeroes; missing objects never do (STR, DSK-016).
   into objects at `ChunkSize` boundaries of the file (helpers) or of the dirty range (streams), so retries of the same
   operation carry the same payload identity. `Append` offsets are relative to the end of file; the SDK appends inline
   only when the file's current length plus the appended bytes fit the threshold, and otherwise (or when the leader
-  rejects an inline append because the file grew meanwhile, with a new operation id) as objects.
+  rejects an inline append because the file grew meanwhile, with a new operation id) as objects. An `Append` with an
+  application-supplied operation id is always sent as objects: it may be retried by a later call after the file grew
+  (by this very append), and its payload identity must not depend on the length the client saw (the leader still stores
+  a result that fits inline inline, see "Extents → inline").
 * **Extents → inline**: when a publication whose result is stored inline leaves bytes of objects inside the result —
   base bytes of an extent-based file (for example a truncation to below the threshold followed by small writes), or
   `Data` changes of objects a write-only stream uploaded early and then truncated below the threshold — the leader

@@ -101,6 +101,12 @@ public sealed partial class RaftNode
     private bool HeardFromLeaderRecently
         => _lead is not null && (_state == NodeState.Leader || _electionElapsed < _cfg.ElectionTicksMin);
 
+    /// <summary>
+    /// True when this node leads, or knows a leader it heard from within the minimum election timeout (host use: a
+    /// follower or learner that has such recent contact is not cut off from its leader).
+    /// </summary>
+    internal bool HasRecentLeaderContact => HeardFromLeaderRecently;
+
     /// <summary>Structural validation of fields whose violation no correct peer can produce.</summary>
     private static bool IsWellFormedMessage(RaftMessage m) => m switch
     {
