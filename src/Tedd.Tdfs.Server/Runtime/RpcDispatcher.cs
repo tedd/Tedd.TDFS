@@ -311,7 +311,7 @@ internal sealed partial class RpcDispatcher : IRpcHandler
             return expectsReply ? Error(denied) : null;
 
         _s.Metrics.RpcHandled();
-        DfsOperationKind operation = MessageTypes.OperationOf(type);
+        DfsOperationKind operation = FaultOperationOf(type, message);
         bool observed = IsObservedForFaults(type);
         DfsOperationId? operationId = Volumes.Service.RequestFaultInfo.OperationOf(message);
         string? volume = (message as IVolumeRequest)?.Header.Volume;
@@ -432,6 +432,17 @@ internal sealed partial class RpcDispatcher : IRpcHandler
     private static ReadOnlyMemory<byte> Error(ErrorReplyMessage error) => MessageCodec.Encode(error);
 
     /// <summary>Consensus and handshake traffic is not reported at request-path fault sites (it is not an operation).</summary>
+    /// <summary>
+    /// The operation kind of a request at the request-path fault sites, as the SDK reports it at its wire sites: a
+    /// transaction-bound request (other than the transaction's own begin/commit/abort and outcome queries) is a
+    /// <see cref="DfsOperationKind.TxOp"/> operation, everything else the kind of its message type.
+    /// </summary>
+    private static DfsOperationKind FaultOperationOf(MessageType type, IWireMessage message) =>
+        message is IVolumeRequest { Header.Transaction: not null }
+        && type is not (MessageType.TxBegin or MessageType.TxCommit or MessageType.TxAbort or MessageType.QueryOperation)
+            ? DfsOperationKind.TxOp
+            : MessageTypes.OperationOf(type);
+
     private static bool IsObservedForFaults(MessageType type)
         => type is not (MessageType.RaftBatch or MessageType.RaftSnapshotChunk);
 

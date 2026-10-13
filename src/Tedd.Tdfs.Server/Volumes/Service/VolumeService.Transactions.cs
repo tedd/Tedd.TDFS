@@ -94,7 +94,7 @@ internal sealed partial class VolumeService
             throw new ArgumentException("The transaction timeout must be positive.");
         TimeSpan limit = _sm.State.Config.Limits.MaxTransactionDuration;
         TimeSpan duration = request.Timeout is { } timeout && timeout < limit ? timeout : limit;
-        return await MutateAsync(context, request, DfsOperationKind.TxBegin,
+        IWireMessage reply = await MutateAsync(context, request, DfsOperationKind.TxBegin,
             (op, _) => Task.FromResult<VolumeCommand>(Stamp(new TxBeginCommand(request.Header.Session, _s.Time.GetUtcNow() + duration), op)),
             result =>
             {
@@ -110,6 +110,15 @@ internal sealed partial class VolumeService
                 return begun with { Capability = capability, CapabilityExpiry = expiry, PlacementEpoch = _s.Control.State.PlacementEpoch };
             },
             bindTransaction: false);
+
+        // F05: the transaction and its staging session are registered; no object of it has been written yet.
+        if (reply is TxBeginResultMessage)
+        {
+            await _s.HitAsync(FaultStage.F05, FaultSites.StagingRegistered, Name, DfsOperationKind.TxBegin,
+                request.Header.Operation.IsEmpty ? null : request.Header.Operation, ct: context.Cancellation);
+        }
+
+        return reply;
     }
 
     /// <summary>
@@ -139,7 +148,7 @@ internal sealed partial class VolumeService
             }
 
             return Task.FromResult<VolumeCommand>(Stamp(new TxCommitCommand(id, descriptor, request.SnapshotName), op));
-        }, bindTransaction: false);
+        }, cleanup: true, bindTransaction: false);
         if (!(_sm.State.Transactions.TryGetValue(id, out TxRecord? after) && after.State == TxState.Active))
             DropTransaction(id);
         return reply;
@@ -150,7 +159,7 @@ internal sealed partial class VolumeService
     {
         DfsOperationId id = (request.Header.Transaction ?? throw new ArgumentException("TxAbort names its transaction in the request header.")).Operation;
         IWireMessage reply = await MutateAsync(context, request, DfsOperationKind.TxAbort,
-            (op, _) => Task.FromResult<VolumeCommand>(Stamp(new TxAbortCommand(id), op)), requireOperation: false, bindTransaction: false);
+            (op, _) => Task.FromResult<VolumeCommand>(Stamp(new TxAbortCommand(id), op)), requireOperation: false, cleanup: true, bindTransaction: false);
         if (reply is TxAbortResultMessage)
             DropTransaction(id);
         return reply;
