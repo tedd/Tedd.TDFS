@@ -559,9 +559,11 @@ internal static class MutHelpers
             foreach ((string holder, List<ObjectId> objects) in byHolder)
             {
                 TestNode node = cluster.Node(holder);
-                await node.CrashAsync();
+                // TestDisk.DeleteObjectAsync goes through the running node's store (silent local loss), so the copies are
+                // dropped first and the node then crashes and returns with a new incarnation.
                 foreach (ObjectId obj in objects)
                     await node.Disk.DeleteObjectAsync(obj);
+                await node.CrashAsync();
                 await node.RestartAsync();
                 await cluster.WaitForStableAsync(TimeSpan.FromSeconds(60), Ct);
             }
@@ -771,6 +773,11 @@ internal static class MutHelpers
 
             v.Reached(lostWrite.Matched >= 1, "write executed with its reply lost");
 
+            // The rules target the first write only: transaction-bound writes travel as WriteAll too, and losing their
+            // replies would abort the transaction's setup instead of exercising its commit.
+            lostWrite.Cancel();
+            lostQuery.Cancel();
+
             DfsTransaction tx = await vol.Transactions.BeginAsync(ct: Ct);
             await tx.Files.WriteAllTextAsync("/mut-outcome-tx", "committed", ct: Ct);
             MessageRule lostCommit = cluster.Network.DropReplies(new MessageFilter(From: options.NetworkName, Type: MessageType.TxCommit), 10_000);
@@ -787,8 +794,6 @@ internal static class MutHelpers
             }
 
             v.Reached(lostCommit.Matched >= 1, "transaction commit executed with its reply lost");
-            lostWrite.Cancel();
-            lostQuery.Cancel();
             lostCommit.Cancel();
 
             await using DfsClient check = await cluster.ConnectAsync(Client("check", m), Ct);
@@ -1277,8 +1282,21 @@ internal static class MutHelpers
             capture.Dispose();
             await append;
 
-            for (int i = 0; i < NodeTimings.Fast.MaxOutcomesPerSession + 40; i++)
+            // Exceed the outcome window. Only retained outcomes count toward MaxOutcomesPerSession (ARCHITECTURE §5.2 step 4):
+            // the SDK keeps drawing internal ids from its pre-reserved block, whose sequences are below the application id and
+            // are retired early by the acknowledgement watermark (PROTOCOL.md §5.1), so write until the id is retired.
+            bool retired = false;
+            for (int i = 0; i < 4 * NodeTimings.Fast.MaxOutcomesPerSession && !retired; i++)
+            {
                 await vol.Files.WriteAllBytesAsync($"/mut-x/fill{i % 4}", TestData.Bytes(21_400 + (ulong)i, 64), Ct);
+                if (i >= NodeTimings.Fast.MaxOutcomesPerSession + 40 && i % 16 == 0)
+                {
+                    retired = (await cluster.Inspect.GetVolumeStateAsync(Vol)).Sessions
+                        .Any(s => s.Id == id.Session && s.RetiredWatermark >= id.Sequence);
+                }
+            }
+
+            v.Reached(retired, "the append's id retired by the per-session outcome window");
             await cluster.DelayAsync(NodeTimings.Fast.OutcomeRetention + TimeSpan.FromSeconds(5), Ct);
             foreach (TestNode node in cluster.Nodes)
                 await node.CrashAsync();
@@ -1298,6 +1316,9 @@ internal static class MutHelpers
 
             foreach (CapturedMessage frame in frames)
             {
+                // The duplicate goes to the node the original was sent to; after the whole-cluster restart it may be a follower
+                // (which answers NotLeader without consulting the operation gate), so it leads the volume again first.
+                await cluster.TransferLeadershipAsync(Vol, frame.To, TimeSpan.FromSeconds(60), ct: Ct);
                 DfsErrorCode code = await cluster.Network.ReplayAsync(frame);
                 v.Check(code != DfsErrorCode.None, ViolationKind.ExpiredIdReplayed, "a delayed duplicate of the retired request was executed");
                 if (code is not DfsErrorCode.None and not DfsErrorCode.OperationExpired)
