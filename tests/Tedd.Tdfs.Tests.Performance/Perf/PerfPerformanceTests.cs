@@ -238,9 +238,7 @@ public sealed class PerfPerformanceTests
                 long pendingBeforeFlush;
                 var timer = Stopwatch.StartNew();
 
-                // Write-only: staging capabilities never authorize reads, so only a write-only stream uploads its staged data
-                // early; a readable writer keeps its staged bytes in memory to serve its own reads (PROTOCOL.md §8.1).
-                await using (DfsStream writer = await vol.Files.OpenAsync(path, FileMode.Create, FileAccess.Write, FileShare.None, Ct))
+                await using (DfsStream writer = await vol.Files.CreateAsync(path, Ct))
                 {
                     for (long b = 0; b < size / block; b++)
                     {

@@ -305,8 +305,10 @@ public sealed class DfsStream : Stream, ILeaseHolder
             total += piece.Length;
         var temp = new byte[total];
         int filled = 0;
-        foreach (StagedPiece piece in pieces)
+        StagedReadGrant? grant = null;
+        for (int index = 0; index < pieces.Count; index++)
         {
+            StagedPiece piece = pieces[index];
             Memory<byte> target = temp.AsMemory(filled, piece.Length);
             switch (piece.Source)
             {
@@ -318,8 +320,8 @@ public sealed class DfsStream : Stream, ILeaseHolder
                 }
 
                 case StagedSource.Uploaded:
-                    // Only write-only streams upload staged data early (staging capabilities never authorize reads).
-                    throw new InvalidOperationException("A readable stream never uploads its staged data before publishing it.");
+                    grant = await ReadUploadedAsync(pieces, index, target, grant, scope).ConfigureAwait(false);
+                    break;
 
                 case StagedSource.Base:
                 {
@@ -349,6 +351,70 @@ public sealed class DfsStream : Stream, ILeaseHolder
         }
 
         return (temp, filled);
+    }
+
+    /// <summary>A read capability covering some of this writer's uploaded, unpublished objects (one read call).</summary>
+    private sealed record StagedReadGrant(ReadOnlyMemory<byte> Capability, HashSet<ObjectId> Objects);
+
+    /// <summary>
+    /// Reads the bytes of <paramref name="pieces"/>[<paramref name="index"/>], a range of an object this writer uploaded early
+    /// and has not published (bounded memory, FSD §6.3/§15). Staging capabilities never authorize <c>GetObject</c>: the leader
+    /// grants read access through <c>ReadRange</c> with the staged-objects extension after verifying the receipts name
+    /// uploads of this handle's open staging session (PROTOCOL.md §8.1). Returns the grant to reuse for later pieces.
+    /// </summary>
+    private async Task<StagedReadGrant> ReadUploadedAsync(List<StagedPiece> pieces, int index, Memory<byte> target, StagedReadGrant? grant,
+        OperationScope scope)
+    {
+        StagedPiece piece = pieces[index];
+        StagedSegment segment = piece.Segment!;
+        UploadedObject uploaded = segment.Object ?? throw new InvalidOperationException("An uploaded staged range has no object.");
+        long objectOffset = segment.ObjectOffset + (piece.Offset - segment.Offset);
+        NodeId[] locations = uploaded.Receipts.Select(r => r.Node).Distinct().ToArray();
+        ulong placementEpoch = uploaded.Receipts.Count == 0 ? 0 : uploaded.Receipts.Max(r => r.PlacementEpoch);
+        for (int attempt = 0; ; attempt++)
+        {
+            if (grant is null || !grant.Objects.Contains(uploaded.Id))
+                grant = await GrantStagedReadAsync(pieces, index, scope).ConfigureAwait(false);
+            try
+            {
+                await _runtime.Data.ReadObjectAsync(scope, _volume, grant.Capability, uploaded.Id, uploaded.Length, uploaded.Checksum, ObjectEncodings.Plain,
+                    placementEpoch, locations, objectOffset, target).ConfigureAwait(false);
+                return grant;
+            }
+            catch (DataCapabilityRejectedException) when (attempt == 0)
+            {
+                // The capability expired between the grant and the fetch: ask again.
+                grant = null;
+            }
+            catch (DataCapabilityRejectedException ex)
+            {
+                throw new UnauthorizedAccessException("Storage nodes rejected the read capability issued for this stream's staged data.", ex);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Asks the leader for read access to the uploaded objects among <paramref name="pieces"/> from <paramref name="first"/> on
+    /// (one receipt per object proves the upload; at most <see cref="ReadRangeMessage.MaxStagedObjects"/> per request).
+    /// </summary>
+    private async Task<StagedReadGrant> GrantStagedReadAsync(List<StagedPiece> pieces, int first, OperationScope scope)
+    {
+        var receipts = new List<ObjectReceipt>();
+        var objects = new HashSet<ObjectId>();
+        for (int i = first; i < pieces.Count && receipts.Count < ReadRangeMessage.MaxStagedObjects; i++)
+        {
+            if (pieces[i] is { Source: StagedSource.Uploaded, Segment.Object: { } uploaded } && uploaded.Receipts.Count > 0 && objects.Add(uploaded.Id))
+                receipts.Add(uploaded.Receipts[0]);
+        }
+
+        if (receipts.Count == 0)
+            throw new InvalidOperationException("An uploaded staged range has no receipt.");
+        ReadRangeResultMessage reply = await _volume.ReadAsync<ReadRangeResultMessage>(scope, "ReadRange(staged)",
+            header => new ReadRangeMessage(header, _handle, 0, default, 0, 0).WithStagedReceipts(receipts), Path, _transaction?.Id,
+            requireSession: true, binding: _binding).ConfigureAwait(false);
+        if (reply.ReadCapability.IsEmpty)
+            throw new DfsProtocolException("The leader granted no read capability for this stream's staged data.");
+        return new StagedReadGrant(reply.ReadCapability, objects);
     }
 
     /// <summary>
@@ -961,7 +1027,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
         DfsStoragePolicy policy = ContentLayout.ResolvePolicy(entry, _policyName) ?? entry.DefaultPolicy;
         long newLength = overlay.Length;
         int threshold = ContentLayout.InlineThreshold(entry, _runtime.Capabilities);
-        // Objects uploaded early (write-only streams) stay objects: the leader materializes them if the result is inline.
+        // Objects uploaded early (spilled to bound memory) stay objects: the leader materializes them if the result is inline.
         bool inline = newLength <= threshold && overlay.Segments.All(s => s.IsBuffered)
             && ContentLayout.InlinePermitted(entry, policy, id => _runtime.Map.Node(id)?.Labels);
 
@@ -970,8 +1036,8 @@ public sealed class DfsStream : Stream, ILeaseHolder
         var seenObjects = new HashSet<ObjectId>();
         StagingLease? staging = null;
 
-        // Uploading replaces buffered ranges with staged objects, which a readable writer cannot read back (staging
-        // capabilities never authorize GetObject): if the publication fails, its staged view returns to buffered bytes.
+        // Uploading replaces buffered ranges with staged objects. If the publication fails, a readable writer's staged view
+        // returns to what it was (buffered bytes stay buffered), so its reads do not depend on uploads of a failed publication.
         StagedOverlay.Snapshot? readable = _canRead ? overlay.Capture() : null;
         CommitFileResultMessage result;
         try
@@ -1037,12 +1103,14 @@ public sealed class DfsStream : Stream, ILeaseHolder
     }
 
     /// <summary>
-    /// True when buffered staged data should be uploaded before the publication (bounded memory). Only write-only
-    /// streams do so: a readable writer must serve its own staged bytes, and staging capabilities never authorize reads.
+    /// True when buffered staged data should be uploaded before the publication (bounded memory, FSD §6.3/§15). A readable
+    /// writer reads uploaded ranges back through a leader-granted read capability (<see cref="ReadUploadedAsync"/>); a
+    /// readable transaction-bound stream keeps its staged bytes buffered (its staging session is the transaction's, not
+    /// bound to the handle, so the leader cannot grant reads of it through the handle).
     /// </summary>
     private bool NeedsSpill()
     {
-        if (_canRead)
+        if (_canRead && _transaction is not null)
             return false;
         StagedOverlay overlay = _overlay!;
         long bound = Math.Max(_bufferSize, ContentLayout.ChunkSize(_runtime.Capabilities));

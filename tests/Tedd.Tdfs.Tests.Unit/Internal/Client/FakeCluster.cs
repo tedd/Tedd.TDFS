@@ -722,12 +722,20 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
         byte[] view = handle.Pinned ?? handle.Inode.Content;
         ulong revision = handle.Pinned is not null ? handle.PinnedRevision : handle.Inode.Revision;
         long length = Math.Max(0, Math.Min(read.Length, Math.Min(MaxReadResult, view.Length - read.Offset)));
+
+        // A readable writer reading back its early uploads (staged-objects extension): the capability covers them too
+        // (this fake's storage node does not check capabilities).
+        bool staged = read.StagedReceipts.Count > 0;
+        if (staged)
+            StagedReadGrants++;
+        ReadOnlyMemory<byte> stagedCapability = staged ? new byte[] { 9 } : default;
+        DateTimeOffset stagedExpiry = staged ? DateTimeOffset.UtcNow.AddHours(1) : default;
         if (length <= 0)
-            return new ReadRangeResultMessage(revision, view.Length, read.Offset, 0, true, ReadOnlyMemory<byte>.Empty, [], default, default, Token(_index));
+            return new ReadRangeResultMessage(revision, view.Length, read.Offset, 0, true, ReadOnlyMemory<byte>.Empty, [], stagedCapability, stagedExpiry, Token(_index));
         if (view.Length <= InlineThreshold)
         {
             return new ReadRangeResultMessage(revision, view.Length, read.Offset, length, true, view.AsMemory((int)read.Offset, (int)length).ToArray(), [],
-                default, default, Token(_index));
+                stagedCapability, stagedExpiry, Token(_index));
         }
 
         // Large files are served as one extent over a synthesized object holding the revision's bytes.
@@ -738,6 +746,9 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
         return new ReadRangeResultMessage(revision, view.Length, read.Offset, length, false, ReadOnlyMemory<byte>.Empty, [extent], new byte[] { 9 },
             DateTimeOffset.UtcNow.AddHours(1), Token(_index));
     }
+
+    /// <summary>Number of ReadRange requests that asked for read access to staged uploads (staged-objects extension).</summary>
+    public int StagedReadGrants { get; private set; }
 
     /// <summary>Largest covered range of one ReadRange result (short results exercise the client's read loop).</summary>
     public long MaxReadResult { get; set; } = long.MaxValue;

@@ -404,18 +404,21 @@ public sealed class ClientReviewTests
             byte[] data = Bytes(10, 200_000);
             await stream.WriteAsync(data);
 
-            // The first object is stored, the next one finds the node full: nothing is published.
-            cluster.PutsBeforeFailure = 1;
+            // The whole chunks beyond the buffer bound were uploaded early (bounded memory); the flush's upload of the rest finds
+            // the node full: nothing is published.
+            Assert.True(Count(cluster, MessageType.PutObject) > 0, "the readable writer uploads staged bytes beyond its buffer early");
+            cluster.PutsBeforeFailure = 0;
             Exception? flush = await Record.ExceptionAsync(() => stream.FlushAsync());
             Assert.IsType<DfsPlacementUnavailableException>(flush);
             Assert.False(stream.IsFaulted);
             Assert.Empty(cluster.Content("/rw")!);
 
-            // The writer still reads exactly its staged bytes ...
+            // The writer still reads exactly its staged bytes (the early uploads through a leader-granted capability) ...
             stream.Position = 0;
             byte[] back = new byte[data.Length];
             await stream.ReadExactlyAsync(back);
             Assert.Equal(data, back);
+            Assert.True(cluster.StagedReadGrants > 0, "uploaded staged ranges are read back through the staged-objects grant");
 
             // ... and a later flush publishes them.
             cluster.PutsBeforeFailure = null;

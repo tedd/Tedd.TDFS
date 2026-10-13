@@ -239,7 +239,8 @@ internal sealed partial class VolumeService
     /// <summary>
     /// <c>ReadRange</c> (PROTOCOL.md §7.4, §9.4): one revision per call; live handles read after a ReadIndex barrier,
     /// version-pinned handles their pinned version, snapshot readers their snapshot root. Inline bytes or the intersecting
-    /// extents plus a read capability for exactly those objects.
+    /// extents plus a read capability for exactly those objects — and for the staged uploads a readable writer names
+    /// (<see cref="ReadRangeMessage.StagedObjectsExtension"/>, PROTOCOL.md §8.1).
     /// </summary>
     public async Task<IWireMessage> ReadRangeAsync(RpcContext context, ReadRangeMessage request)
     {
@@ -249,6 +250,8 @@ internal sealed partial class VolumeService
         RequireGrant(principal, DfsPermissions.Read, "read");
         if (request.Offset < 0 || request.Length < 0 || request.Offset > long.MaxValue - request.Length)
             throw new ArgumentException($"Invalid read range [{request.Offset}, +{request.Length}).");
+        IReadOnlyList<ObjectReceipt> stagedReceipts = request.StagedReceipts;
+        IReadOnlyList<ObjectId> staged = [];
         StreamRecord stream;
         ulong revision;
         CommitToken observed;
@@ -259,6 +262,8 @@ internal sealed partial class VolumeService
             ulong applied = await ReadBarrierAsync(ct);
             VolumeState s = State;
             HandleRecord h = ReadableHandle(s, request.Handle.Value, principal);
+            if (stagedReceipts.Count > 0)
+                staged = StagedUploadsOf(s, h, principal, stagedReceipts);
             if (h.View == HandleView.VersionPinned && h.PinnedInode is { } pinned)
             {
                 stream = pinned.GetStream(h.Stream) ?? throw new DfsLeaseLostException($"The pinned stream of handle {h.Id} does not exist.");
@@ -275,6 +280,8 @@ internal sealed partial class VolumeService
         }
         else if (request.SnapshotPin != 0)
         {
+            if (stagedReceipts.Count > 0)
+                throw new ArgumentException("Staged objects are read back only through the writer's own handle.");
             await ReadBarrierAsync(ct);
             (PinRecord pin, ImmutableSortedDictionary<ulong, InodeRecord> root) = ReaderPin(request.SnapshotPin, principal, request.Header.Session);
             InodeRecord inode = root.GetValueOrDefault(request.Inode.Value) ?? throw new FileNotFoundException($"Inode {request.Inode.Value} is not in the snapshot.");
@@ -307,21 +314,59 @@ internal sealed partial class VolumeService
             throw new ArgumentException("ReadRange addresses a handle or a snapshot reader pin and inode; live reads by inode are not allowed.");
         }
 
-        return BuildReadReply(principal, stream, revision, request.Offset, request.Length, observed);
+        return BuildReadReply(principal, stream, revision, request.Offset, request.Length, observed, staged);
     }
 
-    private ReadRangeResultMessage BuildReadReply(string principal, StreamRecord stream, ulong revision, long offset, long length, CommitToken observed)
+    /// <summary>
+    /// The staged uploads a readable writer may read back (PROTOCOL.md §8.1): every receipt must be authentic (a storage node
+    /// issued it with the cluster receipt key) and name an object of this volume uploaded under an open staging session that
+    /// is bound to <paramref name="h"/> and owned by the caller. Only the writer's own uploads qualify, and only through a
+    /// handle that may read the file anyway; an object id alone never grants access (SEC-004).
+    /// </summary>
+    private List<ObjectId> StagedUploadsOf(VolumeState s, HandleRecord h, string principal, IReadOnlyList<ObjectReceipt> receipts)
+    {
+        var objects = new List<ObjectId>(receipts.Count);
+        foreach (ObjectReceipt receipt in receipts)
+        {
+            bool owned = receipt.Volume == Record.Id
+                && s.Staging.TryGetValue(receipt.Staging.Value, out StagingRecord? staging)
+                && staging.IsOpen && staging.Handle == h.Id && string.Equals(staging.Principal, principal, StringComparison.Ordinal)
+                && receipt.VerifyMac(_s.Keys.ReceiptKey);
+            if (!owned)
+            {
+                _s.Control.ReportSecurityEvent("volume:read staged", "denied", "volume=" + Name + " handle=" + h.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    principal);
+                throw new UnauthorizedAccessException($"Object {receipt.Object} is not an upload of the open staging session of handle {h.Id}.");
+            }
+
+            if (!objects.Contains(receipt.Object))
+                objects.Add(receipt.Object);
+        }
+
+        return objects;
+    }
+
+    private ReadRangeResultMessage BuildReadReply(string principal, StreamRecord stream, ulong revision, long offset, long length, CommitToken observed,
+        IReadOnlyList<ObjectId> staged)
     {
         long fileLength = stream.Length;
         long start = Math.Min(offset, fileLength);
         long end = Math.Min(fileLength, offset + length);
-        if (end <= start)
-            return new ReadRangeResultMessage(revision, fileLength, offset, 0, stream.IsInline, ReadOnlyMemory<byte>.Empty, [], ReadOnlyMemory<byte>.Empty,
-                _s.Time.GetUtcNow(), observed);
-        if (stream.IsInline)
+        if (end <= start || stream.IsInline)
         {
-            return new ReadRangeResultMessage(revision, fileLength, offset, end - start, true, stream.Inline.Slice((int)start, (int)(end - start)), [],
-                ReadOnlyMemory<byte>.Empty, _s.Time.GetUtcNow(), observed);
+            // Nothing (or inline bytes) to fetch from storage nodes: a capability only for the requested staged uploads.
+            byte[] stagedCapability = [];
+            DateTimeOffset stagedExpiry = _s.Time.GetUtcNow();
+            if (staged.Count > 0)
+            {
+                stagedCapability = _s.Objects.Capabilities.IssueRead(Record, principal, staged.OrderBy(o => o.Value), CapabilityLifetime, out stagedExpiry);
+            }
+
+            return end <= start
+                ? new ReadRangeResultMessage(revision, fileLength, offset, 0, stream.IsInline, ReadOnlyMemory<byte>.Empty, [], stagedCapability, stagedExpiry,
+                    observed)
+                : new ReadRangeResultMessage(revision, fileLength, offset, end - start, true, stream.Inline.Slice((int)start, (int)(end - start)), [],
+                    stagedCapability, stagedExpiry, observed);
         }
 
         List<ExtentRef> extents = ContentAlgebra.Intersecting(stream, start, end, MaxExtentsPerRead + 1);
@@ -335,9 +380,9 @@ internal sealed partial class VolumeService
             e.PlacementEpoch, LocationsOf(e))).ToArray();
         byte[] capability = ReadOnlyMemory<byte>.Empty.ToArray();
         DateTimeOffset expiry = _s.Time.GetUtcNow();
-        if (data.Length > 0)
+        if (data.Length > 0 || staged.Count > 0)
         {
-            capability = _s.Objects.Capabilities.IssueRead(Record, principal, data.Select(d => d.Object).Distinct().OrderBy(o => o.Value),
+            capability = _s.Objects.Capabilities.IssueRead(Record, principal, data.Select(d => d.Object).Concat(staged).Distinct().OrderBy(o => o.Value),
                 CapabilityLifetime, out expiry);
         }
 

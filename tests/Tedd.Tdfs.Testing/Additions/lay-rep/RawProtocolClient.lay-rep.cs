@@ -43,12 +43,19 @@ public sealed partial class RawProtocolClient
     /// <param name="volume">Volume name.</param>
     /// <param name="path">Normalized path.</param>
     /// <param name="mode">Open mode (default <see cref="FileMode.OpenOrCreate"/>).</param>
-    public async Task<RawStagedWriter> OpenStagedWriterAsync(string volume, string path, FileMode mode = FileMode.OpenOrCreate)
+    public Task<RawStagedWriter> OpenStagedWriterAsync(string volume, string path, FileMode mode = FileMode.OpenOrCreate)
+        => OpenStagedHandleAsync(volume, path, mode, FileAccess.Write);
+
+    /// <summary>
+    /// <see cref="OpenStagedWriterAsync"/> with an explicit handle access (<see cref="FileAccess.Write"/> or
+    /// <see cref="FileAccess.ReadWrite"/>).
+    /// </summary>
+    internal async Task<RawStagedWriter> OpenStagedHandleAsync(string volume, string path, FileMode mode, FileAccess access)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(volume);
         ArgumentNullException.ThrowIfNull(path);
         (DfsErrorCode openCode, IWireMessage? openReply) = await SendVolumeRequestAsync(volume, mutating: true, header => Encode(new OpenHandleMessage(header,
-            path, mode, FileAccess.Write, FileShare.Read, FileOptions.None, VersionPinned: false, WriteThrough: false, StoragePolicy: null)));
+            path, mode, access, FileShare.Read, FileOptions.None, VersionPinned: false, WriteThrough: false, StoragePolicy: null)));
         if (openReply is not OpenHandleResultMessage opened)
             throw Failure(openCode, openReply, $"OpenHandle of {path} on {volume}");
         (_, RawSession? session) = await GetSessionAsync(volume);

@@ -96,7 +96,8 @@ varuint count
 count × ( varuint32 fieldId, u8 flags, bytes value )      flags: bit 0 = Required, bits 1-7 must be 0
 ```
 
-* Field ids are unique within one block (duplicates are malformed). Version 1 defined **no** extension fields; fields added since are listed with their message (`RestoreSnapshot` field 1 `StoragePool`).
+* Field ids are unique within one block (duplicates are malformed). Version 1 defined **no** extension fields; fields added since are listed with their message (`RestoreSnapshot` field 1 `StoragePool`, `RegisterIncarnation` field 1 `Release`,
+  `ReadRange` field 1 `StagedObjects`).
 * An **unknown optional** extension is preserved on the decoded record (`Extensions`) and re-emitted when the record is
   re-encoded (for example when a node forwards a request), and is otherwise ignored (FMT-003).
 * An **unknown required** extension makes the whole message fail with `Unsupported` (FMT-002): a receiver never
@@ -446,10 +447,13 @@ zeroes; missing objects never do (STR, DSK-016).
   rejects an inline append because the file grew meanwhile, with a new operation id) as objects.
 * **Extents → inline**: when a publication whose result is stored inline leaves bytes of objects inside the result —
   base bytes of an extent-based file (for example a truncation to below the threshold followed by small writes), or
-  `Data` changes of objects a write-only stream uploaded early and then truncated below the threshold — the leader
+  `Data` changes of objects a stream uploaded early and then truncated below the threshold — the leader
   materializes those bytes from the objects into the inline image before proposing; the client never reads the base
-  (or its own staged objects) to rewrite it. Staging capabilities never authorize `GetObject`, so the SDK uploads
-  staged data early (bounded memory) only for write-only streams; readable writers keep their staged bytes in memory.
+  (or its own staged objects) to rewrite it. Streams upload staged data early to keep client memory bounded by their
+  buffers (FSD §6.3, §15). Staging capabilities never authorize `GetObject`: a readable writer reads its own uploaded,
+  unpublished ranges back with a read capability the leader issues through `ReadRange` with the `StagedObjects` extension
+  (§9.4), after verifying one receipt per object names an upload to the open staging session bound to that handle. A
+  readable transaction-bound stream keeps its staged bytes buffered (its staging session is the transaction's).
 * **Inline → extents**: when a publication turns an inline file into an extent-based one, bytes of the new content not
   covered by the change set are taken from the old inline bytes; the leader materializes them as an object written
   under the request's staging session with receipts meeting the file's policy, before proposing. (The client never
@@ -720,7 +724,7 @@ Requests the route of one volume (any authenticated peer → any live node).
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
 | 1 | `Volume` | `string` | Volume name. |
-| 2 | `RequireLeader` | `bool` | When true the request must be served by the volume leader after a ReadIndex barrier, and the reply carries the volume's last applied commit (used by `DfsVolume.GetInfoAsync`). A non-leader answers `DfsErrorCode.NotLeader` with a leader hint. |
+| 2 | `RequireLeader` | `bool` | When true the request must be served by the volume leader after a ReadIndex barrier, and the reply carries the volume's last applied commit (used by `DfsVolume.GetInfoAsync`). A non-leader answers `DfsErrorCode.NotLeader` with a leader hint. Because the reply discloses the volume's last commit, a client principal needs the volume's `Read` grant (or `ClusterAdmin`) for this variant (`AccessDenied`, audited, SEC-003); plain routing (`false`) stays open to every authenticated peer. |
 | 3 | — | `extensions` | Terminal extension block. |
 
 #### `VolumeRouteResult` = 17 (`VolumeRouteResultMessage`)
@@ -778,7 +782,13 @@ Registers a restarted node's new incarnation with the control group (node → co
 | 5 | `Endpoints` | `list<string>` | Current listen endpoints. |
 | 6 | `CapacityBytes` | `varint` | Configured capacity. |
 | 7 | `BootId` | `u128` | Process boot id (see `HelloMessage.BootId`). |
-| 8 | — | `extensions` | Terminal extension block. |
+| 8 | — | `extensions` | Terminal extension block (field 1, see below). |
+
+Extension fields (added after v1 shipped, §2.5):
+
+| Field id | Flags | Value | Meaning |
+|---|---|---|---|
+| 1 `Release` | Optional | `varint32` protocol maximum, `list<string>` understood cluster features (ordinal order) | The software release the registering process runs. When it differs from the member record, the control leader commits a `SetMemberRelease` control entry before the registration, so feature activation (`SetFeature`, refused with `Unsupported` while any live member does not understand the feature) and the cluster protocol version reflect the restarted node (rolling upgrades, FMT-009, CHA-011). Absent (older senders) or malformed: the record keeps what `JoinCluster`/the bootstrap recorded. |
 
 #### `RegisterIncarnationResult` = 21 (`RegisterIncarnationResultMessage`)
 
@@ -812,7 +822,7 @@ Reply to `OpenSessionMessage`.
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
-| 1 | `Session` | `varuint` | Server-issued session number (never reused within the volume epoch). |
+| 1 | `Session` | `varuint` | Server-issued session number (never reused within the volume epoch). Numbers start at a per-volume base derived from the `VolumeId` (a multiple of 2^24, plus one, in [2^24, 2^48]) so that an operation id issued by one volume does not name a session of another (§5.1, SEC-010); a number the volume never issued is refused with `InvalidArgument`, a retired one with `OperationExpired`/`LeaseLost`. Volumes created before per-volume bases number their sessions from 1. |
 | 2 | `FirstSequence` | `varuint` | First operation sequence the client may allocate (sequences are monotonic per session). |
 | 3 | `LeaseDuration` | `duration` | Handle lease duration; renew with `KeepAlive` every third of it. |
 | 4 | `SessionTimeout` | `duration` | Session expires after this long without a `KeepAlive`. |
@@ -964,7 +974,13 @@ Resolves the committed bytes of a file range (client → volume leader, or backu
 | 5 | `Offset` | `varint` | First byte to read. |
 | 6 | `Length` | `varint` | Number of bytes requested. |
 | 7 | `Stream` | `string?` | Named stream to read when addressing a snapshot by `(SnapshotPin, Inode)` (Addendum A, ADS-020); null = the default stream. Must be null for handle reads (a handle is bound to its stream). |
-| 8 | — | `extensions` | Terminal extension block. |
+| 8 | — | `extensions` | Terminal extension block (field 1, see below). |
+
+Extension fields (added after v1 shipped, §2.5):
+
+| Field id | Flags | Value | Meaning |
+|---|---|---|---|
+| 1 `StagedObjects` | Required | `list<ObjectReceipt>` (1..1024, one per object) | A readable writer reads back objects it uploaded early and has not published (§8.1). Valid only on a handle read: every receipt must carry a valid MAC, name this volume and an open staging session bound to the request's handle and owned by the caller (otherwise `AccessDenied`, audited; on a snapshot read `InvalidArgument`). The reply's `ReadCapability` then also covers those objects (alone when the range itself needs none, for example a zero `Length`). Required so that a receiver that does not implement it refuses the request (`Unsupported`) instead of issuing a capability that does not cover the staged objects. |
 
 #### `ReadRangeResult` = 45 (`ReadRangeResultMessage`)
 

@@ -222,8 +222,10 @@ public sealed record CloseHandleResultMessage(
 /// their fixed view), or <c>(SnapshotPin, Inode)</c> for snapshot views. Live reads by inode without a handle are
 /// rejected (they would bypass sharing). One call uses exactly one revision (STR-014). The reply carries inline bytes
 /// or the extents covering the range plus a read capability for those objects; the client fetches object bytes from
-/// storage nodes and verifies checksums. Errors: InvalidHandle, LeaseLost, PinExpired, InvalidArgument (negative
-/// offset/length, offset + length overflow), Integrity.
+/// storage nodes and verifies checksums. A readable writer that uploaded staged bytes early adds the
+/// <see cref="StagedObjectsExtension"/> so that the reply's capability also covers those (unpublished) objects. Errors:
+/// InvalidHandle, LeaseLost, PinExpired, InvalidArgument (negative offset/length, offset + length overflow), AccessDenied
+/// (a staged object that is not an upload of the handle's open staging session), Integrity.
 /// </summary>
 /// <param name="Header">Request header.</param>
 /// <param name="Handle">Handle to read through (empty when reading a snapshot by inode).</param>
@@ -245,8 +247,64 @@ public sealed record ReadRangeMessage(
     /// </summary>
     public string? Stream { get; init; }
 
-    /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
+    /// <summary>
+    /// Extension field id of the staged objects a readable writer reads back (PROTOCOL.md §8.1): a <b>required</b> extension
+    /// whose value is a list of <see cref="ObjectReceipt"/>s, one per object. The leader verifies that each receipt is
+    /// authentic and names an upload to an open staging session bound to the request's (readable) handle, and extends the
+    /// reply's read capability to those objects. Staging capabilities themselves never authorize <c>GetObject</c>.
+    /// </summary>
+    public const uint StagedObjectsExtension = 1;
+
+    /// <summary>Most staged objects one request may name.</summary>
+    public const int MaxStagedObjects = 1024;
+
+    private static readonly System.Collections.Frozen.FrozenSet<uint> UnderstoodExtensions =
+        System.Collections.Frozen.FrozenSet.ToFrozenSet([StagedObjectsExtension]);
+
+    /// <summary>Extensions preserved from the wire (re-emitted on encode), including <see cref="StagedObjectsExtension"/>.</summary>
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
+
+    /// <summary>The receipts carried by <see cref="StagedObjectsExtension"/> (empty when absent).</summary>
+    /// <exception cref="DfsProtocolException">The extension value is malformed.</exception>
+    public IReadOnlyList<ObjectReceipt> StagedReceipts
+    {
+        get
+        {
+            foreach (WireExtension extension in Extensions)
+            {
+                if (extension.FieldId == StagedObjectsExtension)
+                    return DecodeStagedReceipts(extension.Value.Span);
+            }
+
+            return [];
+        }
+    }
+
+    /// <summary>A copy that also asks for read access to the staged objects of <paramref name="receipts"/> (sets the required <see cref="StagedObjectsExtension"/>).</summary>
+    public ReadRangeMessage WithStagedReceipts(IReadOnlyList<ObjectReceipt> receipts)
+    {
+        ArgumentNullException.ThrowIfNull(receipts);
+        if (receipts.Count == 0 || receipts.Count > MaxStagedObjects)
+            throw new ArgumentOutOfRangeException(nameof(receipts), receipts.Count, $"Between 1 and {MaxStagedObjects} staged objects can be named.");
+        var buffer = new System.Buffers.ArrayBufferWriter<byte>(receipts.Count * 160);
+        var writer = new WireWriter(buffer);
+        writer.WriteList(receipts);
+        return this with
+        {
+            Extensions = [.. Extensions.Where(e => e.FieldId != StagedObjectsExtension),
+                new WireExtension(StagedObjectsExtension, Required: true, buffer.WrittenSpan.ToArray())],
+        };
+    }
+
+    private static IReadOnlyList<ObjectReceipt> DecodeStagedReceipts(ReadOnlySpan<byte> value)
+    {
+        var reader = new WireReader(value, WireLimits.Default);
+        IReadOnlyList<ObjectReceipt> receipts = reader.ReadList<ObjectReceipt>();
+        reader.EnsureEnd();
+        if (receipts.Count == 0 || receipts.Count > MaxStagedObjects)
+            throw WireReader.Malformed($"The staged-objects extension names {receipts.Count} objects (1..{MaxStagedObjects}).");
+        return receipts;
+    }
 
     /// <inheritdoc />
     public MessageType Type => WireType;
@@ -280,7 +338,15 @@ public sealed record ReadRangeMessage(
         long offset = reader.ReadVarInt();
         long length = reader.ReadVarInt();
         string? stream = reader.ReadOptionalString();
-        IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
+        List<WireExtension>? list = null;
+        reader.ReadExtensions(UnderstoodExtensions, e => (list ??= []).Add(e));
+        IReadOnlyList<WireExtension> extensions = list is null ? [] : list.ToArray();
+        foreach (WireExtension extension in extensions)
+        {
+            if (extension.FieldId == StagedObjectsExtension)
+                _ = DecodeStagedReceipts(extension.Value.Span); // malformed → protocol error at decode
+        }
+
         return new ReadRangeMessage(header, handle, snapshotPin, inode, offset, length) { Stream = stream, Extensions = extensions };
     }
 }
