@@ -1891,8 +1891,12 @@ public sealed class ConSimulationTests
 
             if (blockAtStep is null)
             {
-                await cluster.WaitUntilAsync(() => Task.FromResult(drain.IsCompleted), TimeSpan.FromSeconds(60), "the voter replacement must complete", Ct);
+                await cluster.WaitUntilAsync(() => Task.FromResult(drain.IsCompleted), TimeSpan.FromSeconds(60), "the drain request must complete", Ct);
                 await drain;
+
+                // DrainNode only marks the node Draining (PROTOCOL.md AdminOp.DrainNode); the membership manager then
+                // replaces its voter seat asynchronously, one single-server change at a time.
+                await WaitForTransitionDoneAsync(cluster, "the voter replacement must complete");
                 GroupInspection done = await cluster.Inspect.GetVolumeGroupAsync(Vol);
                 Assert.Equal(["n1", "n2", "n3"], done.Voters.Order(StringComparer.Ordinal).ToArray());
                 return arm.Hits;
@@ -1939,8 +1943,9 @@ public sealed class ConSimulationTests
             }
 
             cluster.Network.Heal();
-            await cluster.WaitUntilAsync(() => Task.FromResult(drain.IsCompleted), TimeSpan.FromSeconds(60), "the transition must complete once healed", Ct);
+            await cluster.WaitUntilAsync(() => Task.FromResult(drain.IsCompleted), TimeSpan.FromSeconds(60), "the drain request must complete once healed", Ct);
             await drain;
+            await WaitForTransitionDoneAsync(cluster, "the transition must complete once healed");
             await RecoverAndConvergeAsync(cluster);
             GroupInspection group = await cluster.Inspect.GetVolumeGroupAsync(Vol);
             Assert.Equal(["n1", "n2", "n3"], group.Voters.Order(StringComparer.Ordinal).ToArray());
@@ -1967,6 +1972,14 @@ public sealed class ConSimulationTests
             return arm.Hits;
         }, Ct);
     }
+
+    /// <summary>Waits (bounded) until the volume group's voters are {n1,n2,n3} and n0 is no longer a member.</summary>
+    private static Task WaitForTransitionDoneAsync(TestCluster cluster, string because) =>
+        cluster.WaitUntilAsync(async () =>
+        {
+            GroupInspection g = await cluster.Inspect.GetVolumeGroupAsync(Vol);
+            return g.Voters.Order(StringComparer.Ordinal).SequenceEqual(["n1", "n2", "n3"]) && !g.Learners.Contains("n0");
+        }, TimeSpan.FromSeconds(60), because, Ct);
 
     // ------------------------------------------------------------------------------------------------------------
     // CON-015 NewReplicaCannotVotePrematurely
@@ -2005,6 +2018,11 @@ public sealed class ConSimulationTests
                 if (group is null)
                     continue;
                 Assert.DoesNotContain(joiner.Name, group.Voters);
+
+                // The replacement itself has received neither log nor checkpoint yet (the install is held), so it has no
+                // configuration at all (it can neither vote nor count votes); every replica with a configuration keeps n0.
+                if (group.Voters.Count == 0 && group.Learners.Count == 0 && node == joiner)
+                    continue;
                 Assert.Contains("n0", group.Voters);
             }
 
@@ -2043,8 +2061,15 @@ public sealed class ConSimulationTests
             await n2.RestartAsync();
             holdCatchUp.Release();
             holdCatchUp.Disarm();
-            await cluster.WaitUntilAsync(() => Task.FromResult(drain.IsCompleted), TimeSpan.FromSeconds(90), "the drain completes once the replacement caught up", Ct);
+            await cluster.WaitUntilAsync(() => Task.FromResult(drain.IsCompleted), TimeSpan.FromSeconds(90), "the drain request completes", Ct);
             await drain;
+
+            // DrainNode only marks n0 Draining (PROTOCOL.md AdminOp.DrainNode); the voter seat moves asynchronously.
+            await cluster.WaitUntilAsync(async () =>
+            {
+                GroupInspection g = await cluster.Inspect.GetVolumeGroupAsync(Vol);
+                return g.Voters.Contains(joiner.Name) && !g.Voters.Contains("n0");
+            }, TimeSpan.FromSeconds(90), "the replacement becomes a voter once it caught up", Ct);
 
             // Admitted only after catch-up: now a voter, holding the complete state.
             GroupInspection after = await cluster.Inspect.GetVolumeGroupAsync(Vol);
