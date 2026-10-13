@@ -22,6 +22,9 @@ internal sealed partial class VolumeService
     private const int MaxTargetNameBytes = 255;
     private static readonly TimeSpan MaxAwait = TimeSpan.FromMinutes(10);
 
+    /// <summary>Longest time a sync request waits for its transfer to start before it is answered.</summary>
+    private static readonly TimeSpan RequestSyncStartWait = TimeSpan.FromSeconds(1);
+
     // ------------------------------------------------------------------------------------------------- exporter access
 
     /// <summary>The applied (committed) state of this replica, independent of any request's transaction view.</summary>
@@ -259,7 +262,8 @@ internal sealed partial class VolumeService
         RequireBackupAdmin(principal, "request backup sync");
         await EnsureLeaderReadyAsync(context.Cancellation);
         await RequireTargetAsync(request.Target, context.Cancellation);
-        return await MutateAsync(context, request, DfsOperationKind.BackupTransfer, (op, _) =>
+        PinRecord? pinned = null;
+        IWireMessage reply = await MutateAsync(context, request, DfsOperationKind.BackupTransfer, (op, _) =>
         {
             string? snapshot = request.SnapshotName;
             string? export = null;
@@ -276,10 +280,25 @@ internal sealed partial class VolumeService
             return Task.FromResult<VolumeCommand>(Stamp(new RequestBackupSyncCommand(request.Target, snapshot, export), op));
         }, finish: result =>
         {
+            pinned = result.Value as PinRecord;
             _s.BackupExports?.For(this)?.Wake(request.Target);
             return result.Reply ?? new BackupRequestSyncResultMessage(true, CommitToken.None);
         });
+
+        // Answer once the transfer is under way (bounded) when it is the target's next one: the caller observes its effects in
+        // order with the reply. A request queued behind earlier transfers is answered at once.
+        if (pinned is not null && IsNextTransfer(pinned, request.Target) && _s.BackupExports?.For(this)?.Target(request.Target) is { } runner)
+            await runner.WaitForStartAsync(pinned.Id, RequestSyncStartWait);
+        return reply;
     }
+
+    /// <summary>True when <paramref name="pin"/> is the first transfer pin of <paramref name="target"/> in transfer order.</summary>
+    private bool IsNextTransfer(PinRecord pin, string target)
+        => _sm.State.Pins.Values
+            .Where(p => p.Kind == PinKind.Transfer && string.Equals(p.Target, target, StringComparison.Ordinal))
+            .OrderBy(p => p.PinIndex)
+            .ThenBy(p => p.Id)
+            .FirstOrDefault()?.Id == pin.Id;
 
     // ------------------------------------------------------------------------------------------------- BackupAwait
 

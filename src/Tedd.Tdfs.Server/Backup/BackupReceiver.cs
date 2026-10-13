@@ -160,7 +160,19 @@ internal sealed class BackupReceiver
 
         // F18: the object's bytes arrived; nothing is durable yet.
         await _s.HitAsync(FaultStage.F18, FaultSites.BackupObjectReceived, volume.Name, DfsOperationKind.BackupTransfer, m.Object, ct: ct);
-        bool alreadyPresent = store.TryGetInfo(m.Object) is { } existing && existing.Length == m.Length && existing.Checksum == m.Checksum;
+        ObjectRecordInfo? existing = store.TryGetInfo(m.Object);
+        bool alreadyPresent = existing is not null && existing.Length == m.Length && existing.Checksum == m.Checksum;
+        if (existing is not null && !alreadyPresent)
+        {
+            // Another payload is stored under this id (an earlier delivery was mislabelled). It is replaced only when the staged,
+            // authenticated manifest vouches for the arriving bytes and no retained snapshot describes the stored ones.
+            if (staged?.Manifest is null || DescribedByRetained(m.Object, existing))
+                throw new DfsIntegrityException(m.Object, $"Object {m.Object} is already stored with different content.");
+            await store.DeleteAsync(m.Object, ct);
+            Catalog.ForgetStored(m.Object);
+            _s.Warn("backup", BackupServices.Inv($"Volume '{volume.Name}': replaced a stored copy of object {m.Object} that did not match the snapshot's manifest."));
+        }
+
         try
         {
             await store.PutAsync(m.Object, StoreVolume, default, m.Data, DfsOperationKind.BackupTransfer, ct);
@@ -183,19 +195,19 @@ internal sealed class BackupReceiver
         _s.Principals.RequireExport(principal);
         CheckKey(m.Key);
         _s.Keys.RequireUnlocked("receiving a manifest");
-        (BackupVolume volume, StagedTransfer? staged) = RequireCurrent(m.Key);
+        if (m.Offset < 0 || m.TotalLength <= 0 || m.TotalLength > MaxManifestBytes || m.Offset > m.TotalLength || m.Data.Length > m.TotalLength - m.Offset)
+            throw new ArgumentException("The manifest chunk is out of range.");
+        (BackupVolume volume, _) = RequireCurrent(m.Key);
+
+        // Serialized with BackupBegin of the same volume: a manifest sent together with its begin is staged right after it.
+        using IDisposable held = await Catalog.Locks.AcquireAsync(volume.Name, ct);
+        (volume, StagedTransfer? staged) = RequireCurrent(m.Key);
         if (staged is null)
         {
             if (volume.FindById(m.Key.Snapshot) is { Condemned: false })
                 return new BackupPutManifestResultMessage(m.TotalLength, true);
             throw new ArgumentException("No transfer is staged for this transfer key; send BackupBegin first.");
         }
-
-        if (m.Offset < 0 || m.TotalLength <= 0 || m.TotalLength > MaxManifestBytes || m.Offset > m.TotalLength || m.Data.Length > m.TotalLength - m.Offset)
-            throw new ArgumentException("The manifest chunk is out of range.");
-        using IDisposable held = await Catalog.Locks.AcquireAsync(volume.Name, ct);
-        if (!ReferenceEquals(volume.Staged, staged))
-            throw new DfsUnavailableException(DfsErrorCode.Unavailable, "The staged transfer changed; retry.");
         if (staged.Manifest is not null && staged.ManifestIdentity == (m.ManifestChecksum, m.TotalLength))
             return new BackupPutManifestResultMessage(m.TotalLength, true);
 
@@ -320,6 +332,24 @@ internal sealed class BackupReceiver
         }
 
         return missing;
+    }
+
+    /// <summary>True when a retained snapshot's manifest describes exactly the stored copy of <paramref name="id"/>.</summary>
+    private bool DescribedByRetained(ObjectId id, ObjectRecordInfo stored)
+    {
+        foreach (BackupVolume volume in Catalog.Volumes)
+        {
+            foreach (BackupSnapshot snapshot in volume.Snapshots)
+            {
+                if (snapshot.Manifest is not { } manifest)
+                    return true;
+                int index = IndexOf(manifest.Closure, id);
+                if (index >= 0 && manifest.Closure[index].Length == stored.Length && manifest.Closure[index].Checksum == stored.Checksum)
+                    return true;
+            }
+        }
+
+        return false;
     }
 
     private static BackupPublishResultMessage Published(BackupSnapshot snapshot)

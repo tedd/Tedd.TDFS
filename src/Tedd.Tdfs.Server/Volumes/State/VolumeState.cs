@@ -120,6 +120,77 @@ internal sealed record VolumeState
     /// <summary>The inode with <paramref name="id"/>, or null.</summary>
     public InodeRecord? Find(ulong id) => Inodes.GetValueOrDefault(id);
 
+    /// <summary>
+    /// First session id of this volume authority: <see cref="SessionBase"/> of its identity (states that numbered their sessions
+    /// from 1 keep doing so).
+    /// </summary>
+    public ulong FirstSessionId
+    {
+        get
+        {
+            ulong first = SessionBase(Config.Id, Config.Epoch);
+            return NextSessionId >= first ? first : 1;
+        }
+    }
+
+    /// <summary>
+    /// First handle id of this volume authority: <see cref="HandleBase"/> of its identity (states that numbered their handles
+    /// from 1 keep doing so).
+    /// </summary>
+    public ulong FirstHandleId
+    {
+        get
+        {
+            ulong first = HandleBase(Config.Id, Config.Epoch);
+            return NextHandleId >= first ? first : 1;
+        }
+    }
+
+    /// <summary>True when this volume issued handle <paramref name="handle"/> (it may have been closed or expired since).</summary>
+    public bool IssuedHandle(ulong handle) => handle >= FirstHandleId && handle < NextHandleId;
+
+    /// <summary>
+    /// True when the operation ids of <paramref name="session"/> (no longer a live session here) are expired: a session this
+    /// volume issued and retired since, or, in a volume restored from another authority's history, a session numbered below
+    /// this authority's first session (issued by an earlier authority, whose outcomes are not retained here). Any other
+    /// session number was never issued to anyone this volume continues from.
+    /// </summary>
+    public bool ExpiredSession(ulong session) => session < NextSessionId && (session >= FirstSessionId || Restore is not null);
+
+    /// <summary>
+    /// The first session id of a volume authority (volume id and epoch): sessions, and therefore operation and transaction ids,
+    /// are numbered from a base derived from the authority, so the ids of another authority (an earlier volume of the same
+    /// name, the source of a restore, the volume of another cluster) name sessions this volume never issued instead of
+    /// coinciding with its own (RST-008, RST-011). The base lies in [2^40, 2^40 + 2^48) in steps of 2^16.
+    /// </summary>
+    public static ulong SessionBase(VolumeId volume, ulong epoch) => IdentityBase(volume, epoch, 0);
+
+    /// <summary>
+    /// The first handle id of a volume authority: handle ids are bound to their volume the same way (a handle number of another
+    /// volume names a handle this volume never issued, PATH-014). The base lies in [2^40, 2^40 + 2^48) in steps of 2^16, far
+    /// below the transaction-private handle range.
+    /// </summary>
+    public static ulong HandleBase(VolumeId volume, ulong epoch) => IdentityBase(volume, epoch, 0x68616E646C65UL);
+
+    private static ulong IdentityBase(VolumeId volume, ulong epoch, ulong purpose)
+    {
+        Span<byte> bytes = stackalloc byte[16];
+        if (!volume.Value.TryWriteBytes(bytes))
+            throw new InvalidOperationException("A volume id has 16 bytes.");
+        ulong h = Mix(System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(bytes)
+            ^ Mix(System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(bytes[8..]) ^ Mix(epoch ^ Mix(purpose))));
+        return (1UL << 40) + ((h >> 32) << 16);
+    }
+
+    private static ulong Mix(ulong z)
+    {
+        // SplitMix64 finalizer (deterministic on every replica and platform).
+        z += 0x9E3779B97F4A7C15UL;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
+        return z ^ (z >> 31);
+    }
+
     /// <summary>The writer generation of a stream (0 = never had a writer).</summary>
     public ulong WriterGenerationOf(StreamKey key) => WriterGenerations.GetValueOrDefault(key);
 
@@ -139,11 +210,15 @@ internal sealed record VolumeState
             : DfsSecurityDescriptor.DefaultRoot(owner);
         var root = new InodeRecord(InodeRecord.RootId, InodeKind.Directory, 0, 0, creation.CreatedUtc, creation.CreatedUtc, rootSecurity, string.Empty,
             0, string.Empty, InodeRecord.NoStreams, InodeRecord.NoChildren);
+        ulong firstSession = SessionBase(config.Id, config.Epoch);
         return new VolumeState
         {
             Config = config,
             LeaderTime = creation.CreatedUtc,
             Inodes = ImmutableSortedDictionary<ulong, InodeRecord>.Empty.Add(root.Id, root),
+            NextSessionId = firstSession,
+            RetiredSessionsBelow = firstSession,
+            NextHandleId = HandleBase(config.Id, config.Epoch),
         };
     }
 }

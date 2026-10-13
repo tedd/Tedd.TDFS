@@ -20,7 +20,7 @@ internal sealed class BackupDispatcher : IRpcHandler
     private readonly BackupServices _s;
     private readonly Dictionary<IRpcConnection, ConnectionInfo> _connections = new(ReferenceEqualityComparer.Instance);
     private int _inFlight;
-    private TaskCompletionSource? _drained;
+    private CancellationTokenSource? _drained;
 
     public BackupDispatcher(BackupServices services)
     {
@@ -36,12 +36,19 @@ internal sealed class BackupDispatcher : IRpcHandler
     }
 
     /// <summary>Completes once no request is being handled (graceful stop).</summary>
-    public Task WaitForDrainAsync()
+    public async Task WaitForDrainAsync(TimeSpan timeout, TimeProvider time)
     {
         if (_inFlight == 0)
-            return Task.CompletedTask;
-        _drained ??= new TaskCompletionSource();
-        return _drained.Task;
+            return;
+        _drained ??= new CancellationTokenSource();
+        try
+        {
+            await Task.Delay(timeout, time, _drained.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // Drained.
+        }
     }
 
     /// <summary>Closes every inbound connection (stop).</summary>
@@ -74,7 +81,8 @@ internal sealed class BackupDispatcher : IRpcHandler
             if (--_inFlight == 0 && _drained is { } drained)
             {
                 _drained = null;
-                drained.TrySetResult();
+                drained.Cancel();
+                drained.Dispose();
             }
         }
     }

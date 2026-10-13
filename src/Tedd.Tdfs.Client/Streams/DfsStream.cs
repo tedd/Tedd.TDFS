@@ -33,6 +33,9 @@ public sealed class DfsStream : Stream, ILeaseHolder
     private readonly StagedOverlay? _overlay;
     private readonly string _policyName;
     private readonly ulong _snapshotPin;
+
+    /// <summary>The named stream a snapshot read addresses (null for the default stream; snapshot reads go by inode).</summary>
+    private readonly string? _snapshotStream;
     private readonly VolumeBinding _binding;
     private StagingLease? _staging;
     private long _position;
@@ -72,7 +75,11 @@ public sealed class DfsStream : Stream, ILeaseHolder
         _lastToken = openToken;
         _snapshotPin = snapshotPin;
         if (snapshotPin != 0)
+        {
             _released = 1;
+            if (DfsPath.TryNormalize(path, out string normalized, out _))
+                _snapshotStream = DfsStreamPath.GetStreamName(normalized);
+        }
         if (_canWrite)
             _overlay = new StagedOverlay(info.Length);
         if (isAppend)
@@ -361,7 +368,10 @@ public sealed class DfsStream : Stream, ILeaseHolder
         {
             int requested = destination.Length;
             ReadRangeResultMessage range = await _volume.ReadAsync<ReadRangeResultMessage>(scope, "ReadRange",
-                header => new ReadRangeMessage(header, _handle, _snapshotPin, _snapshotPin != 0 ? InodeId : default, position, requested), Path,
+                header => new ReadRangeMessage(header, _handle, _snapshotPin, _snapshotPin != 0 ? InodeId : default, position, requested)
+                {
+                    Stream = _snapshotPin != 0 ? _snapshotStream : null,
+                }, Path,
                 _transaction?.Id,
                 requireSession: true, binding: _binding).ConfigureAwait(false);
             if (_overlay is null)

@@ -6,7 +6,7 @@ namespace Tedd.Tdfs.Server.Runtime;
 
 /// <summary>
 /// Backup plug-in of the node runtime (INTERNALS.md §1.3): the volume leader's backup requests (status, sync, barriers), the
-/// control leader's registration step, restore from a backup host, and the periodic exporter reconciliation.
+/// control leader's registration step, restore from a backup host, and the exporter reconciliation (started on demand).
 /// </summary>
 internal sealed partial class NodeRuntime
 {
@@ -31,7 +31,8 @@ internal sealed partial class NodeRuntime
 
     partial void StartBackupJobs(NodeServices services)
     {
-        BackupExporters exporters = services.BackupExports ?? throw new InvalidOperationException("The backup exporters were not registered.");
-        services.Jobs.StartPeriodic("backup-exporters", services.Timings.Tick * 20, exporters.ReconcileAsync);
+        // The exporter reconciliation starts on demand (BackupExporters.OnVolumeChanged): only nodes hosting volumes with
+        // backup work run it.
+        _ = services.BackupExports ?? throw new InvalidOperationException("The backup exporters were not registered.");
     }
 }

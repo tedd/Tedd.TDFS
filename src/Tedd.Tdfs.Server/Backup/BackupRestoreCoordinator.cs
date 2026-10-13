@@ -76,7 +76,7 @@ internal sealed class BackupRestoreCoordinator
         }
         else
         {
-            run = new Run(identity, RunAsync(principal, body));
+            run = new Run(identity, RunAsync(principal, body, request.RequestId));
             _runs[body.NewVolumeName] = run;
             _ = ForgetWhenDoneAsync(body.NewVolumeName, run);
         }
@@ -116,14 +116,14 @@ internal sealed class BackupRestoreCoordinator
 
     // ------------------------------------------------------------------------------------------------- the restore
 
-    private async Task<AdminVolumeInfoBody> RunAsync(string principal, AdminRestoreFromBackupBody body)
+    private async Task<AdminVolumeInfoBody> RunAsync(string principal, AdminRestoreFromBackupBody body, UInt128 requestId)
     {
         using CancellationTokenSource lifetime = new();
         CancellationToken ct = lifetime.Token;
         ExportSession session = await OpenAsync(body, ct);
         try
         {
-            return await RestoreAsync(principal, body, session, ct);
+            return await RestoreAsync(principal, body, session, requestId, ct);
         }
         finally
         {
@@ -131,7 +131,8 @@ internal sealed class BackupRestoreCoordinator
         }
     }
 
-    private async Task<AdminVolumeInfoBody> RestoreAsync(string principal, AdminRestoreFromBackupBody body, ExportSession session, CancellationToken ct)
+    private async Task<AdminVolumeInfoBody> RestoreAsync(string principal, AdminRestoreFromBackupBody body, ExportSession session, UInt128 requestId,
+        CancellationToken ct)
     {
         ControlHost control = _s.Control;
         if (!control.IsLeader)
@@ -143,7 +144,12 @@ internal sealed class BackupRestoreCoordinator
         VolumeRecord target;
         if (existing is not null)
         {
-            if (!CreatedBy(state, source, body.NewVolumeName, existing.Id))
+            // A restoring volume of the same source is resumed (whoever asks again); a completed one only answers a retry of
+            // the request that completed it.
+            bool resumable = existing.State == WireVolumeState.Active
+                ? Activated(state, requestId, existing.Id)
+                : CreatedBy(state, source, body.NewVolumeName, existing.Id);
+            if (!resumable)
                 throw new DfsAlreadyExistsException($"Volume '{body.NewVolumeName}' already exists.");
             target = existing;
             _s.Info("restore", NodeServices.Inv($"Resuming the restore of volume '{target.Name}' ({target.Id}) from snapshot '{body.SnapshotName}' of a backup host."));
@@ -167,7 +173,7 @@ internal sealed class BackupRestoreCoordinator
                 installed = done.Token;
             }
 
-            VolumeRecord active = await ActivateAsync(principal, target, ct);
+            VolumeRecord active = await ActivateAsync(principal, target, requestId, ct);
             _s.Info("restore", NodeServices.Inv($"Restored snapshot '{body.SnapshotName}' of volume '{body.SourceVolume}' from a backup host into volume '{active.Name}' ({active.Id})."));
             return new AdminVolumeInfoBody(control.ToVolumeEntry(active), installed);
         }
@@ -214,7 +220,7 @@ internal sealed class BackupRestoreCoordinator
         return record;
     }
 
-    private async Task<VolumeRecord> ActivateAsync(string principal, VolumeRecord target, CancellationToken ct)
+    private async Task<VolumeRecord> ActivateAsync(string principal, VolumeRecord target, UInt128 requestId, CancellationToken ct)
     {
         ControlHost control = _s.Control;
         if (control.State.FindVolume(target.Id) is { State: WireVolumeState.Active } already)
@@ -223,7 +229,7 @@ internal sealed class BackupRestoreCoordinator
         if (!control.IsLeader)
             throw control.NotLeader();
         ApplyOutcome outcome = await control.ProposeAsync(
-            new FinishRestoringVolumeCommand(control.NewHeader(HashId("tdfs.backup-restore.activate", target.Id.Value.ToString("N")), principal), target.Id, true),
+            new FinishRestoringVolumeCommand(control.NewHeader(ActivateId(requestId, target.Id), principal), target.Id, true),
             ct);
         if (!outcome.IsSuccess)
             throw outcome.ToException();
@@ -274,21 +280,19 @@ internal sealed class BackupRestoreCoordinator
 
         var io = new ObjectIo(_s);
         var holders = new Dictionary<ObjectId, ImmutableArray<NodeId>>();
-        var running = new List<Task>();
-        foreach (BackupObjectRef obj in manifest.Closure)
-        {
-            while (running.Count >= CopyConcurrency)
-            {
-                Task done = await Task.WhenAny(running);
-                running.Remove(done);
-                await done;
-            }
 
-            (DfsStoragePolicy policy, string pool) = plan[obj.Id];
-            running.Add(CopyOneAsync(session, io, target, staging, obj, policy, pool, holders, ct));
-        }
+        // At most CopyConcurrency workers drain the closure; the first failure stops the others.
+        var queue = new Queue<BackupObjectRef>(manifest.Closure);
+        using var failed = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Exception? failure = null;
+        var workers = new Task[Math.Min(CopyConcurrency, queue.Count)];
+        for (int i = 0; i < workers.Length; i++)
+            workers[i] = WorkAsync();
+        foreach (Task worker in workers)
+            await worker;
+        if (failure is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
 
-        await Task.WhenAll(running);
         var result = new List<InodeRecord>(manifest.Inodes.Count);
         foreach (InodeRecord inode in manifest.Inodes)
         {
@@ -323,6 +327,24 @@ internal sealed class BackupRestoreCoordinator
         }
 
         return result;
+
+        async Task WorkAsync()
+        {
+            while (!failed.IsCancellationRequested && queue.TryDequeue(out BackupObjectRef obj))
+            {
+                try
+                {
+                    (DfsStoragePolicy policy, string pool) = plan[obj.Id];
+                    await CopyOneAsync(session, io, target, staging, obj, policy, pool, holders, failed.Token);
+                }
+                catch (Exception ex) when (ex is not OutOfMemoryException)
+                {
+                    failure ??= ex;
+                    failed.Cancel();
+                    return;
+                }
+            }
+        }
     }
 
     private async Task CopyOneAsync(ExportSession session, ObjectIo io, VolumeRecord target, StagingId staging, BackupObjectRef obj, DfsStoragePolicy policy,
@@ -454,6 +476,14 @@ internal sealed class BackupRestoreCoordinator
 
         return false;
     }
+
+    /// <summary>True when the request <paramref name="requestId"/> activated <paramref name="volume"/> (a retry of a completed restore).</summary>
+    private static bool Activated(ControlState state, UInt128 requestId, VolumeId volume)
+        => state.AdminOutcomes.TryGetValue(ActivateId(requestId, volume), out AdminOutcome? outcome) && outcome.Code == DfsErrorCode.None;
+
+    /// <summary>Request id of the activation, bound to the admin request that completes the restore and to the volume.</summary>
+    private static UInt128 ActivateId(UInt128 requestId, VolumeId volume)
+        => HashId("tdfs.backup-restore.activate", requestId.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\0" + volume.Value.ToString("N"));
 
     /// <summary>The create request id of a new attempt (earlier generations created volumes that are gone).</summary>
     private static UInt128 NextCreateId(ControlState state, string source, string name)

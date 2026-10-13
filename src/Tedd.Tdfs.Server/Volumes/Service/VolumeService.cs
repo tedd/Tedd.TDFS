@@ -70,12 +70,11 @@ internal sealed partial class VolumeService
             ResetLeaderState();
         else if (!_host.IsLeader)
             ClearLeaderState();
+        _s.BackupExports?.OnVolumeChanged(this);
     }
 
     /// <summary>Called when the control record changed (VolumeHost hook).</summary>
-    public void OnRecordChanged()
-    {
-    }
+    public void OnRecordChanged() => _s.BackupExports?.OnVolumeChanged(this);
 
     /// <summary>Stops the service (group closing).</summary>
     public void Dispose()

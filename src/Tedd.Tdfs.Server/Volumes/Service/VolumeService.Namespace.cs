@@ -95,7 +95,7 @@ internal sealed partial class VolumeService
             VolumeState s = State;
             if (!s.Handles.TryGetValue(request.Handle.Value, out HandleRecord? h))
             {
-                if (request.Handle.Value >= s.NextHandleId)
+                if (!s.IssuedHandle(request.Handle.Value))
                     throw new DfsException(DfsErrorCode.InvalidHandle, $"Handle {request.Handle.Value} was never issued by this volume.");
                 throw new DfsLeaseLostException($"Handle {request.Handle.Value} is no longer active.");
             }

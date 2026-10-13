@@ -352,7 +352,7 @@ internal sealed partial class VolumeService
     {
         if (!s.Handles.TryGetValue(id, out HandleRecord? h))
         {
-            if (id == 0 || id >= s.NextHandleId)
+            if (!s.IssuedHandle(id))
                 throw new DfsException(DfsErrorCode.InvalidHandle, $"Handle {id} was never issued by this volume.");
             throw new DfsLeaseLostException($"Handle {id} is no longer active (closed or its lease expired).");
         }

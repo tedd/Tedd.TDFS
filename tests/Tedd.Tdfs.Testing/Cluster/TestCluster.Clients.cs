@@ -116,12 +116,16 @@ public sealed partial class TestCluster
             scheduler.KillProcess(process, "client killed by the test");
     }
 
-    /// <summary>Connects a raw protocol client (bypasses SDK validation) to a node; network identity <c>client:raw{n}</c>.</summary>
+    /// <summary>
+    /// Connects a raw protocol client (bypasses SDK validation) to a live node or a backup node; network identity
+    /// <c>client:raw{n}</c>.
+    /// </summary>
     public Task<RawProtocolClient> ConnectRawAsync(string nodeName, CancellationToken ct = default)
     {
-        TestNode node = Node(nodeName);
+        ArgumentNullException.ThrowIfNull(nodeName);
+        (string name, string endpoint) = FindBackup(nodeName) is { } backup ? (backup.Name, backup.Endpoint) : (Node(nodeName).Name, Node(nodeName).Endpoint);
         int n = Interlocked.Increment(ref _rawCount);
-        return RawProtocolClient.ConnectAsync(this, "client:raw" + n.ToString(CultureInfo.InvariantCulture), node.Name, node.Endpoint, ClusterId, ct);
+        return RawProtocolClient.ConnectAsync(this, "client:raw" + n.ToString(CultureInfo.InvariantCulture), name, endpoint, ClusterId, ct);
     }
 
 

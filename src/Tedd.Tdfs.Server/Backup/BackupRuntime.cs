@@ -163,7 +163,7 @@ internal sealed class BackupRuntime
             return;
         s.IsStopping = true;
         _jobs.Cancel();
-        await Task.WhenAny(Dispatcher.WaitForDrainAsync(), Task.Delay(drainTimeout, s.Time));
+        await Dispatcher.WaitForDrainAsync(drainTimeout, s.Time);
         if (s.Store is not null)
             await s.Store.DisposeAsync();
         await Dispatcher.CloseAllAsync();

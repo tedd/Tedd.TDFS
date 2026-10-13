@@ -37,8 +37,13 @@ internal sealed class TargetExporter
     private readonly NodeServices _s;
     private readonly CancellationTokenSource _cts;
     private readonly Dictionary<ulong, long> _pinSeen = [];
-    private TaskCompletionSource _wake = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private TaskCompletionSource _changed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly Dictionary<ulong, CancellationTokenSource> _startWaiters = [];
+    private readonly HashSet<ulong> _startedPins = [];
+
+    // Waits are delays cancelled by a signal, so their continuations always resume on the node loop.
+    private CancellationTokenSource? _wakeWait;
+    private bool _woken;
+    private CancellationTokenSource _changed = new();
     private ExportConnection? _connection;
     private Task<ExportConnection>? _connecting;
     private TimeSpan _backoff;
@@ -79,8 +84,11 @@ internal sealed class TargetExporter
     /// <summary>True while the last attempt could not reach the target.</summary>
     public bool Offline { get; private set; }
 
-    /// <summary>Source bytes retained only for this target's transfer pins.</summary>
+    /// <summary>Source bytes held by this target's transfer pins (the unpublished history kept for it, see <c>UpdatePinnedBytes</c>).</summary>
     public long PinnedSourceBytes { get; private set; }
+
+    /// <summary>The latest publication of this volume authority the target itself reported in its last answered query.</summary>
+    public DfsBackupCheckpoint? ObservedPublished { get; private set; }
 
     private VolumeService Service => _volume.Service;
 
@@ -118,17 +126,31 @@ internal sealed class TargetExporter
             // Already stopped.
         }
 
-        _wake.TrySetResult();
+        SignalWake();
         SignalChanged();
+        SignalAllStarted();
         DropConnection(_connection);
     }
 
-    /// <summary>Wakes the runner (a sync was requested or the configuration changed).</summary>
+    /// <summary>
+    /// Wakes the runner (a sync was requested or the configuration changed). With <paramref name="resetBackoff"/> the target is
+    /// tried again at once, as if reachable: unreachability budgets apply only after that attempt failed too.
+    /// </summary>
     public void Wake(bool resetBackoff)
     {
         if (resetBackoff)
+        {
             _backoff = TimeSpan.Zero;
-        _wake.TrySetResult();
+            Offline = false;
+        }
+
+        SignalWake();
+    }
+
+    private void SignalWake()
+    {
+        _woken = true;
+        _wakeWait?.Cancel();
     }
 
     /// <summary>Suspends automatic transfers (manual export driver) once the in-flight step finished.</summary>
@@ -186,18 +208,29 @@ internal sealed class TargetExporter
         DropConnection(_connection);
     }
 
+    /// <summary>Waits <paramref name="wait"/> or until woken (a wake that arrived during the step ends the wait at once).</summary>
     private async Task WaitAsync(TimeSpan wait, CancellationToken ct)
     {
-        Task wake = _wake.Task;
-        if (!wake.IsCompleted)
+        if (!_woken && !ct.IsCancellationRequested)
         {
             using var delay = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            await Task.WhenAny(wake, Task.Delay(wait, _s.Time, delay.Token));
-            delay.Cancel();
+            _wakeWait = delay;
+            try
+            {
+                await Task.Delay(wait, _s.Time, delay.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                // Woken or stopped.
+            }
+            finally
+            {
+                if (ReferenceEquals(_wakeWait, delay))
+                    _wakeWait = null;
+            }
         }
 
-        if (_wake.Task.IsCompleted)
-            _wake = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _woken = false;
     }
 
     // ------------------------------------------------------------------------------------------------- one step
@@ -230,15 +263,25 @@ internal sealed class TargetExporter
         BackupProgressRecord? progress = state.BackupProgress.GetValueOrDefault(Name);
         List<PinRecord> pins = PinsOf(state);
         TrackPins(pins);
-        UpdatePinnedBytes(state, pins);
+        UpdatePinnedBytes(state, progress, pins);
+
+        // An abandoned lineage accumulates no source history while its target stays unreachable: automatic schedules
+        // resume once the target answers again (an explicit sync request still pins its snapshot).
+        bool dormant = progress?.ReseedRequired == true && Offline;
         if (pins.Count == 0)
         {
+            SignalAllStarted();
+            if (dormant && !await ReachableAsync(record, ct))
+                return false;
             if (await ScheduleAsync(record, state, progress))
                 return true;
             if (State is not (WireBackupState.Offline or WireBackupState.Failed) || LastError is null)
                 SetState(progress?.ReseedRequired == true ? WireBackupState.ReseedRequired : WireBackupState.Idle);
             return false;
         }
+
+        if (!dormant && await PinNewerSnapshotAsync(record, state, pins))
+            return true;
 
         if (Offline && BudgetExceeded(record, pins) is { } reason)
         {
@@ -267,6 +310,8 @@ internal sealed class TargetExporter
             if (!pins.Any(p => p.Id == id))
                 _pinSeen.Remove(id);
         }
+
+        _startedPins.RemoveWhere(id => !pins.Any(p => p.Id == id));
     }
 
     /// <summary>The exceeded budget while the target is unreachable, or null.</summary>
@@ -284,8 +329,12 @@ internal sealed class TargetExporter
         return null;
     }
 
-    /// <summary>Recomputes (at most once a second) the source bytes retained only by this target's pins.</summary>
-    private void UpdatePinnedBytes(VolumeState state, List<PinRecord> pins)
+    /// <summary>
+    /// Recomputes (at most once a second) the source bytes held by this target's transfer pins: the objects of its pinned
+    /// snapshots that its last published snapshot does not reference (while the source still retains that snapshot;
+    /// otherwise every pinned object counts) — the unpublished history the source keeps for the target.
+    /// </summary>
+    private void UpdatePinnedBytes(VolumeState state, BackupProgressRecord? progress, List<PinRecord> pins)
     {
         if (pins.Count == 0)
         {
@@ -299,15 +348,14 @@ internal sealed class TargetExporter
             return;
         _pinnedComputed = true;
         _pinnedAt = now;
-        var live = new HashSet<ObjectId>();
-        AddObjects(state.Inodes, live);
-        foreach (SnapshotRecord snapshot in state.Snapshots.Values)
+        var published = new HashSet<ObjectId>();
+        if (progress is { ReseedRequired: false, LastSnapshot: { } last } && state.Snapshots.TryGetValue(last, out SnapshotRecord? latest)
+            && latest.Id == progress.LastSnapshotId)
         {
-            if (!ReferenceEquals(snapshot.Root, state.Inodes))
-                AddObjects(snapshot.Root, live);
+            AddObjects(latest.Root, published);
         }
 
-        var pinnedOnly = new Dictionary<ObjectId, long>();
+        var held = new Dictionary<ObjectId, long>();
         foreach (PinRecord pin in pins)
         {
             foreach (InodeRecord inode in pin.Root!.Values)
@@ -318,14 +366,46 @@ internal sealed class TargetExporter
                         continue;
                     foreach (ExtentRef e in stream.Extents)
                     {
-                        if (!live.Contains(e.Object))
-                            pinnedOnly[e.Object] = e.ObjectLength;
+                        if (!published.Contains(e.Object))
+                            held[e.Object] = e.ObjectLength;
                     }
                 }
             }
         }
 
-        PinnedSourceBytes = pinnedOnly.Values.Sum();
+        PinnedSourceBytes = held.Values.Sum();
+    }
+
+    /// <summary>True when the target answers (a connection is established); false while it stays unreachable.</summary>
+    private async Task<bool> ReachableAsync(BackupTargetRecord record, CancellationToken ct)
+    {
+        try
+        {
+            await GetConnectionAsync(record, SmallTimeout, ct);
+        }
+        catch (Exception ex) when (IsConnectivity(ex) && !ct.IsCancellationRequested)
+        {
+            return false;
+        }
+
+        Offline = false;
+        return true;
+    }
+
+    /// <summary>
+    /// <see cref="BackupTargetRecord.OnEverySnapshot"/>: a snapshot newer than every pinned one is pinned as soon as it exists,
+    /// also while an earlier transfer is pending (its owner may delete it before its turn comes).
+    /// </summary>
+    private async Task<bool> PinNewerSnapshotAsync(BackupTargetRecord record, VolumeState state, List<PinRecord> pins)
+    {
+        if (!record.OnEverySnapshot)
+            return false;
+        ulong pinned = pins.Max(p => p.PinIndex);
+        SnapshotRecord? next = state.Snapshots.Values.Where(s => s.BoundaryIndex > pinned).MinBy(s => s.BoundaryIndex);
+        if (next is null)
+            return false;
+        VolumeApplyResult? result = await Service.ProposeBackupHousekeepingAsync(new RequestBackupSyncCommand(Name, next.Name, null));
+        return result is { IsSuccess: true };
     }
 
     private static void AddObjects(ImmutableSortedDictionary<ulong, InodeRecord> root, HashSet<ObjectId> into)
@@ -349,8 +429,10 @@ internal sealed class TargetExporter
     {
         if (record.OnEverySnapshot)
         {
+            // Every snapshot after the covered boundary, in order; a reseed starts from the latest one.
             ulong covered = progress?.CoveredIndex ?? 0;
-            SnapshotRecord? next = state.Snapshots.Values.Where(s => s.BoundaryIndex > covered).MinBy(s => s.BoundaryIndex);
+            IEnumerable<SnapshotRecord> newer = state.Snapshots.Values.Where(s => s.BoundaryIndex > covered);
+            SnapshotRecord? next = progress?.ReseedRequired == true ? newer.MaxBy(s => s.BoundaryIndex) : newer.MinBy(s => s.BoundaryIndex);
             if (next is not null)
             {
                 VolumeApplyResult? result = await Service.ProposeBackupHousekeepingAsync(new RequestBackupSyncCommand(Name, next.Name, null));
@@ -395,7 +477,16 @@ internal sealed class TargetExporter
         (Guid lineage, bool full, SnapshotId? baseSnapshot) = await LineageAsync(progress);
         var key = new BackupTransferKey(state.Config.ClusterId, state.Config.Id, state.Config.Epoch, lineage, snapshot.Id);
         ExportConnection connection = await GetConnectionAsync(record, SmallTimeout, ct);
-        BackupBeginResultMessage begin = await CallAsync<BackupBeginResultMessage>(connection, BeginMessage(key, snapshot, baseSnapshot, full), SmallTimeout, ct);
+        SealedManifest manifest = Seal(key, snapshot, connection.Secret);
+
+        // The manifest travels together with BackupBegin (one round trip less; the target stages it right after the begin). Its
+        // outcome is only a hint: the manifest is sent again below unless the target confirmed it complete.
+        Task<BackupBeginResultMessage> beginning = CallAsync<BackupBeginResultMessage>(connection, BeginMessage(key, snapshot, baseSnapshot, full), SmallTimeout, ct);
+        Task<bool> pipelined = TrySendManifestAsync(connection, key, manifest, ct);
+        SignalStarted(pin.Id);
+        // The pipelined manifest never throws; objects do not wait for it (it is awaited before publishing).
+        BackupBeginResultMessage begin = await beginning;
+
         Offline = false;
         if (!begin.Accepted)
         {
@@ -419,7 +510,6 @@ internal sealed class TargetExporter
 
         // F17: the inventory hint is about to be requested.
         await _s.HitAsync(FaultStage.F17, FaultSites.BackupInventory, Service.Name, DfsOperationKind.BackupTransfer, detail: Name, ct: ct);
-        SealedManifest manifest = Seal(key, snapshot, connection.Secret);
         var missing = new List<ObjectId>();
         for (int offset = 0; offset < manifest.Manifest.Closure.Count; offset += InventoryBatch)
         {
@@ -429,7 +519,8 @@ internal sealed class TargetExporter
         }
 
         await SendObjectsAsync(connection, key, manifest, missing, record, ct);
-        await SendManifestAsync(connection, key, manifest, ct);
+        if (!await pipelined)
+            await SendManifestAsync(connection, key, manifest, ct);
         for (int round = 0; round < MaxPublishRounds; round++)
         {
             SetState(WireBackupState.Verifying);
@@ -526,47 +617,41 @@ internal sealed class TargetExporter
     private async Task SendObjectsAsync(ExportConnection connection, BackupTransferKey key, SealedManifest manifest, IEnumerable<ObjectId> ids,
         BackupTargetRecord record, CancellationToken ct)
     {
-        int concurrency = Math.Max(1, record.MaxConcurrentObjects);
-        using var failed = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var running = new List<Task>();
-        Exception? failure = null;
+        var queue = new Queue<ExtentRef>();
         foreach (ObjectId id in ids.Distinct())
         {
             if (!manifest.Extents.TryGetValue(id, out ExtentRef? extent))
                 throw new DfsIntegrityException(id, $"Backup target '{Name}' asked for object {id}, which is not part of the snapshot.");
-            while (running.Count >= concurrency)
-            {
-                Task done = await Task.WhenAny(running);
-                running.Remove(done);
-                if (done.Exception is { } ex)
-                {
-                    failure ??= ex.InnerException ?? ex;
-                    failed.Cancel();
-                }
-            }
-
-            if (failure is not null)
-                break;
-            running.Add(SendObjectAsync(connection, key, extent, record, failed.Token));
+            queue.Enqueue(extent);
         }
 
-        while (running.Count > 0)
-        {
-            Task done = await Task.WhenAny(running);
-            running.Remove(done);
-            if (done.Exception is { } ex)
-            {
-                failure ??= ex.InnerException ?? ex;
-                failed.Cancel();
-            }
-            else if (done.IsCanceled && failure is null && ct.IsCancellationRequested)
-            {
-                failure = new OperationCanceledException(ct);
-            }
-        }
-
+        // At most MaxConcurrentObjects workers drain the queue; the first failure stops the others.
+        using var failed = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Exception? failure = null;
+        var workers = new Task[Math.Min(Math.Max(1, record.MaxConcurrentObjects), queue.Count)];
+        for (int i = 0; i < workers.Length; i++)
+            workers[i] = WorkAsync();
+        foreach (Task worker in workers)
+            await worker;
         if (failure is not null)
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+
+        async Task WorkAsync()
+        {
+            while (!failed.IsCancellationRequested && queue.TryDequeue(out ExtentRef? extent))
+            {
+                try
+                {
+                    await SendObjectAsync(connection, key, extent, record, failed.Token);
+                }
+                catch (Exception ex) when (ex is not OutOfMemoryException)
+                {
+                    failure ??= ex;
+                    failed.Cancel();
+                    return;
+                }
+            }
+        }
     }
 
     private async Task SendObjectAsync(ExportConnection connection, BackupTransferKey key, ExtentRef extent, BackupTargetRecord record, CancellationToken ct)
@@ -651,32 +736,60 @@ internal sealed class TargetExporter
         throw new DfsProtocolException($"Backup target '{Name}' did not make progress receiving the manifest.");
     }
 
+    /// <summary>Sends the manifest; false (never an exception) when the target did not confirm it complete.</summary>
+    private async Task<bool> TrySendManifestAsync(ExportConnection connection, BackupTransferKey key, SealedManifest manifest, CancellationToken ct)
+    {
+        try
+        {
+            await SendManifestAsync(connection, key, manifest, ct);
+            return true;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            return false;
+        }
+    }
+
     /// <summary>Sends <c>BackupPublish</c>; while it is in flight, polls the target for its durable boundary (BAK-016).</summary>
     private async Task<BackupPublishResultMessage> PublishAsync(ExportConnection connection, BackupTransferKey key, ExportSnapshot snapshot,
         SealedManifest manifest, CancellationToken ct)
     {
         var message = new BackupPublishMessage(key, snapshot.Name, snapshot.Boundary, manifest.Checksum, manifest.Sealed.Length, snapshot.Record.Retention);
         Task<BackupPublishResultMessage> publish = CallAsync<BackupPublishResultMessage>(connection, message, PublishTimeout, ct);
-        TimeSpan poll = _s.Timings.Tick * 20;
-        while (!publish.IsCompleted)
+        using var polling = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task poller = PollDurableAsync(connection, snapshot, polling.Token);
+        try
         {
-            using (var delay = CancellationTokenSource.CreateLinkedTokenSource(ct))
-            {
-                await Task.WhenAny(publish, Task.Delay(poll, _s.Time, delay.Token));
-                delay.Cancel();
-            }
+            return await publish;
+        }
+        finally
+        {
+            polling.Cancel();
+            await poller;
+        }
+    }
 
-            if (publish.IsCompleted || ct.IsCancellationRequested)
-                break;
-            if (await TryRetentionAsync(connection, snapshot, ct) is { } durable && durable.Covered == snapshot.Boundary)
+    /// <summary>Polls the target for the durable boundary of an in-flight publication until cancelled; never throws.</summary>
+    private async Task PollDurableAsync(ExportConnection connection, ExportSnapshot snapshot, CancellationToken ct)
+    {
+        TimeSpan poll = _s.Timings.Tick * 20;
+        try
+        {
+            while (true)
             {
-                if (!DurableBoundary.IsComparableWith(snapshot.Boundary) || DurableBoundary.CompareTo(snapshot.Boundary) < 0)
-                    DurableBoundary = snapshot.Boundary;
-                SetState(WireBackupState.Publishing);
+                await Task.Delay(poll, _s.Time, ct);
+                if (await TryRetentionAsync(connection, snapshot, ct) is { } durable && durable.Covered == snapshot.Boundary && !ct.IsCancellationRequested)
+                {
+                    if (!DurableBoundary.IsComparableWith(snapshot.Boundary) || DurableBoundary.CompareTo(snapshot.Boundary) < 0)
+                        DurableBoundary = snapshot.Boundary;
+                    SetState(WireBackupState.Publishing);
+                }
             }
         }
-
-        return await publish;
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            // Cancelled once the publication was answered, or the target cannot answer queries: the publication decides.
+        }
     }
 
     /// <summary>The target's record of <paramref name="snapshot"/> (published or verified-staged), or null.</summary>
@@ -685,7 +798,7 @@ internal sealed class TargetExporter
         try
         {
             BackupRetentionResultMessage result = await CallAsync<BackupRetentionResultMessage>(connection,
-                new BackupRetentionMessage(snapshot.ClusterId, snapshot.VolumeName, snapshot.Name, null), SmallTimeout, ct);
+                new BackupRetentionMessage(snapshot.ClusterId, snapshot.VolumeName, snapshot.Name, null), SmallTimeout, ct, dropOnTimeout: false);
             return result.Snapshots.LastOrDefault(s => s.Snapshot == snapshot.Id);
         }
         catch (Exception ex) when (IsTransient(ex) && !ct.IsCancellationRequested)
@@ -704,6 +817,16 @@ internal sealed class TargetExporter
     {
         BackupProgressRecord? progress = state.BackupProgress.GetValueOrDefault(target);
         CommitToken published = progress?.LastSnapshot is not null ? state.TokenAt(progress.CoveredIndex) : CommitToken.None;
+        DfsBackupCheckpoint? latest = ProgressCheckpoint(state, target);
+
+        // A publication the target reported before the exporter recorded it (both describe the same authority).
+        if (runner?.ObservedPublished is { } observed && observed.CoveredCommit.VolumeId == state.Config.Id && observed.CoveredCommit.VolumeEpoch == state.Config.Epoch
+            && (published.IsNone || observed.CoveredCommit.CompareTo(published) > 0))
+        {
+            published = observed.CoveredCommit;
+            latest = observed;
+        }
+
         CommitToken durable = published;
         if (runner is not null && !runner.DurableBoundary.IsNone && runner.DurableBoundary.VolumeId == state.Config.Id
             && runner.DurableBoundary.VolumeEpoch == state.Config.Epoch && (durable.IsNone || runner.DurableBoundary.CompareTo(durable) > 0))
@@ -711,13 +834,12 @@ internal sealed class TargetExporter
             durable = runner.DurableBoundary;
         }
 
-        DfsBackupCheckpoint? latest = ProgressCheckpoint(state, target);
         TimeSpan? age = null;
-        if (progress?.LastSnapshot is { } name)
+        if (latest is not null)
         {
-            DateTimeOffset at = state.Snapshots.TryGetValue(name, out SnapshotRecord? snapshot) && snapshot.Id == progress.LastSnapshotId
+            DateTimeOffset at = state.Snapshots.TryGetValue(latest.SnapshotName, out SnapshotRecord? snapshot) && snapshot.Id == latest.SnapshotId
                 ? snapshot.CreatedUtc
-                : progress.UpdatedUtc;
+                : progress?.UpdatedUtc ?? now;
             age = now - at;
             if (age < TimeSpan.Zero)
                 age = TimeSpan.Zero;
@@ -752,22 +874,33 @@ internal sealed class TargetExporter
         {
             if (!_volume.IsCurrent)
                 throw Service.Group.NotLeader();
-            Task changed = _changed.Task;
+            CancellationToken changed = _changed.Token;
             TimeSpan left = timeout - _s.Time.GetElapsedTime(start);
             IReadOnlyList<BackupRetainedSnapshotData>? retained = null;
             if (left > TimeSpan.Zero && Record is { } record)
                 retained = await TryQueryRetainedAsync(record, left < SmallTimeout ? left : SmallTimeout, ct);
             VolumeState state = Service.CommittedState;
             (DfsBackupCheckpoint? checkpoint, DfsBackupCheckpoint? last) = Evaluate(state, retained, commit, exactId, exactName);
+            if (retained is not null)
+                ObservedPublished = last;
             if (checkpoint is not null)
                 return new BackupAwaitResultMessage(true, checkpoint, last);
             left = timeout - _s.Time.GetElapsedTime(start);
             if (left <= TimeSpan.Zero)
                 return new BackupAwaitResultMessage(false, null, last);
             TimeSpan poll = _s.Timings.Tick * 50;
-            using var delay = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            await Task.WhenAny(changed, Task.Delay(left < poll ? left : poll, _s.Time, delay.Token));
-            delay.Cancel();
+            using (var delay = CancellationTokenSource.CreateLinkedTokenSource(ct, changed))
+            {
+                try
+                {
+                    await Task.Delay(left < poll ? left : poll, _s.Time, delay.Token);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    // The runner's state changed: evaluate again.
+                }
+            }
+
             ct.ThrowIfCancellationRequested();
         }
     }
@@ -814,7 +947,7 @@ internal sealed class TargetExporter
         {
             ExportConnection connection = await GetConnectionAsync(record, timeout, linked.Token);
             BackupRetentionResultMessage result = await CallAsync<BackupRetentionResultMessage>(connection,
-                new BackupRetentionMessage(Service.CommittedState.Config.ClusterId, Service.Name, null, null), timeout, linked.Token);
+                new BackupRetentionMessage(Service.CommittedState.Config.ClusterId, Service.Name, null, null), timeout, linked.Token, dropOnTimeout: false);
             return result.Snapshots;
         }
         catch (Exception ex) when ((IsTransient(ex) || ex is OperationCanceledException) && !ct.IsCancellationRequested)
@@ -883,8 +1016,13 @@ internal sealed class TargetExporter
         throw last ?? new DfsUnavailableException(DfsErrorCode.Unavailable, $"Backup target '{Name}' has no endpoint.");
     }
 
-    /// <summary>Sends a request on an export connection; an error reply is thrown as its exception.</summary>
-    public async Task<T> CallAsync<T>(ExportConnection connection, IWireMessage request, TimeSpan timeout, CancellationToken ct)
+    /// <summary>
+    /// Sends a request on an export connection; an error reply is thrown as its exception. A broken connection is dropped (the
+    /// next request reconnects), and so is one whose request timed out — a silently dead link — unless
+    /// <paramref name="dropOnTimeout"/> is false: a query bounded by a caller's short deadline proves nothing about the link
+    /// and must not tear down the transfer sharing it.
+    /// </summary>
+    public async Task<T> CallAsync<T>(ExportConnection connection, IWireMessage request, TimeSpan timeout, CancellationToken ct, bool dropOnTimeout = true)
         where T : class, IWireMessage
     {
         ReadOnlyMemory<byte> reply;
@@ -892,7 +1030,7 @@ internal sealed class TargetExporter
         {
             reply = await connection.Raw.CallAsync(MessageCodec.Encode(request), timeout, ct);
         }
-        catch (Exception ex) when (ex is RpcConnectionException or IOException or ObjectDisposedException || ex is TimeoutException)
+        catch (Exception ex) when (ex is RpcConnectionException or IOException or ObjectDisposedException || (ex is TimeoutException && dropOnTimeout))
         {
             DropConnection(connection);
             throw;
@@ -927,8 +1065,50 @@ internal sealed class TargetExporter
 
     // ------------------------------------------------------------------------------------------------- state
 
+    /// <summary>
+    /// Completes once this runner sent the first requests of a transfer of <paramref name="pin"/> (or an attempt ended), at the
+    /// latest after <paramref name="timeout"/>: a sync request is answered once its transfer is under way.
+    /// </summary>
+    public async Task WaitForStartAsync(ulong pin, TimeSpan timeout)
+    {
+        if (_stopped || _startedPins.Contains(pin))
+            return;
+        if (!_startWaiters.TryGetValue(pin, out CancellationTokenSource? started))
+            _startWaiters[pin] = started = new CancellationTokenSource();
+        try
+        {
+            await Task.Delay(timeout, _s.Time, started.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // Started (or the attempt ended).
+        }
+    }
+
+    private void SignalStarted(ulong pin)
+    {
+        _startedPins.Add(pin);
+        if (_startWaiters.Remove(pin, out CancellationTokenSource? started))
+            Release(started);
+    }
+
+    private void SignalAllStarted()
+    {
+        CancellationTokenSource[] waiters = [.. _startWaiters.Values];
+        _startWaiters.Clear();
+        foreach (CancellationTokenSource waiter in waiters)
+            Release(waiter);
+    }
+
+    private static void Release(CancellationTokenSource signal)
+    {
+        signal.Cancel();
+        signal.Dispose();
+    }
+
     private void OnFailure(Exception ex)
     {
+        SignalAllStarted();
         Offline = IsConnectivity(ex);
         LastError = ex.Message;
         SetState(Offline ? WireBackupState.Offline : WireBackupState.Failed);
@@ -945,9 +1125,9 @@ internal sealed class TargetExporter
 
     private void SignalChanged()
     {
-        TaskCompletionSource changed = _changed;
-        _changed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        changed.TrySetResult();
+        CancellationTokenSource changed = _changed;
+        _changed = new CancellationTokenSource();
+        Release(changed);
     }
 
     /// <summary>True for failures that mean the target could not be reached (budgets apply while it stays so).</summary>

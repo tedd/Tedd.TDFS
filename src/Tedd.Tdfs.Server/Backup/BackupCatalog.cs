@@ -82,6 +82,9 @@ internal sealed class BackupCatalog
     /// <summary>Records a durably stored object in the inventory hint.</summary>
     public void NoteStored(ObjectId id) => _hint.Add(id);
 
+    /// <summary>Removes an object from the inventory hint (its stored copy was deleted).</summary>
+    public void ForgetStored(ObjectId id) => _hint.Remove(id);
+
     /// <summary>Objects the node believes it holds.</summary>
     public int HintCount => _hint.Count;
 

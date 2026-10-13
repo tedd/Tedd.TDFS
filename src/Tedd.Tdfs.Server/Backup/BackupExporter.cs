@@ -20,6 +20,7 @@ internal sealed class BackupExporters
     private readonly NodeServices _s;
     private readonly Dictionary<VolumeId, VolumeExporter> _volumes = [];
     private IRpcTransport? _transport;
+    private bool _jobStarted;
 
     public BackupExporters(NodeServices services)
     {
@@ -35,6 +36,28 @@ internal sealed class BackupExporters
     {
         ArgumentNullException.ThrowIfNull(transport);
         _transport = transport;
+    }
+
+    /// <summary>
+    /// Volume hook (leadership or control record changed): starts the periodic reconciliation the first time this node hosts
+    /// a volume with backup work — a registered target, or backup progress or transfer pins left in its state. Nodes of
+    /// clusters that use no backup run no backup job at all.
+    /// </summary>
+    public void OnVolumeChanged(VolumeService service)
+    {
+        ArgumentNullException.ThrowIfNull(service);
+        if (_jobStarted || _s.IsStopping || !HasBackupWork(service))
+            return;
+        _jobStarted = true;
+        _s.Jobs.StartPeriodic("backup-exporters", _s.Timings.Tick * 20, ReconcileAsync);
+    }
+
+    private static bool HasBackupWork(VolumeService service)
+    {
+        if (service.Record.BackupTargets.Count > 0)
+            return true;
+        VolumeState state = service.CommittedState;
+        return !state.BackupProgress.IsEmpty || state.Pins.Values.Any(p => p.Kind == PinKind.Transfer);
     }
 
     /// <summary>The exporter of a volume this node leads (created on demand for the current term); null when not leading.</summary>

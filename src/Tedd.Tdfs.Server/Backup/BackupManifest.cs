@@ -291,7 +291,7 @@ internal sealed record BackupManifest(
         var inodes = new InodeRecord[inodeCount];
         for (int i = 0; i < inodeCount; i++)
             inodes[i] = StateCodec.ReadInode(ref r);
-        int closureCount = r.ReadCount(36);
+        int closureCount = r.ReadCount(16 + 1 + 16 + 1);
         var closure = new BackupObjectRef[closureCount];
         for (int i = 0; i < closureCount; i++)
             closure[i] = new BackupObjectRef(r.ReadObjectId(), r.ReadVarInt(), r.ReadUInt128(), r.ReadByte());
