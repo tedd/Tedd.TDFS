@@ -74,6 +74,7 @@ internal sealed partial class VolumeService
         _seeded.Clear();
         _plans = null;
         ClearRepairState();
+        ClearGcPushState();
     }
 
     /// <summary>
@@ -181,6 +182,18 @@ internal sealed partial class VolumeService
         if (!_inventoryNodes.TryGetValue(node, out NodeInventory? state))
             return !ReplicaKnowledgeReady;
         return state.Incarnation == member.Incarnation && _s.Time.GetElapsedTime(state.LastReportAt, now) <= LivenessWindow;
+    }
+
+    /// <summary>
+    /// True when <paramref name="node"/> is not a live member, or this leader heard from its registered incarnation but not
+    /// within the liveness window: known down. A node not heard from under its registered incarnation is not known down.
+    /// </summary>
+    private bool IsKnownDown(NodeId node, ControlState control, long now)
+    {
+        if (control.FindMember(node) is not { IsLive: true } member)
+            return true;
+        return _inventoryNodes.TryGetValue(node, out NodeInventory? state) && state.Incarnation == member.Incarnation
+            && _s.Time.GetElapsedTime(state.LastReportAt, now) > LivenessWindow;
     }
 
     /// <summary>Holders whose copies count now: up, the copy reported under the current incarnation, not being deleted.</summary>

@@ -193,7 +193,8 @@ internal sealed class ObjectService
 
     /// <summary>
     /// Deletes the listed copies (GC decisions or excess replicas) whose stored record still carries the listed staging
-    /// session; also used by a volume leader for its own node. Excess-replica deletions hit <c>replica.delete</c> per object.
+    /// session; also used by a volume leader for its own node. A GC decision is one GC sweep on this node (<c>gc.sweep</c>,
+    /// hit before anything is deleted); excess-replica deletions hit <c>replica.delete</c> per object.
     /// </summary>
     public async Task<DeleteObjectsResultMessage> DeleteCopiesAsync(DeleteObjectsMessage message, CancellationToken ct)
     {
@@ -201,6 +202,8 @@ internal sealed class ObjectService
         if (_s.Control.State.FindVolume(message.Volume) is { } volume && message.VolumeEpoch < volume.Epoch)
             throw new DfsEpochMismatchException($"The delete decision is for epoch {message.VolumeEpoch}; volume '{volume.Name}' is at epoch {volume.Epoch}.");
         string? volumeName = _s.Control.State.FindVolume(message.Volume)?.Name;
+        if (!message.ExcessReplicas)
+            await _s.HitAsync(FaultStage.F20, FaultSites.GcSweep, volumeName, DfsOperationKind.Gc, detail: _s.NodeName, ct: ct);
         int deleted = 0;
         int absent = 0;
         long bytes = 0;

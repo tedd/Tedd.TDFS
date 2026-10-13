@@ -8,25 +8,35 @@ namespace Tedd.Tdfs.Client.Internal.Overlay;
 internal sealed record UploadedObject(ObjectId Id, UInt128 Checksum, long Length, IReadOnlyList<Protocol.Messages.ObjectReceipt> Receipts);
 
 /// <summary>
-/// One dirty range of the staged view: <c>[Offset, Offset + Length)</c> of the file maps either to buffered bytes
-/// (<see cref="Buffer"/> from <see cref="BufferOffset"/>) or to bytes of an uploaded object (<see cref="Object"/> from
-/// <see cref="ObjectOffset"/>). Immutable (a snapshot of the overlay can share segments).
+/// One dirty range of the staged view: <c>[Offset, Offset + Length)</c> of the file maps to buffered bytes
+/// (<see cref="Buffer"/> from <see cref="BufferOffset"/>), to bytes of an uploaded object (<see cref="Object"/> from
+/// <see cref="ObjectOffset"/>), or to both: a readable writer keeps the bytes it uploaded early (staging capabilities never
+/// authorize reading them back), so its reads are served from memory while the publication references the object.
+/// Immutable (a snapshot of the overlay can share segments).
 /// </summary>
 internal sealed record StagedSegment(long Offset, long Length, byte[]? Buffer, int BufferOffset, bool OwnsTail, UploadedObject? Object, long ObjectOffset)
 {
     /// <summary>End of the range (exclusive).</summary>
     public long End => Offset + Length;
 
-    /// <summary>True for buffered bytes.</summary>
-    public bool IsBuffered => Buffer is not null;
+    /// <summary>True for buffered bytes that are not uploaded yet.</summary>
+    public bool IsBuffered => Buffer is not null && Object is null;
+
+    /// <summary>True when the bytes are available in memory (buffered, or kept after an early upload).</summary>
+    public bool HasBytes => Buffer is not null;
 
     /// <summary>The part of this segment covering <c>[start, end)</c> (inside the segment).</summary>
     public StagedSegment Slice(long start, long end, bool ownsTail)
     {
         long delta = start - Offset;
-        return IsBuffered
-            ? this with { Offset = start, Length = end - start, BufferOffset = checked(BufferOffset + (int)delta), OwnsTail = ownsTail }
-            : this with { Offset = start, Length = end - start, ObjectOffset = ObjectOffset + delta, OwnsTail = false };
+        return this with
+        {
+            Offset = start,
+            Length = end - start,
+            BufferOffset = Buffer is null ? BufferOffset : checked(BufferOffset + (int)delta),
+            ObjectOffset = Object is null ? ObjectOffset : ObjectOffset + delta,
+            OwnsTail = IsBuffered && ownsTail,
+        };
     }
 
     /// <summary>The buffered bytes of this segment.</summary>
@@ -214,8 +224,18 @@ internal sealed class StagedOverlay
     /// <paramref name="objectOffset"/> (several dirty ranges may share one packed object).
     /// </summary>
     public void ReplaceWithUploaded(long offset, long length, UploadedObject uploaded, long objectOffset = 0)
+        => ReplaceWithUploaded(offset, length, uploaded, objectOffset, retained: null);
+
+    /// <summary>
+    /// Replaces <c>[offset, offset + length)</c> with the bytes of an uploaded object starting at
+    /// <paramref name="objectOffset"/>, keeping <paramref name="retained"/> (exactly <paramref name="length"/> bytes) to
+    /// serve reads of a readable writer.
+    /// </summary>
+    public void ReplaceWithUploaded(long offset, long length, UploadedObject uploaded, long objectOffset, byte[]? retained)
     {
-        Insert(new StagedSegment(offset, length, null, 0, OwnsTail: false, uploaded, objectOffset));
+        if (retained is not null && retained.Length != length)
+            throw new ArgumentException("The retained bytes must cover the replaced range exactly.", nameof(retained));
+        Insert(new StagedSegment(offset, length, retained, 0, OwnsTail: false, uploaded, objectOffset));
     }
 
     /// <summary>Sets the staged length (truncation clips dirty ranges; growth leaves a zero gap).</summary>
@@ -252,7 +272,7 @@ internal sealed class StagedOverlay
             if (next is not null && next.Offset <= position)
             {
                 long pieceEnd = Math.Min(end, next.End);
-                pieces.Add(new StagedPiece(next.IsBuffered ? StagedSource.Buffered : StagedSource.Uploaded, position, (int)(pieceEnd - position), next));
+                pieces.Add(new StagedPiece(next.HasBytes ? StagedSource.Buffered : StagedSource.Uploaded, position, (int)(pieceEnd - position), next));
                 position = pieceEnd;
                 index++;
                 continue;

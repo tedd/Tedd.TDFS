@@ -51,6 +51,13 @@ internal sealed partial class NodeRuntime
         services.Jobs.StartPeriodic("scrub", plane.Scrubber.Step, plane.Scrubber.RunAsync);
         TimeSpan compaction = TimeSpan.FromTicks(Math.Max(t.GcInterval.Ticks * 4, TimeSpan.FromMilliseconds(500).Ticks));
         services.Jobs.StartPeriodic("compaction", compaction, () => CompactAsync(services));
+
+        // Leader-pushed GC: a volume leader classifies newly dereferenced objects as soon as it applied the dereference.
+        services.Raft.Applied += (group, _) =>
+        {
+            if (services.Volumes.TryGetByGroup(group)?.Service is { IsLeader: true } service)
+                service.OnStateApplied();
+        };
     }
 
     /// <summary>One repair pass of every volume this node leads.</summary>
@@ -66,18 +73,26 @@ internal sealed partial class NodeRuntime
     }
 
     /// <summary>
-    /// Scheduled compaction: segments whose reclaimable bytes reach a quarter of a segment are rewritten (any reclaimable
-    /// byte once free space for payload is scarce), oldest first, one segment per step.
+    /// Scheduled compaction, oldest segment first, one segment per step: when free space for payload is scarce every
+    /// reclaimable byte is reclaimed; otherwise only once dead records make up half of the store (and at least one segment),
+    /// rewriting the segments that are at least half dead. Compaction never runs merely because something was deleted.
     /// </summary>
     private static async Task CompactAsync(NodeServices services)
     {
         if (!services.IsServing || services.IsStopping)
             return;
         ObjectStore store = services.ObjectStore;
-        if (store.DeadBytes <= 0)
+        long dead = store.DeadBytes;
+        if (dead <= 0)
             return;
         long segment = SegmentSizeFor(services.Options);
-        double threshold = store.AvailableBytes(ObjectAdmission.Normal) < 2 * segment ? 0 : 0.25;
+        double threshold;
+        if (store.AvailableBytes(ObjectAdmission.Normal) < 2 * segment)
+            threshold = 0;
+        else if (dead >= Math.Max(segment, store.TotalBytes / 2))
+            threshold = 0.5;
+        else
+            return;
         int compacted = await store.CompactSegmentsAsync(threshold);
         if (compacted > 0)
             services.Metrics.SetStored(store.ObjectCount, store.LiveBytes);

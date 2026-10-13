@@ -10,10 +10,10 @@ namespace Tedd.Tdfs.Server.Data;
 /// <summary>
 /// Storage-node side of repair (<c>ReplicateObject</c>, PROTOCOL.md §9.7): a volume leader asks this node to hold a
 /// verified copy of an object. An existing copy is re-verified (every unit and the whole-object checksum) and answered
-/// with a fresh receipt; a damaged one is quarantined and replaced. Otherwise the object is pulled from the listed sources
-/// (node-authenticated <c>GetObject</c>, first source that serves bytes matching the expected length and checksum), the
-/// node-wide repair rate limit is charged, and the copy is stored durably under repair admission (it may use the repair
-/// part of the reserve) before the receipt is issued. Concurrent requests for the same object share one execution.
+/// with a fresh receipt; a damaged one is quarantined and replaced. Otherwise the node-wide repair rate limit is charged,
+/// the object is pulled from the listed sources (node-authenticated <c>GetObject</c>, first source that serves bytes
+/// matching the expected length and checksum) and the copy is stored durably under repair admission (it may use the
+/// repair part of the reserve) before the receipt is issued. Concurrent requests for the same object share one execution.
 /// Runs on the node loop.
 /// </summary>
 internal sealed class RepairWorker
@@ -21,6 +21,9 @@ internal sealed class RepairWorker
     private readonly NodeServices _s;
     private readonly ByteRateLimiter _rate;
     private readonly Dictionary<ObjectId, Task<ReplicateObjectResultMessage>> _running = [];
+
+    /// <summary>Sources whose pull did not answer within the replication deadline, and when (tried last for a while).</summary>
+    private readonly Dictionary<NodeId, long> _slowSources = [];
 
     public RepairWorker(NodeServices services)
     {
@@ -49,11 +52,14 @@ internal sealed class RepairWorker
         return task.WaitAsync(ct);
     }
 
+    /// <summary>How long one replication may take on this node (the requesting leader waits as long).</summary>
+    private TimeSpan ReplicationDeadline => _s.Peers.DefaultCallTimeout * 4;
+
     private async Task<ReplicateObjectResultMessage> RunAsync(ReplicateObjectMessage message)
     {
         try
         {
-            using CancellationTokenSource deadline = _s.CreateDeadline(_s.Peers.DefaultCallTimeout * 4);
+            using CancellationTokenSource deadline = _s.CreateDeadline(ReplicationDeadline);
             return await ReplicateCoreAsync(message, deadline.Token);
         }
         finally
@@ -102,8 +108,9 @@ internal sealed class RepairWorker
                 $"{_s.NodeName} cannot admit a {m.Length}-byte repair copy: {available} bytes are available above its metadata reserve.");
         }
 
+        // The budget is charged before the transfer: a congested node never requests more than its repair rate.
+        await _rate.TakeAsync(m.Length, ct);
         byte[] data = await FetchAsync(m, volume, ct);
-        await _rate.TakeAsync(data.Length, ct);
         (ObjectReceipt receipt, bool alreadyPresent) = await _s.Objects.StoreAsync(m.Object, volume, m.Staging, m.Checksum, m.Length, ObjectEncodings.Plain,
             m.PlacementEpoch, data, DfsOperationKind.Repair, ObjectAdmission.Repair, ct);
         if (!alreadyPresent)
@@ -111,12 +118,18 @@ internal sealed class RepairWorker
         return new ReplicateObjectResultMessage(receipt, alreadyPresent);
     }
 
-    /// <summary>The object's bytes from the first source serving exactly the expected length and checksum.</summary>
+    /// <summary>
+    /// The object's bytes from the first source serving exactly the expected length and checksum. A source that fails or
+    /// serves wrong bytes is skipped; a slow one is waited for within the replication deadline (abandoning it for the next
+    /// source would only add a second transfer to a congested path). A source that did not answer in time is tried last by
+    /// the following replications for two deadlines, so an unreachable source delays one attempt, not every retry.
+    /// </summary>
     private async Task<byte[]> FetchAsync(ReplicateObjectMessage m, VolumeRecord volume, CancellationToken ct)
     {
         Exception? last = null;
         var tried = new HashSet<NodeId>();
-        foreach (NodeId source in m.Sources)
+        long now = _s.Time.GetTimestamp();
+        foreach (NodeId source in m.Sources.OrderBy(source => IsSlow(source, now) ? 1 : 0))
         {
             if (source == _s.NodeId || !tried.Add(source))
                 continue;
@@ -125,10 +138,11 @@ internal sealed class RepairWorker
             try
             {
                 var reply = (GetObjectResultMessage)await _s.Peers.CallAsync(source,
-                    new GetObjectMessage(ReadOnlyMemory<byte>.Empty, volume.Id, m.Object, 0, m.Length), ct: ct);
+                    new GetObjectMessage(ReadOnlyMemory<byte>.Empty, volume.Id, m.Object, 0, m.Length), ReplicationDeadline, ct);
                 if (reply.Offset == 0 && reply.Data.Length == m.Length && reply.ObjectLength == m.Length
                     && ObjectChecksum.Compute(reply.Data.Span) == m.Checksum)
                 {
+                    _slowSources.Remove(source);
                     return reply.Data.ToArray();
                 }
 
@@ -137,6 +151,8 @@ internal sealed class RepairWorker
             catch (Exception ex) when (ex is DfsException or IOException or TimeoutException or OperationCanceledException or UnauthorizedAccessException
                                            or InvalidCastException)
             {
+                if (ex is TimeoutException or OperationCanceledException)
+                    _slowSources[source] = _s.Time.GetTimestamp();
                 if (ct.IsCancellationRequested)
                     throw;
                 last = ex;
@@ -145,5 +161,15 @@ internal sealed class RepairWorker
 
         throw new DfsIntegrityException(m.Object,
             $"No source served a verified copy of object {m.Object}." + (last is null ? string.Empty : " Last error: " + last.Message));
+    }
+
+    private bool IsSlow(NodeId source, long now)
+    {
+        if (!_slowSources.TryGetValue(source, out long at))
+            return false;
+        if (_s.Time.GetElapsedTime(at, now) < ReplicationDeadline * 2)
+            return true;
+        _slowSources.Remove(source);
+        return false;
     }
 }

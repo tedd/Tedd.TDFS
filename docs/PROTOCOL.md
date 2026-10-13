@@ -1810,7 +1810,7 @@ Reply to `ReplicateObjectMessage`.
 
 #### `DeleteObjects` = 118 (`DeleteObjectsMessage`)
 
-Deletes stored copies (volume leader → storage node): garbage the leader proved unreachable at a committed index with a closed staging session (GC), or excess replicas after repair verified the targets (REP-016). Copies are identified by (object, staging session), the unit of GC decisions (ARCHITECTURE §8): a node deletes a copy only while its stored record still carries that staging session, and keeps a copy that a later upload re-bound to another session. Rejected for an older volume epoch. Idempotent.
+Deletes stored copies (volume leader → storage node): garbage the leader proved unreachable at a committed index with a closed staging session (GC), or excess replicas after repair verified the targets (REP-016). Copies are identified by (object, staging session), the unit of GC decisions (ARCHITECTURE §8): a node deletes a copy only while its stored record still carries that staging session, and keeps a copy that a later upload re-bound to another session. A volume leader pushes GC decisions for the copies it knows of (validated publication receipts, inventories, repair receipts) shortly after applying their dereference, in addition to the decisions it returns in `InventoryReportResult`; a GC message (`ExcessReplicas` false) is one GC sweep on the receiving node (fault site `gc.sweep`, hit before anything is deleted), an excess-replica message hits `replica.delete` per copy. Rejected for an older volume epoch. Idempotent.
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|

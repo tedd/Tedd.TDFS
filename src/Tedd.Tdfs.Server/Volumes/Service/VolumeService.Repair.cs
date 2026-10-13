@@ -20,11 +20,18 @@ namespace Tedd.Tdfs.Server.Volumes.Service;
 //    re-verified its copy (ReplicateObject answers with a fresh receipt only for an intact copy, and repairs a damaged
 //    one) — copy before delete, never below the target (REP-016, GC-011). Default-policy objects keep every copy while a
 //    default-policy migration is pending (REP-015).
-//  * Work is rate-limited (RepairBytesPerSecond) and bounded in concurrency; one action per object at a time; a delete
-//    whose outcome is unknown keeps its holder out of every count until it is resolved.
+//  * Work is rate-limited (RepairBytesPerSecond) and bounded in concurrency, overall and per receiving node (a slow or
+//    congested node is not handed more transfers than it can take); one action per object at a time; a delete whose
+//    outcome is unknown keeps its holder out of every count until it is resolved.
 internal sealed partial class VolumeService
 {
     private const int MaxRepairsInFlight = 16;
+
+    /// <summary>Most copies in flight onto one node.</summary>
+    private const int MaxCopiesPerTarget = 1;
+
+    /// <summary>Copies in flight per receiving node.</summary>
+    private readonly Dictionary<NodeId, int> _copiesTo = [];
 
     /// <summary>Objects with a copy or verify/delete job in flight.</summary>
     private readonly HashSet<ObjectId> _repairing = [];
@@ -51,6 +58,7 @@ internal sealed partial class VolumeService
     private void ClearRepairState()
     {
         _repairing.Clear();
+        _copiesTo.Clear();
         _deleting.Clear();
         _refusedUntil.Clear();
         _copyBackoff.Clear();
@@ -211,6 +219,12 @@ internal sealed partial class VolumeService
                         return;
                     }
 
+                    if (_copiesTo.GetValueOrDefault(target) >= MaxCopiesPerTarget)
+                    {
+                        _repairBacklog = true; // the target keeps its place; the copy starts once one of its transfers ends
+                        continue;
+                    }
+
                     rate.Charge(plan.Length);
                     StartCopy(plan, target, sources, epoch);
                 }
@@ -274,6 +288,7 @@ internal sealed partial class VolumeService
     {
         _repairing.Add(plan.Object);
         _repairsInFlight++;
+        _copiesTo[target] = _copiesTo.GetValueOrDefault(target) + 1;
         ulong term = Group.Term;
         _s.Jobs.Run("repair-copy", async () =>
         {
@@ -296,6 +311,10 @@ internal sealed partial class VolumeService
                 {
                     _repairing.Remove(plan.Object);
                     _repairsInFlight = Math.Max(0, _repairsInFlight - 1);
+                    if (_copiesTo.GetValueOrDefault(target) <= 1)
+                        _copiesTo.Remove(target);
+                    else
+                        _copiesTo[target]--;
                     OnRepairJobDone();
                 }
             }
@@ -438,7 +457,9 @@ internal sealed partial class VolumeService
             IReadOnlyList<PlacementNode> targets = Placement.SelectTargets(extent.Object, epoch, policy, IdealNodes(control, pool));
             foreach (PlacementNode target in targets)
             {
-                if (up.Contains(target.Id) || !IsUp(target.Id, control, now))
+                // A target this leader has not heard from under its registered incarnation (it just restarted) is tried:
+                // the copy's receipt is what counts.
+                if (up.Contains(target.Id) || IsKnownDown(target.Id, control, now))
                     continue;
                 var message = new ReplicateObjectMessage(Record.Id, extent.Object, extent.Staging, extent.Checksum, extent.ObjectLength, ObjectEncodings.Plain,
                     epoch, [.. up]);
