@@ -183,7 +183,7 @@ public sealed class VolumeStateMachineSessionTests
     }
 
     [Fact]
-    public void ReserveOperationIds_BlocksAreDisjointAndProtectedFromCountRetirement()
+    public void ReserveOperationIds_BlocksAreDisjointAndRetireWithTheOutcomeWindow()
     {
         var d = new SmDriver();
         ulong session = d.OpenSession(maxOutcomes: 2);
@@ -192,7 +192,15 @@ public sealed class VolumeStateMachineSessionTests
         Assert.Equal(1UL, first.FirstSequence);
         Assert.Equal(5UL, second.FirstSequence);
 
-        // Many later operations: the reserved, unused sequence 2 must stay usable (never retired before use).
+        // A reserved sequence is usable while the window has not passed it.
+        d.Ok<CreateDirectoryResultMessage>(new CreateDirectoryCommand("/early", false, null)
+        {
+            Op = Op(session: session, sequence: 3, kind: DfsOperationKind.CreateDirectory, payload: Hash("early")),
+        });
+        Assert.True(d.Exists("/early"));
+
+        // Many later operations: the window (2 outcomes) retires the oldest sequences, and with them the reserved, never used
+        // sequence 2 (OUT-012: an id below the retired watermark is expired and never executes as a new request).
         for (ulong seq = 10; seq < 16; seq++)
         {
             d.Ok<CreateDirectoryResultMessage>(new CreateDirectoryCommand("/r" + seq, false, null)
@@ -201,12 +209,13 @@ public sealed class VolumeStateMachineSessionTests
             });
         }
 
-        Assert.True(d.State.Sessions[session].RetiredWatermark < 1);
-        d.Ok<CreateDirectoryResultMessage>(new CreateDirectoryCommand("/reserved", false, null)
+        Assert.True(d.State.Sessions[session].RetiredWatermark >= 13);
+        Assert.Equal(2, d.State.Sessions[session].Outcomes.Count);
+        d.Fails(DfsErrorCode.OperationExpired, new CreateDirectoryCommand("/reserved", false, null)
         {
             Op = Op(session: session, sequence: 2, kind: DfsOperationKind.CreateDirectory, payload: Hash("reserved")),
         });
-        Assert.True(d.Exists("/reserved"));
+        Assert.False(d.Exists("/reserved"));
     }
 
     [Fact]
