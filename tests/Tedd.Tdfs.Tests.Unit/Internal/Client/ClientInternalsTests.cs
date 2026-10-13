@@ -235,17 +235,23 @@ public sealed class ClientInternalsTests
         session.Complete(reused);
         Assert.Equal(3UL, session.Watermark);
 
-        // An application id abandons the rest of the internal block (allocation is monotonic, PROTOCOL.md §5.1): the
-        // watermark moves up to the application id but never past it, even once its operation completed.
         session.AddApplicationVisible(10);
-        Assert.Equal(10UL, session.Watermark);
         session.Complete(new DfsOperationId(7, 10));
-        Assert.Equal(10UL, session.Watermark);
-        Assert.False(session.TryAllocate(out _), "sequences below an application id are not used after it");
-        session.AddBlock(11, 4);
+        Assert.Equal(3UL, session.Watermark);
         Assert.True(session.TryAllocate(out DfsOperationId c));
-        Assert.Equal(11UL, c.Sequence);
+        Assert.Equal(3UL, c.Sequence);
+
+        // The leader retired sequences of the block (OperationExpired on an id's only transmission, PROTOCOL.md §5.1): the
+        // rest of the block is abandoned and allocation continues in a new block; the watermark still never passes the
+        // in-flight id or the application id.
+        session.AbandonBlock();
+        Assert.False(session.TryAllocate(out _), "an abandoned block is not used any further");
+        session.AddBlock(11, 4);
+        Assert.True(session.TryAllocate(out DfsOperationId d));
+        Assert.Equal(11UL, d.Sequence);
+        Assert.Equal(3UL, session.Watermark);
         session.Complete(c);
+        session.Complete(d);
         Assert.Equal(10UL, session.Watermark);
     }
 

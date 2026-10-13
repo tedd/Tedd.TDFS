@@ -34,9 +34,9 @@ public sealed class DfsTransactionClient
             throw new DfsReadOnlyException("This volume is served read-only (backup host); transactions are not available.");
         await scope.ValidatedAsync().ConfigureAwait(false);
         // The begin's id becomes the durable transaction id: it is application-visible (queried, resolved by another process),
-        // so it is never acknowledged (PROTOCOL.md §5.1).
+        // so it is never acknowledged (PROTOCOL.md §5.1). The transaction belongs to the session the begin is sent in.
         VolumeContext.Bound<TxBeginResultMessage> bound = await Volume.Context.MutateBoundAsync<TxBeginResultMessage>(scope, "TxBegin", options.OperationId,
-            header => new TxBeginMessage(header, options.Timeout), keepProtected: true).ConfigureAwait(false);
+            header => new TxBeginMessage(header, options.Timeout), keepProtected: true, ownedBySession: true).ConfigureAwait(false);
         TxBeginResultMessage begun = bound.Reply;
         ulong session = bound.Session?.Id ?? begun.Transaction.Operation.Session;
         var staging = new StagingLease(begun.Staging, default, begun.Transaction, session, begun.Capability, begun.CapabilityExpiry, begun.PlacementEpoch,

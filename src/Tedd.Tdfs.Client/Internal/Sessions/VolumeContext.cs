@@ -600,16 +600,21 @@ internal sealed class VolumeContext : IRpcRouter
     /// </param>
     /// <param name="grantsLease">
     /// The request grants a lease (a handle): every attempt waits at most one renewal interval of the session's lease, so
-    /// a lost reply is retried — and the granted handle learned and renewed — before the lease can lapse unrenewed.
+    /// a lost reply is retried — and the granted handle learned and renewed — before the lease can lapse unrenewed. The
+    /// handle belongs to the session the request is sent in, so such a request always opens this client's session first.
+    /// </param>
+    /// <param name="ownedBySession">
+    /// The request creates something the session it is sent in owns (a transaction): it always opens this client's session
+    /// first, also with an application-supplied id.
     /// </param>
     public async Task<TReply> MutateAsync<TReply>(OperationScope scope, string name, DfsOperationId? applicationId,
         Func<RequestHeader, IWireMessage> build, string? path = null, DfsTransactionId? transaction = null, bool rebindable = true,
         DfsOperationId? queryTarget = null, bool queryAsTransaction = false, VolumeBinding? binding = null, bool keepProtected = false,
-        bool grantsLease = false)
+        bool grantsLease = false, bool ownedBySession = false)
         where TReply : IWireMessage<TReply>
     {
         Bound<TReply> bound = await MutateBoundAsync<TReply>(scope, name, applicationId, build, path, transaction, rebindable, queryTarget, queryAsTransaction,
-            binding, keepProtected, grantsLease).ConfigureAwait(false);
+            binding, keepProtected, grantsLease, ownedBySession).ConfigureAwait(false);
         return bound.Reply;
     }
 
@@ -620,13 +625,16 @@ internal sealed class VolumeContext : IRpcRouter
     public async Task<Bound<TReply>> MutateBoundAsync<TReply>(OperationScope scope, string name, DfsOperationId? applicationId,
         Func<RequestHeader, IWireMessage> build, string? path = null, DfsTransactionId? transaction = null, bool rebindable = true,
         DfsOperationId? queryTarget = null, bool queryAsTransaction = false, VolumeBinding? binding = null, bool keepProtected = false,
-        bool grantsLease = false)
+        bool grantsLease = false, bool ownedBySession = false)
         where TReply : IWireMessage<TReply>
     {
-        // An application-supplied id of a request that refers to nothing a session owns needs no session of this client: the
-        // id carries its own session, and another process may retry an id it persisted (FSD §13, OUT-002). Such a request is
-        // sent without opening a session first, so a retry is never held up behind an OpenSession entry that must commit.
-        bool sessionFree = applicationId is not null && rebindable && transaction is null && binding is null;
+        // An application-supplied id of a request that neither refers to nor creates anything a session owns needs no session
+        // of this client: the id carries its own session, and another process may retry an id it persisted (FSD §13,
+        // OUT-002). Such a request is sent without opening a session first, so a retry is never held up behind an OpenSession
+        // entry that must commit. A request that creates a handle or a transaction is owned by the session it is sent in
+        // (RequestHeader.Session): it is always sent in this client's session, or the server would have no session to bind
+        // the handle's lease or the transaction to.
+        bool sessionFree = applicationId is not null && rebindable && transaction is null && binding is null && !grantsLease && !ownedBySession;
         VolumeSession? session = sessionFree ? CurrentSession : await EnsureSessionAsync(scope).ConfigureAwait(false);
         bool sdkAllocated = applicationId is null;
         DfsOperationId operation;

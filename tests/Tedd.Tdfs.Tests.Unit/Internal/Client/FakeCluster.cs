@@ -810,9 +810,8 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
             created = true;
         }
 
+        // Inline changes of an extent-based result are accepted: the real leader stores them as objects (PROTOCOL.md §8.1).
         long old = inode.Content.Length;
-        if (old + append.AppendLength > InlineThreshold && append.Changes.Any(c => c.Kind == RangeChangeKind.Inline))
-            throw new DfsException(DfsErrorCode.InvalidArgument, "Inline change for an extent-based result.");
         inode.Content = Resize(Apply(inode.Content, append.Changes, old), old + append.AppendLength);
         inode.Revision = ++_index;
         LastChanges = append.Changes;

@@ -243,17 +243,23 @@ Every volume-scoped request (39 types, all implementing `IVolumeRequest`) starts
 * **Sequence allocation contract.** The leader reserves strictly increasing, non-overlapping blocks per session with
   `ReserveOperationIds`. The SDK uses **only** sequences the leader handed out: it reserves blocks for its own internal
   operations (64 at a time) and single sequences for application-visible ids, so an application id can never collide
-  with a sequence the SDK allocated concurrently. Allocation is monotonic: reserving an application-visible id abandons
-  the rest of the current internal block, so the outcome window (which retires the lowest sequences first) ages ids in
-  the order they were handed out. An SDK id rejected with `OperationExpired` on its only transmission was retired
-  unused: the SDK abandons its block and continues under a fresh id (a new session only if the session itself expired). A sequence that was allocated but never transmitted is reused by the
-  next allocation (so blocks are used up and their reservations retire). An SDK-allocated id whose **only** transmission
-  is rejected with `OperationExpired` (or, for requests that refer to no handle, pin or staging session, `LeaseLost` for
-  an expired session, or `EpochMismatch` for a re-created volume) did not execute; the SDK opens a new session and
-  continues under a fresh id. After more than one transmission such a rejection (`OperationExpired`, `LeaseLost` or
-  `EpochMismatch`, for SDK and application ids alike) makes the outcome unknown (`DfsCommitOutcomeUnknownException`),
-  because an earlier transmission may have committed before its outcome was retired, its session expired or its volume
-  was re-created. An unexpected (non-error) reply type to a transmitted mutation is likewise an unknown outcome.
+  with a sequence the SDK allocated concurrently. Reserving an application-visible id does not end the current internal
+  block (abandoning it would leave a reservation with unused sequences per application id until the outcome window
+  passes it), so a session may use its sequences out of order. The outcome window (`MaxOutcomesPerSession`) therefore
+  retires the **oldest** outcomes by the log index that decided them, not the lowest sequences, and advances the retired
+  watermark to the highest retired sequence: once an application id above the internal block has aged out, the block's
+  unused sequences are expired too. An SDK-allocated id rejected with `OperationExpired` on its only transmission was
+  retired unused: the SDK abandons the rest of its block and continues under a fresh id (in a new session only if the
+  session itself expired). A sequence that was allocated but never transmitted is reused by
+  the next allocation (so blocks are used up and their reservations retire). An SDK-allocated id whose **only**
+  transmission is rejected with `LeaseLost` for an expired session (requests that refer to no handle, pin or staging
+  session) or `EpochMismatch` for a re-created volume did not execute either; the SDK opens a new session (or binds to
+  the new volume) and continues under a fresh id. After more than one transmission that may have taken effect (a
+  transmission answered `NotLeader` proposed nothing that can commit and does not count) such a rejection
+  (`OperationExpired`, `LeaseLost` or `EpochMismatch`, for SDK and application ids alike) makes the outcome unknown
+  (`DfsCommitOutcomeUnknownException`), because an earlier transmission may have committed before its outcome was
+  retired, its session expired or its volume was re-created. An unexpected (non-error) reply type to a transmitted
+  mutation is likewise an unknown outcome.
 * **Volume binding of retries.** Every transmission of one operation id carries the same `ExpectedVolumeId` /
   `ExpectedVolumeEpoch`: those of the session the id belongs to (an application id: those of its first transmission).
   Requests about anything a session owns — handles, reader and enumeration pins, staging sessions, transactions, and
@@ -281,7 +287,7 @@ Every volume-scoped request (39 types, all implementing `IVolumeRequest`) starts
   ids, new receipts — and still has to get the stored outcome rather than `OperationIdMismatch` (OUT-002, OUT-006).
   The content stays covered (every change's offset, length, kind, object offset/length, checksum, encoding and inline
   bytes), so SDKs split content into objects deterministically (at `ChunkSize` boundaries, inline when the file fits
-  `InlineThreshold`).
+  `InlineThreshold`; an append with an application-supplied id: inline when the appended bytes fit, §8.1).
 
 The volume name, operation id, transaction id, every other request field and the request's own extensions are
 covered. A retry from another process (different session, advanced watermark, re-uploaded content) therefore has the
@@ -411,7 +417,9 @@ checks: MAC (constant time); cluster; volume and epoch (older epoch → rejected
 connection principal; not expired on the verifier's clock; kind matches the request; for `PutObject` the staging id
 matches the request; for `GetObject` the object is listed (`AllowsRead`, binary search). Failures → `AccessDenied`.
 A staging capability is also accepted by `GetObject` for objects stored under **its own** staging session (a writer reading
-back its staged, unpublished data that it uploaded early to bound memory); any other object → `AccessDenied`.
+back its staged, unpublished data that it uploaded early to bound memory); any other object → `AccessDenied`. Only the
+client's own uploads are stored under a client's staging session: objects the leader materializes go under a staging
+session of the leader's (§8.1), so a staging capability never reads bytes its holder did not upload.
 Node peers may omit capabilities on `GetObject` (repair pulls) — clients never may (SEC-004/005).
 
 ### 7.4 Reads
@@ -446,9 +454,13 @@ zeroes; missing objects never do (STR, DSK-016).
   spans at least `DurableCopiesBeforeAck` distinct hosts and `DurableZonesBeforeAck` distinct zones of the file's
   policy (LAY-002) — and `Data` changes (objects uploaded with receipts meeting the policy) otherwise. Content is split
   into objects at `ChunkSize` boundaries of the file (helpers) or of the dirty range (streams), so retries of the same
-  operation carry the same payload identity. `Append` offsets are relative to the end of file; the SDK appends inline
-  only when the file's current length plus the appended bytes fit the threshold, and otherwise (or when the leader
-  rejects an inline append because the file grew meanwhile, with a new operation id) as objects.
+  operation carry the same payload identity. `Append` offsets are relative to the end of file; with an SDK-allocated id
+  the SDK appends inline only when the file's current length plus the appended bytes fit the threshold, and otherwise
+  as objects. With an **application-supplied id** (which another process may retry without knowing the length the
+  first attempt saw, possibly while the original is still in flight on a stalled log) the representation depends on
+  the appended bytes alone: inline when they fit `InlineThreshold`, objects otherwise; no length is read. The leader
+  accepts `Inline` changes whose result is extent-based (or whose policy inline metadata does not satisfy) and stores
+  those bytes as objects meeting the file's policy before proposing (inline → extents below).
 * **Extents → inline**: when a publication whose result is stored inline leaves bytes of objects inside the result —
   base bytes of an extent-based file (for example a truncation to below the threshold followed by small writes), or
   `Data` changes of objects a stream uploaded early and then truncated below the threshold — the leader
@@ -456,9 +468,11 @@ zeroes; missing objects never do (STR, DSK-016).
   (or its own staged objects) to rewrite it. The SDK uploads staged data early (bounded memory, PUB-002) for every
   writable stream; a readable writer reads those ranges back with its staging capability (§7.3).
 * **Inline → extents**: when a publication turns an inline file into an extent-based one, bytes of the new content not
-  covered by the change set are taken from the old inline bytes; the leader materializes them as an object written
-  under the request's staging session with receipts meeting the file's policy, before proposing. (The client never
-  has to read-modify-write to append to a small file.)
+  covered by the change set are taken from the old inline bytes; the leader materializes them (and any `Inline` changes
+  of the request) as objects with receipts meeting the file's policy, before proposing, under a staging session it
+  creates for them and the publication closes — never under the request's staging session, whose capability can read
+  back what is stored under it (§7.3) while these bytes may be ones the caller may write but not read (ACL-015). (The
+  client never has to read-modify-write to append to a small file.)
 * **Extents → inline**: when the result of a publication fits inline (and LAY-002 allows it), the leader reads the kept
   bytes of the old extents back (verified against their checksums) and proposes the content inline; the extents' objects
   become unreferenced at that revision. Either conversion is guarded by the base revision the leader materialized from,

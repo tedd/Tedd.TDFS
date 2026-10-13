@@ -435,6 +435,73 @@ public sealed class VolumeServiceTests
         Assert.Equal(expected[..1500], await c.ReadAsync(w.Handle, 0, 1500));
     }
 
+    [Fact]
+    public async Task InlineToExtents_MaterializedBaseBytesAreNotReadableWithTheWritersStagingCapability()
+    {
+        (RuntimeCluster cluster, VolumeClient c) = await StartAsync(seed: 131);
+        await using RuntimeCluster _ = cluster;
+        byte[] head = Bytes(7, 1000);
+        await c.OkAsync<WriteAllResultMessage>(new WriteAllMessage(c.Op(), "/base", head.Length, [RangeChange.ForInline(0, head)], [], default, null, null, false, 0));
+        OpenHandleResultMessage w = await c.OpenAsync("/base", FileMode.Open, FileAccess.ReadWrite, FileShare.Read);
+        CreateStagingResultMessage staging = await c.StagingAsync(w.Handle);
+        byte[] tail = Bytes(8, 20_000);
+        (RangeChange change, IReadOnlyList<ObjectReceipt> receipts) = await c.UploadAsync(staging, head.Length, tail);
+        await c.OkAsync<CommitFileResultMessage>(new CommitFileMessage(c.Op(), w.Handle, w.WriterGeneration, 0, -1, head.Length + tail.Length, [change],
+            receipts, staging.Staging, null));
+
+        // The leader stored the old inline bytes as an object. The writer's staging capability reads back what the writer
+        // uploaded under its staging session (PROTOCOL.md §7.3), but never the materialized base bytes: a principal may write a
+        // stream it may not read (ACL-015), and its staging capability must not become a read authorization (SEC-004).
+        ReadRangeResultMessage range = await c.OkAsync<ReadRangeResultMessage>(new ReadRangeMessage(c.Header(), w.Handle, 0, default, 0, head.Length + tail.Length));
+        ExtentData materialized = Assert.Single(range.Extents, e => e.Offset == 0);
+        ExtentData uploaded = Assert.Single(range.Extents, e => e.Object == change.Object);
+        Assert.NotEqual(uploaded.Object, materialized.Object);
+
+        async Task<IWireMessage> GetWithStagingCapabilityAsync(ExtentData extent)
+        {
+            IWireMessage? last = null;
+            foreach (RuntimeNode node in cluster.Running)
+            {
+                if (extent.Locations.Count > 0 && !extent.Locations.Contains(node.Id))
+                    continue;
+                RawClient client = await c.ConnectionAsync(node);
+                VolumeEntry entry = ((VolumeRouteResultMessage)await client.CallOrThrowAsync<VolumeRouteResultMessage>(new GetVolumeRouteMessage("vol"))).Volume;
+                last = await client.CallAsync(new GetObjectMessage(staging.Capability, entry.Id, extent.Object, 0, extent.ObjectLength));
+                if (last is GetObjectResultMessage)
+                    return last;
+            }
+
+            return last ?? throw new InvalidOperationException($"No node holds object {extent.Object}.");
+        }
+
+        var own = Assert.IsType<GetObjectResultMessage>(await GetWithStagingCapabilityAsync(uploaded));
+        Assert.Equal(tail, own.Data.ToArray());
+        var denied = Assert.IsType<ErrorReplyMessage>(await GetWithStagingCapabilityAsync(materialized));
+        Assert.Equal(DfsErrorCode.AccessDenied, denied.Code);
+    }
+
+    [Fact]
+    public async Task InlineAppendToAnExtentBasedFile_IsStoredAsObjectsByTheLeader()
+    {
+        // An append with an application id carries small suffixes inline whatever the file's length (PROTOCOL.md §8.1): the
+        // leader stores them as objects meeting the policy when the result is extent-based.
+        (RuntimeCluster cluster, VolumeClient c) = await StartAsync(seed: 137);
+        await using RuntimeCluster _ = cluster;
+        CreateStagingResultMessage staging = await c.StagingAsync();
+        byte[] body = Bytes(9, 20_000);
+        (RangeChange change, IReadOnlyList<ObjectReceipt> receipts) = await c.UploadAsync(staging, 0, body);
+        await c.OkAsync<WriteAllResultMessage>(new WriteAllMessage(c.Op(), "/big", body.Length, [change], receipts, staging.Staging, null, null, false, 0));
+
+        byte[] suffix = Bytes(10, 300);
+        var appended = await c.OkAsync<AppendResultMessage>(new AppendMessage(c.Op(), "/big", default, 0, suffix.Length, [RangeChange.ForInline(0, suffix)], [],
+            default, false, null, null));
+        Assert.Equal((20_000L, 20_300L), (appended.OldLength, appended.NewLength));
+        OpenHandleResultMessage reader = await c.OpenAsync("/big", FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        Assert.False(reader.Info.IsInline);
+        byte[] expected = [.. body, .. suffix];
+        Assert.Equal(expected, await c.ReadAsync(reader.Handle, 0, expected.Length));
+    }
+
     private static async Task AssertReplicasConvergeAsync(RuntimeCluster cluster)
     {
         await RuntimeCluster.WaitUntilAsync(async () =>

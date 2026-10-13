@@ -493,28 +493,54 @@ public sealed partial class DfsFileClient
         int threshold = ContentLayout.InlineThreshold(entry, Runtime.Capabilities);
         bool inlineRejected = false;
         bool stagingReplaced = false;
+
+        // An application-supplied id may be retried — by another process — after the original committed (the file has grown
+        // since) or while it is still in flight (the volume's log may be stalled, so no linearizable read completes). Such a
+        // retry cannot know the length the first attempt saw, and the representation is part of the payload identity
+        // (PROTOCOL.md §5.2): a length-based choice could turn a legitimate retry into OperationIdMismatch. The representation
+        // of an application-id append therefore depends on the appended bytes alone: inline when they fit the inline
+        // threshold — the leader stores them as objects meeting the file's policy when the result is extent-based or the
+        // policy requires it (§8.1, LAY-002) — and objects otherwise. Only the byte helper accepts an id, and its content does
+        // not depend on the length. (Transaction-bound appends keep the length-based choice: the transaction answers their
+        // ids from its own results.)
+        bool lengthIndependent = options.OperationId is not null && Transaction is null;
         while (true)
         {
-            // The current length decides the representation (and whether a text preamble is due). A principal may hold
-            // AppendData without ReadAttributes (ACL-015): it then appends blind — as objects (the leader stores the result
-            // inline when it fits) and without a preamble.
-            GetInfoResultMessage? info;
-            try
+            // Otherwise the current length decides the representation (and whether a text preamble is due). A principal may
+            // hold AppendData without ReadAttributes (ACL-015): it then appends blind — as objects (the leader stores the
+            // result inline when it fits) and without a preamble.
+            GetInfoResultMessage? info = null;
+            if (!lengthIndependent)
             {
-                info = await InfoAsync(path, scope).ConfigureAwait(false);
-            }
-            catch (UnauthorizedAccessException)
-            {
-                info = null;
+                try
+                {
+                    info = await InfoAsync(path, scope).ConfigureAwait(false);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    info = null;
+                }
             }
 
             bool known = info is not null;
             long current = info is { Exists: true, Info: { } file } && (file.Kind == WireEntryKind.File || file.IsStream) ? file.Length : 0;
             ReadOnlyMemory<byte> bytes = content(known ? current : 1);
-            DfsStoragePolicy policy = known
-                ? await PolicyForAsync(path, options.StoragePolicy, entry, info, scope).ConfigureAwait(false)
-                : ContentLayout.ResolvePolicy(entry, options.StoragePolicy) ?? entry.DefaultPolicy;
-            bool inline = known && !inlineRejected && current + bytes.Length <= threshold && ContentLayout.InlinePermitted(entry, policy, LabelsOf);
+            bool inline;
+            DfsStoragePolicy policy;
+            if (lengthIndependent)
+            {
+                inline = bytes.Length <= threshold;
+                policy = inline ? ContentLayout.ResolvePolicy(entry, options.StoragePolicy) ?? entry.DefaultPolicy
+                    : await AppendPolicyAsync(path, options.StoragePolicy, entry, scope).ConfigureAwait(false);
+            }
+            else
+            {
+                policy = known
+                    ? await PolicyForAsync(path, options.StoragePolicy, entry, info, scope).ConfigureAwait(false)
+                    : ContentLayout.ResolvePolicy(entry, options.StoragePolicy) ?? entry.DefaultPolicy;
+                inline = known && !inlineRejected && current + bytes.Length <= threshold && ContentLayout.InlinePermitted(entry, policy, LabelsOf);
+            }
+
             Payload payload = inline
                 ? Payload.Inline(bytes)
                 : await UploadAsync(bytes, 0, entry, policy, scope).ConfigureAwait(false);
@@ -553,6 +579,22 @@ public sealed partial class DfsFileClient
     /// </summary>
     private bool IsClosedHelperStaging(DfsException ex, Payload payload, DfsMutationOptions options) =>
         ex.ErrorCode == DfsErrorCode.LeaseLost && payload.Lease is not null && Transaction is null && options.OperationId is null;
+
+    /// <summary>
+    /// The policy an application-id append uploads its objects for: the file's own policy where the caller may read it, else
+    /// the requested or default one (a blind append, ACL-015; the leader validates the receipts against the file's policy).
+    /// </summary>
+    private async Task<DfsStoragePolicy> AppendPolicyAsync(string path, string? requested, VolumeEntry entry, OperationScope scope)
+    {
+        try
+        {
+            return await PolicyForAsync(path, requested, entry, null, scope).ConfigureAwait(false);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return ContentLayout.ResolvePolicy(entry, requested) ?? entry.DefaultPolicy;
+        }
+    }
 
     /// <summary>The changes, receipts and staging session (with its lease, when uploaded) of a publication's content.</summary>
     private sealed record Payload(IReadOnlyList<RangeChange> Changes, IReadOnlyList<ObjectReceipt> Receipts, StagingId Staging, StagingLease? Lease = null)

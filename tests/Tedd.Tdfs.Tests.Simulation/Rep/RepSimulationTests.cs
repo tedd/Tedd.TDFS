@@ -891,7 +891,9 @@ public sealed class RepSimulationTests
             arm.Disarm();
             arm.Release();
 
-            await stop.CancelAsync();
+            // Synchronous cancellation: CancelAsync runs the registered callbacks on the thread pool, an uncontrolled
+            // dependency of a deterministic run (HAR-002).
+            stop.Cancel();
             await foreground;
             Assert.Empty(errors);
             Assert.True(foregroundOps > 0, "foreground traffic must have run during the rebalance");

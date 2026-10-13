@@ -64,7 +64,9 @@ internal static class OperationGate
         {
             if (session.State == SessionState.Expired)
                 return new GateDecision(GateKind.Expired, $"Operation {id}: its session expired.", null);
-            if (id.Sequence <= session.RetiredWatermark)
+            // (A retained outcome may lie below the watermark — the window retires by age — and reaches this point only when
+            // dedup is disabled.)
+            if (id.Sequence <= session.RetiredWatermark && !session.Outcomes.ContainsKey(id.Sequence))
                 return new GateDecision(GateKind.Expired, $"Operation {id} is below the retired watermark {session.RetiredWatermark}.", null);
 
             // A session that obtains its sequences from this volume's leader (ReserveOperationIds; the SDK always does) uses
@@ -148,9 +150,13 @@ internal static class OperationGate
 
     /// <summary>
     /// Retires the oldest outcomes beyond the session's window (ARCHITECTURE §5.2 step 4, OUT-012/019): the window is a hard
-    /// bound, and the durable retired watermark advances to the newest retired sequence, so every older sequence — including
-    /// reserved ids never used — is expired from then on and can never execute as a new request. Reservations wholly below
-    /// the watermark are dropped. (The SDK allocates sequences monotonically, so a session's ids age in sequence order.)
+    /// bound on the session's most recent outcomes. Age is the log index that decided an outcome (ties: the lower sequence),
+    /// not its sequence: a client may use the sequences of its reservations in any order (an application id reserved
+    /// after an internal block can be used before the rest of that block), and an outcome older than the window must
+    /// retire however high its sequence is. The durable retired watermark advances to the highest retired sequence, so
+    /// every lower sequence without a retained outcome — including reserved ids never used, which were reserved before
+    /// it — is expired from then on and can never execute as a new request; retained outcomes below the watermark are
+    /// still answered from the record. Reservations wholly below the watermark are dropped.
     /// </summary>
     private static SessionRecord RetireByCount(SessionRecord session)
     {
@@ -161,9 +167,15 @@ internal static class OperationGate
         ulong watermark = session.RetiredWatermark;
         while (outcomes.Count > max)
         {
-            ulong oldest = outcomes.Keys.First();
-            outcomes = outcomes.Remove(oldest);
-            watermark = Math.Max(watermark, oldest);
+            OutcomeRecord? oldest = null;
+            foreach (OutcomeRecord outcome in outcomes.Values)
+            {
+                if (oldest is null || outcome.Index < oldest.Index || (outcome.Index == oldest.Index && outcome.Sequence < oldest.Sequence))
+                    oldest = outcome;
+            }
+
+            outcomes = outcomes.Remove(oldest!.Sequence);
+            watermark = Math.Max(watermark, oldest.Sequence);
         }
 
         ImmutableList<ReservedRange> reserved = session.Reserved.RemoveAll(r => r.Last <= watermark);
