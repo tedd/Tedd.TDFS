@@ -125,6 +125,8 @@ internal sealed class VolumeSession
 
     /// <summary>
     /// Registers a sequence the leader reserved for the application: protected for the session's lifetime (never acknowledged).
+    /// The rest of the current internal block is abandoned, so sequences stay monotonic per session (PROTOCOL.md §5.1): every
+    /// later internal operation is newer than the application's id, and the leader's outcome window ages them in that order.
     /// </summary>
     public void AddApplicationVisible(ulong sequence)
     {
@@ -133,7 +135,26 @@ internal sealed class VolumeSession
             _applicationVisible.Add(sequence);
             _protected.Add(sequence);
             _highWater = Math.Max(_highWater, sequence + 1);
+            AbandonBlockLocked();
         }
+    }
+
+    /// <summary>
+    /// Abandons the unallocated rest of the current internal block and the released sequences: the next internal allocation
+    /// reserves a new block (above everything handed out so far). Used after the leader retired sequences of the block.
+    /// </summary>
+    public void AbandonBlock()
+    {
+        lock (_sync)
+            AbandonBlockLocked();
+    }
+
+    private void AbandonBlockLocked()
+    {
+        _next = _end;
+        foreach (ulong released in _free)
+            _protected.Remove(released);
+        _free.Clear();
     }
 
     /// <summary>

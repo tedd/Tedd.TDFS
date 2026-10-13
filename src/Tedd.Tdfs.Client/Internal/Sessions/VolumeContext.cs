@@ -768,8 +768,17 @@ internal sealed class VolumeContext : IRpcRouter
                 // The referenced handle, staging session or transaction is gone: definite.
                 return false;
 
+            case DfsErrorCode.OperationExpired:
+                // The sequence was retired by the session's outcome window (or the session expired) before it was ever used:
+                // allocation moves past the current block. The fresh reservation also detects an expired session, which
+                // then expires here and is replaced (AllocateWithSessionAsync).
+                if (CurrentSession is { } current && request.Operation is { } retired && retired.Session == current.Id)
+                    current.AbandonBlock();
+                await replace(scope).ConfigureAwait(false);
+                return true;
+
             default:
-                // OperationExpired, or LeaseLost of the session itself: continue under a new session.
+                // LeaseLost of the session itself: continue under a new session.
                 if (CurrentSession is { } session && request.Operation is { } old && old.Session == session.Id)
                     ExpireSession(session, error.Message);
                 await replace(scope).ConfigureAwait(false);

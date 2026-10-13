@@ -243,7 +243,10 @@ Every volume-scoped request (39 types, all implementing `IVolumeRequest`) starts
 * **Sequence allocation contract.** The leader reserves strictly increasing, non-overlapping blocks per session with
   `ReserveOperationIds`. The SDK uses **only** sequences the leader handed out: it reserves blocks for its own internal
   operations (64 at a time) and single sequences for application-visible ids, so an application id can never collide
-  with a sequence the SDK allocated concurrently. A sequence that was allocated but never transmitted is reused by the
+  with a sequence the SDK allocated concurrently. Allocation is monotonic: reserving an application-visible id abandons
+  the rest of the current internal block, so the outcome window (which retires the lowest sequences first) ages ids in
+  the order they were handed out. An SDK id rejected with `OperationExpired` on its only transmission was retired
+  unused: the SDK abandons its block and continues under a fresh id (a new session only if the session itself expired). A sequence that was allocated but never transmitted is reused by the
   next allocation (so blocks are used up and their reservations retire). An SDK-allocated id whose **only** transmission
   is rejected with `OperationExpired` (or, for requests that refer to no handle, pin or staging session, `LeaseLost` for
   an expired session, or `EpochMismatch` for a re-created volume) did not execute; the SDK opens a new session and
@@ -878,7 +881,7 @@ Reply to `QueryOperationMessage`.
 
 #### `ReserveOperationIds` = 36 (`ReserveOperationIdsMessage`)
 
-Reserves a block of operation sequences in the caller's session (client → volume leader) so that ids handed to the application (`DfsVolume.NewOperationIdAsync`) are known to the leader and not retired before use.
+Reserves a block of operation sequences in the caller's session (client → volume leader) so that ids handed to the application (`DfsVolume.NewOperationIdAsync`) are known to the leader. A reserved id stays usable until the session expires or its outcome window (`MaxOutcomesPerSession` newer outcomes) retires it; a retired id is `OperationExpired`, never executed.
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|

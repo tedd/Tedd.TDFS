@@ -28,9 +28,6 @@ internal readonly record struct GateDecision(GateKind Kind, string Message, Outc
 /// </summary>
 internal static class OperationGate
 {
-    /// <summary>Hard bound of retained outcomes per session, even while reserved ids are pending (memory safety).</summary>
-    public const int HardOutcomeFactor = 4;
-
     /// <summary>Classifies an operation against the applied state.</summary>
     public static GateDecision Check(VolumeState state, OperationHeader op)
     {
@@ -142,6 +139,12 @@ internal static class OperationGate
         return state with { Sessions = state.Sessions.SetItem(session.Id, session) };
     }
 
+    /// <summary>
+    /// Retires the oldest outcomes beyond the session's window (ARCHITECTURE §5.2 step 4, OUT-012/019): the window is a hard
+    /// bound, and the durable retired watermark advances to the newest retired sequence, so every older sequence — including
+    /// reserved ids never used — is expired from then on and can never execute as a new request. Reservations wholly below
+    /// the watermark are dropped. (The SDK allocates sequences monotonically, so a session's ids age in sequence order.)
+    /// </summary>
     private static SessionRecord RetireByCount(SessionRecord session)
     {
         int max = Math.Max(1, session.MaxOutcomes);
@@ -149,28 +152,16 @@ internal static class OperationGate
             return session;
         ImmutableSortedDictionary<ulong, OutcomeRecord> outcomes = session.Outcomes;
         ulong watermark = session.RetiredWatermark;
-        ImmutableList<ReservedRange> reserved = session.Reserved;
         while (outcomes.Count > max)
         {
             ulong oldest = outcomes.Keys.First();
-            if (FirstUnused(reserved) is { } blocking && blocking < oldest)
-            {
-                // Retiring past an unused reserved id would expire it before use: keep the outcome (soft bound) unless the
-                // hard bound is exceeded, in which case the oldest blocking reservation is abandoned.
-                if (outcomes.Count <= max * HardOutcomeFactor)
-                    break;
-                reserved = reserved.RemoveAt(0);
-                continue;
-            }
-
             outcomes = outcomes.Remove(oldest);
             watermark = Math.Max(watermark, oldest);
         }
 
+        ImmutableList<ReservedRange> reserved = session.Reserved.RemoveAll(r => r.Last <= watermark);
         return session with { Outcomes = outcomes, RetiredWatermark = watermark, Reserved = reserved };
     }
 
-    private static ulong? FirstUnusedReserved(SessionRecord session) => FirstUnused(session.Reserved);
-
-    private static ulong? FirstUnused(ImmutableList<ReservedRange> reserved) => reserved.Count == 0 ? null : reserved[0].First;
+    private static ulong? FirstUnusedReserved(SessionRecord session) => session.Reserved.Count == 0 ? null : session.Reserved[0].First;
 }
