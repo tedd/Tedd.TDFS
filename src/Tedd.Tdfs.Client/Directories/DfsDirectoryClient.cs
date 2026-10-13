@@ -48,6 +48,9 @@ public sealed partial class DfsDirectoryClient
 
     private ulong Pin => View?.Pin ?? 0;
 
+    /// <summary>The volume binding of the transaction or snapshot view this facade works in (null for the live volume).</summary>
+    private VolumeBinding? Bound => Transaction?.Binding ?? View?.Binding;
+
     /// <summary>Creates a directory and any missing ancestors (idempotent: an existing directory is returned).</summary>
     public Task<DfsDirectoryInfo> CreateDirectoryAsync(string path, CancellationToken ct = default) =>
         CreateDirectoryAsync(path, new DfsMutationOptions(), ct);
@@ -68,7 +71,7 @@ public sealed partial class DfsDirectoryClient
         scope.Path = p;
         await scope.ValidatedAsync().ConfigureAwait(false);
         CreateDirectoryResultMessage result = await Context.MutateAsync<CreateDirectoryResultMessage>(scope, "CreateDirectory", options.OperationId,
-            header => new CreateDirectoryMessage(header, p, Recursive: true, options.CommitSnapshotName), p, TxId).ConfigureAwait(false);
+            header => new CreateDirectoryMessage(header, p, Recursive: true, options.CommitSnapshotName), p, TxId, binding: Bound).ConfigureAwait(false);
         return WireConvert.ToDirectoryInfo(result.Info, result.Token);
     }
 
@@ -137,7 +140,7 @@ public sealed partial class DfsDirectoryClient
         scope.Path = source;
         await scope.ValidatedAsync().ConfigureAwait(false);
         MoveResultMessage result = await Context.MutateAsync<MoveResultMessage>(scope, "Move", options.OperationId,
-            header => new MoveMessage(header, source, destination, Overwrite: false, ExpectDirectory: true, options.CommitSnapshotName), source, TxId)
+            header => new MoveMessage(header, source, destination, Overwrite: false, ExpectDirectory: true, options.CommitSnapshotName), source, TxId, binding: Bound)
             .ConfigureAwait(false);
         return result.Token;
     }
@@ -166,7 +169,7 @@ public sealed partial class DfsDirectoryClient
         scope.Path = p;
         await scope.ValidatedAsync().ConfigureAwait(false);
         DeleteResultMessage result = await Context.MutateAsync<DeleteResultMessage>(scope, "Delete", options.OperationId,
-            header => new DeleteMessage(header, p, recursive, ExpectDirectory: true, options.CommitSnapshotName), p, TxId).ConfigureAwait(false);
+            header => new DeleteMessage(header, p, recursive, ExpectDirectory: true, options.CommitSnapshotName), p, TxId, binding: Bound).ConfigureAwait(false);
         if (!result.Existed)
             throw DfsErrors.ToException(DfsErrorCode.DirectoryNotFound, $"Directory '{Validation.Printable(p)}' does not exist.", p);
         return result.Token;
@@ -208,7 +211,7 @@ public sealed partial class DfsDirectoryClient
         using DfsTransaction.TransactionOperation? txOperation = EnterTransaction();
         scope.Path = p;
         await scope.ValidatedAsync().ConfigureAwait(false);
-        ListDirectoryResultMessage page = await ListAsync(p, validated, continuationToken, scope).ConfigureAwait(false);
+        ListDirectoryResultMessage page = await ListAsync(p, validated, continuationToken, Bound, scope).ConfigureAwait(false);
         return new DfsDirectoryPage(page.Entries.Select(e => WireConvert.ToEntry(p, e)).ToArray(), page.Continuation, page.PinnedAt);
     }
 
@@ -220,6 +223,7 @@ public sealed partial class DfsDirectoryClient
     {
         var holder = new EnumerationPin();
         ulong pin = 0;
+        VolumeBinding? binding = Bound;
         try
         {
             string? continuation = null;
@@ -230,21 +234,29 @@ public sealed partial class DfsDirectoryClient
                 using (OperationScope scope = Begin(DfsOperationKind.Enumerate, ct))
                 {
                     if (first)
-                    {
                         await scope.StartedAsync().ConfigureAwait(false);
-                        using DfsTransaction.TransactionOperation? txOperation = EnterTransaction();
+
+                    // Every page is transaction-bound I/O: it cannot overlap the commit and fails once the transaction ended.
+                    using DfsTransaction.TransactionOperation? txOperation = EnterTransaction();
+                    if (first)
+                    {
                         scope.Path = path;
                         await scope.ValidatedAsync().ConfigureAwait(false);
                     }
 
                     holder.ThrowIfExpired();
-                    page = await ListAsync(path, options, continuation, scope).ConfigureAwait(false);
+                    page = await ListAsync(path, options, continuation, binding, scope).ConfigureAwait(false);
                 }
 
-                if (first && page.EnumerationPin != 0)
+                if (first)
                 {
-                    pin = page.EnumerationPin;
-                    Context.RegisterPin(pin, Context.CurrentSession, holder);
+                    // Later pages read the version pinned by the first one, in the volume that answered it.
+                    binding ??= page.PinnedAt.IsNone ? Context.CurrentBinding : new VolumeBinding(page.PinnedAt.VolumeId, page.PinnedAt.VolumeEpoch);
+                    if (page.EnumerationPin != 0)
+                    {
+                        pin = page.EnumerationPin;
+                        Context.RegisterPin(pin, Context.CurrentSession, holder);
+                    }
                 }
 
                 first = false;
@@ -258,16 +270,17 @@ public sealed partial class DfsDirectoryClient
         finally
         {
             if (pin != 0)
-                await ReleasePinAsync(pin).ConfigureAwait(false);
+                await ReleasePinAsync(pin, binding).ConfigureAwait(false);
         }
     }
 
-    private Task<ListDirectoryResultMessage> ListAsync(string path, DfsEnumerationOptions options, string? continuation, OperationScope scope) =>
+    private Task<ListDirectoryResultMessage> ListAsync(string path, DfsEnumerationOptions options, string? continuation, VolumeBinding? binding,
+        OperationScope scope) =>
         Context.ReadAsync<ListDirectoryResultMessage>(scope, "ListDirectory",
             header => new ListDirectoryMessage(header, path, options.Pattern, WireConvert.ToWire(options.Kinds), options.PageSize, continuation, Pin),
-            path, TxId, requireSession: true);
+            path, TxId, requireSession: true, binding: binding, sessionOnly: continuation is null && Pin == 0 && TxId is null);
 
-    private async Task ReleasePinAsync(ulong pin)
+    private async Task ReleasePinAsync(ulong pin, VolumeBinding? binding)
     {
         Context.UnregisterPin(pin);
         if (Runtime.IsDisposed)
@@ -275,7 +288,7 @@ public sealed partial class DfsDirectoryClient
         try
         {
             using OperationScope scope = Runtime.BeginOperation(DfsOperationKind.Enumerate, Volume.Name, null, CancellationToken.None);
-            await CloseSnapshotPinAsync(Context, pin, scope).ConfigureAwait(false);
+            await CloseSnapshotPinAsync(Context, pin, scope, binding).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
@@ -284,8 +297,8 @@ public sealed partial class DfsDirectoryClient
         }
     }
 
-    /// <summary>Releases a reader pin (<c>CloseSnapshot</c>; idempotent).</summary>
-    internal static async Task CloseSnapshotPinAsync(VolumeContext context, ulong pin, OperationScope scope)
+    /// <summary>Releases a reader pin (<c>CloseSnapshot</c>; idempotent) of <paramref name="binding"/>'s volume.</summary>
+    internal static async Task CloseSnapshotPinAsync(VolumeContext context, ulong pin, OperationScope scope, VolumeBinding? binding)
     {
         var request = new RpcRequest
         {
@@ -293,7 +306,7 @@ public sealed partial class DfsDirectoryClient
             ReplyType = MessageType.CloseSnapshotResult,
             Kind = CallKind.Idempotent,
             Router = context,
-            Build = _ => ValueTask.FromResult<IWireMessage>(new CloseSnapshotMessage(context.Header(context.CurrentSession), pin)),
+            Build = _ => ValueTask.FromResult<IWireMessage>(new CloseSnapshotMessage(context.Header(context.CurrentSession, default, null, binding), pin)),
         };
         await context.Runtime.Rpc.InvokeAsync(request, scope).ConfigureAwait(false);
     }
@@ -317,7 +330,7 @@ public sealed partial class DfsDirectoryClient
 
     private Task<GetInfoResultMessage> InfoAsync(string path, OperationScope scope) =>
         Context.ReadAsync<GetInfoResultMessage>(scope, "GetInfo", header => new GetInfoMessage(header, path, default, Pin), path, TxId,
-            requireSession: Pin != 0 || TxId is not null);
+            requireSession: Pin != 0 || TxId is not null, binding: Bound);
 
     /// <summary>Holder of an enumeration's pin (renewed by keep-alive; an expiry fails the enumeration).</summary>
     private sealed class EnumerationPin : IPinHolder

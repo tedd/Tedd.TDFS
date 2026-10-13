@@ -13,19 +13,23 @@ public sealed class DfsSnapshotView : IAsyncDisposable, IDisposable, IPinHolder
     private int _disposed;
     private Exception? _expired;
 
-    internal DfsSnapshotView(DfsVolume volume, DfsSnapshotInfo info, ulong pin)
+    internal DfsSnapshotView(DfsVolume volume, DfsSnapshotInfo info, ulong pin, VolumeBinding binding)
     {
         ArgumentNullException.ThrowIfNull(volume);
         ArgumentNullException.ThrowIfNull(info);
         Volume = volume;
         Info = info;
         Pin = pin;
+        Binding = binding;
         Files = new DfsFileClient(volume, isReadOnly: true, transaction: null, view: this);
         Directories = new DfsDirectoryClient(volume, isReadOnly: true, transaction: null, view: this);
     }
 
     /// <summary>The owning volume facade.</summary>
     internal DfsVolume Volume { get; }
+
+    /// <summary>The volume binding the reader pin belongs to (every request through the view carries it).</summary>
+    internal VolumeBinding Binding { get; }
 
     /// <summary>The reader pin holding the snapshot.</summary>
     internal ulong Pin { get; }
@@ -56,7 +60,7 @@ public sealed class DfsSnapshotView : IAsyncDisposable, IDisposable, IPinHolder
         try
         {
             using OperationScope scope = runtime.BeginOperation(DfsOperationKind.OpenSnapshot, Volume.Name, null, CancellationToken.None);
-            await DfsDirectoryClient.CloseSnapshotPinAsync(Volume.Context, Pin, scope).ConfigureAwait(false);
+            await DfsDirectoryClient.CloseSnapshotPinAsync(Volume.Context, Pin, scope, Binding).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {

@@ -87,32 +87,27 @@ internal sealed class StagedOverlay
     /// <summary>True when the staged view differs from the base.</summary>
     public bool IsDirty => _segments.Count > 0 || Length != BaseLength || MinLength != BaseLength;
 
-    /// <summary>Staged, unpublished bytes (buffered and uploaded).</summary>
-    public long PendingBytes
-    {
-        get
-        {
-            long total = 0;
-            foreach (StagedSegment segment in _segments)
-                total += segment.Length;
-            return total;
-        }
-    }
+    /// <summary>
+    /// Staged, unpublished bytes (buffered and uploaded). Safe to read while the owning stream works (it backs the
+    /// ungated <see cref="DfsStream.PendingBytes"/>): it never enumerates a list another call may be changing.
+    /// </summary>
+    public long PendingBytes => Sum(bufferedOnly: false);
 
     /// <summary>Buffered (not yet uploaded) bytes.</summary>
-    public long BufferedBytes
-    {
-        get
-        {
-            long total = 0;
-            foreach (StagedSegment segment in _segments)
-            {
-                if (segment.IsBuffered)
-                    total += segment.Length;
-            }
+    public long BufferedBytes => Sum(bufferedOnly: true);
 
-            return total;
+    private long Sum(bool bufferedOnly)
+    {
+        List<StagedSegment> segments = Volatile.Read(ref _segments);
+        long total = 0;
+        for (int i = 0; i < segments.Count; i++)
+        {
+            StagedSegment? segment = i < segments.Count ? segments[i] : null;
+            if (segment is not null && (!bufferedOnly || segment.IsBuffered))
+                total += segment.Length;
         }
+
+        return total;
     }
 
     /// <summary>The truncation point to publish (<c>-1</c> when the base is never clipped).</summary>

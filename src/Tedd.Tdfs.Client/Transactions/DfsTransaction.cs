@@ -3,6 +3,7 @@ using Tedd.Tdfs.Client.Internal.Data;
 using Tedd.Tdfs.Client.Internal.Facades;
 using Tedd.Tdfs.Client.Internal.Rpc;
 using Tedd.Tdfs.Client.Internal.Runtime;
+using Tedd.Tdfs.Client.Internal.Sessions;
 using Tedd.Tdfs.Protocol;
 using Tedd.Tdfs.Protocol.Messages;
 
@@ -20,7 +21,7 @@ public sealed class DfsTransaction : IAsyncDisposable, IDisposable
     private int _state = (int)DfsTransactionState.Active;
     private int _inFlight;
 
-    internal DfsTransaction(DfsVolume volume, DfsTransactionId id, CommitToken readVersion, StagingLease staging)
+    internal DfsTransaction(DfsVolume volume, DfsTransactionId id, CommitToken readVersion, StagingLease staging, VolumeBinding binding)
     {
         ArgumentNullException.ThrowIfNull(volume);
         ArgumentNullException.ThrowIfNull(staging);
@@ -28,12 +29,16 @@ public sealed class DfsTransaction : IAsyncDisposable, IDisposable
         Id = id;
         ReadVersion = readVersion;
         Staging = staging;
+        Binding = binding;
         Files = new DfsFileClient(volume, isReadOnly: false, transaction: this);
         Directories = new DfsDirectoryClient(volume, isReadOnly: false, transaction: this);
     }
 
     /// <summary>The owning volume facade.</summary>
     internal DfsVolume Volume { get; }
+
+    /// <summary>The volume binding the transaction belongs to (every transaction-bound request carries it).</summary>
+    internal VolumeBinding Binding { get; }
 
     /// <summary>The transaction's staging session (uploads of transaction-bound writes).</summary>
     internal StagingLease Staging { get; }
@@ -121,10 +126,9 @@ public sealed class DfsTransaction : IAsyncDisposable, IDisposable
 
         try
         {
-
             TxCommitResultMessage result = await Volume.Context.MutateAsync<TxCommitResultMessage>(scope, "TxCommit", null,
-                header => new TxCommitMessage(header, snapshotName), null, Id, rebindable: false, queryTarget: Id.Operation, queryAsTransaction: true)
-                .ConfigureAwait(false);
+                header => new TxCommitMessage(header, snapshotName), null, Id, rebindable: false, queryTarget: Id.Operation, queryAsTransaction: true,
+                binding: Binding).ConfigureAwait(false);
             SetState(DfsTransactionState.Committed);
             ForgetStreams();
             Runtime.Emit("tx.committed", $"Transaction {Id} committed.", null, Id, Volume.Name, result.Token);
@@ -176,10 +180,15 @@ public sealed class DfsTransaction : IAsyncDisposable, IDisposable
     public void Abort() =>
         SyncBridge.Run(() => AbortAsync(CancellationToken.None));
 
-    /// <summary>Aborts the transaction unless it committed (best effort; never commits).</summary>
+    /// <summary>
+    /// Aborts the transaction unless it committed (best effort; never commits). An unresolved commit (state
+    /// <see cref="DfsTransactionState.Unknown"/>) is asked to abort too: the abort never reverses a commit and reports it,
+    /// so the state becomes definite when the leader answers.
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
-        if (State is not (DfsTransactionState.Active or DfsTransactionState.Committing))
+        DfsTransactionState state = State;
+        if (state is not (DfsTransactionState.Active or DfsTransactionState.Committing or DfsTransactionState.Unknown))
             return;
         if (Runtime.IsDisposed)
         {
@@ -192,13 +201,15 @@ public sealed class DfsTransaction : IAsyncDisposable, IDisposable
             using OperationScope scope = Runtime.BeginOperation(DfsOperationKind.TxAbort, Volume.Name, null, CancellationToken.None);
             TxAbortResultMessage result = await SendAbortAsync(scope).ConfigureAwait(false);
             SetState(result.FinalStatus == WireOutcomeStatus.Committed ? DfsTransactionState.Committed : DfsTransactionState.Aborted);
+            ForgetStreams();
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
-            // The leader aborts an abandoned transaction at its deadline; disposal must not throw for it.
+            // The leader aborts an abandoned transaction at its deadline; disposal must not throw for it. Only a transaction
+            // that never requested its commit is known to end aborted: an uncertain or in-flight commit stays unresolved.
             Runtime.Emit("tx.abort-failed", $"Aborting transaction {Id} on disposal failed ({ex.GetType().Name}); it expires at its deadline.", null, Id,
                 Volume.Name, exception: ex);
-            SetState(DfsTransactionState.Aborted);
+            TryTransition(DfsTransactionState.Active, DfsTransactionState.Aborted);
         }
     }
 
@@ -215,7 +226,7 @@ public sealed class DfsTransaction : IAsyncDisposable, IDisposable
             Kind = CallKind.Idempotent,
             Router = Volume.Context,
             Transaction = Id,
-            Build = _ => ValueTask.FromResult<IWireMessage>(new TxAbortMessage(Volume.Context.Header(Volume.Context.CurrentSession, default, Id))),
+            Build = _ => ValueTask.FromResult<IWireMessage>(new TxAbortMessage(Volume.Context.Header(Volume.Context.CurrentSession, default, Id, Binding))),
         };
         return (TxAbortResultMessage)await Runtime.Rpc.InvokeAsync(request, scope).ConfigureAwait(false);
     }
@@ -249,6 +260,23 @@ public sealed class DfsTransaction : IAsyncDisposable, IDisposable
         lock (_sync)
         {
             ThrowIfNotActive();
+            _inFlight++;
+        }
+
+        return new TransactionOperation(this);
+    }
+
+    /// <summary>
+    /// Registers a transaction-bound operation when the transaction is active; otherwise returns null and reports the
+    /// state that refused it (cleanup paths such as stream disposal act on the ended transaction instead of failing).
+    /// </summary>
+    internal TransactionOperation? TryEnter(out DfsTransactionState state)
+    {
+        lock (_sync)
+        {
+            state = State;
+            if (state != DfsTransactionState.Active)
+                return null;
             _inFlight++;
         }
 

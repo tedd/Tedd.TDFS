@@ -325,15 +325,37 @@ internal sealed class VolumeContext : IRpcRouter
         Notify(lostHandles, lostPins, reason, DfsErrors.ToException(DfsErrorCode.PinExpired, reason.Message));
     }
 
-    /// <summary>Builds a request header for the current binding.</summary>
-    public RequestHeader Header(VolumeSession? session, DfsOperationId operation = default, DfsTransactionId? transaction = null)
+    /// <summary>The binding requests that refer to nothing session-owned carry: the bound volume (or the map's entry before binding).</summary>
+    public VolumeBinding CurrentBinding
+    {
+        get
+        {
+            lock (_sync)
+                return CurrentBindingLocked();
+        }
+    }
+
+    private VolumeBinding CurrentBindingLocked()
+    {
+        if (_bound)
+            return new VolumeBinding(_volumeId, _epoch);
+        VolumeEntry? mapped = Runtime.Map.Volume(Name);
+        return new VolumeBinding(mapped?.Id ?? default, mapped?.Epoch ?? 0);
+    }
+
+    /// <summary>
+    /// Builds a request header. The expected volume is <paramref name="binding"/> when given (requests about something a
+    /// session owns: its operation ids, handles, pins, staging sessions, transactions), else the binding of
+    /// <paramref name="session"/>, else the current binding — so a request meant for a volume that was since re-created
+    /// or restored is rejected (<c>EpochMismatch</c>) instead of being applied to the new volume.
+    /// </summary>
+    public RequestHeader Header(VolumeSession? session, DfsOperationId operation = default, DfsTransactionId? transaction = null, VolumeBinding? binding = null)
     {
         lock (_sync)
         {
-            VolumeId expectedId = _bound ? _volumeId : Runtime.Map.Volume(Name)?.Id ?? default;
-            ulong expectedEpoch = _bound ? _epoch : Runtime.Map.Volume(Name)?.Epoch ?? 0;
+            VolumeBinding target = binding ?? session?.Binding ?? CurrentBindingLocked();
             VolumeSession? s = session is { IsExpired: false } ? session : null;
-            return new RequestHeader(Name, expectedId, expectedEpoch, s?.Id ?? 0, operation, s?.Watermark ?? 0, transaction);
+            return new RequestHeader(Name, target.Id, target.Epoch, s?.Id ?? 0, operation, s?.Watermark ?? 0, transaction);
         }
     }
 
@@ -353,20 +375,27 @@ internal sealed class VolumeContext : IRpcRouter
 
         // One nonce for every retry of this open: a retried request receives the same session (PROTOCOL.md §5.3).
         UInt128 nonce = Runtime.Random.NextUInt128();
+        VolumeBinding openedUnder = default;
         var request = new RpcRequest
         {
             Name = "OpenSession",
             ReplyType = MessageType.OpenSessionResult,
             Kind = CallKind.Idempotent,
             Router = this,
-            Build = _ => ValueTask.FromResult<IWireMessage>(new OpenSessionMessage(Header(null), Runtime.Options.ClientName, nonce)),
+            Build = _ =>
+            {
+                RequestHeader header = Header(null);
+                openedUnder = new VolumeBinding(header.ExpectedVolumeId, header.ExpectedVolumeEpoch);
+                return ValueTask.FromResult<IWireMessage>(new OpenSessionMessage(header, Runtime.Options.ClientName, nonce));
+            },
             OnError = RebindOnEpochMismatchAsync,
         };
         var reply = (OpenSessionResultMessage)await Runtime.Rpc.InvokeAsync(request, scope).ConfigureAwait(false);
         VolumeSession session;
         lock (_sync)
         {
-            session = new VolumeSession(reply.Session, reply.FirstSequence, reply.LeaseDuration, reply.SessionTimeout, _volumeId, _epoch);
+            // The session belongs to the volume the answered request was addressed to.
+            session = new VolumeSession(reply.Session, reply.FirstSequence, reply.LeaseDuration, reply.SessionTimeout, openedUnder.Id, openedUnder.Epoch);
             _session = session;
             _helperStaging = null;
         }
@@ -401,16 +430,20 @@ internal sealed class VolumeContext : IRpcRouter
     }
 
     /// <summary>Allocates an SDK-internal operation id (reserving a new block from the leader when the current one is used up).</summary>
-    public async ValueTask<DfsOperationId> AllocateAsync(OperationScope scope)
+    public async ValueTask<DfsOperationId> AllocateAsync(OperationScope scope) =>
+        (await AllocateWithSessionAsync(scope).ConfigureAwait(false)).Id;
+
+    /// <summary>Allocates an SDK-internal operation id and returns the session (and so the volume binding) it belongs to.</summary>
+    public async ValueTask<(DfsOperationId Id, VolumeSession Session)> AllocateWithSessionAsync(OperationScope scope)
     {
         for (int attempt = 0; ; attempt++)
         {
             VolumeSession session = await EnsureSessionAsync(scope).ConfigureAwait(false);
             if (session.TryAllocate(out DfsOperationId id))
-                return id;
+                return (id, session);
             using AsyncLock.Releaser held = await LockAsync(_reserveLock, scope).ConfigureAwait(false);
             if (session.TryAllocate(out id))
-                return id;
+                return (id, session);
             try
             {
                 ReserveOperationIdsResultMessage block = await ReserveAsync(session, SequenceBlockSize, scope).ConfigureAwait(false);
@@ -419,6 +452,12 @@ internal sealed class VolumeContext : IRpcRouter
             }
             catch (DfsException ex) when (attempt < 2 && ex.ErrorCode is DfsErrorCode.LeaseLost or DfsErrorCode.OperationExpired or DfsErrorCode.LimitExceeded)
             {
+                ExpireSession(session, ex.Message);
+            }
+            catch (DfsException ex) when (attempt < 2 && ex.ErrorCode is DfsErrorCode.EpochMismatch)
+            {
+                // The session belongs to a volume that was re-created or restored: learn the new binding (which expires it).
+                await RefreshBindingAsync(scope).ConfigureAwait(false);
                 ExpireSession(session, ex.Message);
             }
         }
@@ -441,6 +480,11 @@ internal sealed class VolumeContext : IRpcRouter
             }
             catch (DfsException ex) when (attempt < 2 && ex.ErrorCode is DfsErrorCode.LeaseLost or DfsErrorCode.OperationExpired)
             {
+                ExpireSession(session, ex.Message);
+            }
+            catch (DfsException ex) when (attempt < 2 && ex.ErrorCode is DfsErrorCode.EpochMismatch)
+            {
+                await RefreshBindingAsync(scope).ConfigureAwait(false);
                 ExpireSession(session, ex.Message);
             }
         }
@@ -478,8 +522,26 @@ internal sealed class VolumeContext : IRpcRouter
     /// Executes a read-only (or naturally idempotent) volume request routed to the leader (or the backup host). The
     /// session is attached when one is open (or opened when <paramref name="requireSession"/>).
     /// </summary>
+    /// <param name="scope">The operation.</param>
+    /// <param name="name">Diagnostic name.</param>
+    /// <param name="build">Builds the request for a header.</param>
+    /// <param name="path">Path for exceptions.</param>
+    /// <param name="transaction">Transaction of transaction-bound requests.</param>
+    /// <param name="requireSession">Open a session when none is open (the request creates or uses something session-owned).</param>
+    /// <param name="attemptTimeout">Per-attempt reply timeout (null derives one from the operation timeout).</param>
+    /// <param name="binding">
+    /// The volume binding of what the request refers to (a handle, pin, staging session or transaction); null for requests
+    /// that refer to nothing session-owned. A bound request is never moved to a re-created volume: <c>EpochMismatch</c> is
+    /// then a definite failure.
+    /// </param>
+    /// <param name="sessionOnly">
+    /// The request refers to nothing the session owns (it only needs <em>a</em> session): a <c>LeaseLost</c> reply then
+    /// means the session expired, and the request is retried under a new one. Otherwise <c>LeaseLost</c> concerns the
+    /// referenced handle, pin or staging session alone and is reported (the session and its other handles are unaffected).
+    /// </param>
     public async Task<TReply> ReadAsync<TReply>(OperationScope scope, string name, Func<RequestHeader, IWireMessage> build, string? path = null,
-        DfsTransactionId? transaction = null, bool requireSession = false, TimeSpan? attemptTimeout = null)
+        DfsTransactionId? transaction = null, bool requireSession = false, TimeSpan? attemptTimeout = null, VolumeBinding? binding = null,
+        bool sessionOnly = false)
         where TReply : IWireMessage<TReply>
     {
         if (requireSession)
@@ -496,12 +558,19 @@ internal sealed class VolumeContext : IRpcRouter
             Build = async s =>
             {
                 VolumeSession? session = requireSession ? await EnsureSessionAsync(s).ConfigureAwait(false) : CurrentSession;
-                return build(Header(session, default, transaction));
+                return build(Header(session, default, transaction, binding));
             },
-            OnError = (error, s, transmissions) => OnReadErrorAsync(error, s, requireSession),
+            OnError = (error, s, transmissions) => OnReadErrorAsync(error, s, requireSession && sessionOnly && binding is null, binding is not null),
         };
         return (TReply)await Runtime.Rpc.InvokeAsync(request, scope).ConfigureAwait(false);
     }
+
+    /// <summary>A reply together with the volume binding and session of the request that produced it.</summary>
+    /// <typeparam name="TReply">Reply type.</typeparam>
+    /// <param name="Reply">The success reply.</param>
+    /// <param name="Binding">The binding the request was addressed to (what it created belongs to that volume).</param>
+    /// <param name="Session">The session the request carried (it owns what the request created).</param>
+    public readonly record struct Bound<TReply>(TReply Reply, VolumeBinding Binding, VolumeSession? Session);
 
     /// <summary>
     /// Executes a mutation with an operation id (the application's, or one allocated here) under the full outcome
@@ -520,14 +589,41 @@ internal sealed class VolumeContext : IRpcRouter
     /// </param>
     /// <param name="queryTarget">Outcome query target (default: the operation id itself).</param>
     /// <param name="queryAsTransaction">Query the target as a transaction (TxCommit).</param>
+    /// <param name="binding">
+    /// The volume binding of what the request refers to (handle, staging session, transaction); null to address the volume
+    /// the operation id's session belongs to. Every transmission of one operation id carries the same binding, so a retry
+    /// can never execute against a re-created volume.
+    /// </param>
+    /// <param name="keepProtected">
+    /// The id becomes visible to the application (a transaction id): it is never acknowledged, so its outcome stays
+    /// queryable (PROTOCOL.md §5.1).
+    /// </param>
     public async Task<TReply> MutateAsync<TReply>(OperationScope scope, string name, DfsOperationId? applicationId,
         Func<RequestHeader, IWireMessage> build, string? path = null, DfsTransactionId? transaction = null, bool rebindable = true,
-        DfsOperationId? queryTarget = null, bool queryAsTransaction = false)
+        DfsOperationId? queryTarget = null, bool queryAsTransaction = false, VolumeBinding? binding = null, bool keepProtected = false)
+        where TReply : IWireMessage<TReply>
+    {
+        Bound<TReply> bound = await MutateBoundAsync<TReply>(scope, name, applicationId, build, path, transaction, rebindable, queryTarget, queryAsTransaction,
+            binding, keepProtected).ConfigureAwait(false);
+        return bound.Reply;
+    }
+
+    /// <summary>
+    /// <see cref="MutateAsync{TReply}"/> that also reports the binding and session of the request (they own what it
+    /// created: a handle, a staging session, a transaction, a reader pin).
+    /// </summary>
+    public async Task<Bound<TReply>> MutateBoundAsync<TReply>(OperationScope scope, string name, DfsOperationId? applicationId,
+        Func<RequestHeader, IWireMessage> build, string? path = null, DfsTransactionId? transaction = null, bool rebindable = true,
+        DfsOperationId? queryTarget = null, bool queryAsTransaction = false, VolumeBinding? binding = null, bool keepProtected = false)
         where TReply : IWireMessage<TReply>
     {
         VolumeSession session = await EnsureSessionAsync(scope).ConfigureAwait(false);
         bool sdkAllocated = applicationId is null;
         DfsOperationId operation;
+
+        // The binding every transmission of the id carries: fixed by the caller, else the binding of the session the
+        // SDK allocated the id from, else (application ids) the binding at the first transmission.
+        VolumeBinding? pinned = binding;
         if (applicationId is { } supplied)
         {
             operation = supplied;
@@ -535,9 +631,13 @@ internal sealed class VolumeContext : IRpcRouter
         }
         else
         {
-            operation = await AllocateAsync(scope).ConfigureAwait(false);
+            (operation, VolumeSession owner) = await AllocateWithSessionAsync(scope).ConfigureAwait(false);
+            pinned ??= owner.Binding;
+            if (keepProtected)
+                owner.Protect(operation);
         }
 
+        VolumeSession? sent = null;
         RpcRequest request = null!;
         request = new RpcRequest
         {
@@ -551,17 +651,28 @@ internal sealed class VolumeContext : IRpcRouter
             Build = async s =>
             {
                 VolumeSession current = await EnsureSessionAsync(s).ConfigureAwait(false);
-                return build(Header(current, request.Operation.GetValueOrDefault(), transaction));
+                pinned ??= current.Binding;
+                sent = current;
+                return build(Header(current, request.Operation.GetValueOrDefault(), transaction, pinned));
             },
-            Resolve = s => ResolveOutcomeAsync(request, s, queryTarget ?? request.Operation.GetValueOrDefault(), queryAsTransaction),
-            OnError = (error, s, transmissions) => OnMutationErrorAsync(request, error, s, transmissions, sdkAllocated, rebindable && transaction is null),
+            Resolve = s => ResolveOutcomeAsync(request, s, queryTarget ?? request.Operation.GetValueOrDefault(), queryAsTransaction, pinned),
+            OnError = (error, s, transmissions) => OnMutationErrorAsync(request, error, s, transmissions, sdkAllocated,
+                rebindable && transaction is null && binding is null, async replaceScope =>
+                {
+                    // A definitively rejected SDK id is replaced by a fresh one of the current session (and binding).
+                    (DfsOperationId fresh, VolumeSession owner) = await AllocateWithSessionAsync(replaceScope).ConfigureAwait(false);
+                    request.ReplaceOperation(fresh);
+                    pinned = binding ?? owner.Binding;
+                    if (keepProtected)
+                        owner.Protect(fresh);
+                }),
         };
 
         try
         {
             IWireMessage reply = await Runtime.Rpc.InvokeAsync(request, scope).ConfigureAwait(false);
-            Finish(request, sdkAllocated, definite: true);
-            return (TReply)reply;
+            Finish(request, sdkAllocated, keepProtected);
+            return new Bound<TReply>((TReply)reply, pinned ?? default, sent);
         }
         catch (DfsCommitOutcomeUnknownException)
         {
@@ -574,14 +685,15 @@ internal sealed class VolumeContext : IRpcRouter
         }
         catch (Exception)
         {
-            Finish(request, sdkAllocated, definite: true);
+            Finish(request, sdkAllocated, keepProtected);
             throw;
         }
     }
 
-    private void Finish(RpcRequest request, bool sdkAllocated, bool definite)
+    /// <summary>The request ended definitely: its id is acknowledged (or reused when it was never transmitted).</summary>
+    private void Finish(RpcRequest request, bool sdkAllocated, bool keepProtected)
     {
-        if (request.Operation is not { } id || !definite)
+        if (request.Operation is not { } id)
             return;
         VolumeSession? session;
         lock (_sync)
@@ -589,52 +701,68 @@ internal sealed class VolumeContext : IRpcRouter
         if (session is null)
             return;
         if (sdkAllocated && request.Transmissions == 0)
-            session.Release(id);
-        else
-            session.Complete(id);
-    }
-
-    private async ValueTask<bool> OnMutationErrorAsync(RpcRequest request, ErrorReplyMessage error, OperationScope scope, int transmissions, bool sdkAllocated,
-        bool rebindable)
-    {
-        switch (error.Code)
         {
-            case DfsErrorCode.EpochMismatch:
-                // Rejected before execution: the name designates another volume now.
-                await RefreshBindingAsync(scope).ConfigureAwait(false);
-                if (!rebindable || !sdkAllocated || transmissions > 1)
-                    return false;
-                request.ReplaceOperation(await AllocateAsync(scope).ConfigureAwait(false));
-                return true;
-
-            case DfsErrorCode.OperationExpired:
-            case DfsErrorCode.LeaseLost when rebindable:
-                if (!sdkAllocated)
-                    return false;
-                if (transmissions > 1)
-                {
-                    // An earlier transmission of this id may have committed before its outcome was retired.
-                    throw Runtime.Rpc.CreateUnknown(request, error.ToException(request.Path));
-                }
-
-                if (CurrentSession is { } session && request.Operation is { } old && old.Session == session.Id)
-                    ExpireSession(session, error.Message);
-                request.ReplaceOperation(await AllocateAsync(scope).ConfigureAwait(false));
-                return true;
-
-            default:
-                return false;
+            if (keepProtected)
+                session.Unprotect(id);
+            session.Release(id);
+        }
+        else if (!keepProtected)
+        {
+            session.Complete(id);
         }
     }
 
-    private async ValueTask<bool> OnReadErrorAsync(ErrorReplyMessage error, OperationScope scope, bool requireSession)
+    /// <summary>
+    /// Error replies to a mutation that need more than the generic handling (PROTOCOL.md §5.1). <c>EpochMismatch</c>,
+    /// <c>OperationExpired</c> and <c>LeaseLost</c> reject a transmission without executing it — but after more than one
+    /// transmission an earlier one may have committed before the rejection became possible (the outcome was retired, the
+    /// session expired, the volume was re-created), so the outcome is then unknown. After a single transmission an
+    /// SDK-allocated id moves to a fresh id (a new session, or the re-created volume for requests that refer to nothing
+    /// session-owned); otherwise the rejection is the definite answer.
+    /// </summary>
+    private async ValueTask<bool> OnMutationErrorAsync(RpcRequest request, ErrorReplyMessage error, OperationScope scope, int transmissions, bool sdkAllocated,
+        bool rebindable, Func<OperationScope, Task> replace)
     {
+        if (error.Code is not (DfsErrorCode.EpochMismatch or DfsErrorCode.OperationExpired or DfsErrorCode.LeaseLost))
+            return false;
+        if (transmissions > 1)
+            throw Runtime.Rpc.CreateUnknown(request, error.ToException(request.Path));
+        if (!sdkAllocated)
+            return false;
         switch (error.Code)
         {
             case DfsErrorCode.EpochMismatch:
+                // The name designates another volume now (re-created or restored).
+                await RefreshBindingAsync(scope).ConfigureAwait(false);
+                if (!rebindable)
+                    return false;
+                await replace(scope).ConfigureAwait(false);
+                return true;
+
+            case DfsErrorCode.LeaseLost when !rebindable:
+                // The referenced handle, staging session or transaction is gone: definite.
+                return false;
+
+            default:
+                // OperationExpired, or LeaseLost of the session itself: continue under a new session.
+                if (CurrentSession is { } session && request.Operation is { } old && old.Session == session.Id)
+                    ExpireSession(session, error.Message);
+                await replace(scope).ConfigureAwait(false);
+                return true;
+        }
+    }
+
+    private async ValueTask<bool> OnReadErrorAsync(ErrorReplyMessage error, OperationScope scope, bool retryOnSessionLoss, bool bound)
+    {
+        switch (error.Code)
+        {
+            case DfsErrorCode.EpochMismatch when bound:
+                // The handle, pin, staging session or transaction belongs to a volume that no longer holds the name.
+                return false;
+            case DfsErrorCode.EpochMismatch:
                 await RefreshBindingAsync(scope).ConfigureAwait(false);
                 return true;
-            case DfsErrorCode.LeaseLost when requireSession:
+            case DfsErrorCode.LeaseLost when retryOnSessionLoss:
                 if (CurrentSession is { } session)
                 {
                     ExpireSession(session, error.Message);
@@ -710,9 +838,12 @@ internal sealed class VolumeContext : IRpcRouter
     /// outcome so the answer is definite. Committed → the original success reply; aborted → the definite failure;
     /// otherwise null (the outcome stays unknown).
     /// </summary>
-    private async Task<IWireMessage?> ResolveOutcomeAsync(RpcRequest request, OperationScope scope, DfsOperationId target, bool isTransaction)
+    private async Task<IWireMessage?> ResolveOutcomeAsync(RpcRequest request, OperationScope scope, DfsOperationId target, bool isTransaction,
+        VolumeBinding? binding)
     {
-        QueryOperationResultMessage result = await QueryAsync(target, isTransaction, resolve: true, scope).ConfigureAwait(false);
+        // Asked of the volume the request was addressed to: a re-created volume must never fence (and so "abort") an id
+        // that may have committed in its predecessor.
+        QueryOperationResultMessage result = await QueryAsync(target, isTransaction, resolve: true, scope, binding).ConfigureAwait(false);
         switch (result.Status)
         {
             case WireOutcomeStatus.Committed:
@@ -741,8 +872,9 @@ internal sealed class VolumeContext : IRpcRouter
         }
     }
 
-    /// <summary>Sends <c>QueryOperation</c> for <paramref name="target"/>.</summary>
-    public async Task<QueryOperationResultMessage> QueryAsync(DfsOperationId target, bool isTransaction, bool resolve, OperationScope scope)
+    /// <summary>Sends <c>QueryOperation</c> for <paramref name="target"/> (to <paramref name="binding"/>'s volume when given).</summary>
+    public async Task<QueryOperationResultMessage> QueryAsync(DfsOperationId target, bool isTransaction, bool resolve, OperationScope scope,
+        VolumeBinding? binding = null)
     {
         var request = new RpcRequest
         {
@@ -750,13 +882,15 @@ internal sealed class VolumeContext : IRpcRouter
             ReplyType = MessageType.QueryOperationResult,
             Kind = CallKind.Idempotent,
             Router = this,
-            Build = _ => ValueTask.FromResult<IWireMessage>(new QueryOperationMessage(Header(CurrentSession), target, isTransaction, resolve)),
+            Build = _ => ValueTask.FromResult<IWireMessage>(new QueryOperationMessage(Header(CurrentSession, default, null, binding), target, isTransaction,
+                resolve)),
         };
         return (QueryOperationResultMessage)await Runtime.Rpc.InvokeAsync(request, scope).ConfigureAwait(false);
     }
 
     /// <summary>Closes a handle (idempotent; releases sharing, writer authority, pin and bound staging).</summary>
-    public async Task<CloseHandleResultMessage> CloseHandleAsync(HandleId handle, ulong generation, DfsTransactionId? transaction, OperationScope scope)
+    public async Task<CloseHandleResultMessage> CloseHandleAsync(HandleId handle, ulong generation, DfsTransactionId? transaction, OperationScope scope,
+        VolumeBinding? binding)
     {
         var request = new RpcRequest
         {
@@ -765,7 +899,7 @@ internal sealed class VolumeContext : IRpcRouter
             Kind = CallKind.Idempotent,
             Router = this,
             Transaction = transaction,
-            Build = _ => ValueTask.FromResult<IWireMessage>(new CloseHandleMessage(Header(CurrentSession, default, transaction), handle, generation)),
+            Build = _ => ValueTask.FromResult<IWireMessage>(new CloseHandleMessage(Header(CurrentSession, default, transaction, binding), handle, generation)),
         };
         return (CloseHandleResultMessage)await Runtime.Rpc.InvokeAsync(request, scope).ConfigureAwait(false);
     }
@@ -790,32 +924,39 @@ internal sealed class VolumeContext : IRpcRouter
             return lease;
         }
 
-        CreateStagingResultMessage created = await MutateAsync<CreateStagingResultMessage>(scope, "CreateStaging", null,
+        Bound<CreateStagingResultMessage> bound = await MutateBoundAsync<CreateStagingResultMessage>(scope, "CreateStaging", null,
             header => new CreateStagingMessage(header, default, default)).ConfigureAwait(false);
-        lease = new StagingLease(created.Staging, default, null, session.Id, created.Capability, created.CapabilityExpiry, created.PlacementEpoch);
+        CreateStagingResultMessage created = bound.Reply;
+
+        // The staging session belongs to the client session the creating request carried (a new one when the old expired).
+        ulong owner = bound.Session?.Id ?? session.Id;
+        lease = new StagingLease(created.Staging, default, null, owner, created.Capability, created.CapabilityExpiry, created.PlacementEpoch, bound.Binding);
         lock (_sync)
         {
-            if (CurrentSession is { } current && current.Id == session.Id)
+            if (CurrentSession is { } current && current.Id == owner)
                 _helperStaging = lease;
         }
 
         return lease;
     }
 
-    /// <summary>Creates a staging session bound to a writable handle.</summary>
-    public async Task<StagingLease> CreateHandleStagingAsync(HandleId handle, OperationScope scope)
+    /// <summary>Creates a staging session bound to a writable handle (of <paramref name="binding"/>'s volume).</summary>
+    public async Task<StagingLease> CreateHandleStagingAsync(HandleId handle, OperationScope scope, VolumeBinding? binding)
     {
         VolumeSession session = await EnsureSessionAsync(scope).ConfigureAwait(false);
-        CreateStagingResultMessage created = await MutateAsync<CreateStagingResultMessage>(scope, "CreateStaging", null,
-            header => new CreateStagingMessage(header, handle, default), rebindable: false).ConfigureAwait(false);
-        return new StagingLease(created.Staging, handle, null, session.Id, created.Capability, created.CapabilityExpiry, created.PlacementEpoch);
+        Bound<CreateStagingResultMessage> bound = await MutateBoundAsync<CreateStagingResultMessage>(scope, "CreateStaging", null,
+            header => new CreateStagingMessage(header, handle, default), rebindable: false, binding: binding).ConfigureAwait(false);
+        CreateStagingResultMessage created = bound.Reply;
+        return new StagingLease(created.Staging, handle, null, bound.Session?.Id ?? session.Id, created.Capability, created.CapabilityExpiry,
+            created.PlacementEpoch, bound.Binding);
     }
 
     /// <summary>Renews the capability of <paramref name="lease"/> (<c>CreateStaging</c> with <c>Renew</c>; no log entry).</summary>
     public async Task RenewStagingAsync(StagingLease lease, OperationScope scope)
     {
         CreateStagingResultMessage renewed = await ReadAsync<CreateStagingResultMessage>(scope, "CreateStaging(renew)",
-            header => new CreateStagingMessage(header, lease.Handle, lease.Id), transaction: lease.Transaction, requireSession: true).ConfigureAwait(false);
+            header => new CreateStagingMessage(header, lease.Handle, lease.Id), transaction: lease.Transaction, requireSession: true,
+            binding: lease.Binding).ConfigureAwait(false);
         lease.Update(renewed.Capability, renewed.CapabilityExpiry, renewed.PlacementEpoch);
     }
 
@@ -1005,7 +1146,18 @@ internal sealed class VolumeContext : IRpcRouter
                     Router = this,
                     Build = _ => ValueTask.FromResult<IWireMessage>(new KeepAliveMessage(Header(session), handles, updates, pins)),
                 };
-                result = (KeepAliveResultMessage)await Runtime.Rpc.InvokeAsync(request, scope).ConfigureAwait(false);
+                try
+                {
+                    result = (KeepAliveResultMessage)await Runtime.Rpc.InvokeAsync(request, scope).ConfigureAwait(false);
+                }
+                catch (DfsException ex) when (ex.ErrorCode == DfsErrorCode.EpochMismatch)
+                {
+                    // The session's volume was re-created or restored: learn the new binding now, which faults the old
+                    // volume's streams and pins instead of letting them believe their leases are being renewed.
+                    await RefreshBindingAsync(scope).ConfigureAwait(false);
+                    ExpireSession(session, ex.Message);
+                    return;
+                }
             }
 
             Process(session, result, updates);

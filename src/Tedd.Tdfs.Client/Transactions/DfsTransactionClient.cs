@@ -2,6 +2,7 @@ using Tedd.Tdfs.Client.Internal;
 using Tedd.Tdfs.Client.Internal.Data;
 using Tedd.Tdfs.Client.Internal.Facades;
 using Tedd.Tdfs.Client.Internal.Runtime;
+using Tedd.Tdfs.Client.Internal.Sessions;
 using Tedd.Tdfs.Protocol.Messages;
 
 namespace Tedd.Tdfs;
@@ -32,12 +33,16 @@ public sealed class DfsTransactionClient
         if (Volume.IsReadOnly)
             throw new DfsReadOnlyException("This volume is served read-only (backup host); transactions are not available.");
         await scope.ValidatedAsync().ConfigureAwait(false);
-        TxBeginResultMessage begun = await Volume.Context.MutateAsync<TxBeginResultMessage>(scope, "TxBegin", options.OperationId,
-            header => new TxBeginMessage(header, options.Timeout)).ConfigureAwait(false);
-        ulong session = Volume.Context.CurrentSession?.Id ?? begun.Transaction.Operation.Session;
-        var staging = new StagingLease(begun.Staging, default, begun.Transaction, session, begun.Capability, begun.CapabilityExpiry, begun.PlacementEpoch);
+        // The begin's id becomes the durable transaction id: it is application-visible (queried, resolved by another process),
+        // so it is never acknowledged (PROTOCOL.md §5.1).
+        VolumeContext.Bound<TxBeginResultMessage> bound = await Volume.Context.MutateBoundAsync<TxBeginResultMessage>(scope, "TxBegin", options.OperationId,
+            header => new TxBeginMessage(header, options.Timeout), keepProtected: true).ConfigureAwait(false);
+        TxBeginResultMessage begun = bound.Reply;
+        ulong session = bound.Session?.Id ?? begun.Transaction.Operation.Session;
+        var staging = new StagingLease(begun.Staging, default, begun.Transaction, session, begun.Capability, begun.CapabilityExpiry, begun.PlacementEpoch,
+            bound.Binding);
         runtime.Emit("tx.begun", $"Transaction {begun.Transaction} begun at {begun.ReadVersion}.", null, begun.Transaction, Volume.Name, begun.ReadVersion);
-        return new DfsTransaction(Volume, begun.Transaction, begun.ReadVersion, staging);
+        return new DfsTransaction(Volume, begun.Transaction, begun.ReadVersion, staging, bound.Binding);
     }
 
     /// <summary>Synchronous counterpart of <see cref="BeginAsync"/>.</summary>

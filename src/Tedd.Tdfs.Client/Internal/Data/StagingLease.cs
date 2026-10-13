@@ -1,3 +1,5 @@
+using Tedd.Tdfs.Client.Internal.Sessions;
+
 namespace Tedd.Tdfs.Client.Internal.Data;
 
 /// <summary>
@@ -13,16 +15,20 @@ internal sealed class StagingLease
     private ulong _placementEpoch;
 
     public StagingLease(StagingId id, HandleId handle, DfsTransactionId? transaction, ulong sessionId, ReadOnlyMemory<byte> capability,
-        DateTimeOffset expiry, ulong placementEpoch)
+        DateTimeOffset expiry, ulong placementEpoch, VolumeBinding binding)
     {
         Id = id;
         Handle = handle;
         Transaction = transaction;
         SessionId = sessionId;
+        Binding = binding;
         _capability = capability;
         _expiry = expiry;
         _placementEpoch = placementEpoch;
     }
+
+    /// <summary>The volume binding the staging session belongs to (renewals carry it).</summary>
+    public VolumeBinding Binding { get; }
 
     /// <summary>Remaining validity below which the capability is renewed before an upload.</summary>
     public static readonly TimeSpan RenewalMargin = TimeSpan.FromSeconds(5);

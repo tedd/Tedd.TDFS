@@ -1,5 +1,6 @@
 using Tedd.Tdfs.Client.Internal;
 using Tedd.Tdfs.Client.Internal.Runtime;
+using Tedd.Tdfs.Client.Internal.Sessions;
 using Tedd.Tdfs.Protocol.Messages;
 
 namespace Tedd.Tdfs;
@@ -12,7 +13,7 @@ public sealed partial class DfsFileClient
     /// order). A stream path reads its file's descriptor.
     /// </summary>
     public Task<DfsSecurityDescriptor> GetAccessControlAsync(string path, CancellationToken ct = default) =>
-        SecurityOperations.GetAccessControlAsync(Volume, Begin, Validation.Path, path, Pin, TxId, ct, EnterTransaction);
+        SecurityOperations.GetAccessControlAsync(Volume, Begin, Validation.Path, path, Pin, TxId, Bound, ct, EnterTransaction);
 
     /// <summary>Synchronous counterpart of <see cref="GetAccessControlAsync"/>.</summary>
     public DfsSecurityDescriptor GetAccessControl(string path) =>
@@ -23,7 +24,7 @@ public sealed partial class DfsFileClient
     /// <paramref name="descriptor"/> are ignored; change the owner with <see cref="SetOwnerAsync"/>).
     /// </summary>
     public Task<CommitToken> SetAccessControlAsync(string path, DfsSecurityDescriptor descriptor, CancellationToken ct = default) =>
-        SecurityOperations.SetAccessControlAsync(Volume, Begin, Validation.Path, path, descriptor, TxId, ct, EnsureWritable, EnterTransaction);
+        SecurityOperations.SetAccessControlAsync(Volume, Begin, Validation.Path, path, descriptor, TxId, Bound, ct, EnsureWritable, EnterTransaction);
 
     /// <summary>Synchronous counterpart of <see cref="SetAccessControlAsync"/>.</summary>
     public CommitToken SetAccessControl(string path, DfsSecurityDescriptor descriptor) =>
@@ -31,7 +32,7 @@ public sealed partial class DfsFileClient
 
     /// <summary>Changes the owner of a file (TakeOwnership for oneself, Administrators for any owner).</summary>
     public Task<CommitToken> SetOwnerAsync(string path, DfsIdentity owner, CancellationToken ct = default) =>
-        SecurityOperations.SetOwnerAsync(Volume, Begin, Validation.Path, path, owner, TxId, ct, EnsureWritable, EnterTransaction);
+        SecurityOperations.SetOwnerAsync(Volume, Begin, Validation.Path, path, owner, TxId, Bound, ct, EnsureWritable, EnterTransaction);
 
     /// <summary>Synchronous counterpart of <see cref="SetOwnerAsync"/>.</summary>
     public CommitToken SetOwner(string path, DfsIdentity owner) =>
@@ -39,7 +40,7 @@ public sealed partial class DfsFileClient
 
     /// <summary>The rights <paramref name="identity"/> (null = the caller) would be granted on a file.</summary>
     public Task<DfsFileSystemRights> GetEffectiveRightsAsync(string path, DfsIdentity? identity = null, CancellationToken ct = default) =>
-        SecurityOperations.GetEffectiveRightsAsync(Volume, Begin, Validation.Path, path, identity, Pin, TxId, ct, EnterTransaction);
+        SecurityOperations.GetEffectiveRightsAsync(Volume, Begin, Validation.Path, path, identity, Pin, TxId, Bound, ct, EnterTransaction);
 
     /// <summary>Synchronous counterpart of <see cref="GetEffectiveRightsAsync"/>.</summary>
     public DfsFileSystemRights GetEffectiveRights(string path, DfsIdentity? identity = null) =>
@@ -57,7 +58,8 @@ public sealed partial class DfsFileClient
         scope.Path = p;
         await scope.ValidatedAsync().ConfigureAwait(false);
         ListStreamsResultMessage result = await Volume.Context.ReadAsync<ListStreamsResultMessage>(scope, "ListStreams",
-            header => new ListStreamsMessage(header, p, Pin), p, TxId, requireSession: Pin != 0 || TxId is not null).ConfigureAwait(false);
+            header => new ListStreamsMessage(header, p, Pin), p, TxId, requireSession: Pin != 0 || TxId is not null,
+            binding: Bound).ConfigureAwait(false);
         return result.Streams.Select(s => new DfsStreamInfo(s.Name, s.Length, s.Revision)).ToArray();
     }
 
@@ -70,7 +72,7 @@ public sealed partial class DfsFileClient
 internal static class SecurityOperations
 {
     public static async Task<DfsSecurityDescriptor> GetAccessControlAsync(DfsVolume volume, Func<DfsOperationKind, CancellationToken, OperationScope> begin,
-        Func<string?, string, string> validate, string path, ulong pin, DfsTransactionId? transaction, CancellationToken ct, Func<IDisposable?> enterTransaction)
+        Func<string?, string, string> validate, string path, ulong pin, DfsTransactionId? transaction, VolumeBinding? binding, CancellationToken ct, Func<IDisposable?> enterTransaction)
     {
         using OperationScope scope = begin(DfsOperationKind.GetInfo, ct);
         await scope.StartedAsync().ConfigureAwait(false);
@@ -79,12 +81,12 @@ internal static class SecurityOperations
         scope.Path = p;
         await scope.ValidatedAsync().ConfigureAwait(false);
         GetAccessControlResultMessage result = await volume.Context.ReadAsync<GetAccessControlResultMessage>(scope, "GetAccessControl",
-            header => new GetAccessControlMessage(header, p, pin), p, transaction, requireSession: pin != 0 || transaction is not null).ConfigureAwait(false);
+            header => new GetAccessControlMessage(header, p, pin), p, transaction, requireSession: pin != 0 || transaction is not null, binding: binding).ConfigureAwait(false);
         return result.Descriptor;
     }
 
     public static async Task<CommitToken> SetAccessControlAsync(DfsVolume volume, Func<DfsOperationKind, CancellationToken, OperationScope> begin,
-        Func<string?, string, string> validate, string path, DfsSecurityDescriptor descriptor, DfsTransactionId? transaction, CancellationToken ct,
+        Func<string?, string, string> validate, string path, DfsSecurityDescriptor descriptor, DfsTransactionId? transaction, VolumeBinding? binding, CancellationToken ct,
         Action ensureWritable, Func<IDisposable?> enterTransaction)
     {
         using OperationScope scope = begin(DfsOperationKind.Admin, ct);
@@ -101,12 +103,12 @@ internal static class SecurityOperations
         scope.Path = p;
         await scope.ValidatedAsync().ConfigureAwait(false);
         SetAccessControlResultMessage result = await volume.Context.MutateAsync<SetAccessControlResultMessage>(scope, "SetAccessControl", null,
-            header => new SetAccessControlMessage(header, p, descriptor), p, transaction).ConfigureAwait(false);
+            header => new SetAccessControlMessage(header, p, descriptor), p, transaction, binding: binding).ConfigureAwait(false);
         return result.Token;
     }
 
     public static async Task<CommitToken> SetOwnerAsync(DfsVolume volume, Func<DfsOperationKind, CancellationToken, OperationScope> begin,
-        Func<string?, string, string> validate, string path, DfsIdentity owner, DfsTransactionId? transaction, CancellationToken ct, Action ensureWritable,
+        Func<string?, string, string> validate, string path, DfsIdentity owner, DfsTransactionId? transaction, VolumeBinding? binding, CancellationToken ct, Action ensureWritable,
         Func<IDisposable?> enterTransaction)
     {
         using OperationScope scope = begin(DfsOperationKind.Admin, ct);
@@ -121,12 +123,12 @@ internal static class SecurityOperations
         scope.Path = p;
         await scope.ValidatedAsync().ConfigureAwait(false);
         SetOwnerResultMessage result = await volume.Context.MutateAsync<SetOwnerResultMessage>(scope, "SetOwner", null,
-            header => new SetOwnerMessage(header, p, owner), p, transaction).ConfigureAwait(false);
+            header => new SetOwnerMessage(header, p, owner), p, transaction, binding: binding).ConfigureAwait(false);
         return result.Token;
     }
 
     public static async Task<DfsFileSystemRights> GetEffectiveRightsAsync(DfsVolume volume, Func<DfsOperationKind, CancellationToken, OperationScope> begin,
-        Func<string?, string, string> validate, string path, DfsIdentity? identity, ulong pin, DfsTransactionId? transaction, CancellationToken ct,
+        Func<string?, string, string> validate, string path, DfsIdentity? identity, ulong pin, DfsTransactionId? transaction, VolumeBinding? binding, CancellationToken ct,
         Func<IDisposable?> enterTransaction)
     {
         using OperationScope scope = begin(DfsOperationKind.GetInfo, ct);
@@ -136,7 +138,7 @@ internal static class SecurityOperations
         scope.Path = p;
         await scope.ValidatedAsync().ConfigureAwait(false);
         GetEffectiveRightsResultMessage result = await volume.Context.ReadAsync<GetEffectiveRightsResultMessage>(scope, "GetEffectiveRights",
-            header => new GetEffectiveRightsMessage(header, p, identity, pin), p, transaction, requireSession: pin != 0 || transaction is not null)
+            header => new GetEffectiveRightsMessage(header, p, identity, pin), p, transaction, requireSession: pin != 0 || transaction is not null, binding: binding)
             .ConfigureAwait(false);
         return result.Rights;
     }

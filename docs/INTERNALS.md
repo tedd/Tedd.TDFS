@@ -350,7 +350,9 @@ Internal/Rpc/       RpcInvoker (routing, NotLeader redirects, retries with the s
                     leader, any node)
 Internal/Sessions/  VolumeContext (volume binding id/epoch, leader routing via GetVolumeRoute, session open, sequence
                     blocks, Read/Mutate helpers, keep-alive timer, weak handle/pin registries, helper staging session),
-                    VolumeSession (session id, reserved sequence blocks, ack watermark)
+                    VolumeSession (session id, reserved sequence blocks, ack watermark, the session's volume binding),
+                    VolumeBinding (expected volume id/epoch carried by every request about something a session owns,
+                    and by every transmission of one operation id)
 Internal/Data/      DataPlane (HRW upload with fallback, receipts until the ack policy is met, grace for extra copies;
                     verified range reads with replica failover and LocateObject; never zero-fill), ContentLayout (chunking
                     at ChunkSize boundaries, inline-permission from the voters' failure domains), StagingLease

@@ -159,7 +159,10 @@ internal sealed class RpcInvoker
 
             byte[] frame = MessageCodec.Encode(message);
             Task<ReadOnlyMemory<byte>> pending = connection.StartCall(frame, attemptTimeout, scope.Token);
-            if (!(pending.IsFaulted && pending.Exception?.GetBaseException() is RpcConnectionException))
+
+            // A call refused before sending (connection closed, token already cancelled) transmitted nothing.
+            bool refused = pending.IsCanceled || (pending.IsFaulted && pending.Exception?.GetBaseException() is RpcConnectionException);
+            if (!refused)
             {
                 transmissions++;
                 request.Transmissions = transmissions;
@@ -232,7 +235,12 @@ internal sealed class RpcInvoker
             if (reply is not ErrorReplyMessage error)
             {
                 _runtime.Pool.Invalidate(connection);
-                throw new DfsProtocolException($"{request.Name}: expected {request.ReplyType} from {endpoint}, received {reply.Type}.");
+                var violation = new DfsProtocolException($"{request.Name}: expected {request.ReplyType} from {endpoint}, received {reply.Type}.");
+
+                // The node answered something unexpected after receiving the mutation: it may have applied it.
+                if (mutation)
+                    throw Unknown(request, request.Operation.GetValueOrDefault(), violation);
+                throw violation;
             }
 
             request.Router.OnAnswered(endpoint);

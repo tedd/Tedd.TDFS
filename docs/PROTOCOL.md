@@ -234,9 +234,18 @@ Every volume-scoped request (39 types, all implementing `IVolumeRequest`) starts
   next allocation (so blocks are used up and their reservations retire). An SDK-allocated id whose **only** transmission
   is rejected with `OperationExpired` (or, for requests that refer to no handle, pin or staging session, `LeaseLost` for
   an expired session, or `EpochMismatch` for a re-created volume) did not execute; the SDK opens a new session and
-  continues under a fresh id. After more than one transmission such a rejection makes the outcome unknown
-  (`DfsCommitOutcomeUnknownException`), because an earlier transmission may have committed before its outcome was
-  retired.
+  continues under a fresh id. After more than one transmission such a rejection (`OperationExpired`, `LeaseLost` or
+  `EpochMismatch`, for SDK and application ids alike) makes the outcome unknown (`DfsCommitOutcomeUnknownException`),
+  because an earlier transmission may have committed before its outcome was retired, its session expired or its volume
+  was re-created. An unexpected (non-error) reply type to a transmitted mutation is likewise an unknown outcome.
+* **Volume binding of retries.** Every transmission of one operation id carries the same `ExpectedVolumeId` /
+  `ExpectedVolumeEpoch`: those of the session the id belongs to (an application id: those of its first transmission).
+  Requests about anything a session owns — handles, reader and enumeration pins, staging sessions, transactions, and
+  `QueryOperation(Resolve)` of an SDK request's own id — carry the binding of the volume that issued it. A re-created or
+  restored volume therefore rejects them with `EpochMismatch` instead of applying them (handle, session and sequence
+  numbers restart in a new volume, so an old number may designate something else there); only an SDK-allocated id
+  whose single transmission was rejected that way, of a request that refers to nothing session-owned, moves to the new
+  volume under a fresh id.
 * `Header.AckWatermark` retires outcomes, so the SDK advances it only past sequences whose outcome it has observed and
   will never ask about again. Ids handed to or supplied by the application (`NewOperationIdAsync`,
   `DfsMutationOptions.OperationId`, transaction ids) may be retried or queried by another process after this one is
@@ -308,7 +317,9 @@ carry an operation id; **opt** = may carry one (then retries are deduplicated); 
   `ExpireHandles`/`ExpireSessions`; client clocks are never authoritative (LOCK-014). A new leader treats every lease
   as renewed at its election.
 * `KeepAliveResult.ExpiredHandles` / `ExpiredPins` / `SessionExpired` tell the client which streams to fault
-  (`LeaseLost`, `PinExpired`) and when to open a new session (NET-018).
+  (`LeaseLost`, `PinExpired`) and when to open a new session (NET-018). A `KeepAlive` rejected with `EpochMismatch`
+  (it carries its session's binding) means the volume was re-created or restored: the SDK re-learns the binding at once
+  and faults every handle and pin of the old volume.
 * Live-read handles report `HandlePinUpdate(handle, pinIndex)` after each read so GC can reclaim objects of older
   revisions; version-pinned handles keep their pin for their lifetime.
 * Backup nodes keep sessions and pins locally (no Raft) for snapshot readers (BAK-013, BAK-027).
@@ -316,10 +327,17 @@ carry an operation id; **opt** = may carry one (then retries are deduplicated); 
   `QueryOperation`, `BackupStatus`, `BackupAwait`, `GetAccessControl`, `GetEffectiveRights`, `ListStreams`) may carry
   `Session = 0`; the SDK attaches its session when one is open (for the acknowledgement watermark) but never opens one
   just to read. Requests through handles, pins, staging sessions or transactions carry the owning session.
+* `LeaseLost` answers the object a request refers to: for a request through a handle, pin, staging session or
+  transaction it means that object is gone (its own lease expired, or its session did), and the SDK faults only what
+  depends on it — other handles of the session keep working until `KeepAliveResult` reports them. Only for a request
+  that refers to nothing session-owned (for example the first `ListDirectory` page) does `LeaseLost` mean the session
+  itself expired, so the SDK opens a new one and retries.
 * Whole-file helpers (`WriteAll`, `Append`) share one unbound staging session per client session (`CreateStaging`
   with an empty `Handle`); it stays open across publications (only the leader's own materialization staging closes
   with its publication) and is replaced when the client session expires. Stream writers use a staging session bound
-  to their handle; transactions use the staging session returned by `TxBegin`.
+  to their handle; transactions use the staging session returned by `TxBegin`. A publication rejected with `LeaseLost`
+  because its helper staging session closed (with the client session) applied nothing: the SDK uploads the content
+  again under a new staging session and publishes it under a new SDK-allocated id.
 
 ## 7. Data plane
 

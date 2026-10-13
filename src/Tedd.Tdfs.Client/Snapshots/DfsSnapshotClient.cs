@@ -1,6 +1,7 @@
 using Tedd.Tdfs.Client.Internal;
 using Tedd.Tdfs.Client.Internal.Facades;
 using Tedd.Tdfs.Client.Internal.Runtime;
+using Tedd.Tdfs.Client.Internal.Sessions;
 using Tedd.Tdfs.Protocol;
 using Tedd.Tdfs.Protocol.Messages;
 
@@ -63,10 +64,15 @@ public sealed class DfsSnapshotClient
         catch (DfsCommitOutcomeUnknownException unknown) when (adapters.PreparedCount > 0)
         {
             // Applications stay paused until the capture can no longer happen later: fence it first (bounded).
-            CreateSnapshotResultMessage? fenced = await FenceAsync(unknown.OperationId, options.AdapterTimeout).ConfigureAwait(false);
+            (WireOutcomeStatus status, CreateSnapshotResultMessage? fenced) = await FenceAsync(unknown.OperationId, options.AdapterTimeout).ConfigureAwait(false);
             if (fenced is null)
             {
-                await adapters.AbortAndResumeAsync().ConfigureAwait(false);
+                // Abort tells an adapter that the capture failed; a capture that committed (its reply not retained) or whose
+                // fate stays open only resumes them.
+                if (status == WireOutcomeStatus.Aborted)
+                    await adapters.AbortAndResumeAsync().ConfigureAwait(false);
+                else
+                    await adapters.ResumeAsync().ConfigureAwait(false);
                 throw;
             }
 
@@ -86,7 +92,11 @@ public sealed class DfsSnapshotClient
     public DfsSnapshotInfo Create(string name, DfsSnapshotOptions? options = null) =>
         SyncBridge.Run(() => CreateAsync(name, options, CancellationToken.None));
 
-    private async Task<CreateSnapshotResultMessage?> FenceAsync(DfsOperationId operation, TimeSpan budget)
+    /// <summary>
+    /// Fences an uncertain capture: its final status (<see cref="WireOutcomeStatus.Pending"/> when the fence itself failed)
+    /// and its reply when it committed and the reply was retained.
+    /// </summary>
+    private async Task<(WireOutcomeStatus Status, CreateSnapshotResultMessage? Created)> FenceAsync(DfsOperationId operation, TimeSpan budget)
     {
         try
         {
@@ -95,8 +105,10 @@ public sealed class DfsSnapshotClient
             if (result.Status == WireOutcomeStatus.Committed && !result.ResultFrame.IsEmpty
                 && MessageCodec.Decode(result.ResultFrame.Span) is CreateSnapshotResultMessage committed)
             {
-                return committed;
+                return (result.Status, committed);
             }
+
+            return (result.Status, null);
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
@@ -104,7 +116,7 @@ public sealed class DfsSnapshotClient
                 exception: ex);
         }
 
-        return null;
+        return (WireOutcomeStatus.Pending, null);
     }
 
     /// <summary>Lists the volume's snapshots.</summary>
@@ -148,10 +160,10 @@ public sealed class DfsSnapshotClient
         await scope.StartedAsync().ConfigureAwait(false);
         Validation.Name(name, nameof(name));
         await scope.ValidatedAsync().ConfigureAwait(false);
-        OpenSnapshotResultMessage opened;
+        VolumeContext.Bound<OpenSnapshotResultMessage> bound;
         try
         {
-            opened = await Volume.Context.MutateAsync<OpenSnapshotResultMessage>(scope, "OpenSnapshot", null,
+            bound = await Volume.Context.MutateBoundAsync<OpenSnapshotResultMessage>(scope, "OpenSnapshot", null,
                 header => new OpenSnapshotMessage(header, name)).ConfigureAwait(false);
         }
         catch (DfsCommitOutcomeUnknownException unknown)
@@ -160,8 +172,9 @@ public sealed class DfsSnapshotClient
             throw new DfsUnavailableException(DfsErrorCode.Unavailable, $"Opening snapshot '{name}' did not complete.", unknown.InnerException ?? unknown);
         }
 
-        var view = new DfsSnapshotView(Volume, WireConvert.ToSnapshotInfo(opened.Snapshot), opened.SnapshotPin);
-        Volume.Context.RegisterPin(opened.SnapshotPin, Volume.Context.CurrentSession, view);
+        OpenSnapshotResultMessage opened = bound.Reply;
+        var view = new DfsSnapshotView(Volume, WireConvert.ToSnapshotInfo(opened.Snapshot), opened.SnapshotPin, bound.Binding);
+        Volume.Context.RegisterPin(opened.SnapshotPin, bound.Session ?? Volume.Context.CurrentSession, view);
         return view;
     }
 

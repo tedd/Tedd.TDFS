@@ -1,6 +1,16 @@
 namespace Tedd.Tdfs.Client.Internal.Sessions;
 
 /// <summary>
+/// The volume a request is meant for (<c>RequestHeader.ExpectedVolumeId</c>/<c>ExpectedVolumeEpoch</c>, PROTOCOL.md §4.1).
+/// Everything a session owns (operation ids, handles, pins, staging sessions, transactions) belongs to the binding the
+/// session was opened under; requests about it carry that binding so a re-created or restored volume rejects them with
+/// <c>EpochMismatch</c> instead of applying them to an unrelated volume (PATH-014, RST-008). The default value means "any".
+/// </summary>
+/// <param name="Id">Expected volume id (empty = any).</param>
+/// <param name="Epoch">Expected volume epoch (0 = any).</param>
+internal readonly record struct VolumeBinding(VolumeId Id, ulong Epoch);
+
+/// <summary>
 /// The client's session on one volume (ARCHITECTURE §7, PROTOCOL.md §5–6): the server-issued session id, the operation
 /// sequences the leader reserved for this client, and the acknowledgement watermark.
 /// </summary>
@@ -52,6 +62,9 @@ internal sealed class VolumeSession
 
     /// <summary>Volume epoch the session belongs to.</summary>
     public ulong Epoch { get; }
+
+    /// <summary>The volume binding the session (and everything it owns) belongs to.</summary>
+    public VolumeBinding Binding => new(Volume, Epoch);
 
     /// <summary>True once the leader reported the session expired (a new one is opened on demand).</summary>
     public bool IsExpired { get; private set; }
@@ -136,6 +149,18 @@ internal sealed class VolumeSession
             _applicationVisible.Add(id.Sequence);
             _protected.Add(id.Sequence);
         }
+    }
+
+    /// <summary>
+    /// Withdraws the application-visible protection of an SDK-allocated id that was never transmitted (it can then be
+    /// released for reuse with <see cref="Release"/>).
+    /// </summary>
+    public void Unprotect(DfsOperationId id)
+    {
+        if (id.Session != Id)
+            return;
+        lock (_sync)
+            _applicationVisible.Remove(id.Sequence);
     }
 
     /// <summary>The outcome of <paramref name="id"/> is known to the client: it may be acknowledged (unless application-visible).</summary>

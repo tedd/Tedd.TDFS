@@ -33,6 +33,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
     private readonly StagedOverlay? _overlay;
     private readonly string _policyName;
     private readonly ulong _snapshotPin;
+    private readonly VolumeBinding _binding;
     private StagingLease? _staging;
     private long _position;
     private long _knownLength;
@@ -43,7 +44,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
 
     internal DfsStream(VolumeContext volume, DfsTransaction? transaction, HandleId handle, FileInfoData info, string path, DfsReadView readView,
         DfsWriteMode writeMode, FileAccess access, FileShare share, bool isAppend, ulong writerGeneration, int bufferSize, CommitToken openToken,
-        ulong snapshotPin)
+        ulong snapshotPin, VolumeBinding binding)
     {
         ArgumentNullException.ThrowIfNull(volume);
         ArgumentNullException.ThrowIfNull(info);
@@ -52,6 +53,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
         _runtime = volume.Runtime;
         _transaction = transaction;
         _handle = handle;
+        _binding = binding;
         Path = path;
         InodeId = info.Inode;
         OpenRevision = info.Revision;
@@ -355,7 +357,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
             ReadRangeResultMessage range = await _volume.ReadAsync<ReadRangeResultMessage>(scope, "ReadRange",
                 header => new ReadRangeMessage(header, _handle, _snapshotPin, _snapshotPin != 0 ? InodeId : default, position, requested), Path,
                 _transaction?.Id,
-                requireSession: true).ConfigureAwait(false);
+                requireSession: true, binding: _binding).ConfigureAwait(false);
             if (_overlay is null)
             {
                 if (ReadView == DfsReadView.Live)
@@ -723,7 +725,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
             GetInfoResultMessage result = await _volume.ReadAsync<GetInfoResultMessage>(scope, "GetInfo",
                 header => _snapshotPin != 0
                     ? new GetInfoMessage(header, Path, default, _snapshotPin)
-                    : new GetInfoMessage(header, string.Empty, _handle, 0), Path, _transaction?.Id, requireSession: true).ConfigureAwait(false);
+                    : new GetInfoMessage(header, string.Empty, _handle, 0), Path, _transaction?.Id, requireSession: true, binding: _binding).ConfigureAwait(false);
             if (!result.Exists || result.Info is null)
                 throw new DfsProtocolException("GetInfo through an open handle reported no file.");
             if (_overlay is null && ReadView == DfsReadView.Live)
@@ -836,13 +838,24 @@ public sealed class DfsStream : Stream, ILeaseHolder
             return Task.FromCanceled(ct);
         }
 
-        return AbortGatedAsync(gate, ct);
+        DfsTransaction.TransactionOperation? transaction;
+        try
+        {
+            transaction = EnterForCleanup("AbortAsync");
+        }
+        catch
+        {
+            gate.Dispose();
+            throw;
+        }
+
+        return AbortGatedAsync(gate, transaction, ct);
     }
 
     /// <summary>Synchronous counterpart of <see cref="AbortAsync"/>.</summary>
     public void Abort() => SyncBridge.Run(() => AbortAsync(CancellationToken.None));
 
-    private async Task AbortGatedAsync(AsyncGate.Scope gate, CancellationToken ct)
+    private async Task AbortGatedAsync(AsyncGate.Scope gate, DfsTransaction.TransactionOperation? transaction, CancellationToken ct)
     {
         try
         {
@@ -851,10 +864,31 @@ public sealed class DfsStream : Stream, ILeaseHolder
         }
         finally
         {
+            transaction?.Dispose();
             Volatile.Write(ref _disposed, 1);
             gate.ExitAndClose();
             _gate.Close();
         }
+    }
+
+    /// <summary>
+    /// Registers a cleanup call (disposal, abort) of a transaction-bound stream with its transaction, so the transaction
+    /// cannot start committing (and publishing this stream's staged view) while the call discards or publishes it. A call
+    /// overlapping a commit in progress is rejected with <see cref="InvalidOperationException"/> and changes nothing; after
+    /// the transaction ended the call proceeds without a registration.
+    /// </summary>
+    private DfsTransaction.TransactionOperation? EnterForCleanup(string operation)
+    {
+        if (_transaction is null)
+            return null;
+        DfsTransaction.TransactionOperation? registration = _transaction.TryEnter(out DfsTransactionState state);
+        if (registration is null && state == DfsTransactionState.Committing)
+        {
+            throw new InvalidOperationException(
+                $"{operation} cannot run while transaction {_transaction.Id} is committing; the commit publishes this stream's staged changes.");
+        }
+
+        return registration;
     }
 
     /// <summary>
@@ -886,30 +920,45 @@ public sealed class DfsStream : Stream, ILeaseHolder
         var receipts = new List<ObjectReceipt>();
         var seenObjects = new HashSet<ObjectId>();
         StagingLease? staging = null;
-        if (inline)
-        {
-            foreach (StagedSegment segment in overlay.Segments)
-                changes.Add(ContentLayout.InlineChange(segment.Offset, segment.Bytes));
-        }
-        else
-        {
-            staging = await EnsureStagingAsync(scope).ConfigureAwait(false);
-            await UploadBufferedAsync(scope, staging, entry, policy, all: true).ConfigureAwait(false);
-            foreach (StagedSegment segment in overlay.Segments)
-            {
-                UploadedObject uploaded = segment.Object ?? throw new InvalidOperationException("A buffered range was not uploaded.");
-                changes.Add(new RangeChange(segment.Offset, segment.Length, RangeChangeKind.Data, uploaded.Id, segment.ObjectOffset, uploaded.Length,
-                    uploaded.Checksum, ObjectEncodings.Plain, ReadOnlyMemory<byte>.Empty));
-                if (seenObjects.Add(uploaded.Id))
-                    receipts.AddRange(uploaded.Receipts);
-            }
-        }
 
-        long truncateTo = overlay.TruncateTo;
-        StagingId stagingId = receipts.Count > 0 ? staging!.Id : default;
-        CommitFileResultMessage result = await _volume.MutateAsync<CommitFileResultMessage>(scope, "CommitFile", options?.OperationId,
-            header => new CommitFileMessage(header, _handle, WriterGeneration, 0, truncateTo, newLength, changes, receipts, stagingId,
-                options?.CommitSnapshotName), Path, _transaction?.Id, rebindable: false).ConfigureAwait(false);
+        // Uploading replaces buffered ranges with staged objects, which a readable writer cannot read back (staging
+        // capabilities never authorize GetObject): if the publication fails, its staged view returns to buffered bytes.
+        StagedOverlay.Snapshot? readable = _canRead ? overlay.Capture() : null;
+        CommitFileResultMessage result;
+        try
+        {
+            if (inline)
+            {
+                foreach (StagedSegment segment in overlay.Segments)
+                    changes.Add(ContentLayout.InlineChange(segment.Offset, segment.Bytes));
+            }
+            else if (overlay.Segments.Count > 0)
+            {
+                // A pure length change (truncation, sparse extension) of an extent-based file references no new object.
+                staging = await EnsureStagingAsync(scope).ConfigureAwait(false);
+                await UploadBufferedAsync(scope, staging, entry, policy, all: true).ConfigureAwait(false);
+                foreach (StagedSegment segment in overlay.Segments)
+                {
+                    UploadedObject uploaded = segment.Object ?? throw new InvalidOperationException("A buffered range was not uploaded.");
+                    changes.Add(new RangeChange(segment.Offset, segment.Length, RangeChangeKind.Data, uploaded.Id, segment.ObjectOffset, uploaded.Length,
+                        uploaded.Checksum, ObjectEncodings.Plain, ReadOnlyMemory<byte>.Empty));
+                    if (seenObjects.Add(uploaded.Id))
+                        receipts.AddRange(uploaded.Receipts);
+                }
+            }
+
+            long truncateTo = overlay.TruncateTo;
+            StagingId stagingId = receipts.Count > 0 ? staging!.Id : default;
+            result = await _volume.MutateAsync<CommitFileResultMessage>(scope, "CommitFile", options?.OperationId,
+                header => new CommitFileMessage(header, _handle, WriterGeneration, 0, truncateTo, newLength, changes, receipts, stagingId,
+                    options?.CommitSnapshotName), Path, _transaction?.Id, rebindable: false, binding: _binding).ConfigureAwait(false);
+        }
+        catch
+        {
+            if (readable is not null)
+                overlay.Restore(readable);
+            throw;
+        }
 
         overlay.Reset(result.NewLength);
         _knownLength = result.NewLength;
@@ -933,7 +982,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
             return existing;
         StagingLease lease = _transaction is not null
             ? _transaction.Staging
-            : await _volume.CreateHandleStagingAsync(_handle, scope).ConfigureAwait(false);
+            : await _volume.CreateHandleStagingAsync(_handle, scope, _binding).ConfigureAwait(false);
         _staging = lease;
         return lease;
     }
@@ -1080,10 +1129,23 @@ public sealed class DfsStream : Stream, ILeaseHolder
             return ValueTask.CompletedTask;
         }
 
-        return new ValueTask(DisposeGatedAsync(gate));
+        DfsTransaction.TransactionOperation? transaction;
+        try
+        {
+            // Disposal of a transaction-bound stream cannot overlap the transaction's commit (TX-017): the commit
+            // publishes this stream's staged view.
+            transaction = EnterForCleanup("DisposeAsync");
+        }
+        catch
+        {
+            gate.Dispose();
+            throw;
+        }
+
+        return new ValueTask(DisposeGatedAsync(gate, transaction));
     }
 
-    private async Task DisposeGatedAsync(AsyncGate.Scope gate)
+    private async Task DisposeGatedAsync(AsyncGate.Scope gate, DfsTransaction.TransactionOperation? transaction)
     {
         Exception? failure = null;
         try
@@ -1094,6 +1156,13 @@ public sealed class DfsStream : Stream, ILeaseHolder
                 {
                     failure = fault;
                 }
+                else if (_transaction is { } ended && transaction is null)
+                {
+                    // The transaction ended. An abort (the application's decision) discarded its staged changes, these
+                    // included: disposal is cleanup only (FSD §8.2). Otherwise the changes were never part of it.
+                    if (ended.State != DfsTransactionState.Aborted)
+                        failure = new InvalidOperationException($"Transaction {ended.Id} is {ended.State}; this stream's staged changes are not part of it.");
+                }
                 else if (_runtime.IsDisposed)
                 {
                     failure = new ObjectDisposedException(nameof(DfsClient), "The DfsClient was disposed before the stream's staged changes were published.");
@@ -1102,8 +1171,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
                 {
                     try
                     {
-                        // Transaction-bound staged changes join the transaction; after its commit or abort they are lost.
-                        using DfsTransaction.TransactionOperation? transaction = _transaction?.Enter();
+                        // Transaction-bound staged changes join the transaction (the registration keeps its commit out).
                         using OperationScope scope = Begin(DfsOperationKind.CommitFile, CancellationToken.None);
                         await scope.HitAsync(FaultStage.F00, FaultSites.ClientOperationStart).ConfigureAwait(false);
                         await scope.HitAsync(FaultStage.F01, FaultSites.ClientValidated).ConfigureAwait(false);
@@ -1122,6 +1190,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
         }
         finally
         {
+            transaction?.Dispose();
             Volatile.Write(ref _disposed, 1);
             gate.ExitAndClose();
             _gate.Close();
@@ -1143,7 +1212,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
         try
         {
             using OperationScope scope = Begin(DfsOperationKind.CloseHandle, ct);
-            await _volume.CloseHandleAsync(_handle, WriterGeneration, _transaction?.Id, scope).ConfigureAwait(false);
+            await _volume.CloseHandleAsync(_handle, WriterGeneration, _transaction?.Id, scope, _binding).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {

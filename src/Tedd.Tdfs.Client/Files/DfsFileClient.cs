@@ -49,6 +49,9 @@ public sealed partial class DfsFileClient
 
     private ulong Pin => View?.Pin ?? 0;
 
+    /// <summary>The volume binding of the transaction or snapshot view this facade works in (null for the live volume).</summary>
+    private VolumeBinding? Bound => Transaction?.Binding ?? View?.Binding;
+
     // ---- Open family ------------------------------------------------------------------------------------------
 
     /// <summary>Opens a stream with FileStream-like semantics (FSD §6.1).</summary>
@@ -109,12 +112,16 @@ public sealed partial class DfsFileClient
     {
         bool pinned = options.ReadView == DfsReadView.VersionPinned;
         bool writeThrough = options.WriteMode == DfsWriteMode.WriteThrough;
-        OpenHandleResultMessage opened = await Context.MutateAsync<OpenHandleResultMessage>(scope, "OpenHandle", options.OperationId,
+        VolumeContext.Bound<OpenHandleResultMessage> bound = await Context.MutateBoundAsync<OpenHandleResultMessage>(scope, "OpenHandle", options.OperationId,
             header => new OpenHandleMessage(header, path, options.Mode, options.Access, options.Share, options.Options, pinned, writeThrough, options.StoragePolicy),
-            path, TxId).ConfigureAwait(false);
+            path, TxId, binding: Bound).ConfigureAwait(false);
+        OpenHandleResultMessage opened = bound.Reply;
+
+        // The handle belongs to the session and volume the open was addressed to: every request through it carries that
+        // binding, and its lease is renewed with that session.
         var stream = new DfsStream(Context, Transaction, opened.Handle, opened.Info, path, options.ReadView, options.WriteMode, options.Access, options.Share,
-            options.Mode == FileMode.Append, opened.WriterGeneration, options.BufferSize, opened.Token, snapshotPin: 0);
-        if (Context.CurrentSession is { } session)
+            options.Mode == FileMode.Append, opened.WriterGeneration, options.BufferSize, opened.Token, snapshotPin: 0, bound.Binding);
+        if ((bound.Session ?? Context.CurrentSession) is { } session)
             Context.RegisterHandle(opened.Handle, session, stream);
         Transaction?.Register(stream);
         return stream;
@@ -127,7 +134,7 @@ public sealed partial class DfsFileClient
         GetInfoResultMessage info = await InfoAsync(path, scope).ConfigureAwait(false);
         FileInfoData file = RequireFile(info, path);
         return new DfsStream(Context, null, default, file, path, DfsReadView.VersionPinned, DfsWriteMode.OnFlush, FileAccess.Read, options.Share,
-            isAppend: false, 0, options.BufferSize, info.ObservedAt, Pin);
+            isAppend: false, 0, options.BufferSize, info.ObservedAt, Pin, View!.Binding);
     }
 
     // ---- Whole-file reads -------------------------------------------------------------------------------------
@@ -238,7 +245,11 @@ public sealed partial class DfsFileClient
             {
                 int read;
                 using (OperationScope scope = Begin(DfsOperationKind.Read, ct))
+                using (EnterTransaction())
+                {
+                    // Each read is transaction-bound I/O: it cannot overlap the commit and fails once the transaction ended.
                     read = await stream.ReadInternalAsync(buffer, scope).ConfigureAwait(false);
+                }
                 ReadOnlySpan<byte> data = buffer.AsSpan(0, read);
                 if (decoder is null)
                 {
@@ -387,6 +398,8 @@ public sealed partial class DfsFileClient
         using DfsTransaction.TransactionOperation? txOperation = EnterTransaction();
         byte[] withPreamble = TextCodec.Encode(contents, encoding, includePreamble: encoding is not null);
         byte[] plain = encoding is null || encoding.Preamble.Length == 0 ? withPreamble : TextCodec.Encode(contents, encoding, includePreamble: false);
+        if (withPreamble.Length > Context.MaxPublishBytes)
+            throw new DfsLimitExceededException(nameof(DfsVolumeLimits.MaxPublishBytes), Context.MaxPublishBytes, withPreamble.Length);
         scope.Path = p;
         await scope.ValidatedAsync().ConfigureAwait(false);
         return await AppendCoreAsync(p, currentLength => currentLength == 0 ? withPreamble : plain, new DfsMutationOptions(), scope).ConfigureAwait(false);
@@ -413,14 +426,28 @@ public sealed partial class DfsFileClient
         DfsStoragePolicy policy = await PolicyForAsync(path, options.StoragePolicy, entry, null, scope).ConfigureAwait(false);
         int threshold = ContentLayout.InlineThreshold(entry, Runtime.Capabilities);
         bool inline = bytes.Length <= threshold && ContentLayout.InlinePermitted(entry, policy, LabelsOf);
-        Payload payload = inline
-            ? Payload.Inline(bytes)
-            : await UploadAsync(bytes, 0, entry, policy, scope).ConfigureAwait(false);
         long length = bytes.Length;
-        WriteAllResultMessage result = await Context.MutateAsync<WriteAllResultMessage>(scope, "WriteAll", options.OperationId,
-            header => new WriteAllMessage(header, path, length, payload.Changes, payload.Receipts, payload.Staging, options.StoragePolicy,
-                options.CommitSnapshotName, CreateParents: false, ExpectedRevision: 0), path, TxId).ConfigureAwait(false);
-        return result.Token;
+        for (int attempt = 0; ; attempt++)
+        {
+            Payload payload = inline
+                ? Payload.Inline(bytes)
+                : await UploadAsync(bytes, 0, entry, policy, scope).ConfigureAwait(false);
+            try
+            {
+                // A publication referring to a staging session never moves to another session: its uploads belong to it.
+                WriteAllResultMessage result = await Context.MutateAsync<WriteAllResultMessage>(scope, "WriteAll", options.OperationId,
+                    header => new WriteAllMessage(header, path, length, payload.Changes, payload.Receipts, payload.Staging, options.StoragePolicy,
+                        options.CommitSnapshotName, CreateParents: false, ExpectedRevision: 0), path, TxId, rebindable: payload.Staging.IsEmpty,
+                    binding: Bound).ConfigureAwait(false);
+                return result.Token;
+            }
+            catch (DfsException ex) when (attempt == 0 && IsClosedHelperStaging(ex, payload, options))
+            {
+                // The shared helper staging session was closed with its client session: nothing was applied; upload the
+                // content again under a new staging session and publish it under a new operation id.
+                Context.DropHelperStaging(payload.Lease!);
+            }
+        }
     }
 
     private async Task<CommitToken> AppendCoreAsync(string path, Func<long, ReadOnlyMemory<byte>> content, DfsMutationOptions options,
@@ -428,14 +455,16 @@ public sealed partial class DfsFileClient
     {
         VolumeEntry entry = await EntryAsync(scope).ConfigureAwait(false);
         int threshold = ContentLayout.InlineThreshold(entry, Runtime.Capabilities);
-        for (int attempt = 0; ; attempt++)
+        bool inlineRejected = false;
+        bool stagingReplaced = false;
+        while (true)
         {
             // The current length decides the representation (and whether a text preamble is due).
             GetInfoResultMessage info = await InfoAsync(path, scope).ConfigureAwait(false);
             long current = info is { Exists: true, Info: { Kind: WireEntryKind.File } file } ? file.Length : 0;
             ReadOnlyMemory<byte> bytes = content(current);
             DfsStoragePolicy policy = await PolicyForAsync(path, options.StoragePolicy, entry, info, scope).ConfigureAwait(false);
-            bool inline = attempt == 0 && current + bytes.Length <= threshold && ContentLayout.InlinePermitted(entry, policy, LabelsOf);
+            bool inline = !inlineRejected && current + bytes.Length <= threshold && ContentLayout.InlinePermitted(entry, policy, LabelsOf);
             Payload payload = inline
                 ? Payload.Inline(bytes)
                 : await UploadAsync(bytes, 0, entry, policy, scope).ConfigureAwait(false);
@@ -444,19 +473,34 @@ public sealed partial class DfsFileClient
             {
                 AppendResultMessage result = await Context.MutateAsync<AppendResultMessage>(scope, "Append", options.OperationId,
                     header => new AppendMessage(header, path, default, 0, appendLength, payload.Changes, payload.Receipts, payload.Staging,
-                        CreateIfMissing: true, options.StoragePolicy, options.CommitSnapshotName), path, TxId).ConfigureAwait(false);
+                        CreateIfMissing: true, options.StoragePolicy, options.CommitSnapshotName), path, TxId, rebindable: payload.Staging.IsEmpty,
+                    binding: Bound).ConfigureAwait(false);
                 return result.Token;
             }
-            catch (ArgumentException) when (inline && options.OperationId is null)
+            catch (ArgumentException) when (inline && !inlineRejected && options.OperationId is null)
             {
                 // The file grew past the inline threshold between the length check and the append (the inline change
                 // was rejected before anything was applied): append again as objects under a new operation id.
+                inlineRejected = true;
+            }
+            catch (DfsException ex) when (!stagingReplaced && IsClosedHelperStaging(ex, payload, options))
+            {
+                // As for WriteAll: the helper staging session closed with its client session; upload again.
+                stagingReplaced = true;
+                Context.DropHelperStaging(payload.Lease!);
             }
         }
     }
 
-    /// <summary>The changes, receipts and staging session of a publication's content.</summary>
-    private sealed record Payload(IReadOnlyList<RangeChange> Changes, IReadOnlyList<ObjectReceipt> Receipts, StagingId Staging)
+    /// <summary>
+    /// True when a publication of SDK-allocated id was rejected because the helper staging session its objects were
+    /// uploaded under is closed (<c>LeaseLost</c>; nothing was applied).
+    /// </summary>
+    private bool IsClosedHelperStaging(DfsException ex, Payload payload, DfsMutationOptions options) =>
+        ex.ErrorCode == DfsErrorCode.LeaseLost && payload.Lease is not null && Transaction is null && options.OperationId is null;
+
+    /// <summary>The changes, receipts and staging session (with its lease, when uploaded) of a publication's content.</summary>
+    private sealed record Payload(IReadOnlyList<RangeChange> Changes, IReadOnlyList<ObjectReceipt> Receipts, StagingId Staging, StagingLease? Lease = null)
     {
         public static Payload Inline(ReadOnlyMemory<byte> bytes) =>
             new(bytes.IsEmpty ? [] : [ContentLayout.InlineChange(0, bytes.ToArray())], [], default);
@@ -488,7 +532,7 @@ public sealed partial class DfsFileClient
                     receipts.AddRange(copies);
                 }
 
-                return new Payload(changes, receipts, staging.Id);
+                return new Payload(changes, receipts, staging.Id, Transaction is null ? staging : null);
             }
             catch (DfsException ex) when (attempt == 0 && Transaction is null && ex.ErrorCode is DfsErrorCode.LeaseLost)
             {
@@ -548,7 +592,7 @@ public sealed partial class DfsFileClient
         scope.Path = source;
         await scope.ValidatedAsync().ConfigureAwait(false);
         CopyResultMessage result = await Context.MutateAsync<CopyResultMessage>(scope, "Copy", options.OperationId,
-            header => new CopyMessage(header, source, destination, overwrite, 0, options.StoragePolicy, options.CommitSnapshotName), source, TxId)
+            header => new CopyMessage(header, source, destination, overwrite, 0, options.StoragePolicy, options.CommitSnapshotName), source, TxId, binding: Bound)
             .ConfigureAwait(false);
         return result.Token;
     }
@@ -578,7 +622,7 @@ public sealed partial class DfsFileClient
         scope.Path = source;
         await scope.ValidatedAsync().ConfigureAwait(false);
         MoveResultMessage result = await Context.MutateAsync<MoveResultMessage>(scope, "Move", options.OperationId,
-            header => new MoveMessage(header, source, destination, overwrite, ExpectDirectory: false, options.CommitSnapshotName), source, TxId)
+            header => new MoveMessage(header, source, destination, overwrite, ExpectDirectory: false, options.CommitSnapshotName), source, TxId, binding: Bound)
             .ConfigureAwait(false);
         return result.Token;
     }
@@ -607,7 +651,7 @@ public sealed partial class DfsFileClient
         scope.Path = p;
         await scope.ValidatedAsync().ConfigureAwait(false);
         DeleteResultMessage result = await Context.MutateAsync<DeleteResultMessage>(scope, "Delete", options.OperationId,
-            header => new DeleteMessage(header, p, Recursive: false, ExpectDirectory: false, options.CommitSnapshotName), p, TxId).ConfigureAwait(false);
+            header => new DeleteMessage(header, p, Recursive: false, ExpectDirectory: false, options.CommitSnapshotName), p, TxId, binding: Bound).ConfigureAwait(false);
         return result.Token;
     }
 
@@ -661,7 +705,7 @@ public sealed partial class DfsFileClient
         scope.Path = p;
         await scope.ValidatedAsync().ConfigureAwait(false);
         SetPolicyResultMessage result = await Context.MutateAsync<SetPolicyResultMessage>(scope, "SetPolicy", null,
-            header => new SetPolicyMessage(header, p, policyName), p, TxId).ConfigureAwait(false);
+            header => new SetPolicyMessage(header, p, policyName), p, TxId, binding: Bound).ConfigureAwait(false);
         return result.Token;
     }
 
@@ -681,7 +725,7 @@ public sealed partial class DfsFileClient
         scope.Path = p;
         await scope.ValidatedAsync().ConfigureAwait(false);
         SetAccessResultMessage result = await Context.MutateAsync<SetAccessResultMessage>(scope, "SetAccess", null,
-            header => new SetAccessMessage(header, p, access.OwnerOnly, access.ReadOnlyForOthers), p, TxId).ConfigureAwait(false);
+            header => new SetAccessMessage(header, p, access.OwnerOnly, access.ReadOnlyForOthers), p, TxId, binding: Bound).ConfigureAwait(false);
         return result.Token;
     }
 
@@ -711,7 +755,7 @@ public sealed partial class DfsFileClient
     /// <summary><c>GetInfo</c> of a path in this facade's view (live, transaction or snapshot).</summary>
     internal Task<GetInfoResultMessage> InfoAsync(string path, OperationScope scope) =>
         Context.ReadAsync<GetInfoResultMessage>(scope, "GetInfo", header => new GetInfoMessage(header, path, default, Pin), path, TxId,
-            requireSession: Pin != 0 || TxId is not null);
+            requireSession: Pin != 0 || TxId is not null, binding: Bound);
 
     private async Task<VolumeEntry> EntryAsync(OperationScope scope)
     {

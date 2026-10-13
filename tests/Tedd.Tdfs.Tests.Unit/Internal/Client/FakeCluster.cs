@@ -32,6 +32,9 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
     private readonly Dictionary<string, Inode> _paths = new(StringComparer.Ordinal);
     private readonly Dictionary<ulong, SessionState> _sessions = [];
     private readonly Dictionary<ulong, HandleState> _handles = [];
+    private readonly HashSet<ulong> _expiredHandles = [];
+    private readonly Dictionary<ulong, StagingState> _staging = [];
+    private readonly Dictionary<DfsTransactionId, TxState> _transactions = [];
     private readonly Dictionary<ObjectId, (byte[] Data, UInt128 Checksum, StagingId Staging)> _objects = [];
     private ulong _index = 10;
     private ulong _nextSession = 1;
@@ -61,7 +64,153 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
 
     public NodeId NodeId { get; }
 
-    public VolumeId VolumeId { get; }
+    /// <summary>Id of the volume currently named <see cref="VolumeName"/> (changes when it is re-created).</summary>
+    public VolumeId VolumeId { get; private set; }
+
+    /// <summary>Authority epoch of the current volume.</summary>
+    public ulong Epoch { get; private set; } = 1;
+
+    /// <summary>Every volume request header received (binding, session and watermark assertions).</summary>
+    public ConcurrentQueue<(MessageType Type, RequestHeader Header)> Headers { get; } = new();
+
+    /// <summary>
+    /// Called (under the cluster lock) for every request after the handshake; a non-null result is sent as the reply
+    /// instead of dispatching the request.
+    /// </summary>
+    public Func<IWireMessage, IWireMessage?>? Intercept { get; set; }
+
+    /// <summary>Called (under the cluster lock) after a request was dispatched, with the reply about to be sent.</summary>
+    public Action<IWireMessage, IWireMessage>? AfterDispatch { get; set; }
+
+    /// <summary>When set, this many further PutObject requests succeed and every later one fails (until reset to null).</summary>
+    public int? PutsBeforeFailure { get; set; }
+
+    /// <summary>Handle lease duration issued with new sessions (the SDK renews every third of it).</summary>
+    public TimeSpan LeaseDuration { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Highest acknowledgement watermark any request carried for <paramref name="session"/>.</summary>
+    public ulong MaxWatermark(ulong session)
+    {
+        lock (_sync)
+            return _sessions.TryGetValue(session, out SessionState? s) ? s.MaxWatermark : 0;
+    }
+
+    /// <summary>Ids of the sessions issued so far (in the current volume).</summary>
+    public IReadOnlyList<ulong> SessionIds
+    {
+        get
+        {
+            lock (_sync)
+                return [.. _sessions.Keys.Order()];
+        }
+    }
+
+    /// <summary>Handle ids currently open.</summary>
+    public IReadOnlyList<ulong> HandleIds
+    {
+        get
+        {
+            lock (_sync)
+                return [.. _handles.Keys.Order()];
+        }
+    }
+
+    /// <summary>State of a transaction known to the volume.</summary>
+    public string? TransactionState(DfsTransactionId id)
+    {
+        lock (_sync)
+            return _transactions.TryGetValue(id, out TxState? tx) ? tx.State : null;
+    }
+
+    /// <summary>Creates (or replaces) a file directly in the committed state.</summary>
+    public void SeedFile(string path, byte[] content)
+    {
+        lock (_sync)
+        {
+            Inode inode = _paths.TryGetValue(path, out Inode? existing) ? existing : CreateFile(path, null);
+            inode.Content = content.ToArray();
+            inode.Revision = ++_index;
+        }
+    }
+
+    /// <summary>
+    /// The leader expires a session (as after missed keep-alives): its handles expire, its staging sessions close, its
+    /// operation ids become expired.
+    /// </summary>
+    public void ExpireSession(ulong session)
+    {
+        lock (_sync)
+        {
+            if (!_sessions.TryGetValue(session, out SessionState? state))
+                return;
+            state.Expired = true;
+            foreach ((ulong id, HandleState handle) in _handles.ToArray())
+            {
+                if (handle.Session == session)
+                    ExpireHandleCore(id);
+            }
+
+            foreach (StagingState staging in _staging.Values)
+            {
+                if (staging.Session == session)
+                    staging.Closed = true;
+            }
+        }
+    }
+
+    /// <summary>Opens a live read handle on <paramref name="path"/> owned by <paramref name="session"/> (as if that session had opened it).</summary>
+    public ulong OpenHandleDirect(string path, ulong session)
+    {
+        lock (_sync)
+        {
+            Inode inode = _paths[path];
+            ulong id = _nextHandle++;
+            _handles[id] = new HandleState(inode, false, null, 0, 0, session);
+            return id;
+        }
+    }
+
+    /// <summary>The leader expires one handle's lease (its session stays alive).</summary>
+    public void ExpireHandle(ulong handle)
+    {
+        lock (_sync)
+            ExpireHandleCore(handle);
+    }
+
+    private void ExpireHandleCore(ulong handle)
+    {
+        if (!_handles.Remove(handle))
+            return;
+        _expiredHandles.Add(handle);
+        foreach (StagingState staging in _staging.Values)
+        {
+            if (staging.Handle == handle)
+                staging.Closed = true;
+        }
+    }
+
+    /// <summary>
+    /// Deletes the volume and creates a new, unrelated one under the same name (new id, epoch 1, empty namespace, session
+    /// and handle numbering restarting like a fresh state machine).
+    /// </summary>
+    public void RecreateVolume()
+    {
+        lock (_sync)
+        {
+            VolumeId = new VolumeId(Guid.NewGuid());
+            Epoch = 1;
+            _paths.Clear();
+            _paths["/"] = new Inode(1, isDirectory: true, ++_index);
+            _sessions.Clear();
+            _handles.Clear();
+            _expiredHandles.Clear();
+            _staging.Clear();
+            _transactions.Clear();
+            _nextSession = 1;
+            _nextHandle = 100;
+            _nextStaging = 1;
+        }
+    }
 
     /// <summary>Default storage policy: one copy in one zone (a single storage node can satisfy it).</summary>
     public static DfsStoragePolicy SingleCopy { get; } = new()
@@ -184,33 +333,69 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
     {
         lock (_sync)
         {
-            return message switch
+            if (Intercept?.Invoke(message) is { } intercepted)
+                return intercepted;
+            IWireMessage reply;
+            try
             {
-                GetClusterMapMessage => new ClusterMapResultMessage(1, Map()),
-                GetVolumeRouteMessage route => route.Volume == VolumeName
-                    ? new VolumeRouteResultMessage(Volume(), NodeId, Endpoint, 1, Token(_index))
-                    : throw new DfsException(DfsErrorCode.VolumeNotFound, $"No volume '{route.Volume}'."),
-                OpenSessionMessage => OpenSession(),
-                ReserveOperationIdsMessage reserve => Reserve(reserve),
-                KeepAliveMessage keep => new KeepAliveResultMessage([], [], !_sessions.ContainsKey(keep.Header.Session), TimeSpan.FromSeconds(30),
-                    DateTimeOffset.UtcNow),
-                QueryOperationMessage query => Query(query),
-                PutObjectMessage put => Put(put),
-                GetObjectMessage get => Get(get),
-                CreateStagingMessage staging => Mutate(staging.Header, staging, () => CreateStaging(staging)),
-                OpenHandleMessage open => Mutate(open.Header, open, () => Open(open)),
-                CloseHandleMessage close => Close(close),
-                ReadRangeMessage read => Read(read),
-                GetInfoMessage info => GetInfo(info),
-                CommitFileMessage commit => Mutate(commit.Header, commit, () => Commit(commit)),
-                WriteAllMessage write => Mutate(write.Header, write, () => WriteAll(write)),
-                AppendMessage append => Mutate(append.Header, append, () => Append(append)),
-                DeleteMessage delete => Mutate(delete.Header, delete, () => Delete(delete)),
-                CreateDirectoryMessage create => Mutate(create.Header, create, () => CreateDirectory(create)),
-                ListDirectoryMessage list => List(list),
-                _ => throw new DfsException(DfsErrorCode.Unsupported, $"The fake cluster does not serve {message.Type}."),
-            };
+                reply = DispatchCore(message);
+            }
+            catch (DfsException ex)
+            {
+                reply = new ErrorReplyMessage(ex.ErrorCode, ex.Message, null, ex.IsRetryable);
+            }
+
+            AfterDispatch?.Invoke(message, reply);
+            return reply;
         }
+    }
+
+    private IWireMessage DispatchCore(IWireMessage message)
+    {
+        if (message is IVolumeRequest volumeRequest)
+            CheckHeader(message.Type, volumeRequest.Header);
+        return message switch
+        {
+            GetClusterMapMessage => new ClusterMapResultMessage(1, Map()),
+            GetVolumeRouteMessage route => route.Volume == VolumeName
+                ? new VolumeRouteResultMessage(Volume(), NodeId, Endpoint, 1, Token(_index))
+                : throw new DfsException(DfsErrorCode.VolumeNotFound, $"No volume '{route.Volume}'."),
+            OpenSessionMessage => OpenSession(),
+            ReserveOperationIdsMessage reserve => Reserve(reserve),
+            KeepAliveMessage keep => new KeepAliveResultMessage([], [], !_sessions.TryGetValue(keep.Header.Session, out SessionState? live) || live.Expired,
+                LeaseDuration, DateTimeOffset.UtcNow),
+            QueryOperationMessage query => Query(query),
+            PutObjectMessage put => Put(put),
+            GetObjectMessage get => Get(get),
+            CreateStagingMessage staging => staging.Renew.IsEmpty
+                ? Mutate(staging.Header, staging, () => CreateStaging(staging))
+                : CreateStaging(staging),
+            OpenHandleMessage open => Mutate(open.Header, open, () => Open(open)),
+            CloseHandleMessage close => Close(close),
+            ReadRangeMessage read => Read(read),
+            GetInfoMessage info => GetInfo(info),
+            CommitFileMessage commit => Mutate(commit.Header, commit, () => Commit(commit)),
+            WriteAllMessage write => Mutate(write.Header, write, () => WriteAll(write)),
+            AppendMessage append => Mutate(append.Header, append, () => Append(append)),
+            DeleteMessage delete => Mutate(delete.Header, delete, () => Delete(delete)),
+            CreateDirectoryMessage create => Mutate(create.Header, create, () => CreateDirectory(create)),
+            ListDirectoryMessage list => List(list),
+            TxBeginMessage begin => Mutate(begin.Header, begin, () => TxBegin(begin)),
+            TxCommitMessage commit => Mutate(commit.Header, commit, () => TxCommit(commit)),
+            TxAbortMessage abort => TxAbort(abort),
+            CloseSnapshotMessage => new CloseSnapshotResultMessage(true),
+            _ => throw new DfsException(DfsErrorCode.Unsupported, $"The fake cluster does not serve {message.Type}."),
+        };
+    }
+
+    /// <summary>The volume binding check of every volume request (PROTOCOL.md §4.1) and watermark bookkeeping.</summary>
+    private void CheckHeader(MessageType type, RequestHeader header)
+    {
+        Headers.Enqueue((type, header));
+        if ((header.ExpectedVolumeId != default && header.ExpectedVolumeId != VolumeId) || (header.ExpectedVolumeEpoch != 0 && header.ExpectedVolumeEpoch != Epoch))
+            throw new DfsException(DfsErrorCode.EpochMismatch, $"Volume '{VolumeName}' is now {VolumeId} epoch {Epoch}.");
+        if (header.Session != 0 && _sessions.TryGetValue(header.Session, out SessionState? session) && header.AckWatermark > session.MaxWatermark)
+            session.MaxWatermark = header.AckWatermark;
     }
 
     private ClusterMapData Map()
@@ -221,10 +406,10 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
     }
 
     private VolumeEntry Volume() =>
-        new(VolumeId, VolumeName, 1, WireVolumeState.Active, [NodeId], [], NodeId, new DfsMetadataPolicy { Voters = 1 }, SingleCopy,
+        new(VolumeId, VolumeName, Epoch, WireVolumeState.Active, [NodeId], [], NodeId, new DfsMetadataPolicy { Voters = 1 }, SingleCopy,
             new Dictionary<string, DfsStoragePolicy>(StringComparer.Ordinal), InlineThreshold, new DfsVolumeLimits());
 
-    private CommitToken Token(ulong index) => new(ClusterId, VolumeId, 1, index);
+    private CommitToken Token(ulong index) => new(ClusterId, VolumeId, Epoch, index);
 
     // ------------------------------------------------------------------------------------------------ sessions
 
@@ -232,7 +417,7 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
     {
         ulong id = _nextSession++;
         _sessions[id] = new SessionState();
-        return new OpenSessionResultMessage(id, 1, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(90), DateTimeOffset.UtcNow, 1000, TimeSpan.FromMinutes(5),
+        return new OpenSessionResultMessage(id, 1, LeaseDuration, LeaseDuration * 3, DateTimeOffset.UtcNow, 1000, TimeSpan.FromMinutes(5),
             Token(++_index));
     }
 
@@ -245,15 +430,21 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
     }
 
     private SessionState RequireSession(ulong id) =>
-        _sessions.TryGetValue(id, out SessionState? session) ? session : throw new DfsException(DfsErrorCode.LeaseLost, $"Session {id} expired.");
+        _sessions.TryGetValue(id, out SessionState? session) && !session.Expired
+            ? session
+            : throw new DfsException(DfsErrorCode.LeaseLost, $"Session {id} expired.");
 
-    /// <summary>The operation gate: a stored outcome is replayed; a fenced id answers its abort; otherwise the request executes once.</summary>
+    /// <summary>
+    /// The operation gate: a stored outcome is replayed; an id of an expired (or unknown) session is OperationExpired and
+    /// never executed; otherwise the request executes once.
+    /// </summary>
     private IWireMessage Mutate(RequestHeader header, IWireMessage request, Func<IWireMessage> execute)
     {
         DfsOperationId op = header.Operation;
         if (op.IsEmpty)
             return execute();
-        SessionState session = RequireSession(op.Session);
+        if (!_sessions.TryGetValue(op.Session, out SessionState? session) || session.Expired)
+            throw new DfsException(DfsErrorCode.OperationExpired, $"Operation {op} belongs to an expired session.");
         if (session.Outcomes.TryGetValue(op.Sequence, out Outcome? stored))
         {
             if (stored.Kind != request.Type && !stored.Fenced)
@@ -280,6 +471,8 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
     private QueryOperationResultMessage Query(QueryOperationMessage query)
     {
         DfsOperationId target = query.Target;
+        if (query.IsTransaction)
+            return QueryTransaction(query);
         if (!_sessions.TryGetValue(target.Session, out SessionState? session))
             return new QueryOperationResultMessage(target, WireOutcomeStatus.NotFound, CommitToken.None, DfsErrorCode.None, null, DfsOperationKind.Unknown, default);
         if (session.Outcomes.TryGetValue(target.Sequence, out Outcome? outcome))
@@ -303,18 +496,113 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
             default);
     }
 
+    // ------------------------------------------------------------------------------------------------ transactions
+
+    private TxBeginResultMessage TxBegin(TxBeginMessage begin)
+    {
+        RequireSession(begin.Header.Session);
+        var id = new DfsTransactionId(begin.Header.Operation);
+        var staging = new StagingId(_nextStaging++);
+        _staging[staging.Value] = new StagingState(begin.Header.Session, 0);
+        _transactions[id] = new TxState { Staging = staging.Value };
+        return new TxBeginResultMessage(id, Token(++_index), staging, new byte[] { 4, 5, 6 }, DateTimeOffset.UtcNow.AddHours(1), DateTimeOffset.UtcNow.AddHours(1),
+            1, new DfsVolumeLimits());
+    }
+
+    private TxCommitResultMessage TxCommit(TxCommitMessage commit)
+    {
+        TxState tx = RequireTransaction(commit.Header);
+        if (tx.State != "Active")
+            throw new DfsException(DfsErrorCode.TransactionAborted, "The transaction is not active.");
+        tx.State = "Committed";
+        tx.Token = Token(++_index);
+        CloseStaging(tx.Staging);
+        return new TxCommitResultMessage(tx.Token, null);
+    }
+
+    private TxAbortResultMessage TxAbort(TxAbortMessage abort)
+    {
+        TxState tx = RequireTransaction(abort.Header);
+        if (tx.State == "Committed")
+            return new TxAbortResultMessage(WireOutcomeStatus.Committed, tx.Token);
+        tx.State = "Aborted";
+        CloseStaging(tx.Staging);
+        return new TxAbortResultMessage(WireOutcomeStatus.Aborted, Token(++_index));
+    }
+
+    private QueryOperationResultMessage QueryTransaction(QueryOperationMessage query)
+    {
+        DfsOperationId target = query.Target;
+        if (!_transactions.TryGetValue(new DfsTransactionId(target), out TxState? tx))
+        {
+            return new QueryOperationResultMessage(target, query.Resolve ? WireOutcomeStatus.Aborted : WireOutcomeStatus.NotFound, CommitToken.None,
+                query.Resolve ? DfsErrorCode.Cancelled : DfsErrorCode.None, null, DfsOperationKind.TxCommit, default);
+        }
+
+        if (tx.State == "Active" && query.Resolve)
+        {
+            tx.State = "Aborted";
+            CloseStaging(tx.Staging);
+        }
+
+        return tx.State switch
+        {
+            "Committed" => new QueryOperationResultMessage(target, WireOutcomeStatus.Committed, tx.Token, DfsErrorCode.None, null, DfsOperationKind.TxCommit,
+                MessageCodec.Encode(new TxCommitResultMessage(tx.Token, null))),
+            "Aborted" => new QueryOperationResultMessage(target, WireOutcomeStatus.Aborted, CommitToken.None, DfsErrorCode.TransactionAborted, "aborted",
+                DfsOperationKind.TxCommit, default),
+            _ => new QueryOperationResultMessage(target, WireOutcomeStatus.Pending, CommitToken.None, DfsErrorCode.None, null, DfsOperationKind.TxCommit, default),
+        };
+    }
+
+    private TxState RequireTransaction(RequestHeader header) =>
+        header.Transaction is { } id && _transactions.TryGetValue(id, out TxState? tx)
+            ? tx
+            : throw new DfsException(DfsErrorCode.TransactionAborted, "Unknown transaction.");
+
+    private void CloseStaging(ulong staging)
+    {
+        if (_staging.TryGetValue(staging, out StagingState? state))
+            state.Closed = true;
+    }
+
     // ------------------------------------------------------------------------------------------------ data plane
 
     private CreateStagingResultMessage CreateStaging(CreateStagingMessage message)
     {
-        StagingId id = message.Renew.Value != 0 ? message.Renew : new StagingId(_nextStaging++);
-        return new CreateStagingResultMessage(id, new byte[] { 1, 2, 3 }, DateTimeOffset.UtcNow.AddHours(1), 1, message.Renew.Value != 0 ? CommitToken.None : Token(++_index));
+        if (message.Renew.Value != 0)
+        {
+            if (!_staging.TryGetValue(message.Renew.Value, out StagingState? existing) || existing.Closed)
+                throw new DfsException(DfsErrorCode.LeaseLost, $"Staging session {message.Renew} is closed.");
+            return new CreateStagingResultMessage(message.Renew, new byte[] { 1, 2, 3 }, DateTimeOffset.UtcNow.AddHours(1), 1, CommitToken.None);
+        }
+
+        RequireSession(message.Header.Session);
+        if (!message.Handle.IsEmpty && !_handles.ContainsKey(message.Handle.Value))
+            throw new DfsException(DfsErrorCode.LeaseLost, $"Handle {message.Handle} is not active.");
+        var id = new StagingId(_nextStaging++);
+        _staging[id.Value] = new StagingState(message.Header.Session, message.Handle.Value);
+        return new CreateStagingResultMessage(id, new byte[] { 1, 2, 3 }, DateTimeOffset.UtcNow.AddHours(1), 1, Token(++_index));
+    }
+
+    /// <summary>Publications referring to a closed staging session are rejected (nothing proposed).</summary>
+    private void RequireOpenStaging(StagingId staging)
+    {
+        if (!staging.IsEmpty && (!_staging.TryGetValue(staging.Value, out StagingState? state) || state.Closed))
+            throw new DfsException(DfsErrorCode.LeaseLost, $"Staging session {staging} is closed; its uploads can no longer be published.");
     }
 
     private PutObjectResultMessage Put(PutObjectMessage put)
     {
         if (ObjectChecksum.Compute(put.Data.Span) != put.Checksum || put.Data.Length != put.Length)
             throw new DfsException(DfsErrorCode.Integrity, "Checksum mismatch.");
+        if (PutsBeforeFailure is { } remaining)
+        {
+            if (remaining <= 0)
+                throw new DfsException(DfsErrorCode.CapacityExhausted, "The storage node is full.");
+            PutsBeforeFailure = remaining - 1;
+        }
+
         bool present = _objects.ContainsKey(put.Object);
         _objects[put.Object] = (put.Data.ToArray(), put.Checksum, put.Staging);
         var receipt = new ObjectReceipt(put.Object, put.Volume, put.Staging, put.Checksum, put.Length, ObjectEncodings.Plain, NodeId, 1, put.PlacementEpoch,
@@ -389,12 +677,13 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
             truncated = true;
         }
 
+        RequireSession(open.Header.Session);
         bool writable = (open.Access & FileAccess.Write) != 0;
         if (writable && _handles.Values.Any(h => h.Inode == inode && h.Writable))
             throw new DfsException(DfsErrorCode.WriterConflict, "Another writer.");
         ulong generation = writable ? ++inode!.WriterGeneration : 0;
         var handle = new HandleState(inode!, writable, open.VersionPinned ? inode!.Content.ToArray() : null, open.VersionPinned ? inode!.Revision : 0,
-            generation);
+            generation, open.Header.Session);
         ulong id = _nextHandle++;
         _handles[id] = handle;
         return new OpenHandleResultMessage(new HandleId(id), Describe(open.Path, inode!), generation, inode!.Revision, TimeSpan.FromSeconds(30), created,
@@ -417,10 +706,19 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
         return new CloseHandleResultMessage(removed, removed ? Token(++_index) : CommitToken.None);
     }
 
+    /// <summary>A handle of the caller: LeaseLost once expired, InvalidHandle when foreign or never issued.</summary>
+    private HandleState RequireHandle(RequestHeader header, HandleId id)
+    {
+        if (_expiredHandles.Contains(id.Value))
+            throw new DfsException(DfsErrorCode.LeaseLost, $"Handle {id} is no longer active (closed or its lease expired).");
+        if (!_handles.TryGetValue(id.Value, out HandleState? handle) || handle.Session != header.Session)
+            throw new DfsException(DfsErrorCode.InvalidHandle, $"Handle {id} is not a handle of this session.");
+        return handle;
+    }
+
     private ReadRangeResultMessage Read(ReadRangeMessage read)
     {
-        if (!_handles.TryGetValue(read.Handle.Value, out HandleState? handle))
-            throw new DfsException(DfsErrorCode.InvalidHandle, "Unknown handle.");
+        HandleState handle = RequireHandle(read.Header, read.Handle);
         byte[] view = handle.Pinned ?? handle.Inode.Content;
         ulong revision = handle.Pinned is not null ? handle.PinnedRevision : handle.Inode.Revision;
         long length = Math.Max(0, Math.Min(read.Length, Math.Min(MaxReadResult, view.Length - read.Offset)));
@@ -448,8 +746,7 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
     {
         if (info.Handle.Value != 0)
         {
-            if (!_handles.TryGetValue(info.Handle.Value, out HandleState? handle))
-                throw new DfsException(DfsErrorCode.InvalidHandle, "Unknown handle.");
+            HandleState handle = RequireHandle(info.Header, info.Handle);
             FileInfoData data = Describe(string.Empty, handle.Inode);
             if (handle.Pinned is not null)
                 data = data with { Length = handle.Pinned.Length, Revision = handle.PinnedRevision };
@@ -471,6 +768,7 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
     {
         if (!_handles.TryGetValue(commit.Handle.Value, out HandleState? handle) || !handle.Writable || handle.Generation != commit.Generation)
             throw new DfsException(DfsErrorCode.LeaseLost, "Stale handle.");
+        RequireOpenStaging(commit.Staging);
         Inode inode = handle.Inode;
         byte[] content = inode.Content;
         if (commit.TruncateTo >= 0 && commit.TruncateTo < content.Length)
@@ -488,6 +786,7 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
 
     private WriteAllResultMessage WriteAll(WriteAllMessage write)
     {
+        RequireOpenStaging(write.Staging);
         bool created = false;
         if (!_paths.TryGetValue(write.Path, out Inode? inode))
         {
@@ -503,6 +802,7 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
 
     private AppendResultMessage Append(AppendMessage append)
     {
+        RequireOpenStaging(append.Staging);
         bool created = false;
         if (!_paths.TryGetValue(append.Path, out Inode? inode))
         {
@@ -622,13 +922,35 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
         public string Policy { get; set; } = string.Empty;
     }
 
-    private sealed record HandleState(Inode Inode, bool Writable, byte[]? Pinned, ulong PinnedRevision, ulong Generation);
+    private sealed record HandleState(Inode Inode, bool Writable, byte[]? Pinned, ulong PinnedRevision, ulong Generation, ulong Session);
 
     private sealed class SessionState
     {
         public ulong Highest { get; set; }
 
+        public bool Expired { get; set; }
+
+        public ulong MaxWatermark { get; set; }
+
         public Dictionary<ulong, Outcome> Outcomes { get; } = [];
+    }
+
+    private sealed class StagingState(ulong session, ulong handle)
+    {
+        public ulong Session { get; } = session;
+
+        public ulong Handle { get; } = handle;
+
+        public bool Closed { get; set; }
+    }
+
+    private sealed class TxState
+    {
+        public string State { get; set; } = "Active";
+
+        public CommitToken Token { get; set; }
+
+        public ulong Staging { get; init; }
     }
 
     private sealed record Outcome(MessageType Kind, byte[] Frame, bool Success, bool Fenced);
