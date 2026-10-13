@@ -38,6 +38,10 @@ public sealed class AclIntegrationTests
             Transport = TransportKind.Quic,
             Storage = StorageKind.Disk,
             ScenarioTimeout = TimeSpan.FromMinutes(4),
+            // Read capabilities live max(PinDuration, LeaseDuration) — 2 s with the fast test timings — but the stolen
+            // capabilities are replayed across ~40 sequential connections per phase; an expired capability would make the
+            // positive control fail and the theft checks pass for the wrong reason (expiry instead of the principal binding).
+            Timings = NodeTimings.Fast with { PinDuration = TimeSpan.FromMinutes(2) },
         }, async cluster =>
         {
             await using DfsClient adminClient = await cluster.ConnectAsync(new TestClientOptions { Name = "acl-admin" }, Ct);

@@ -120,6 +120,34 @@ internal sealed record VolumeState
     /// <summary>The inode with <paramref name="id"/>, or null.</summary>
     public InodeRecord? Find(ulong id) => Inodes.GetValueOrDefault(id);
 
+    /// <summary>
+    /// First session number of the volume <paramref name="volume"/>: a deterministic function of the volume id in
+    /// [2^24, 2^48] (a multiple of 2^24, plus one). Session numbers are part of every operation id, and an id is bound to
+    /// the volume that issued it (PROTOCOL.md §5.1); numbering each volume's sessions from its own base keeps an id of one
+    /// volume from naming a session of another (where it would execute as that session's operation — SEC-010), as the
+    /// expected-volume binding of an application id is only known from its first transmission.
+    /// </summary>
+    public static ulong SessionBase(VolumeId volume)
+    {
+        Span<byte> bytes = stackalloc byte[16];
+        volume.Value.TryWriteBytes(bytes);
+        ulong folded = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(bytes)
+                       ^ System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(bytes[8..]);
+        return (((folded & 0xFF_FFFF) | 1) << 24) + 1;
+    }
+
+    /// <summary>
+    /// True when <paramref name="session"/> is a number this volume issued (it may since have been retired); false for a
+    /// number it never issued. Volumes persisted before per-volume session bases number their sessions from 1.
+    /// </summary>
+    public bool IssuedSession(ulong session)
+    {
+        if (session == 0 || session >= NextSessionId)
+            return false;
+        ulong first = SessionBase(Config.Id);
+        return session >= first || NextSessionId < first;
+    }
+
     /// <summary>The writer generation of a stream (0 = never had a writer).</summary>
     public ulong WriterGenerationOf(StreamKey key) => WriterGenerations.GetValueOrDefault(key);
 
@@ -139,10 +167,13 @@ internal sealed record VolumeState
             : DfsSecurityDescriptor.DefaultRoot(owner);
         var root = new InodeRecord(InodeRecord.RootId, InodeKind.Directory, 0, 0, creation.CreatedUtc, creation.CreatedUtc, rootSecurity, string.Empty,
             0, string.Empty, InodeRecord.NoStreams, InodeRecord.NoChildren);
+        ulong sessionBase = SessionBase(creation.Id);
         return new VolumeState
         {
             Config = config,
             LeaderTime = creation.CreatedUtc,
+            NextSessionId = sessionBase,
+            RetiredSessionsBelow = sessionBase,
             Inodes = ImmutableSortedDictionary<ulong, InodeRecord>.Empty.Add(root.Id, root),
         };
     }

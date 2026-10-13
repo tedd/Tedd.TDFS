@@ -75,13 +75,20 @@ public sealed class SecIntegrationTests
             switch (identity)
             {
                 case PeerIdentityCase.KnownNodeWrongSecret:
+                {
                     await victim.StopAsync();
-                    await victim.RestartAsync(o =>
+                    // The at-rest keys derive from the cluster secret (ARCHITECTURE §11): with the wrong secret the member may
+                    // already be unable to authenticate its own journal and refuse to start. Refusing is a valid (stronger)
+                    // outcome — a node that does not run is never a reachable trusted member either.
+                    Exception? start = await Record.ExceptionAsync(() => victim.RestartAsync(o =>
                     {
                         originalSecret = o.ClusterSecret;
                         return o with { ClusterSecret = wrongSecret };
-                    });
+                    }));
+                    Assert.True(start is null or DfsIntegrityException or DfsAuthenticationException,
+                        $"a member with the wrong cluster secret must either run untrusted or refuse to start, got {start?.GetType().Name}: {start?.Message}");
                     break;
+                }
                 case PeerIdentityCase.UnknownNodeWrongSecret:
                     await victim.CrashAsync();
                     TestNode intruder = await cluster.AddNodeAsync(new TestNodeSpec("n3", victim.Labels.Zone), o => o with { ClusterSecret = wrongSecret }, join: true, Ct);
@@ -457,7 +464,9 @@ public sealed class SecIntegrationTests
             var rawChecks = new (DfsOperationKind Kind, string Path, string? Path2, DfsPermissions Required, DfsErrorCode WhenAllowed, bool Mutates)[]
             {
                 (DfsOperationKind.GetInfo, rawRoot + "/a.txt", null, DfsPermissions.Read, DfsErrorCode.None, false),
-                (DfsOperationKind.GetInfo, rawRoot + "/missing.txt", null, DfsPermissions.Read, DfsErrorCode.FileNotFound, false),
+                // On the wire absence is not an error (PROTOCOL.md GetInfo: Exists = false, FSD §5.4), so an allowed raw GetInfo
+                // of a missing name succeeds; a principal without Read must still get AccessDenied independent of existence.
+                (DfsOperationKind.GetInfo, rawRoot + "/missing.txt", null, DfsPermissions.Read, DfsErrorCode.None, false),
                 (DfsOperationKind.Open, rawRoot + "/raw-new.bin", null, DfsPermissions.Write, DfsErrorCode.None, true),
                 (DfsOperationKind.WriteAll, rawRoot + "/b.txt", null, DfsPermissions.Write, DfsErrorCode.None, true),
                 (DfsOperationKind.Move, rawRoot + "/c.txt", rawRoot + "/c-moved.txt", DfsPermissions.Write, DfsErrorCode.None, true),

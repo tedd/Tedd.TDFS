@@ -288,7 +288,7 @@ internal sealed partial class VolumeStateMachine
             throw Fail(DfsErrorCode.InvalidArgument, "The request needs a session (OpenSession first).");
         if (!s.Sessions.TryGetValue(session, out SessionRecord? record))
         {
-            throw session < s.NextSessionId
+            throw s.IssuedSession(session)
                 ? Fail(DfsErrorCode.LeaseLost, $"Session {session} expired.")
                 : Fail(DfsErrorCode.InvalidArgument, $"Session {session} was never issued by this volume.");
         }

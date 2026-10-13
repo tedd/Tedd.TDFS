@@ -191,8 +191,9 @@ internal sealed partial class VolumeStateMachine
             return Status(target, WireOutcomeStatus.NotFound, "The operation id is empty.");
         if (!s.Sessions.TryGetValue(target.Session, out session))
         {
-            return Status(target, target.Session < s.NextSessionId ? WireOutcomeStatus.Expired : WireOutcomeStatus.NotFound,
-                target.Session < s.NextSessionId ? "The operation's session is retired." : "This volume never issued the operation's session.");
+            bool issued = s.IssuedSession(target.Session);
+            return Status(target, issued ? WireOutcomeStatus.Expired : WireOutcomeStatus.NotFound,
+                issued ? "The operation's session is retired." : "This volume never issued the operation's session.");
         }
 
         if (!string.Equals(session.Principal, principal, StringComparison.Ordinal))

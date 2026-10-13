@@ -47,6 +47,19 @@ internal sealed class ControlService
         CommitToken last = CommitToken.None;
         if (message.RequireLeader)
         {
+            // The leader variant backs DfsVolume.GetInfoAsync: it discloses the volume's last commit, so a client principal
+            // needs the Read grant on the volume (SEC-003); plain routing stays open to every authenticated peer, as the
+            // route carries nothing beyond the cluster map.
+            if (!context.IsNode)
+            {
+                string principal = context.Principal ?? string.Empty;
+                if ((Control.State.GetPermissions(principal, volume.Id) & DfsPermissions.Read) == 0 && !Control.State.IsClusterAdmin(principal))
+                {
+                    Control.ReportSecurityEvent("volume:get info", "denied", "volume=" + volume.Name, principal);
+                    throw new UnauthorizedAccessException($"Principal '{principal}' lacks the Read grant on volume '{volume.Name}' (get info).");
+                }
+            }
+
             if (group is null)
                 throw new DfsUnavailableException(DfsErrorCode.NotLeader, $"{_s.NodeName} does not host volume '{volume.Name}'.");
             if (!group.IsLeader)

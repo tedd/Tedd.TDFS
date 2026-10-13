@@ -94,6 +94,9 @@ public sealed partial class NodeInspector
             [.. state.Features]);
     });
 
+    /// <summary>The id of the cluster this node belongs to (its applied control state; empty before it knows one).</summary>
+    internal Task<Guid> GetClusterIdAsync() => _loop.InvokeAsync(() => S.Control.State.ClusterId);
+
     /// <summary>Process-level status (serving, registered incarnation).</summary>
     internal Task<HarnessNodeStatus> GetNodeStatusAsync() => _loop.InvokeAsync(() =>
         new HarnessNodeStatus(S.NodeId, S.Incarnation, S.IsServing, S.IsStopping, S.Control.IsSelfRegistered));
@@ -104,12 +107,21 @@ public sealed partial class NodeInspector
     /// volume name), the term and this node's name whenever a group's role or term changes and this node leads it (and once
     /// immediately for every group it already leads). Dispose the result to stop.
     /// </summary>
-    internal Task<IDisposable> ObserveLeadershipAsync(Action<string, string, ulong, string> observer)
+    /// <param name="observer">The observer.</param>
+    /// <param name="cluster">
+    /// Only leaderships of groups of this cluster are reported (<see cref="Guid.Empty"/> = any): a node re-bootstrapped under
+    /// another cluster's identity leads that cluster's groups, whose names ("control") and terms collide with this one's.
+    /// </param>
+    internal Task<IDisposable> ObserveLeadershipAsync(Action<string, string, ulong, string> observer, Guid cluster = default)
     {
         ArgumentNullException.ThrowIfNull(observer);
         return _loop.InvokeAsync<IDisposable>(() =>
         {
-            var subscription = new LeadershipSubscription(_loop, S.Raft, S.NodeName, observer);
+            ControlHost control = S.Control;
+            Func<bool> accept = cluster == Guid.Empty
+                ? static () => true
+                : () => control.State.ClusterId == Guid.Empty || control.State.ClusterId == cluster;
+            var subscription = new LeadershipSubscription(_loop, S.Raft, S.NodeName, observer, accept);
             foreach (GroupRuntime group in S.Raft.Groups)
                 subscription.OnChanged(group);
             return subscription;
@@ -238,20 +250,22 @@ public sealed partial class NodeInspector
         private readonly RaftGroupHost _raft;
         private readonly string _node;
         private readonly Action<string, string, ulong, string> _observer;
+        private readonly Func<bool> _accept;
         private bool _disposed;
 
-        public LeadershipSubscription(INodeLoop loop, RaftGroupHost raft, string node, Action<string, string, ulong, string> observer)
+        public LeadershipSubscription(INodeLoop loop, RaftGroupHost raft, string node, Action<string, string, ulong, string> observer, Func<bool> accept)
         {
             _loop = loop;
             _raft = raft;
             _node = node;
             _observer = observer;
+            _accept = accept;
             _raft.LeadershipChanged += OnChanged;
         }
 
         public void OnChanged(GroupRuntime group)
         {
-            if (!_disposed && group.IsLeader && !group.IsClosed)
+            if (!_disposed && group.IsLeader && !group.IsClosed && _accept())
                 _observer(group.Name, group.DisplayName, group.Term, _node);
         }
 

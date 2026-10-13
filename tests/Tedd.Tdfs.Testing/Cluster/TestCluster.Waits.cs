@@ -575,6 +575,8 @@ public sealed partial class TestCluster
             try
             {
                 NodeInspector inspector = node.Inspect;
+                if (await IsForeignAsync(inspector))
+                    continue; // runs another cluster's identity (SEC-001): never a member, leader or replica of this one
                 IReadOnlyList<GroupInspection> groups = await inspector.GetGroupsAsync();
                 HarnessNodeStatus status = groupsOnly ? EmptyStatus : await inspector.GetNodeStatusAsync();
                 HarnessControlSummary control = groupsOnly ? EmptyControl : await inspector.GetControlSummaryAsync();
@@ -589,6 +591,17 @@ public sealed partial class TestCluster
         }
 
         return views;
+    }
+
+    /// <summary>
+    /// True when the node runs under another cluster's identity (for example a member's endpoint re-bootstrapped as a foreign
+    /// cluster): its groups ("control" included) belong to that cluster, so leader, stability and split-brain views of this
+    /// cluster must not count them. A node that does not know its cluster yet (joining) is not foreign.
+    /// </summary>
+    internal async Task<bool> IsForeignAsync(NodeInspector inspector)
+    {
+        Guid id = await inspector.GetClusterIdAsync();
+        return id != Guid.Empty && id != ClusterId;
     }
 
     /// <summary>True for the exceptions an inspector call raises when the node went away (crash, stop, pause, kill).</summary>
