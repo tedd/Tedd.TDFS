@@ -79,8 +79,9 @@ internal sealed partial class GroupRuntime
         if (_closed)
             return false;
 
-        // F10 after local append: leader-side proposals whose entries are now durable here (CON-007 blocks here).
-        if (ready.EntriesToPersist.Count > 0 && _proposals.Count > 0)
+        // F10 after local append: entries now durable here, before this node acknowledges them (CON-007 blocks here; OFF-004
+        // stops a follower here).
+        if (ready.EntriesToPersist.Count > 0 && (_proposals.Count > 0 || _s.Faults.IsEnabled))
             await ReportLocalAppendsAsync(ready.EntriesToPersist);
 
         // 2. Messages (depend on step 1).
@@ -141,6 +142,31 @@ internal sealed partial class GroupRuntime
             catch (FaultReplyDroppedException)
             {
                 p.DropReply = true; // the request executes; only its reply is lost
+            }
+
+            if (_closed)
+                return;
+        }
+
+        if (!_s.Faults.IsEnabled)
+            return;
+
+        // Replicated entries this node did not propose (a follower's local append, before its acknowledgement is sent): the
+        // operation comes from the command itself. Entries without an operation (no-ops) are not reported.
+        foreach (RaftEntry entry in entries)
+        {
+            if (_proposals.ContainsKey((entry.Index, entry.Term)))
+                continue;
+            ProposalContext context = DescribeEntry(entry);
+            if (context.Operation == DfsOperationKind.Unknown)
+                continue;
+            try
+            {
+                await _s.HitAsync(FaultStage.F10, FaultSites.RaftAfterLocalAppend, VolumeName, context.Operation, context.OperationId, context.Path);
+            }
+            catch (FaultReplyDroppedException)
+            {
+                // A replica has no reply of its own to lose.
             }
 
             if (_closed)

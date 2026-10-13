@@ -3096,7 +3096,12 @@ public sealed class OffSimulationTests
                 {
                     await follower.StopAsync();
                     byte[] wrongSecret = TestData.Bytes(0xBAD5_EC2E, 32);
-                    await TryAsync(() => follower.RestartAsync(o => o with { ClusterSecret = wrongSecret }));
+                    ReadOnlyMemory<byte> legitimateSecret = default;
+                    await TryAsync(() => follower.RestartAsync(o =>
+                    {
+                        legitimateSecret = o.ClusterSecret;
+                        return o with { ClusterSecret = wrongSecret };
+                    }));
                     await other.CrashAsync();   // only the leader and the impostor remain
                     OffAttempt<CommitToken> write = await TryAsync(() => av.Files.WriteAllBytesAsync(path, V2, Ct));
                     Assert.False(write.Succeeded, "a node with wrong cluster credentials must never complete a quorum");
@@ -3107,7 +3112,9 @@ public sealed class OffSimulationTests
                     await cluster.WaitForStableAsync(Bounded, Ct);
                     if (follower.State == TestNodeState.Running)
                         await follower.StopAsync();
-                    await follower.RestartAsync();
+
+                    // The node returns with its legitimate credentials (a reconfigured restart keeps its options).
+                    await follower.RestartAsync(o => o with { ClusterSecret = legitimateSecret });
                     await cluster.WaitForStableAsync(Bounded, Ct);
                     await cluster.WaitForReplicationAsync(Volume, Ct);
                     await cluster.Inspect.AssertReplicasConvergedAsync(Volume);
