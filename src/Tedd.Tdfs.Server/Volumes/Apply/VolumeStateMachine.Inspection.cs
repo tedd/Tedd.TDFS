@@ -56,7 +56,7 @@ internal sealed partial class VolumeStateMachine
             .Where(p => p.Key.Length > 0)
             .Select(p => new StreamInspection(p.Key, p.Value.Length, p.Value.Revision, Extents(p.Value)))
             .ToArray();
-        return new FileInspection(filePath, new InodeId(inode.Id), inode.Revision, main.Length, main.IsInline,
+        return new FileInspection(filePath, new InodeId(inode.Id), inode.ReportedRevision, main.Length, main.IsInline,
             s.WriterGenerationOf(new StreamKey(inode.Id, DfsStreamPath.DefaultStreamName)), inode.PolicyName, Extents(main), streams);
     }
 

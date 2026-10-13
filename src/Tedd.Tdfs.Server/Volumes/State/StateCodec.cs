@@ -85,6 +85,7 @@ internal static class StateCodec
         w.WriteVarUInt(n.Id);
         w.WriteByte((byte)n.Kind);
         w.WriteVarUInt(n.Revision);
+        w.WriteVarUInt(n.MetadataRevision);
         w.WriteVarUInt(n.CreatedIndex);
         w.WriteDateTimeOffset(n.CreatedUtc);
         w.WriteDateTimeOffset(n.ModifiedUtc);
@@ -114,6 +115,7 @@ internal static class StateCodec
         if (kind is not (InodeKind.File or InodeKind.Directory))
             throw WireReader.Malformed($"Unknown inode kind {(byte)kind}.");
         ulong revision = r.ReadVarUInt();
+        ulong metadataRevision = r.ReadVarUInt();
         ulong created = r.ReadVarUInt();
         DateTimeOffset createdUtc = r.ReadDateTimeOffset();
         DateTimeOffset modifiedUtc = r.ReadDateTimeOffset();
@@ -137,7 +139,10 @@ internal static class StateCodec
             children[childName] = r.ReadVarUInt();
         }
 
-        return new InodeRecord(id, kind, revision, created, createdUtc, modifiedUtc, security, policy, parent, name, streams.ToImmutable(), children.ToImmutable());
+        return new InodeRecord(id, kind, revision, created, createdUtc, modifiedUtc, security, policy, parent, name, streams.ToImmutable(), children.ToImmutable())
+        {
+            MetadataRevision = metadataRevision,
+        };
     }
 
     public static void WriteAdapter(ref WireWriter w, AdapterRecord a)

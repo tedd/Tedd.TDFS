@@ -246,7 +246,17 @@ internal sealed partial class AdminService
   `ApplyResult Apply<Feature>(VolumeState s, Cmd c, ApplyContext ctx, out VolumeState next)` → outcome stored.
 * Leader-only, non-replicated state (lease timers, tx working roots, enumeration cache, in-flight op coalescing,
   inventory/location maps, repair queues, exporter state) lives in `VolumeService` partials and is rebuilt after
-  leadership changes.
+  leadership changes. A lease the leader has not seen yet counts as renewed when first seen (never measured from the
+  election: a handle granted by an applied entry whose reply path is still held must not expire).
+* Revisions: `InodeRecord.Revision` advances for every change of the record (it is the checkpoint version key
+  `(Id, Revision)`, so every change must advance it); `MetadataRevision` only for the inode's own metadata (creation,
+  owner, ACL, policy, name/parent). The revision reported for a file (`FileInfoData.Revision`, listings, inspection,
+  conditional writes) is `ReportedRevision` = max(default-stream revision, metadata revision): named-stream writes do not
+  change it (ADS-011). `CommitFile.BaseRevision` conflicts only when the stream's content changed after the base.
+* The leader pre-checks a command by running apply without committing (`DryRun`). A definitely (non-retryably) refused
+  request **with** an operation id is still proposed, so apply records the refusal as the id's outcome (an answered id
+  never executes later); retryable refusals and id-less refusals are answered from the pre-check. Apply catches every
+  exception (except OOM) as a deterministic `Internal` failure of the entry.
 
 ### 1.3 Runtime plug-in points (how feature areas attach)
 

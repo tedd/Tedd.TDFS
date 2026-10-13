@@ -53,8 +53,36 @@ internal sealed partial class VolumeService
 
     private void RenewPin(ulong pin) => _pinRenewals[pin] = _s.Time.GetTimestamp();
 
+    /// <summary>
+    /// Time since the last renewal this leader saw. A lease this leader has not seen yet counts as renewed now: a lease that
+    /// existed at the election is renewed by the election (ARCHITECTURE §5.3), and one granted by an entry this leader applied
+    /// but whose reply path has not recorded the grant yet (for example while held at F12) must not be expired as if it had
+    /// been granted when the leader was elected.
+    /// </summary>
     private TimeSpan SinceRenewal(Dictionary<ulong, long> renewals, ulong id, long now)
-        => _s.Time.GetElapsedTime(renewals.TryGetValue(id, out long at) ? Math.Max(at, _leaderSince) : _leaderSince, now);
+    {
+        if (!renewals.TryGetValue(id, out long at))
+        {
+            renewals[id] = now;
+            return TimeSpan.Zero;
+        }
+
+        return _s.Time.GetElapsedTime(Math.Max(at, _leaderSince), now);
+    }
+
+    /// <summary>Drops lease-tracking entries of handles, sessions and pins the applied state no longer has.</summary>
+    private void PruneRenewals(VolumeState s)
+    {
+        static void Prune(Dictionary<ulong, long> renewals, Func<ulong, bool> alive)
+        {
+            foreach (ulong id in renewals.Keys.Where(id => !alive(id)).ToArray())
+                renewals.Remove(id);
+        }
+
+        Prune(_handleRenewals, s.Handles.ContainsKey);
+        Prune(_sessionRenewals, id => s.Sessions.TryGetValue(id, out SessionRecord? session) && session.State == SessionState.Active);
+        Prune(_pinRenewals, s.Pins.ContainsKey);
+    }
 
     /// <summary>
     /// Leader maintenance (periodic job): proposes expiry of handles, sessions and reader pins the leader saw not renewed in
@@ -86,6 +114,7 @@ internal sealed partial class VolumeService
         long now = _s.Time.GetTimestamp();
         VolumeState s = State;
         NodeNow(out DateTimeOffset wall);
+        PruneRenewals(s);
 
         ImmutableArray<ulong> sessions = [.. s.Sessions.Values
             .Where(x => x.State == SessionState.Active && SinceRenewal(_sessionRenewals, x.Id, now) > x.SessionTimeout)
@@ -198,7 +227,7 @@ internal sealed partial class VolumeService
                 _handleRenewals.Remove(request.Handle.Value);
                 return result.Reply!;
             },
-            requireOperation: false);
+            requireOperation: false, cleanup: true);
     }
 
     // ------------------------------------------------------------------------------------------------- ReadRange
@@ -221,6 +250,8 @@ internal sealed partial class VolumeService
         CommitToken observed;
         if (!request.Handle.IsEmpty)
         {
+            if (request.Stream is not null)
+                throw new ArgumentException("A handle read addresses the handle's own stream; Stream is only valid for snapshot reads by inode.");
             ulong applied = await ReadBarrierAsync(ct);
             VolumeState s = State;
             HandleRecord h = ReadableHandle(s, request.Handle.Value, principal);
@@ -247,7 +278,22 @@ internal sealed partial class VolumeService
             (IReadOnlySet<DfsIdentity> ids, bool admin) = IdentitySetOf(principal);
             if (!VolumeAccess.Has(VolumeAccess.Rights(chain, ids, admin), DfsFileSystemRights.ReadData))
                 throw new UnauthorizedAccessException($"Principal '{principal}' may not read inode {inode.Id} of the snapshot.");
-            stream = inode.DefaultStream ?? throw new DfsException(DfsErrorCode.IsADirectory, $"Inode {inode.Id} is a directory.");
+            if (request.Stream is { } named)
+            {
+                // Named streams of files and directories are part of the snapshot (ADS-020); stream names follow component rules.
+                if (named.Length == 0 || !DfsPath.TryNormalize("/x:" + named, out string normalizedStream, out _)
+                    || DfsStreamPath.GetStreamName(normalizedStream) is not { } streamName)
+                {
+                    throw new ArgumentException($"'{named}' is not a valid stream name.");
+                }
+
+                stream = inode.GetStream(streamName) ?? throw new FileNotFoundException($"Inode {inode.Id} has no stream '{streamName}' in the snapshot.");
+            }
+            else
+            {
+                stream = inode.DefaultStream ?? throw new DfsException(DfsErrorCode.IsADirectory, $"Inode {inode.Id} is a directory.");
+            }
+
             RenewPin(pin.Id);
             revision = stream.Revision;
             observed = Token(pin.PinIndex);

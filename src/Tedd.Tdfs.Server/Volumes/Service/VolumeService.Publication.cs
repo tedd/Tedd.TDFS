@@ -43,8 +43,17 @@ internal sealed partial class VolumeService
                 string path = PathForFaults(s, h.Inode, h.Stream);
                 ImmutableArray<StreamChange> changes = await ValidateChangesAsync(request.Changes, request.Receipts, request.Staging, policy, pool,
                     DfsOperationKind.CommitFile, op.Id, path, ct);
+                if (h.IsAppend && VolumeStateMachine.AppendHandleError(stream.Length, request.TruncateTo, request.NewLength, changes) is { } appendError)
+                {
+                    // Checked on the client's changes before the leader may rewrite them into a materialized form (FSD 6.1).
+                    throw new ArgumentException(appendError);
+                }
+
                 PublishPlan plan = await PlanAsync(stream, request.TruncateTo, changes, request.NewLength, policy, pool, request.Staging, op, ct);
-                var spec = new PublishSpec(plan.TruncateTo, request.NewLength, plan.Changes, plan.FinalInline, plan.Derived, request.Staging.Value, plan.LeaderStaging);
+                var spec = new PublishSpec(plan.TruncateTo, request.NewLength, plan.Changes, plan.FinalInline, plan.Derived, request.Staging.Value, plan.LeaderStaging)
+                {
+                    Policy = inode.PolicyName,
+                };
                 return new Prepared(Stamp(new CommitFileCommand(h.Id, request.Generation, request.BaseRevision, spec, request.SnapshotName), op), hold);
             }
             catch
@@ -52,7 +61,7 @@ internal sealed partial class VolumeService
                 hold.Dispose();
                 throw;
             }
-        });
+        }, cleanup: true);
         CountStaleWrite(reply);
         return reply;
     }
@@ -77,11 +86,17 @@ internal sealed partial class VolumeService
             {
                 res = new NamespaceView(State.Inodes).Resolve(filePath);
                 InodeRecord? existing = res.Found ? res.Target : null;
-                (DfsStoragePolicy policy, string pool) = PolicyOf(existing?.PolicyName ?? request.StoragePolicy ?? res.Parent?.PolicyName ?? string.Empty);
+
+                // The policy the file will be under: its own, or for a new file the requested one, else the policy of the
+                // directory it is created in; with CreateParents the missing directories inherit the nearest existing one's.
+                string policyName = existing?.PolicyName ?? request.StoragePolicy ?? res.Parent?.PolicyName
+                    ?? (request.CreateParents && res.Status == ResolveStatus.AncestorMissing && res.Ancestors.Count > 0 ? res.Ancestors[^1].PolicyName : null)
+                    ?? string.Empty;
+                (DfsStoragePolicy policy, string pool) = PolicyOf(policyName);
                 ImmutableArray<StreamChange> changes = await ValidateChangesAsync(request.Changes, request.Receipts, request.Staging, policy, pool,
                     DfsOperationKind.WriteAll, op.Id, path, ct);
                 PublishPlan plan = await PlanAsync(null, 0, changes, request.Length, policy, pool, request.Staging, op, ct);
-                var spec = new PublishSpec(0, request.Length, plan.Changes, plan.FinalInline, 0, request.Staging.Value, plan.LeaderStaging);
+                var spec = new PublishSpec(0, request.Length, plan.Changes, plan.FinalInline, 0, request.Staging.Value, plan.LeaderStaging) { Policy = policyName };
                 return new Prepared(Stamp(new WriteAllCommand(path, spec, request.StoragePolicy, request.SnapshotName, request.CreateParents,
                     request.ExpectedRevision), op), hold);
             }
@@ -90,7 +105,7 @@ internal sealed partial class VolumeService
                 hold?.Dispose();
                 throw;
             }
-        });
+        }, cleanup: true);
     }
 
     /// <summary><c>Append</c> (FSD §5.4, OUT-006): atomic suffix under one operation id, by path or through a writable handle.</summary>
@@ -127,7 +142,8 @@ internal sealed partial class VolumeService
             {
                 InodeRecord? inode = key is { } target ? State.Find(target.Inode) : null;
                 StreamRecord? stream = key is { } target2 ? inode?.GetStream(target2.Stream) : null;
-                (DfsStoragePolicy policy, string pool) = PolicyOf(inode?.PolicyName ?? request.StoragePolicy ?? parent?.PolicyName ?? string.Empty);
+                string policyName = inode?.PolicyName ?? request.StoragePolicy ?? parent?.PolicyName ?? string.Empty;
+                (DfsStoragePolicy policy, string pool) = PolicyOf(policyName);
                 string faultPath = path.Length > 0 ? path : PathForFaults(State, key?.Inode ?? 0, key?.Stream ?? string.Empty);
                 ImmutableArray<StreamChange> relative = await ValidateChangesAsync(request.Changes, request.Receipts, request.Staging, policy, pool,
                     DfsOperationKind.Append, op.Id, faultPath, ct);
@@ -141,13 +157,13 @@ internal sealed partial class VolumeService
                 bool isAbsolute;
                 if (!changed && !plan.FinalInline)
                 {
-                    spec = new PublishSpec(-1, request.AppendLength, relative, false, 0, request.Staging.Value, 0);
+                    spec = new PublishSpec(-1, request.AppendLength, relative, false, 0, request.Staging.Value, 0) { Policy = policyName };
                     isAbsolute = false;
                 }
                 else
                 {
                     spec = new PublishSpec(-1, oldLength + request.AppendLength, plan.Changes, plan.FinalInline, stream?.Revision ?? 0, request.Staging.Value,
-                        plan.LeaderStaging);
+                        plan.LeaderStaging) { Policy = policyName };
                     isAbsolute = true;
                 }
 
@@ -159,15 +175,16 @@ internal sealed partial class VolumeService
                 hold?.Dispose();
                 throw;
             }
-        });
+        }, cleanup: true);
         CountStaleWrite(reply);
         return reply;
     }
 
     /// <summary>
-    /// <c>Copy</c>: metadata-only copy of the source's current revision (all streams; objects shared) (one entry). Inline
-    /// source streams are stored as objects first when the destination's policy is stronger than what inline metadata
-    /// guarantees (LAY-002).
+    /// <c>Copy</c>: metadata-only copy of the source's current revision (objects shared) (one entry): a plain source copied to
+    /// a new plain destination copies every stream; otherwise the addressed source stream replaces (or creates) the addressed
+    /// destination stream only (ADS-04). Inline source streams are stored as objects first when the destination's policy is
+    /// stronger than what inline metadata guarantees (LAY-002).
     /// </summary>
     public Task<IWireMessage> CopyAsync(RpcContext context, CopyMessage request)
     {
@@ -182,46 +199,103 @@ internal sealed partial class VolumeService
             var command = Stamp(new CopyCommand(source, destination, request.Overwrite, request.ExpectedSourceRevision, request.StoragePolicy,
                 request.SnapshotName), op);
             var view = new NamespaceView(State.Inodes);
-            if (view.Resolve(source) is not { Found: true, Target: { IsDirectory: false } from })
+            (string sourceFile, string? sourceStream, string destinationFile, string? destinationStream) = VolumeStateMachine.SplitCopyPaths(source, destination);
+            if (view.Resolve(sourceFile) is not { Found: true, Target: { } from })
                 return command;
-            Resolution target = view.Resolve(destination);
-            string? policyName = target is { Found: true, Target: { IsDirectory: false } existing } ? existing.PolicyName : request.StoragePolicy ?? from.PolicyName;
+            Resolution target = view.Resolve(destinationFile);
+            string? policyName = target is { Found: true, Target: { } existing } ? existing.PolicyName : request.StoragePolicy ?? from.PolicyName;
             (DfsStoragePolicy policy, string pool) = PolicyOf(policyName);
-            (ImmutableArray<StreamMaterialization> materialized, ulong staging) = await MaterializeInlineAsync(command, from, policy, pool, op, ct);
+            bool wholeFile = sourceStream is null && destinationStream is null && !target.Found;
+            string? only = wholeFile ? null : sourceStream ?? DfsStreamPath.DefaultStreamName;
+            (ImmutableArray<StreamMaterialization> materialized, ulong staging) = await MaterializeInlineAsync(command, from, policy, pool, op, ct, only,
+                replaceWeakExtents: true);
             return staging == 0 ? command : command with { Materialized = materialized, LeaderStaging = staging };
-        });
+        }, cleanup: true);
     }
 
     /// <summary>
     /// Stores the inline streams of <paramref name="inode"/> as objects meeting <paramref name="policy"/> when inline metadata
-    /// does not guarantee it (LAY-002), under a new leader staging session; nothing when inline storage satisfies the policy
-    /// or <paramref name="command"/> would be refused anyway.
+    /// does not guarantee it (LAY-002), and with <paramref name="replaceWeakExtents"/> (a copy) also re-places every object
+    /// whose known durable copies do not meet <paramref name="policy"/> inside <paramref name="pool"/> (a copy under a stronger
+    /// policy or into another pool must not share objects that fail its durability or pool, DEC-10, POOL-02), under a new
+    /// leader staging session; nothing when no stream needs it or <paramref name="command"/> would be refused anyway.
     /// </summary>
     private async Task<(ImmutableArray<StreamMaterialization> Materialized, ulong Staging)> MaterializeInlineAsync(VolumeCommand command, InodeRecord inode,
-        DfsStoragePolicy policy, string pool, OperationHeader op, CancellationToken ct)
+        DfsStoragePolicy policy, string pool, OperationHeader op, CancellationToken ct, string? onlyStream = null, bool replaceWeakExtents = false)
     {
-        KeyValuePair<string, StreamRecord>[] inline = [.. inode.Streams.Where(p => p.Value is { IsInline: true, Length: > 0 })];
-        if (inline.Length == 0 || InlineAllowed(policy) || !DryRun(command).IsSuccess)
+        bool inlineAllowed = InlineAllowed(policy);
+        KeyValuePair<string, StreamRecord>[] work = [.. inode.Streams.Where(p => (onlyStream is null || string.Equals(p.Key, onlyStream, StringComparison.Ordinal))
+            && (p.Value is { IsInline: true, Length: > 0 } ? !inlineAllowed
+                : replaceWeakExtents && !p.Value.IsInline && p.Value.Extents.Any(e => !MeetsPolicy(e, policy, pool))))];
+        if (work.Length == 0 || !DryRun(command).IsSuccess)
             return ([], 0);
         ulong leaderStaging = await CreateLeaderStagingAsync(op, ct);
         var staging = new StagingId(leaderStaging);
-        ImmutableArray<StreamMaterialization>.Builder materialized = ImmutableArray.CreateBuilder<StreamMaterialization>(inline.Length);
-        foreach ((string name, StreamRecord stream) in inline)
+        string sourcePool = PolicyOf(inode.PolicyName).Pool;
+        ImmutableArray<StreamMaterialization>.Builder materialized = ImmutableArray.CreateBuilder<StreamMaterialization>(work.Length);
+        foreach ((string name, StreamRecord stream) in work)
         {
             ImmutableList<ExtentRef>.Builder extents = ImmutableList.CreateBuilder<ExtentRef>();
-            for (long done = 0; done < stream.Length;)
+            if (stream.IsInline)
             {
-                int chunk = (int)Math.Min(stream.Length - done, _s.Timings.MaxObjectSize);
-                StoredObject stored = await Io.StoreObjectAsync(Record, stream.Inline.Slice((int)done, chunk), staging, policy, pool, ct);
-                extents.Add(new ExtentRef(done, chunk, stored.Object, 0, stored.Length, stored.Checksum, ObjectEncodings.Plain, stored.PlacementEpoch, staging,
-                    stored.Holders));
-                done += chunk;
+                for (long done = 0; done < stream.Length;)
+                {
+                    int chunk = (int)Math.Min(stream.Length - done, _s.Timings.MaxObjectSize);
+                    StoredObject stored = await Io.StoreObjectAsync(Record, stream.Inline.Slice((int)done, chunk), staging, policy, pool, ct);
+                    extents.Add(new ExtentRef(done, chunk, stored.Object, 0, stored.Length, stored.Checksum, ObjectEncodings.Plain, stored.PlacementEpoch,
+                        staging, stored.Holders));
+                    done += chunk;
+                }
+            }
+            else
+            {
+                // The same layout over verified copies stored for the policy: every extent keeps its range and object offset.
+                var replaced = new Dictionary<ObjectId, StoredObject>();
+                foreach (ExtentRef e in stream.Extents)
+                {
+                    if (MeetsPolicy(e, policy, pool))
+                    {
+                        extents.Add(e);
+                        continue;
+                    }
+
+                    if (!replaced.TryGetValue(e.Object, out StoredObject? stored))
+                    {
+                        byte[] data = await Io.ReadObjectAsync(Record, e.Object, e.Checksum, e.ObjectLength, LocationsOf(e), sourcePool, ct);
+                        stored = await Io.StoreObjectAsync(Record, data, staging, policy, pool, ct);
+                        replaced[e.Object] = stored;
+                    }
+
+                    extents.Add(e with
+                    {
+                        Object = stored.Object,
+                        ObjectLength = stored.Length,
+                        Checksum = stored.Checksum,
+                        Encoding = ObjectEncodings.Plain,
+                        PlacementEpoch = stored.PlacementEpoch,
+                        Staging = staging,
+                        Locations = stored.Holders,
+                    });
+                }
             }
 
             materialized.Add(new StreamMaterialization(name, stream.Revision, extents.ToImmutable()));
         }
 
         return (materialized.MoveToImmutable(), leaderStaging);
+    }
+
+    /// <summary>
+    /// True when the known durable holders of an extent's object (receipt holders at publication and inventories) that are live
+    /// members of <paramref name="pool"/> meet the policy's acknowledgement copies and zones.
+    /// </summary>
+    private bool MeetsPolicy(ExtentRef extent, DfsStoragePolicy policy, string pool)
+    {
+        ControlState control = _s.Control.State;
+        HashSet<NodeId> members = [.. control.PoolMembers(pool).Where(m => m.IsLive).Select(m => m.Id)];
+        DfsTopologyLabels[] labels = [.. LocationsOf(extent).Where(members.Contains).Select(n => control.FindMember(n)?.Labels).OfType<DfsTopologyLabels>()];
+        (int copies, int zones) = Tedd.Tdfs.Data.Placement.CountDomains(labels);
+        return copies >= policy.DurableCopiesBeforeAck && zones >= policy.DurableZonesBeforeAck;
     }
 
     private void CountStaleWrite(IWireMessage reply)

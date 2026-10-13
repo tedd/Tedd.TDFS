@@ -118,6 +118,23 @@ internal sealed record InodeRecord(ulong Id, InodeKind Kind, ulong Revision, ulo
     /// <summary>Root inode id.</summary>
     public const ulong RootId = 1;
 
+    /// <summary>
+    /// Raft index of the last change of the inode's own metadata — creation, owner, ACL, storage policy, name or parent — as
+    /// opposed to <see cref="Revision"/>, which also advances for changes of any stream or of the children.
+    /// </summary>
+    public ulong MetadataRevision { get; init; }
+
+    /// <summary>
+    /// The revision reported to clients for the inode itself (<c>FileInfoData.Revision</c> of a plain path, directory
+    /// listings, inspection): for a file the latest change of its default stream or of its metadata — a write to a named
+    /// stream does not change it (ADS-011), an ACL or policy change does (ACL-07, NS-018); for a directory
+    /// <see cref="Revision"/> (entries and metadata).
+    /// </summary>
+    public ulong ReportedRevision => IsDirectory ? Revision : Math.Max(MetadataRevision, DefaultStream?.Revision ?? 0);
+
+    /// <summary>The revision reported for <paramref name="stream"/> (<c>""</c> = the inode's own reported revision).</summary>
+    public ulong RevisionOf(string stream) => stream.Length == 0 ? ReportedRevision : GetStream(stream)?.Revision ?? 0;
+
     /// <summary>True for directories.</summary>
     public bool IsDirectory => Kind == InodeKind.Directory;
 

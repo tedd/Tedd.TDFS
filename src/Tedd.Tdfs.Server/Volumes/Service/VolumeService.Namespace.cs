@@ -35,7 +35,8 @@ internal sealed partial class VolumeService
         string destination = NormalizePath(request.Destination);
         RequireGrant(context.Principal ?? string.Empty, DfsPermissions.Write, "move");
         return MutateAsync(context, request, DfsOperationKind.Move,
-            (op, _) => Task.FromResult<VolumeCommand>(Stamp(new MoveCommand(source, destination, request.Overwrite, request.ExpectDirectory, request.SnapshotName), op)));
+            (op, _) => Task.FromResult<VolumeCommand>(Stamp(new MoveCommand(source, destination, request.Overwrite, request.ExpectDirectory, request.SnapshotName), op)),
+            cleanup: true);
     }
 
     /// <summary><c>Delete</c>: file, named stream or directory (recursive: atomic detach) (committed).</summary>
@@ -44,7 +45,8 @@ internal sealed partial class VolumeService
         string path = NormalizePath(request.Path);
         RequireGrant(context.Principal ?? string.Empty, DfsPermissions.Write, "delete");
         return MutateAsync(context, request, DfsOperationKind.Delete,
-            (op, _) => Task.FromResult<VolumeCommand>(Stamp(new DeleteCommand(path, request.Recursive, request.ExpectDirectory, request.SnapshotName), op)));
+            (op, _) => Task.FromResult<VolumeCommand>(Stamp(new DeleteCommand(path, request.Recursive, request.ExpectDirectory, request.SnapshotName), op)),
+            cleanup: true);
     }
 
     /// <summary><c>SetPolicy</c>: selects a named policy (validated against the volume's policies) for an inode (committed).</summary>
@@ -326,7 +328,7 @@ internal sealed partial class VolumeService
             }
 
             long length = node.IsDirectory ? 0 : node.DefaultStream?.Length ?? 0;
-            page.Add(new DirectoryEntryData(child.Key, node.IsDirectory ? WireEntryKind.Directory : WireEntryKind.File, new InodeId(node.Id), node.Revision,
+            page.Add(new DirectoryEntryData(child.Key, node.IsDirectory ? WireEntryKind.Directory : WireEntryKind.File, new InodeId(node.Id), node.ReportedRevision,
                 length, node.ModifiedUtc));
         }
 

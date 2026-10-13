@@ -59,7 +59,7 @@ internal sealed partial class VolumeService
     {
         RequireGrant(context.Principal ?? string.Empty, DfsPermissions.Snapshot, "delete snapshot");
         return MutateAsync(context, request, DfsOperationKind.DeleteSnapshot,
-            (op, _) => Task.FromResult<VolumeCommand>(Stamp(new DeleteSnapshotCommand(request.Name), op)));
+            (op, _) => Task.FromResult<VolumeCommand>(Stamp(new DeleteSnapshotCommand(request.Name), op)), cleanup: true);
     }
 
     /// <summary><c>SetRetention</c>: shortening or removing a hold requires RetentionAdmin.</summary>
@@ -93,7 +93,7 @@ internal sealed partial class VolumeService
     public async Task<IWireMessage> CloseSnapshotAsync(RpcContext context, CloseSnapshotMessage request)
     {
         IWireMessage reply = await MutateAsync(context, request, DfsOperationKind.OpenSnapshot,
-            (op, _) => Task.FromResult<VolumeCommand>(Stamp(new ReleasePinCommand(request.SnapshotPin), op)), requireOperation: false);
+            (op, _) => Task.FromResult<VolumeCommand>(Stamp(new ReleasePinCommand(request.SnapshotPin), op)), requireOperation: false, cleanup: true);
         _pinRenewals.Remove(request.SnapshotPin);
         return reply;
     }

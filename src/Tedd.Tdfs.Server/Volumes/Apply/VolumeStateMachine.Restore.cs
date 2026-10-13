@@ -141,7 +141,10 @@ internal sealed partial class VolumeStateMachine
         {
             if (n.Id == 0)
                 throw Fail(DfsErrorCode.InvalidArgument, "Inode id 0 is reserved.");
-            staged = staged.SetItem(n.Id, n);
+
+            // Staged records get this volume's revision space now: their source revisions could equal the version key of
+            // one of this volume's own records (the empty root is (1, 0)), and checkpoints store each (id, revision) once.
+            staged = staged.SetItem(n.Id, n with { Revision = ctx.Index });
         }
 
         restore = restore with { Staged = staged };
@@ -167,7 +170,7 @@ internal sealed partial class VolumeStateMachine
             var streams = ImmutableSortedDictionary.CreateBuilder<string, StreamRecord>(StringComparer.Ordinal);
             foreach (KeyValuePair<string, StreamRecord> pair in n.Streams)
                 streams[pair.Key] = pair.Value with { Revision = ctx.Index, CreatedIndex = ctx.Index };
-            inodes[n.Id] = n with { Revision = ctx.Index, CreatedIndex = ctx.Index, Streams = streams.ToImmutable() };
+            inodes[n.Id] = n with { Revision = ctx.Index, MetadataRevision = ctx.Index, CreatedIndex = ctx.Index, Streams = streams.ToImmutable() };
             next = Math.Max(next, n.Id + 1);
         }
 

@@ -305,6 +305,13 @@ internal sealed record StreamChange(long Offset, long Length, RangeChangeKind Ch
 internal sealed record PublishSpec(long TruncateTo, long NewLength, ImmutableArray<StreamChange> Changes, bool FinalInline, ulong DerivedFromRevision,
     ulong Staging, ulong LeaderStaging)
 {
+    /// <summary>
+    /// Name of the storage policy the leader validated the receipts and chose the representation against (LAY-002); apply
+    /// refuses the publication (WriterConflict, retryable) when the target inode is under another policy by then. Null =
+    /// not checked.
+    /// </summary>
+    public string? Policy { get; init; }
+
     internal void Write(ref WireWriter w)
     {
         w.WriteVarInt(TruncateTo);
@@ -316,6 +323,7 @@ internal sealed record PublishSpec(long TruncateTo, long NewLength, ImmutableArr
         w.WriteVarUInt(DerivedFromRevision);
         w.WriteVarUInt(Staging);
         w.WriteVarUInt(LeaderStaging);
+        w.WriteOptionalString(Policy);
     }
 
     internal static PublishSpec Read(ref WireReader r)
@@ -326,7 +334,10 @@ internal sealed record PublishSpec(long TruncateTo, long NewLength, ImmutableArr
         var changes = ImmutableArray.CreateBuilder<StreamChange>(count);
         for (int i = 0; i < count; i++)
             changes.Add(StreamChange.Read(ref r));
-        return new PublishSpec(truncate, length, changes.MoveToImmutable(), r.ReadBool(), r.ReadVarUInt(), r.ReadVarUInt(), r.ReadVarUInt());
+        return new PublishSpec(truncate, length, changes.MoveToImmutable(), r.ReadBool(), r.ReadVarUInt(), r.ReadVarUInt(), r.ReadVarUInt())
+        {
+            Policy = r.ReadOptionalString(),
+        };
     }
 
     /// <summary>Objects referenced by data changes.</summary>

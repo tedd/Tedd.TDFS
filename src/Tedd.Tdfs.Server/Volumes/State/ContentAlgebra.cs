@@ -58,6 +58,13 @@ internal static class ContentAlgebra
         }
 
         ulong created = baseStream?.CreatedIndex ?? index;
+        if (finalInline && newLength > inlineThreshold)
+        {
+            // Checked before materializing anything: an inline result is bounded by the threshold (never allocate by an
+            // untrusted length).
+            return ContentResult.Fail(DfsErrorCode.InvalidArgument, $"A {newLength}-byte stream exceeds the inline threshold {inlineThreshold}.");
+        }
+
         if (large is not null)
         {
             if (finalInline)

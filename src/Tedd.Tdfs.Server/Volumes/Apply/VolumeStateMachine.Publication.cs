@@ -77,6 +77,14 @@ internal sealed partial class VolumeStateMachine
                 $"The stream changed (revision {before?.Revision ?? 0}) after the leader prepared the publication from revision {spec.DerivedFromRevision}; retry.");
         }
 
+        // Receipts and the representation were judged against a policy (LAY-002): a policy change committed in between
+        // must not let the publication through under a stronger policy it was never checked against.
+        if (spec.Policy is { } planned && !string.Equals(planned, inode.PolicyName, StringComparison.Ordinal))
+        {
+            throw Fail(DfsErrorCode.WriterConflict,
+                $"The storage policy of the file changed to '{inode.PolicyName}' after the leader validated the publication against '{planned}'; retry.");
+        }
+
         RequireLimits(s, newLength, spec);
         RequireOpenStaging(s, ctx, spec);
         ContentResult result = ContentAlgebra.Apply(before, truncateTo, changes, newLength, spec.FinalInline, s.Config.InlineThreshold, ctx.Index);
@@ -115,14 +123,42 @@ internal sealed partial class VolumeStateMachine
         HandleRecord h = RequireWriterHandle(s, ctx, c.Handle, c.Generation);
         if (s.Find(h.Inode) is not { } inode || inode.GetStream(h.Stream) is not { } stream)
             throw Fail(DfsErrorCode.LeaseLost, $"The stream of handle {h.Id} no longer exists.");
-        if (c.BaseRevision != 0 && c.BaseRevision != stream.Revision)
-            throw Fail(DfsErrorCode.WriterConflict, $"Base revision {c.BaseRevision} is stale (current {stream.Revision}).");
-        if (h.IsAppend && c.Spec.TruncateTo >= 0 && c.Spec.TruncateTo < stream.Length)
-            throw Fail(DfsErrorCode.InvalidArgument, "An append handle cannot truncate.");
+        // The base is a revision the client observed (the reported revision of its open or last publication, which also
+        // advances for metadata changes): the publication conflicts only when the stream's content changed after it.
+        if (c.BaseRevision != 0 && c.BaseRevision < stream.Revision)
+            throw Fail(DfsErrorCode.WriterConflict, $"Base revision {c.BaseRevision} is stale (the stream changed at {stream.Revision}).");
+        if (h.IsAppend)
+        {
+            // An append handle only adds a suffix (FSD 6.1): it never truncates or rewrites existing bytes, also when the
+            // principal holds AppendData but not WriteData (ACL-05). A leader-derived spec was checked before materializing.
+            string? error = AppendHandleError(stream.Length, c.Spec.TruncateTo, c.Spec.NewLength, c.Spec.DerivedFromRevision == 0 ? c.Spec.Changes : []);
+            if (error is not null)
+                throw Fail(DfsErrorCode.InvalidArgument, error);
+        }
+
         (s, InodeRecord updated, StreamRecord after) = Publish(s, ctx, inode, h.Stream, c.Spec.TruncateTo, c.Spec.Changes, c.Spec.NewLength, c.Spec);
         (s, SnapshotInfoData? snapshot) = SnapshotInSameEntry(s, ctx, c.SnapshotName);
-        ulong revision = h.Stream.Length == 0 ? updated.Revision : after.Revision;
-        return (s, VolumeApplyResult.Ok(new CommitFileResultMessage(new InodeId(updated.Id), revision, after.Length, s.TokenAt(ctx.Index), snapshot)));
+        return (s, VolumeApplyResult.Ok(new CommitFileResultMessage(new InodeId(updated.Id), updated.RevisionOf(h.Stream), after.Length, s.TokenAt(ctx.Index),
+            snapshot)));
+    }
+
+    /// <summary>
+    /// Why a publication through an append handle is not a pure append to the stream of <paramref name="length"/> bytes (it
+    /// truncates, shortens, or changes a byte below the current end), or null.
+    /// </summary>
+    internal static string? AppendHandleError(long length, long truncateTo, long newLength, IEnumerable<StreamChange> changes)
+    {
+        if (truncateTo >= 0 && truncateTo < length)
+            return "An append handle cannot truncate.";
+        if (newLength < length)
+            return $"An append handle cannot shorten the stream ({newLength} < {length}).";
+        foreach (StreamChange change in changes)
+        {
+            if (change.Offset < length)
+                return $"An append handle writes only at the end of the stream; [{change.Offset}, +{change.Length}) lies below it ({length}).";
+        }
+
+        return null;
     }
 
     private static (VolumeState, VolumeApplyResult) ApplyWriteAll(VolumeState s, ApplyContext ctx, WriteAllCommand c)
@@ -135,9 +171,13 @@ internal sealed partial class VolumeStateMachine
         (string filePath, string? streamName) = DfsStreamPath.Split(path);
         string stream = streamName ?? DfsStreamPath.DefaultStreamName;
         (s, InodeRecord inode, bool created) = ResolveOrCreateFile(s, ctx, path, filePath, stream, create: true, c.CreateParents, c.StoragePolicy, append: false);
-        if (!created && c.ExpectedRevision != 0)
+        if (c.ExpectedRevision != 0)
         {
-            ulong current = stream.Length == 0 ? inode.Revision : inode.GetStream(stream)?.Revision ?? 0;
+            // A conditional replacement needs the expected revision to be current; an absent file or stream has none, so a
+            // conditional write never creates one.
+            if (created)
+                throw Fail(DfsErrorCode.WriterConflict, $"'{path}' does not exist, so it is not at revision {c.ExpectedRevision}.");
+            ulong current = inode.RevisionOf(stream);
             if (current != c.ExpectedRevision)
                 throw Fail(DfsErrorCode.WriterConflict, $"'{path}' is at revision {current}, not {c.ExpectedRevision}.");
         }
@@ -145,8 +185,8 @@ internal sealed partial class VolumeStateMachine
         RequireImplicitWriter(s, new StreamKey(inode.Id, stream), $"write '{path}'");
         (s, InodeRecord updated, StreamRecord after) = Publish(s, ctx, inode, stream, 0, c.Spec.Changes, c.Spec.NewLength, c.Spec);
         (s, SnapshotInfoData? snapshot) = SnapshotInSameEntry(s, ctx, c.SnapshotName);
-        ulong revision = stream.Length == 0 ? updated.Revision : after.Revision;
-        return (s, VolumeApplyResult.Ok(new WriteAllResultMessage(new InodeId(updated.Id), revision, after.Length, created, s.TokenAt(ctx.Index), snapshot)));
+        return (s, VolumeApplyResult.Ok(new WriteAllResultMessage(new InodeId(updated.Id), updated.RevisionOf(stream), after.Length, created, s.TokenAt(ctx.Index),
+            snapshot)));
     }
 
     private static (VolumeState, VolumeApplyResult) ApplyAppend(VolumeState s, ApplyContext ctx, AppendCommand c)
@@ -182,9 +222,10 @@ internal sealed partial class VolumeStateMachine
             throw Fail(DfsErrorCode.InvalidArgument, "The appended length is invalid or overflows the file length.");
         IReadOnlyList<StreamChange> changes;
         long newLength;
-        if (c.Absolute)
+        if (c.Absolute && (c.Spec.DerivedFromRevision != 0 || oldLength == 0))
         {
-            // The leader materialized the whole result from the base revision (checked through DerivedFromRevision).
+            // The leader materialized the whole result from the base revision (checked through DerivedFromRevision), or
+            // planned it against an absent stream that is still empty (absolute and relative offsets coincide).
             changes = c.Spec.Changes;
             newLength = c.Spec.NewLength;
             if (newLength < oldLength)
@@ -192,6 +233,17 @@ internal sealed partial class VolumeStateMachine
         }
         else
         {
+            // Relative changes; or an absolute plan made against an absent stream (no base revision to check) that another
+            // publication created and filled before this entry: the planned content is exactly the suffix, so it is appended
+            // at the current end instead of overwriting what was committed meanwhile (an append is never lost). When the
+            // representation the leader planned no longer fits the stream as it is now (it became inline meanwhile, or the
+            // inline result would outgrow the threshold), the append is a retryable conflict with no effect.
+            if (!RepresentationHolds(before, oldLength + appended, c.Spec.FinalInline, s.Config.InlineThreshold))
+            {
+                throw Fail(DfsErrorCode.WriterConflict,
+                    "The stream changed concurrently and the append can no longer be stored as the leader prepared it; retry.");
+            }
+
             var shifted = new List<StreamChange>(c.Spec.Changes.Length);
             foreach (StreamChange change in c.Spec.Changes)
             {
@@ -206,9 +258,19 @@ internal sealed partial class VolumeStateMachine
 
         (s, InodeRecord updated, StreamRecord after) = Publish(s, ctx, inode, stream, -1, changes, newLength, c.Spec);
         (s, SnapshotInfoData? snapshot) = SnapshotInSameEntry(s, ctx, c.SnapshotName);
-        ulong revision = stream.Length == 0 ? updated.Revision : after.Revision;
-        return (s, VolumeApplyResult.Ok(new AppendResultMessage(new InodeId(updated.Id), revision, oldLength, after.Length, created, s.TokenAt(ctx.Index),
-            snapshot)));
+        return (s, VolumeApplyResult.Ok(new AppendResultMessage(new InodeId(updated.Id), updated.RevisionOf(stream), oldLength, after.Length, created,
+            s.TokenAt(ctx.Index), snapshot)));
+    }
+
+    /// <summary>
+    /// True when appending a planned suffix to <paramref name="before"/> keeps the planned representation: an inline result
+    /// needs an inline (or absent) base and a final length within the threshold; an extent result a base without inline bytes.
+    /// </summary>
+    private static bool RepresentationHolds(StreamRecord? before, long newLength, bool finalInline, int inlineThreshold)
+    {
+        if (finalInline)
+            return newLength <= inlineThreshold && (before is null || before.IsInline);
+        return before is not { IsInline: true, Length: > 0 };
     }
 
     /// <summary>
@@ -295,8 +357,9 @@ internal sealed partial class VolumeStateMachine
         => s.Staging.TryGetValue(id, out StagingRecord? staging) ? CloseStaging(s, staging, index) : s;
 
     /// <summary>
-    /// The stream as stored under a stronger policy: a leader-materialized inline stream becomes its extents (LAY-002),
-    /// provided it is still at the materialized revision; other streams are returned unchanged.
+    /// The stream as stored under a stronger policy: a leader-materialized inline stream becomes its extents (LAY-002), and a
+    /// copied extent stream uses the leader's re-placed objects where the shared ones do not meet the destination's policy or
+    /// pool — provided the source is still at the materialized revision; other streams are returned unchanged.
     /// </summary>
     internal static StreamRecord MaterializedStream(VolumeState s, ImmutableArray<StreamMaterialization> materialized, ulong leaderStaging, string name,
         StreamRecord source)
@@ -304,10 +367,30 @@ internal sealed partial class VolumeStateMachine
         StreamMaterialization? m = materialized.IsDefault ? null : materialized.FirstOrDefault(x => string.Equals(x.Stream, name, StringComparison.Ordinal));
         if (m is null)
             return source;
-        if (!source.IsInline || source.Revision != m.SourceRevision)
+        if (source.Revision != m.SourceRevision)
             throw Fail(DfsErrorCode.WriterConflict, $"Stream '{name}' changed after the leader stored its bytes as objects; retry.");
         if (!s.Staging.TryGetValue(leaderStaging, out StagingRecord? staging) || !staging.IsOpen)
             throw Fail(DfsErrorCode.InvalidArgument, $"The leader staging session {leaderStaging} is not open.");
+        if (!source.IsInline)
+        {
+            // Re-placed objects: the same layout, each extent either unchanged or backed by a leader-stored copy.
+            if (m.Extents.Count != source.Extents.Count)
+                throw Fail(DfsErrorCode.InvalidArgument, $"The re-placed extents of stream '{name}' do not match its layout.");
+            for (int i = 0; i < m.Extents.Count; i++)
+            {
+                ExtentRef was = source.Extents[i];
+                ExtentRef now = m.Extents[i];
+                bool unchanged = now.Object == was.Object && now.ObjectOffset == was.ObjectOffset;
+                if (now.Offset != was.Offset || now.Length != was.Length
+                    || (!unchanged && (now.Staging.Value != leaderStaging || now.ObjectOffset < 0 || now.ObjectOffset > now.ObjectLength - now.Length)))
+                {
+                    throw Fail(DfsErrorCode.InvalidArgument, $"The re-placed extents of stream '{name}' do not match its layout.");
+                }
+            }
+
+            return source with { Extents = m.Extents };
+        }
+
         long covered = 0;
         foreach (ExtentRef e in m.Extents)
         {
@@ -321,83 +404,122 @@ internal sealed partial class VolumeStateMachine
         return new StreamRecord(source.Length, false, ReadOnlyMemory<byte>.Empty, m.Extents, source.Revision, source.CreatedIndex);
     }
 
+    /// <summary>
+    /// Which streams a copy reads (Addendum A, ADS-04): a plain source copied to a new plain destination copies the default
+    /// stream and every named stream; otherwise exactly one stream is copied — the addressed source stream (default for a plain
+    /// path) into the addressed destination stream (default for a plain path), and the destination's other streams stay.
+    /// </summary>
+    internal static (string SourceFile, string? SourceStream, string DestinationFile, string? DestinationStream) SplitCopyPaths(string source, string destination)
+    {
+        (string sourceFile, string? sourceStream) = DfsStreamPath.Split(source);
+        (string destinationFile, string? destinationStream) = DfsStreamPath.Split(destination);
+        return (sourceFile, sourceStream, destinationFile, destinationStream);
+    }
+
     private static (VolumeState, VolumeApplyResult) CopyCore(VolumeState s, ApplyContext ctx, CopyCommand c)
     {
         RequireGrant(ctx, DfsPermissions.Write, "copy");
         RequireGrant(ctx, DfsPermissions.Read, "copy");
         string source = NormalizePath(c.Source);
         string destination = NormalizePath(c.Destination);
-        if (DfsStreamPath.HasStream(source) || DfsStreamPath.HasStream(destination))
-            throw Fail(DfsErrorCode.InvalidPath, "Copy addresses whole files (all streams are copied); stream paths are not accepted.");
+        (string sourceFile, string? sourceStreamName, string destinationFile, string? destinationStreamName) = SplitCopyPaths(source, destination);
+        string sourceStream = sourceStreamName ?? DfsStreamPath.DefaultStreamName;
+        string destinationStream = destinationStreamName ?? DfsStreamPath.DefaultStreamName;
+        if (DfsPath.IsRoot(destinationFile))
+            throw Fail(destinationStreamName is null ? DfsErrorCode.IsADirectory : DfsErrorCode.InvalidPath, "Nothing can be copied onto the root directory.");
+
         var view = new NamespaceView(s.Inodes);
-        Resolution src = view.Resolve(source);
+        Resolution src = view.Resolve(sourceFile);
         RequireTraverse(s, ctx, src);
         if (!src.Found)
-            throw Fail(src.ParentExists ? DfsErrorCode.FileNotFound : DfsErrorCode.FileNotFound, $"'{source}' does not exist.");
+            throw Fail(DfsErrorCode.FileNotFound, $"'{source}' does not exist.");
         InodeRecord from = src.Target!;
-        if (from.IsDirectory)
+        if (from.IsDirectory && sourceStreamName is null)
             throw Fail(DfsErrorCode.IsADirectory, $"'{source}' is a directory.");
-        if (c.ExpectedSourceRevision != 0 && c.ExpectedSourceRevision != from.Revision)
-            throw Fail(DfsErrorCode.WriterConflict, $"'{source}' is at revision {from.Revision}, not {c.ExpectedSourceRevision}.");
+        if (!from.Streams.ContainsKey(sourceStream))
+            throw Fail(DfsErrorCode.FileNotFound, $"Stream '{source}' does not exist.");
+        ulong sourceRevision = from.RevisionOf(sourceStream);
+        if (c.ExpectedSourceRevision != 0 && c.ExpectedSourceRevision != sourceRevision)
+            throw Fail(DfsErrorCode.WriterConflict, $"'{source}' is at revision {sourceRevision}, not {c.ExpectedSourceRevision}.");
         Require(ctx, src.ChainNearestFirst(), DfsFileSystemRights.ReadData, $"read '{source}'");
-        foreach (HandleRecord h in HandlesOf(s, from.Id))
-        {
-            if ((h.Share & FileShare.Read) == 0)
-                throw Fail(DfsErrorCode.SharingViolation, $"'{source}' is open by handle {h.Id} without FileShare.Read.");
-        }
 
-        Resolution dst = view.Resolve(destination);
+        Resolution dst = view.Resolve(destinationFile);
         RequireTraverse(s, ctx, dst);
         if (!dst.ParentExists)
             throw Fail(DfsErrorCode.DirectoryNotFound, $"The directory of '{destination}' does not exist.");
+        bool wholeFile = sourceStreamName is null && destinationStreamName is null && !dst.Found;
+
+        // The source streams read must be shareable for reading (sharing is per stream, ADS-05).
+        IEnumerable<HandleRecord> readers = wholeFile ? HandlesOf(s, from.Id) : HandlesOf(s, new StreamKey(from.Id, sourceStream));
+        if (readers.FirstOrDefault(h => (h.Share & FileShare.Read) == 0) is { } exclusive)
+            throw Fail(DfsErrorCode.SharingViolation, $"'{source}' is open by handle {exclusive.Id} without FileShare.Read.");
+
+        StreamRecord CopyOf(string name, StreamRecord stream, StreamRecord? replaced)
+            => MaterializedStream(s, c.Materialized, c.LeaderStaging, name, stream) with
+            {
+                Revision = ctx.Index,
+                CreatedIndex = replaced?.CreatedIndex ?? ctx.Index,
+            };
+
         bool created;
         InodeRecord to;
+        ImmutableSortedDictionary<string, StreamRecord> streams;
+        var dropped = new List<ObjectId>();
         if (dst.Found)
         {
             to = dst.Target!;
             if (to.Id == from.Id)
-                throw Fail(DfsErrorCode.InvalidArgument, $"'{source}' cannot be copied onto itself.");
-            if (to.IsDirectory)
+                throw Fail(DfsErrorCode.InvalidArgument, $"'{source}' cannot be copied onto its own file '{destination}'.");
+            if (to.IsDirectory && destinationStreamName is null)
                 throw Fail(DfsErrorCode.IsADirectory, $"'{destination}' is a directory.");
-            if (!c.Overwrite)
+            StreamRecord? replaced = to.GetStream(destinationStream);
+            if (replaced is not null && !c.Overwrite)
                 throw Fail(DfsErrorCode.AlreadyExists, $"'{destination}' already exists.");
-            Require(ctx, dst.ChainNearestFirst(), DfsFileSystemRights.WriteData, $"overwrite '{destination}'");
-            foreach (string stream in from.Streams.Keys)
-                RequireImplicitWriter(s, new StreamKey(to.Id, stream), $"copy onto '{destination}'");
-            created = false;
+            Require(ctx, dst.ChainNearestFirst(), DfsFileSystemRights.WriteData,
+                replaced is null ? $"create stream '{destination}'" : $"overwrite '{destination}'");
+            if (replaced is null && to.NamedStreamCount >= DfsStreamPath.MaxStreamsPerInode)
+            {
+                throw Fail(DfsErrorCode.LimitExceeded, $"'{destinationFile}' already has {to.NamedStreamCount} named streams.",
+                    LimitDetail("MaxStreamsPerInode", DfsStreamPath.MaxStreamsPerInode, to.NamedStreamCount + 1));
+            }
+
+            RequireImplicitWriter(s, new StreamKey(to.Id, destinationStream), $"copy onto '{destination}'");
+
+            // Only the addressed destination stream is replaced; a copy source's named streams are not merged (ADS-011).
+            StreamRecord copy = CopyOf(sourceStream, from.Streams[sourceStream], replaced);
+            if (replaced is not null)
+                dropped.AddRange(Dropped(replaced, copy));
+            streams = to.Streams.SetItem(destinationStream, copy);
+            created = replaced is null;
         }
         else
         {
             Require(ctx, dst.ParentChainNearestFirst(), DfsFileSystemRights.CreateFiles, $"create '{destination}'");
             (s, ulong id) = AllocateInode(s);
             to = NewInode(s, ctx, id, InodeKind.File, dst.Parent!, dst.Name, c.StoragePolicy ?? from.PolicyName);
-            s = Link(s, ctx, dst.Parent!, to);
-            to = s.Inodes[id];
+            streams = to.Streams;
+            if (wholeFile)
+            {
+                // A new file receives the default stream and every named stream of the source (ADS-010).
+                foreach (KeyValuePair<string, StreamRecord> pair in from.Streams)
+                    streams = streams.SetItem(pair.Key, CopyOf(pair.Key, pair.Value, null));
+            }
+            else
+            {
+                // A new file holding the copied stream (as its default stream, or as the addressed named stream beside an
+                // empty default stream, ADS-003).
+                streams = streams.SetItem(destinationStream, CopyOf(sourceStream, from.Streams[sourceStream], null));
+            }
+
             created = true;
         }
 
-        // Every source stream replaces the destination stream of the same name (objects shared); other destination streams stay.
-        ImmutableSortedDictionary<string, StreamRecord> streams = to.Streams;
-        var dropped = new List<ObjectId>();
-        foreach (KeyValuePair<string, StreamRecord> pair in from.Streams)
-        {
-            StreamRecord copy = MaterializedStream(s, c.Materialized, c.LeaderStaging, pair.Key, pair.Value) with
-            {
-                Revision = ctx.Index,
-                CreatedIndex = streams.TryGetValue(pair.Key, out StreamRecord? old) ? old.CreatedIndex : ctx.Index,
-            };
-            if (old is not null)
-                dropped.AddRange(Dropped(old, copy));
-            streams = streams.SetItem(pair.Key, copy);
-        }
-
-        if (streams.Count - (streams.ContainsKey(DfsStreamPath.DefaultStreamName) ? 1 : 0) > DfsStreamPath.MaxStreamsPerInode)
-            throw Fail(DfsErrorCode.LimitExceeded, "The copy would exceed the named-stream limit of the destination.",
-                LimitDetail("MaxStreamsPerInode", DfsStreamPath.MaxStreamsPerInode, streams.Count - 1));
         InodeRecord updated = Touch(to with { Streams = streams }, ctx);
-        s = Put(s, updated);
+        s = created && !dst.Found ? Link(s, ctx, dst.Parent!, updated) : Put(s, updated);
+        updated = s.Inodes[updated.Id];
         s = Dereference(s, dropped, ctx.Index);
         (s, SnapshotInfoData? snapshot) = SnapshotInSameEntry(s, ctx, c.SnapshotName);
-        return (s, VolumeApplyResult.Ok(new CopyResultMessage(new InodeId(updated.Id), updated.Revision, from.Revision, created, s.TokenAt(ctx.Index), snapshot)));
+        return (s, VolumeApplyResult.Ok(new CopyResultMessage(new InodeId(updated.Id), updated.RevisionOf(destinationStream), sourceRevision, created,
+            s.TokenAt(ctx.Index), snapshot)));
     }
 }

@@ -82,6 +82,10 @@ internal sealed partial class VolumeStateMachine
         {
             if (!creating)
                 throw Fail(DfsErrorCode.FileNotFound, $"'{path}' does not exist.");
+
+            // Creating is a mutation whatever the requested access (OpenOrCreate with read access creates too): it needs the
+            // volume Write grant as well as the ACL right (ACL-06).
+            RequireGrant(ctx, DfsPermissions.Write, $"create '{path}'");
             Require(ctx, res.ParentChainNearestFirst(), DfsFileSystemRights.CreateFiles, $"create '{path}'");
             (s, ulong id) = AllocateInode(s);
             inode = NewInode(s, ctx, id, InodeKind.File, res.Parent!, res.Name, c.StoragePolicy ?? res.Parent!.PolicyName);
@@ -103,6 +107,7 @@ internal sealed partial class VolumeStateMachine
             {
                 if (!creating)
                     throw Fail(DfsErrorCode.FileNotFound, $"Stream '{path}' does not exist.");
+                RequireGrant(ctx, DfsPermissions.Write, $"create stream '{path}'");
                 Require(ctx, chain, DfsFileSystemRights.WriteData, $"create stream '{path}'");
                 if (inode.NamedStreamCount >= DfsStreamPath.MaxStreamsPerInode)
                 {

@@ -100,7 +100,7 @@ internal sealed partial class VolumeStateMachine
         {
             // Renaming an entry onto itself (identical normalized name): nothing changes.
             (VolumeState same, SnapshotInfoData? sameSnap) = SnapshotInSameEntry(s, ctx, c.SnapshotName);
-            return (same, VolumeApplyResult.Ok(new MoveResultMessage(new InodeId(node.Id), node.Revision, s.TokenAt(ctx.Index), sameSnap)));
+            return (same, VolumeApplyResult.Ok(new MoveResultMessage(new InodeId(node.Id), node.ReportedRevision, s.TokenAt(ctx.Index), sameSnap)));
         }
 
         if (!dst.ParentExists)
@@ -137,13 +137,13 @@ internal sealed partial class VolumeStateMachine
         InodeRecord targetParent = s.Inodes[dstParent.Id];
         targetParent = Touch(targetParent with { Children = targetParent.Children.SetItem(dst.Name, node.Id) }, ctx);
         s = Put(s, targetParent);
-        InodeRecord moved = Touch(node with { ParentId = targetParent.Id, Name = dst.Name }, ctx);
+        InodeRecord moved = TouchMetadata(node with { ParentId = targetParent.Id, Name = dst.Name }, ctx);
         s = Put(s, moved);
         if (replaced is not null)
             s = DetachSubtree(s, [replaced], ctx.Index);
 
         (s, SnapshotInfoData? snapshot) = SnapshotInSameEntry(s, ctx, c.SnapshotName);
-        return (s, VolumeApplyResult.Ok(new MoveResultMessage(new InodeId(moved.Id), moved.Revision, s.TokenAt(ctx.Index), snapshot)));
+        return (s, VolumeApplyResult.Ok(new MoveResultMessage(new InodeId(moved.Id), moved.ReportedRevision, s.TokenAt(ctx.Index), snapshot)));
     }
 
     private static (VolumeState, VolumeApplyResult) ApplyDelete(VolumeState s, ApplyContext ctx, DeleteCommand c)

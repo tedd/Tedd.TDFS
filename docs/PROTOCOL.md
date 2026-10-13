@@ -221,6 +221,15 @@ Every volume-scoped request (39 types, all implementing `IVolumeRequest`) starts
 * The leader applies mutations through the operation gate (ARCHITECTURE §5.2). For an id with a retained outcome it
   returns the **stored outcome** (same reply, same `CommitToken`, no second effect), never re-executing against the
   current namespace (OUT-006..009). An in-flight duplicate is coalesced with the original proposal (OUT-005).
+* A definite (non-retryable, §11.1) refusal of a request that carries an id (AlreadyExists, FileNotFound, AccessDenied,
+  ...) is decided through the log like a success: the leader proposes the request even when its pre-check refuses it,
+  apply records the refusal as the id's outcome, and retries, delayed duplicates and `QueryOperation` get that definite
+  answer (a refused id never executes later, OUT-013). Retryable refusals answered by the leader's pre-check
+  (`SharingViolation`, `WriterConflict`, `PlacementUnavailable` — receipts are per attempt, §5.2 — `NotLeader`) and
+  request-validation failures are not recorded: the same id may still execute, so a client that abandons it resolves it
+  with `QueryOperation(Resolve: true)`. A refusal decided by apply itself is always the id's outcome.
+* Only the session's own principal can retire its outcomes: `Header.AckWatermark` with another principal's session is
+  ignored.
 * An id whose session expired or whose sequence was retired fails with `OperationExpired` and is never executed as new
   (OUT-012). `QueryOperation(Resolve: true)` fences an id with no outcome (definite `Aborted`) so a delayed copy can
   never commit later (OUT-013).
@@ -901,7 +910,8 @@ Resolves the committed bytes of a file range (client → volume leader, or backu
 | 4 | `Inode` | `InodeId` | Inode to read when addressing by snapshot pin; empty otherwise. |
 | 5 | `Offset` | `varint` | First byte to read. |
 | 6 | `Length` | `varint` | Number of bytes requested. |
-| 7 | — | `extensions` | Terminal extension block. |
+| 7 | `Stream` | `string?` | Named stream to read when addressing a snapshot by `(SnapshotPin, Inode)` (Addendum A, ADS-020); null = the default stream. Must be null for handle reads (a handle is bound to its stream). |
+| 8 | — | `extensions` | Terminal extension block. |
 
 #### `ReadRangeResult` = 45 (`ReadRangeResultMessage`)
 
@@ -1006,7 +1016,7 @@ Publishes one complete new revision of a file through a writable handle (client 
 | 1 | `Header` | `RequestHeader` | Request header; `RequestHeader.Operation` identifies the mutation (retries reuse it). |
 | 2 | `Handle` | `HandleId` | Writable handle. |
 | 3 | `Generation` | `varuint` | Writer generation bound to the handle. |
-| 4 | `BaseRevision` | `varuint` | Revision the staged changes were made against; 0 = do not check. |
+| 4 | `BaseRevision` | `varuint` | Revision the staged changes were made against (the `Revision` reported by the open or the last publication); the commit fails with WriterConflict when the stream's content changed after it (metadata changes such as ACL or rename do not conflict); 0 = do not check. |
 | 5 | `TruncateTo` | `varint` | Lowest length the staged view reached since the base revision (−1 = no truncation); content beyond it is discarded before changes apply, so extension never reveals discarded bytes (STR-011). |
 | 6 | `NewLength` | `varint` | File length after publication. |
 | 7 | `Changes` | `list<RangeChange>` | Changed ranges with absolute offsets, applied in order. |
@@ -1043,7 +1053,7 @@ Atomically replaces the complete contents of a file by path, creating it if abse
 | 7 | `StoragePolicy` | `string?` | Named storage policy when the file is created; null = volume default. |
 | 8 | `SnapshotName` | `string?` | Commit-and-snapshot: when set, a snapshot with this name is created in the same metadata decision as the mutation (FSD §11.2); null for none. |
 | 9 | `CreateParents` | `bool` | True to create missing parent directories. |
-| 10 | `ExpectedRevision` | `varuint` | Replace only if the current revision equals this value (0 = unconditional); mismatch → WriterConflict. |
+| 10 | `ExpectedRevision` | `varuint` | Replace only if the current revision (`FileInfoData.Revision` of `Path`) equals this value (0 = unconditional); mismatch, or an absent file or stream, → WriterConflict (a conditional write never creates). |
 | 11 | — | `extensions` | Terminal extension block. |
 
 #### `WriteAllResult` = 55 (`WriteAllResultMessage`)
@@ -1096,7 +1106,7 @@ Reply to `AppendMessage`.
 
 #### `Copy` = 58 (`CopyMessage`)
 
-Copies a file inside a volume as metadata only (client → volume leader; one committed `Copy` entry): the destination receives the source revision's extent map (objects are shared) or inline bytes; inline streams are first stored as objects by the leader when the destination's policy is stronger than what inline metadata guarantees (LAY-002). The source revision is pinned for the whole operation; an existing destination keeps its inode identity. Errors: FileNotFound (source), AlreadyExists (destination exists and not `Overwrite`), InvalidArgument (copy onto itself), SharingViolation, IsADirectory, CrossVolume, AccessDenied.
+Copies a file inside a volume as metadata only (client → volume leader; one committed `Copy` entry): the destination receives the source revision's extent map (objects are shared) or inline bytes; inline streams are first stored as objects by the leader when the destination's policy is stronger than what inline metadata guarantees (LAY-002). The source revision is pinned for the whole operation; an existing destination keeps its inode identity. Streams (Addendum A, ADS-04): a plain source copied to a new plain destination copies the default stream and every named stream; otherwise exactly one stream is copied — the addressed source stream (default stream for a plain path) replaces or creates the addressed destination stream (default stream for a plain path) — and the destination's other streams are kept (a source's named streams are never merged into an existing file). `Overwrite` is needed only when the addressed destination stream exists. Errors: FileNotFound (source file or stream), AlreadyExists (destination stream exists and not `Overwrite`), InvalidArgument (copy onto the source's own file), SharingViolation, IsADirectory, CrossVolume, AccessDenied.
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
@@ -1104,7 +1114,7 @@ Copies a file inside a volume as metadata only (client → volume leader; one co
 | 2 | `Source` | `string` | Source file path. |
 | 3 | `Destination` | `string` | Destination file path. |
 | 4 | `Overwrite` | `bool` | True to replace an existing destination file. |
-| 5 | `ExpectedSourceRevision` | `varuint` | Copy only if the source is at this revision (0 = current); mismatch → WriterConflict. |
+| 5 | `ExpectedSourceRevision` | `varuint` | Copy only if the source (`FileInfoData.Revision` of `Source`) is at this revision (0 = current); mismatch → WriterConflict. |
 | 6 | `StoragePolicy` | `string?` | Named storage policy for a newly created destination; null = the source policy. |
 | 7 | `SnapshotName` | `string?` | Commit-and-snapshot: when set, a snapshot with this name is created in the same metadata decision as the mutation (FSD §11.2); null for none. |
 | 8 | — | `extensions` | Terminal extension block. |
@@ -2681,7 +2691,7 @@ Metadata of a file or directory (FSD NS-04), used by open, get-info and create-d
 | 1 | `Path` | `string` | Normalized path the entry was resolved through (empty for a detached inode reached through a handle). |
 | 2 | `Kind` | `enum WireEntryKind` | Entry kind. |
 | 3 | `Inode` | `InodeId` | Inode identity. |
-| 4 | `Revision` | `varuint` | Revision (log index of the last modification). |
+| 4 | `Revision` | `varuint` | Revision (log index of the last modification). For a file: the last change of its default stream or of its own metadata (owner, ACL, storage policy, name/parent) — writes to named streams do not change it (ADS-011); for a named stream (`IsStream`): the stream's last change; for a directory: the last change of its entries or metadata. |
 | 5 | `Length` | `varint` | File length (0 for directories). |
 | 6 | `CreatedUtc` | `timestamp` | Creation time (leader wall clock carried in the log entry). |
 | 7 | `ModifiedUtc` | `timestamp` | Last modification time (leader wall clock carried in the log entry). |

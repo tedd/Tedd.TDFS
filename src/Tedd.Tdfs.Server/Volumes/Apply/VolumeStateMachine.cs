@@ -53,11 +53,14 @@ internal sealed partial class VolumeStateMachine : IReplicatedStateMachine, ICom
         {
             decoded = CommandCodec.Decode(command.Span);
         }
-        catch (DfsProtocolException ex)
+        catch (Exception ex) when (ex is not OutOfMemoryException)
         {
+            // Every replica decodes the same bytes the same way: a malformed command (whatever the decoder threw) is a
+            // deterministic failed entry that still advances the applied index.
             _state = _state with { AppliedIndex = index };
             Changed?.Invoke(_state);
-            return ApplyOutcome.Failure(ex.ErrorCode, "Malformed volume command: " + ex.Message);
+            DfsErrorCode code = ex is DfsProtocolException protocol ? protocol.ErrorCode : DfsErrorCode.ProtocolError;
+            return ApplyOutcome.Failure(code, "Malformed volume command: " + ex.Message);
         }
 
         var ctx = new ApplyContext(index, term, decoded);
@@ -108,7 +111,7 @@ internal sealed partial class VolumeStateMachine : IReplicatedStateMachine, ICom
         => new(code, message, new ErrorReplyMessage(code, message, op.Id), null);
 
     private static VolumeState Acknowledge(VolumeState state, OperationHeader op)
-        => op.RequestSession != 0 && op.AckWatermark > 1 ? OperationGate.Acknowledge(state, op.RequestSession, op.AckWatermark) : state;
+        => op.RequestSession != 0 && op.AckWatermark > 1 ? OperationGate.Acknowledge(state, op.RequestSession, op.AckWatermark, op.Principal) : state;
 
     /// <summary>Runs the feature handler; handler failures leave the state unchanged except for the applied index.</summary>
     private static (VolumeState State, VolumeApplyResult Result) ExecuteGuarded(VolumeState state, ApplyContext ctx)
@@ -120,6 +123,13 @@ internal sealed partial class VolumeStateMachine : IReplicatedStateMachine, ICom
         catch (ApplyFailure failure)
         {
             return (state, VolumeApplyResult.Fail(failure.Code, failure.Message, failure.Detail));
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            // Apply is deterministic, so an unexpected exception is one too (every replica throws it for this entry): the
+            // command fails without effect, the applied index still advances and an operation id records the failure
+            // (a retry gets the same answer instead of executing again).
+            return (state, VolumeApplyResult.Fail(DfsErrorCode.Internal, $"Applying {ctx.Command.Kind} failed: {ex.GetType().Name}: {ex.Message}"));
         }
     }
 

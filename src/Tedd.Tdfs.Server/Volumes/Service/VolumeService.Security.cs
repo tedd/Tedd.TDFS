@@ -25,7 +25,7 @@ internal sealed partial class VolumeService
         IReadOnlyList<DfsAccessRule> rules = VolumeAccess.EffectiveRules(chain, DfsStreamPath.GetFilePath(path));
         var descriptor = new DfsSecurityDescriptor(target.Owner, rules, target.Security.AreAccessRulesProtected);
         _ = root;
-        return new GetAccessControlResultMessage(descriptor, new InodeId(target.Id), target.Revision, observed);
+        return new GetAccessControlResultMessage(descriptor, new InodeId(target.Id), target.ReportedRevision, observed);
     }
 
     /// <summary><c>SetAccessControl</c>: replaces explicit entries and the protection flag (committed <c>SetAcl</c>).</summary>

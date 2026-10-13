@@ -38,9 +38,9 @@ internal sealed partial class VolumeStateMachine
                 streams = streams.SetItem(pair.Key, stored with { Revision = ctx.Index });
         }
 
-        InodeRecord updated = Touch(inode with { PolicyName = c.PolicyName, Streams = streams }, ctx);
+        InodeRecord updated = TouchMetadata(inode with { PolicyName = c.PolicyName, Streams = streams }, ctx);
         s = Put(s, updated);
-        return (s, VolumeApplyResult.Ok(new SetPolicyResultMessage(new InodeId(updated.Id), updated.Revision, s.TokenAt(ctx.Index))));
+        return (s, VolumeApplyResult.Ok(new SetPolicyResultMessage(new InodeId(updated.Id), updated.ReportedRevision, s.TokenAt(ctx.Index))));
     }
 
     private static (VolumeState, VolumeApplyResult) ApplySetAcl(VolumeState s, ApplyContext ctx, SetAclCommand c)
@@ -69,11 +69,11 @@ internal sealed partial class VolumeStateMachine
             next = Canonical(explicitOnly);
         }
 
-        InodeRecord updated = Touch(inode with { Security = next }, ctx);
+        InodeRecord updated = TouchMetadata(inode with { Security = next }, ctx);
         s = Put(s, updated);
         IWireMessage reply = c.Change == AclChangeKind.AccessFlags
-            ? new SetAccessResultMessage(new InodeId(updated.Id), updated.Revision, s.TokenAt(ctx.Index))
-            : new SetAccessControlResultMessage(new InodeId(updated.Id), updated.Revision, s.TokenAt(ctx.Index));
+            ? new SetAccessResultMessage(new InodeId(updated.Id), updated.ReportedRevision, s.TokenAt(ctx.Index))
+            : new SetAccessControlResultMessage(new InodeId(updated.Id), updated.ReportedRevision, s.TokenAt(ctx.Index));
         return (s, VolumeApplyResult.Ok(reply));
     }
 
@@ -99,8 +99,8 @@ internal sealed partial class VolumeStateMachine
                 throw Fail(DfsErrorCode.AccessDenied, $"Only administrators may make another identity ({c.Owner}) the owner of '{path}'.");
         }
 
-        InodeRecord updated = Touch(inode with { Security = inode.Security with { Owner = c.Owner } }, ctx);
+        InodeRecord updated = TouchMetadata(inode with { Security = inode.Security with { Owner = c.Owner } }, ctx);
         s = Put(s, updated);
-        return (s, VolumeApplyResult.Ok(new SetOwnerResultMessage(new InodeId(updated.Id), updated.Revision, s.TokenAt(ctx.Index))));
+        return (s, VolumeApplyResult.Ok(new SetOwnerResultMessage(new InodeId(updated.Id), updated.ReportedRevision, s.TokenAt(ctx.Index))));
     }
 }

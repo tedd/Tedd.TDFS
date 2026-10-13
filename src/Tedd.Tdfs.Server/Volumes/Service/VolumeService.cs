@@ -25,7 +25,7 @@ internal sealed partial class VolumeService
     private readonly VolumeHost _host;
     private readonly VolumeStateMachine _sm;
     private readonly Dictionary<DfsOperationId, InFlight> _inFlight = [];
-    private readonly Dictionary<StreamKey, Queue<TaskCompletionSource>> _publishLocks = [];
+    private readonly KeyedAsyncLock<StreamKey> _publishLocks = new();
     private ulong _readyTerm;
     private bool _disposed;
 
@@ -230,8 +230,11 @@ internal sealed partial class VolumeService
             {
                 await Barrier.WaitAsync(token);
                 final = command with { Op = Refresh(header), LeaderTime = _s.Time.GetUtcNow() };
+
+                // A command without an operation id that the refreshed authorization refuses is not proposed; one with an id
+                // is, so apply (which re-checks with the same identities and grants) records the refusal as the id's outcome.
                 VolumeApplyResult check = DryRun(final);
-                if (!check.IsSuccess && IsAuthorizationFailure(check.Code))
+                if (!check.IsSuccess && IsAuthorizationFailure(check.Code) && !header.HasOperation)
                     throw new UnauthorizedAccessException(check.Message);
             }
 
@@ -250,24 +253,27 @@ internal sealed partial class VolumeService
     /// The reply is the apply result's reply (an error reply for failures).
     /// </summary>
     private Task<IWireMessage> MutateAsync(RpcContext context, IVolumeRequest request, DfsOperationKind kind,
-        Func<OperationHeader, CancellationToken, Task<VolumeCommand>> prepare, Func<VolumeApplyResult, IWireMessage>? finish = null, bool requireOperation = true)
-        => MutateAsync(context, request, kind, async (op, ct) => new Prepared(await prepare(op, ct)), finish, requireOperation);
+        Func<OperationHeader, CancellationToken, Task<VolumeCommand>> prepare, Func<VolumeApplyResult, IWireMessage>? finish = null, bool requireOperation = true,
+        bool cleanup = false)
+        => MutateAsync(context, request, kind, async (op, ct) => new Prepared(await prepare(op, ct)), finish, requireOperation, cleanup);
 
     /// <summary>A prepared command and an optional hold (for example a per-stream publication lock) released after its proposal.</summary>
     private readonly record struct Prepared(VolumeCommand Command, IDisposable? Hold = null);
 
-    /// <inheritdoc cref="MutateAsync(RpcContext, IVolumeRequest, DfsOperationKind, Func{OperationHeader, CancellationToken, Task{VolumeCommand}}, Func{VolumeApplyResult, IWireMessage}?, bool)"/>
+    /// <inheritdoc cref="MutateAsync(RpcContext, IVolumeRequest, DfsOperationKind, Func{OperationHeader, CancellationToken, Task{VolumeCommand}}, Func{VolumeApplyResult, IWireMessage}?, bool, bool)"/>
     private async Task<IWireMessage> MutateAsync(RpcContext context, IVolumeRequest request, DfsOperationKind kind,
-        Func<OperationHeader, CancellationToken, Task<Prepared>> prepare, Func<VolumeApplyResult, IWireMessage>? finish = null, bool requireOperation = true)
+        Func<OperationHeader, CancellationToken, Task<Prepared>> prepare, Func<VolumeApplyResult, IWireMessage>? finish = null, bool requireOperation = true,
+        bool cleanup = false)
     {
         CancellationToken ct = context.Cancellation;
+        string? cleanupPath = cleanup ? RequestFaultInfo.PathOf(request) : null;
         RejectTransaction(request);
         await EnsureLeaderReadyAsync(ct);
         OperationHeader op = Header(context, request, kind);
         if (requireOperation && !op.HasOperation)
             throw new ArgumentException($"{kind} requests must carry an operation id (OUT-001).");
         if (!op.HasOperation)
-            return Finish(await ExecuteAsync(op, prepare, ct), finish);
+            return Finish(await ExecuteAsync(op, prepare, ct, cleanup, cleanupPath), finish);
 
         GateDecision gate = OperationGate.Check(State, op);
         switch (gate.Kind)
@@ -297,7 +303,7 @@ internal sealed partial class VolumeService
         _inFlight[op.Id] = entry;
         try
         {
-            VolumeApplyResult result = await ExecuteAsync(op, prepare, ct);
+            VolumeApplyResult result = await ExecuteAsync(op, prepare, ct, cleanup, cleanupPath);
             entry.Completion.TrySetResult(result);
             return Finish(result, finish);
         }
@@ -315,19 +321,39 @@ internal sealed partial class VolumeService
     }
 
     private async Task<VolumeApplyResult> ExecuteAsync(OperationHeader op, Func<OperationHeader, CancellationToken, Task<Prepared>> prepare,
-        CancellationToken ct)
+        CancellationToken ct, bool cleanup = false, string? cleanupPath = null)
     {
         Prepared prepared = await prepare(op, ct);
         try
         {
+            // A definite refusal (not retryable: AlreadyExists, FileNotFound, AccessDenied, ...) of a request with an operation
+            // id is decided through the log: the request is proposed anyway and apply records the refusal as the id's outcome,
+            // so the answer is authoritative — a delayed copy or a re-proposal of the same id can never execute later
+            // (OUT-013), retries get the same answer and QueryOperation reports it instead of NotFound. A retryable refusal
+            // (SharingViolation, WriterConflict: "retrying the same operation may succeed", PROTOCOL.md §11.1) and any
+            // refusal of a request without an id are answered from the pre-check without a log entry.
             VolumeApplyResult check = DryRun(prepared.Command);
-            if (!check.IsSuccess)
+            if (!check.IsSuccess && (!op.HasOperation || DfsErrors.IsRetryableByDefault(check.Code)))
             {
                 ErrorReplyMessage error = check.Reply as ErrorReplyMessage ?? new ErrorReplyMessage(check.Code, check.Message);
                 return check with { Reply = op.HasOperation ? error with { OperationId = op.Id } : error };
             }
 
-            return await ProposeAsync(prepared.Command, ct);
+            VolumeApplyResult result = await ProposeAsync(prepared.Command, ct);
+            if (cleanup && result.IsSuccess && !result.Replayed)
+            {
+                // F15: the decision released a reservation, pin or references (post-decision cleanup). The decision is
+                // committed: a cancellation while held here must not turn it into a failure (coalesced duplicates share it).
+                try
+                {
+                    await _s.HitAsync(FaultStage.F15, FaultSites.CleanupRelease, Name, op.Operation, op.HasOperation ? op.Id : null, cleanupPath, ct: ct);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                }
+            }
+
+            return result;
         }
         finally
         {
@@ -364,35 +390,7 @@ internal sealed partial class VolumeService
     }
 
     /// <summary>Serializes leader-side planning and proposal of publications per stream (materialization stays consistent).</summary>
-    private async Task<IDisposable> LockStreamAsync(StreamKey key, CancellationToken ct)
-    {
-        if (_publishLocks.TryGetValue(key, out Queue<TaskCompletionSource>? queue))
-        {
-            var waiter = new TaskCompletionSource();
-            queue.Enqueue(waiter);
-            await waiter.Task.WaitAsync(ct);
-        }
-        else
-        {
-            _publishLocks[key] = new Queue<TaskCompletionSource>();
-        }
-
-        return new StreamLock(this, key);
-    }
-
-    private void UnlockStream(StreamKey key)
-    {
-        if (!_publishLocks.TryGetValue(key, out Queue<TaskCompletionSource>? queue))
-            return;
-        while (queue.Count > 0)
-        {
-            TaskCompletionSource next = queue.Dequeue();
-            if (next.TrySetResult())
-                return;
-        }
-
-        _publishLocks.Remove(key);
-    }
+    private Task<IDisposable> LockStreamAsync(StreamKey key, CancellationToken ct) => _publishLocks.AcquireAsync(key, ct);
 
     /// <summary>Normalizes a request path (InvalidPath on failure, PATH-012).</summary>
     private static string NormalizePath(string path)
@@ -413,18 +411,5 @@ internal sealed partial class VolumeService
         public string Principal { get; } = principal;
 
         public TaskCompletionSource<VolumeApplyResult> Completion { get; } = new();
-    }
-
-    private sealed class StreamLock(VolumeService owner, StreamKey key) : IDisposable
-    {
-        private bool _released;
-
-        public void Dispose()
-        {
-            if (_released)
-                return;
-            _released = true;
-            owner.UnlockStream(key);
-        }
     }
 }

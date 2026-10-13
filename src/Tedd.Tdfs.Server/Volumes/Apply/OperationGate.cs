@@ -114,12 +114,18 @@ internal static class OperationGate
 
     /// <summary>
     /// Retires outcomes of <paramref name="sessionId"/> below the client's acknowledgement watermark (the client will never
-    /// retry or query them), advancing the durable retired watermark.
+    /// retry or query them), advancing the durable retired watermark. Only the session's own principal can acknowledge its
+    /// outcomes: a watermark sent with another principal's session id is ignored (it would expire that principal's
+    /// operation ids, OUT-004).
     /// </summary>
-    public static VolumeState Acknowledge(VolumeState state, ulong sessionId, ulong ackWatermark)
+    public static VolumeState Acknowledge(VolumeState state, ulong sessionId, ulong ackWatermark, string principal)
     {
-        if (!state.Sessions.TryGetValue(sessionId, out SessionRecord? session) || session.State != SessionState.Active)
+        if (!state.Sessions.TryGetValue(sessionId, out SessionRecord? session) || session.State != SessionState.Active
+            || !string.Equals(session.Principal, principal, StringComparison.Ordinal))
+        {
             return state;
+        }
+
         ulong below = ackWatermark - 1;
         ulong cap = FirstUnusedReserved(session) is { } first ? Math.Min(below, first - 1) : below;
         if (cap <= session.RetiredWatermark)

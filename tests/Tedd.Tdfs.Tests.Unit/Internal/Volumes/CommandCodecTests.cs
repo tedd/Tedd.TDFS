@@ -14,7 +14,10 @@ public sealed class CommandCodecTests
         new DfsSecurityDescriptor(DfsIdentity.User("u"), [new DfsAccessRule(DfsIdentity.Everyone, DfsFileSystemRights.Read)], true), "pair", 1, "n",
         InodeRecord.NoStreams.Add("", new StreamRecord(10, false, ReadOnlyMemory<byte>.Empty, [DataChange(0, 10, Obj(3), 2).Extent!], 9, 4))
             .Add("s", new StreamRecord(2, true, new byte[] { 1, 2 }, ImmutableList<ExtentRef>.Empty, 8, 7)),
-        InodeRecord.NoChildren);
+        InodeRecord.NoChildren)
+    {
+        MetadataRevision = 6,
+    };
 
     public static TheoryData<int> Kinds()
     {
@@ -26,7 +29,7 @@ public sealed class CommandCodecTests
 
     private static VolumeCommand Sample(VolumeCommandKind kind)
     {
-        PublishSpec spec = Spec(20, 4, false, 3, DataChange(0, 10, Obj(1), 4), Zero(10, 2), Inline(12, [1, 2, 3]));
+        PublishSpec spec = Spec(20, 4, false, 3, DataChange(0, 10, Obj(1), 4), Zero(10, 2), Inline(12, [1, 2, 3])) with { Policy = "pair" };
         VolumeCommand command = kind switch
         {
             VolumeCommandKind.OpenSession => new OpenSessionCommand("c", new UInt128(1, 2), TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), 7, TimeSpan.FromSeconds(3)),
@@ -100,6 +103,10 @@ public sealed class CommandCodecTests
         Assert.Equal(command.Op!.Id, decoded.Op!.Id);
         Assert.Equal(command.Op.Identities, decoded.Op.Identities);
         Assert.Equal(encoded, CommandCodec.Encode(decoded));
+        if (decoded is CommitFileCommand commit)
+            Assert.Equal("pair", commit.Spec.Policy);
+        if (decoded is RestoreChunkCommand chunk)
+            Assert.Equal(6UL, chunk.Inodes[0].MetadataRevision);
     }
 
     [Fact]

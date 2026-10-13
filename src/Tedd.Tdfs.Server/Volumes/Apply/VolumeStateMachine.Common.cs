@@ -135,7 +135,10 @@ internal sealed partial class VolumeStateMachine
             ? InodeRecord.NoStreams.Add(DfsStreamPath.DefaultStreamName, StreamRecord.Empty(ctx.Index))
             : InodeRecord.NoStreams;
         _ = s;
-        return new InodeRecord(id, kind, ctx.Index, ctx.Index, ctx.Now, ctx.Now, security, policy, parent.Id, name, streams, InodeRecord.NoChildren);
+        return new InodeRecord(id, kind, ctx.Index, ctx.Index, ctx.Now, ctx.Now, security, policy, parent.Id, name, streams, InodeRecord.NoChildren)
+        {
+            MetadataRevision = ctx.Index,
+        };
     }
 
     /// <summary>Adds a child entry to a directory (bumping its revision) and stores both records.</summary>
@@ -147,6 +150,9 @@ internal sealed partial class VolumeStateMachine
 
     /// <summary>A new version of an inode modified by the current entry.</summary>
     internal static InodeRecord Touch(InodeRecord inode, ApplyContext ctx) => inode with { Revision = ctx.Index, ModifiedUtc = ctx.Now };
+
+    /// <summary>A new version of an inode whose own metadata (owner, ACL, policy, name or parent) the current entry changed.</summary>
+    internal static InodeRecord TouchMetadata(InodeRecord inode, ApplyContext ctx) => Touch(inode, ctx) with { MetadataRevision = ctx.Index };
 
     /// <summary>Stores an inode record.</summary>
     internal static VolumeState Put(VolumeState s, InodeRecord inode) => s with { Inodes = s.Inodes.SetItem(inode.Id, inode) };
@@ -294,7 +300,7 @@ internal sealed partial class VolumeStateMachine
         StreamRecord? s = inode.GetStream(streamName);
         bool isStream = streamName.Length > 0;
         long length = s?.Length ?? 0;
-        ulong revision = isStream ? s?.Revision ?? inode.Revision : inode.Revision;
+        ulong revision = isStream ? s?.Revision ?? inode.Revision : inode.ReportedRevision;
         ulong generation = state?.WriterGenerationOf(new StreamKey(inode.Id, streamName)) ?? 0;
         return new FileInfoData(path, inode.IsDirectory ? WireEntryKind.Directory : WireEntryKind.File, new InodeId(inode.Id), revision,
             inode.IsDirectory && !isStream ? 0 : length, inode.CreatedUtc, inode.ModifiedUtc, OwnerText(security.Owner), ownerOnly, readOnly,

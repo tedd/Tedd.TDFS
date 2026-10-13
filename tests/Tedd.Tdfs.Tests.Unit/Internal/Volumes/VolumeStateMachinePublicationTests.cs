@@ -175,10 +175,13 @@ public sealed class VolumeStateMachinePublicationTests
         Assert.Equal(dstInode, copied.Inode.Value);
         InodeRecord dst = d.Inode("/dst");
         Assert.Equal(Obj(1), dst.DefaultStream!.Extents.Single().Object);
-        Assert.Equal(new byte[] { 7, 7 }, dst.GetStream("meta")!.Inline.ToArray());
+        // Over an existing file only the addressed (default) stream is replaced; the source's named streams are not merged (ADS-011).
+        Assert.Null(dst.GetStream("meta"));
         CopyResultMessage fresh = d.Ok<CopyResultMessage>(new CopyCommand("/src", "/fresh", false, 0, null, null) { Op = Op("alice") });
         Assert.True(fresh.Created);
         Assert.Empty(d.Inode("/fresh").Security.Rules);
+        // A new file receives every stream (ADS-010).
+        Assert.Equal(new byte[] { 7, 7 }, d.Inode("/fresh").GetStream("meta")!.Inline.ToArray());
     }
 
     [Fact]
