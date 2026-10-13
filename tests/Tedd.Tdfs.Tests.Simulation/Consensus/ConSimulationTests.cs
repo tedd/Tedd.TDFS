@@ -671,6 +671,12 @@ public sealed class ConSimulationTests
             TestNode leader = await cluster.GetLeaderAsync(Vol, Ct);
             TestNode[] followers = Others(cluster, leader);
 
+            // Before proposing a client mutation the volume leader synchronizes with the control leader (control barrier,
+            // SEC-006/ACL-026; it waits up to two election timeouts when the control leader is unreachable). A leader that
+            // can no longer send to its followers would lose its leadership during that wait, so the volume leader also
+            // leads the control group here: the barrier is then local.
+            await cluster.TransferLeadershipAsync(Control, leader.Name, ct: Ct);
+
             // The writer's session (and, should the SDK keep one per session, its staging session) is established while
             // replication still works: once replication is cut, nothing else can commit, so the faulted request must be
             // the only proposal it needs. All faulted payloads stay at or below the 4 KiB inline threshold, so no object
@@ -682,12 +688,6 @@ public sealed class ConSimulationTests
             DfsOperationId k = await writerVolume.NewOperationIdAsync(Ct);
             await cluster.WaitForReplicationAsync(Vol, Ct);
             int inodesBefore = (await cluster.Inspect.GetVolumeStateAsync(Vol, leader.Name)).InodeCount;
-
-            // The leader can no longer send to its followers: it appends the entry to its own journal but can never
-            // replicate or commit it. Once the entry is appended the writer is also confined to the leader, so no SDK
-            // retry can reach a new leader.
-            foreach (TestNode follower in followers)
-                cluster.Network.Cut(leader.Name, follower.Name);
 
             DfsOperationKind kind;
             Func<Task> invoke;
@@ -713,8 +713,18 @@ public sealed class ConSimulationTests
                     throw new ArgumentOutOfRangeException(nameof(operation));
             }
 
+            // The request is held at the leader right before it is proposed (after the SDK's own preparatory reads, such as
+            // the current length an append reads first, which need a heartbeat quorum). Then the leader can no longer send
+            // to its followers: it appends the entry to its own journal but can never replicate or commit it. Once the
+            // entry is appended the writer is also confined to the leader, so no SDK retry can reach a new leader.
+            FaultArm beforePropose = cluster.Faults.Arm(new FaultMatch(FaultSites.RaftBeforePropose, Node: leader.Name, Volume: Vol, Operation: kind),
+                FaultAction.Block());
             FaultArm appended = cluster.Faults.Arm(new FaultMatch(FaultSites.RaftAfterLocalAppend, Node: leader.Name, Volume: Vol, Operation: kind), FaultAction.Block());
             Task pending = invoke();
+            await beforePropose.WaitTriggeredAsync(ElectionBound);
+            foreach (TestNode follower in followers)
+                cluster.Network.Cut(leader.Name, follower.Name);
+            beforePropose.Release();
             await appended.WaitTriggeredAsync(ElectionBound);
             cluster.Faults.AssertReached(appended);
             foreach (TestNode follower in followers)
@@ -1362,6 +1372,11 @@ public sealed class ConSimulationTests
 
             TestNode leader = await cluster.GetLeaderAsync(Vol, Ct);
             TestNode[] followers = Others(cluster, leader);
+
+            // The isolated leader must still append client entries: it passes its control barrier (SEC-006, which waits up
+            // to two election timeouts for an unreachable control leader, longer than the isolated leader keeps its
+            // leadership) only when it leads the control group itself.
+            await cluster.TransferLeadershipAsync(Control, leader.Name, ct: Ct);
             await using DfsClient stale = await cluster.ConnectAsync(new TestClientOptions { Name = "stale", SeedNodes = [leader.Name], OperationTimeout = ShortOperationTimeout }, Ct);
             await using DfsClient freshClient = await cluster.ConnectAsync(new TestClientOptions { Name = "fresh", SeedNodes = Names(followers), OperationTimeout = ElectionBound }, Ct);
             DfsVolume staleVolume = stale.GetVolume(Vol);

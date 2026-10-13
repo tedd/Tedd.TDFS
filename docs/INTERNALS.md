@@ -301,9 +301,10 @@ internal sealed partial class VolumeHost
   `groups/vol-{id:N}`, then calls `OnOpened`; record changes call `OnRecordChanged(previous)`; role/leader/term changes
   call `OnLeadershipChanged`; before closing (volume deleted, node no longer listed and removed from the applied
   configuration, or node stop) it calls `OnClosing`. Deleted volumes, and unlisted ones whose applied configuration no
-  longer contains this node, delete their group data; stop keeps it. A node that is unlisted but still in the applied
-  configuration (it may have been removed while cut off and never learn it) leaves the group after a grace period but
-  keeps its log: a member the configuration may still count as a voter must never lose its log.
+  longer contains this node, delete their group data; stop keeps it. A node that is unlisted but still a voter of the
+  applied configuration keeps hosting the group (its replacement may still be catching up; leaving would reduce the
+  group's failure tolerance, RCV-01); one that is only a learner there leaves after a grace period but keeps its log: a
+  member the configuration may still count must never lose its log.
   Leader-only jobs (lease expiry, GC, repair, exporter) start in `OnLeadershipChanged` when `IsLeader` and must stop
   themselves when leadership is lost or `Group.IsClosed`.
 * **Membership** is owned by the runtime: the control leader's `MembershipManager` chooses volume voters/learners
