@@ -40,8 +40,16 @@ internal sealed class ObjectService
     }
 
     /// <summary>Stores an object durably and returns a receipt (also used by local callers such as repair and restore).</summary>
-    public async Task<(ObjectReceipt Receipt, bool AlreadyPresent)> StoreAsync(ObjectId obj, VolumeRecord volume, StagingId staging, UInt128 checksum,
+    public Task<(ObjectReceipt Receipt, bool AlreadyPresent)> StoreAsync(ObjectId obj, VolumeRecord volume, StagingId staging, UInt128 checksum,
         long length, byte encoding, ulong placementEpoch, ReadOnlyMemory<byte> data, DfsOperationKind operation, CancellationToken ct)
+        => StoreAsync(obj, volume, staging, checksum, length, encoding, placementEpoch, data, operation, ObjectAdmission.Normal, ct);
+
+    /// <summary>
+    /// Stores an object durably and returns a receipt. <paramref name="admission"/> selects how much of the reserve the
+    /// copy may use: repair copies (<see cref="ObjectAdmission.Repair"/>) may fill the repair reserve, client payload never.
+    /// </summary>
+    public async Task<(ObjectReceipt Receipt, bool AlreadyPresent)> StoreAsync(ObjectId obj, VolumeRecord volume, StagingId staging, UInt128 checksum,
+        long length, byte encoding, ulong placementEpoch, ReadOnlyMemory<byte> data, DfsOperationKind operation, ObjectAdmission admission, CancellationToken ct)
     {
         if (!_s.Control.IsSelfRegistered)
         {
@@ -65,14 +73,29 @@ internal sealed class ObjectService
 
         bool alreadyPresent = Store.TryGetInfo(obj) is { } existing && existing.Volume == volume.Id && existing.Staging == staging
             && existing.Checksum == checksum && existing.Length == length;
-        await Store.PutAsync(obj, volume.Id, staging, data, operation, ct);
+        await Store.PutAsync(obj, volume.Id, staging, data, operation, admission, ct);
         await _s.HitAsync(FaultStage.F08, FaultSites.ObjectAfterFlushBeforeReceipt, volume.Name, operation, obj: obj, ct: ct);
         _s.Metrics.ObjectPut(data.Length);
         _s.Metrics.SetStored(Store.ObjectCount, Store.LiveBytes);
+        return (IssueReceipt(obj, volume, staging, checksum, length, encoding, placementEpoch), alreadyPresent);
+    }
+
+    /// <summary>
+    /// Issues a durability receipt for a copy this node holds durably (after its flush, or after re-verifying an existing
+    /// copy). Requires the node's current incarnation to be registered (RCV-02).
+    /// </summary>
+    public ObjectReceipt IssueReceipt(ObjectId obj, VolumeRecord volume, StagingId staging, UInt128 checksum, long length, byte encoding, ulong placementEpoch)
+    {
+        if (!_s.Control.IsSelfRegistered)
+        {
+            throw new DfsUnavailableException(DfsErrorCode.NodeUnavailable,
+                $"{_s.NodeName} has not registered incarnation {_s.Incarnation} yet and issues no receipts (RCV-02).");
+        }
+
         ObjectReceipt receipt = Receipts.Issue(_s.Keys.ReceiptKey, obj, volume.Id, staging, checksum, length, encoding, _s.NodeId, _s.Incarnation,
             placementEpoch, _s.Time.GetUtcNow());
         _s.Metrics.ReceiptIssued();
-        return (receipt, alreadyPresent);
+        return receipt;
     }
 
     private async ValueTask<IWireMessage> PutObjectAsync(RpcContext context, IWireMessage request)
@@ -166,8 +189,15 @@ internal sealed class ObjectService
     }
 
     private async ValueTask<IWireMessage> DeleteObjectsAsync(RpcContext context, IWireMessage request)
+        => await DeleteCopiesAsync((DeleteObjectsMessage)request, context.Cancellation);
+
+    /// <summary>
+    /// Deletes the listed copies (GC decisions or excess replicas) whose stored record still carries the listed staging
+    /// session; also used by a volume leader for its own node. Excess-replica deletions hit <c>replica.delete</c> per object.
+    /// </summary>
+    public async Task<DeleteObjectsResultMessage> DeleteCopiesAsync(DeleteObjectsMessage message, CancellationToken ct)
     {
-        var message = (DeleteObjectsMessage)request;
+        ArgumentNullException.ThrowIfNull(message);
         if (_s.Control.State.FindVolume(message.Volume) is { } volume && message.VolumeEpoch < volume.Epoch)
             throw new DfsEpochMismatchException($"The delete decision is for epoch {message.VolumeEpoch}; volume '{volume.Name}' is at epoch {volume.Epoch}.");
         string? volumeName = _s.Control.State.FindVolume(message.Volume)?.Name;
@@ -184,11 +214,15 @@ internal sealed class ObjectService
 
             if (message.ExcessReplicas)
             {
-                await _s.HitAsync(FaultStage.F20, FaultSites.ReplicaDelete, volumeName, DfsOperationKind.Repair, obj: target.Object,
-                    ct: context.Cancellation);
+                await _s.HitAsync(FaultStage.F20, FaultSites.ReplicaDelete, volumeName, DfsOperationKind.Repair, obj: target.Object, ct: ct);
+                if (Store.TryGetInfo(target.Object) is not { } current || current.Volume != message.Volume || current.Staging != target.Staging)
+                {
+                    absent++;
+                    continue;
+                }
             }
 
-            await Store.DeleteAsync(target.Object, context.Cancellation);
+            await Store.DeleteAsync(target.Object, ct);
             deleted++;
             bytes += info.Length;
         }

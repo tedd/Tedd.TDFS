@@ -257,7 +257,7 @@ internal sealed partial class AdminService
         RequireLeader();
         await Control.Group!.ReadIndexAsync(ct);
         RaftConfState conf = Control.Group.AppliedConf;
-        return new AdminNodeListBody(NodesByName().Select(m => Control.ToNodeEntry(m, conf)).ToArray());
+        return new AdminNodeListBody(NodesByName().Select(m => WithReportedUsage(Control.ToNodeEntry(m, conf))).ToArray());
     }
 
     private IEnumerable<MemberRecord> NodesByName()
@@ -315,6 +315,8 @@ internal sealed partial class AdminService
         MemberRecord member = RequireMember(name);
         if (status == WireNodeStatus.Removed && !force && State.Members.Values.Count(m => m.IsLive) <= 1)
             throw new DfsException(DfsErrorCode.InvalidArgument, $"Node '{name}' is the last live member and cannot be removed.");
+        if (status == WireNodeStatus.Removed && !force && member.IsLive)
+            RemovalCheck?.Invoke(member);
         return await ProposeEmptyAsync(message, new SetMemberStatusCommand(Header(message, principal), member.Id, status, force), ct);
     }
 

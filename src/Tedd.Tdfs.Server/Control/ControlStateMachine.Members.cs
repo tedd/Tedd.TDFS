@@ -157,7 +157,10 @@ internal sealed partial class ControlStateMachine
             }
         }
 
-        State.PlacementEpoch++;
+        // Placement only changes when the node enters or leaves the eligible set (Draining → Drained → Removed moves an
+        // already ineligible node and keeps every object's targets).
+        if (m.IsPlacementEligible != updated.IsPlacementEligible)
+            State.PlacementEpoch++;
         return ApplyOutcome.Success(updated);
     }
 

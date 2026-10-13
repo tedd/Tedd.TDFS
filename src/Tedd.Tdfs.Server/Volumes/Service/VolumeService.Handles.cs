@@ -28,7 +28,7 @@ internal sealed partial class VolumeService
         _handleRenewals.Clear();
         _sessionRenewals.Clear();
         _pinRenewals.Clear();
-        _locations.Clear();
+        ClearReplicaTracking();
         _inventories.Clear();
         _staged.Clear();
         _transactions.Clear();
@@ -42,7 +42,7 @@ internal sealed partial class VolumeService
         _handleRenewals.Clear();
         _sessionRenewals.Clear();
         _pinRenewals.Clear();
-        _locations.Clear();
+        ClearReplicaTracking();
         _inventories.Clear();
         _staged.Clear();
         _transactions.Clear();

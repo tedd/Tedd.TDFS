@@ -89,6 +89,9 @@ internal sealed class NodeServices
 
     public ObjectService Objects { get; set; } = null!;
 
+    /// <summary>Maintenance plane (inventory/GC sweeps, repair, scrubbing, usage reports); null until the data handlers are registered.</summary>
+    public MaintenancePlane? Maintenance { get; set; }
+
     public AdminService Admin { get; set; } = null!;
 
     public MembershipManager Membership { get; set; } = null!;

@@ -188,6 +188,7 @@ peer                                         server (live node or backup node)
 | `RestoreVolume` | control leader | Node (restore coordinator) |
 | `RestoreInstall` | leader of the restoring volume | Node (restore coordinator) |
 | `InventoryReport` | volume leader | Node |
+| `ReportUsage` | control leader | Node |
 | `RaftBatch`, `RaftSnapshotChunk` | group members | Node |
 | `BackupBegin` … `BackupPublish`, `BackupRetention`, `BackupExportRestore` | backup node | Client authenticated as the export / retention / reader principal |
 
@@ -318,6 +319,7 @@ carry an operation id; **opt** = may carry one (then retries are deduplicated); 
 | `DeleteObjects` | local delete | — | Idempotent; deletes a copy only while its record still carries the decided staging session (`ObjectStagingRef`). |
 | `InventoryReport` | — | — (report id, page) | Idempotent per page; the GC answer is only given on the last page. |
 | `CopyObjects` | durable local writes | — (from, to) | Idempotent per pair. |
+| `ReportUsage` | — (leader memory) | — | Idempotent: the latest report of a node replaces the previous one. |
 | `RestoreVolume` | `CreateRestoringVolume` / `FinishRestoringVolume` (control) | `RequestId` | Deduplicated by the control group's administrative outcomes. |
 | `RestoreInstall` | `RestoreChunk` / `RestoreComplete` | — (source tag) | Idempotent per restore source. |
 | `RaftBatch`, `RaftSnapshotChunk` | Raft | — | Raft tolerates duplicates/reordering. |
@@ -586,7 +588,7 @@ answered with `Unsupported`.
 | `Grant` / `Revoke` (32/33) | `AdminGrantBody` | `AdminEmptyBody` | control leader | ClusterAdmin or VolumeAdmin |
 | `RotateDataKey` (40) | `AdminVolumeNameBody` | `AdminKeyRotationBody` | control leader | VolumeAdmin |
 | `ExportRecoveryKey` (41) | `AdminExportRecoveryKeyBody` | `AdminRecoveryKeyBody` | control leader | ClusterAdmin |
-| `StartScrub` (50) | `AdminStartScrubBody` | `AdminEmptyBody` | control leader (fans out) | ClusterAdmin |
+| `StartScrub` (50) | `AdminStartScrubBody` | `AdminEmptyBody` | control leader (fans out with the `ReportUsage` replies) | ClusterAdmin |
 | `StartRepair` (51) | `AdminVolumeNameBody` | `AdminEmptyBody` | volume leader | VolumeAdmin |
 | `ReplicaHealth` (52) | `AdminVolumeNameBody` | `ReplicaHealthData` | volume leader | VolumeAdmin |
 | `RestoreFromBackup` (60) | `AdminRestoreFromBackupBody` | `AdminVolumeInfoBody` | control leader | ClusterAdmin |
@@ -1782,7 +1784,7 @@ Reply to `LocateObjectMessage`.
 
 #### `ReplicateObject` = 116 (`ReplicateObjectMessage`)
 
-Repair pull (volume leader → target storage node): fetch the object from one of the sources (node-authenticated `GetObject`), verify length and checksum, store it durably and return a receipt. Idempotent.
+Repair pull (volume leader → target storage node): fetch the object from one of the sources (node-authenticated `GetObject`), verify length and checksum, store it durably and return a receipt. Idempotent. A copy the node already holds is re-verified (record header, every unit, whole-object checksum) and answered with a fresh receipt and `AlreadyPresent`; a damaged one is quarantined and replaced from a source (the volume leader relies on this to verify the copies it keeps before deleting excess replicas). Repair copies are admitted under repair admission: they may use the upper half of the node's reserve, which client payload never does (GC-017); below it the node answers CapacityExhausted before pulling anything. Errors: VolumeNotFound, Integrity (conflicting content, or no source served a verified copy), CapacityExhausted, LimitExceeded, NodeUnavailable (incarnation not registered yet).
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
@@ -1878,6 +1880,31 @@ Reply to `CopyObjectsMessage`.
 | 1 | `Receipts` | `list<ObjectReceipt>` | Receipts of the stored copies. |
 | 2 | `MissingSources` | `list<ObjectId>` | Source objects this node does not hold. |
 | 3 | — | `extensions` | Terminal extension block. |
+
+#### `ReportUsage` = 124 (`ReportUsageMessage`)
+
+Periodic usage and maintenance report (storage node → control leader, node-authenticated, every `InventoryInterval`). Every node reports its device usage; a node that leads volume groups also summarizes each volume's replica state. The control leader keeps the latest report of each node in memory only (a new control leader rebuilds the picture from the next reports) and derives from it node and pool usage (`ListNodes`, `ListPools`), pool replica health (`PoolStatus`), the Draining → Drained transition (a draining node that votes in no group and that every relevant volume leader lists as up with no kept copies), the safety checks of a non-forced `RemoveNode`, and the completion of default-policy migrations (it proposes `CompletePolicyMigration` when a leader reports the pending target met). Errors: NotLeader (with a hint), StaleIncarnation, AccessDenied (a node may only report itself).
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Node` | `NodeId` | Reporting node. |
+| 2 | `Incarnation` | `varuint` | Reporting node incarnation; reports of a stale incarnation are rejected. |
+| 3 | `CapacityBytes` | `varint` | Usable device capacity (the smaller of the configured and the device capacity). |
+| 4 | `UsedBytes` | `varint` | Device bytes in use (objects, logs, checkpoints, everything). |
+| 5 | `AvailableBytes` | `varint` | Bytes client payload could still add before admission refuses it (capacity minus the reserve). |
+| 6 | `RepairAvailableBytes` | `varint` | Bytes repair copies could still add (they may use the repair half of the reserve). |
+| 7 | `ObjectBytes` | `varint` | Bytes of live object records in the node's object store. |
+| 8 | `Volumes` | `list<VolumeUsageReport>` | Summaries of the volumes this node leads (empty when it leads none, or while a new leader has not heard from every node for one liveness window). |
+| 9 | — | `extensions` | Terminal extension block. |
+
+#### `ReportUsageResult` = 125 (`ReportUsageResultMessage`)
+
+Reply to `ReportUsageMessage`.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `ScrubRequest` | `varuint` | Sequence number of the latest scrub requested for the reporting node by `AdminOp.StartScrub` under the current control leader (0 = none); the node starts a full scrub pass when it sees a number it has not acted on yet. |
+| 2 | — | `extensions` | Terminal extension block. |
 
 ### 9.8 Consensus
 
@@ -2837,6 +2864,19 @@ One member of the cluster map (live node or registered backup node).
 | 13 | `Pools` | `set<string>` | Named storage pools the node belongs to (Addendum A, POOL-02; the implicit `default` pool holds every member and is not listed). Clients place objects of a policy with `DfsStoragePolicy.Pool` (or the volume's `StoragePool`) on the members of that pool only (trailing field). |
 | 14 | — | `extensions` | Terminal extension block. |
 
+#### `NodeHoldingReport`
+
+One node's holdings of a volume's objects, as its volume leader knows them (part of `VolumeUsageReport`).
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Node` | `NodeId` | Holder. |
+| 2 | `Up` | `bool` | True when the node's inventory is current (it reported recently under its registered incarnation); false for the last-known holdings of a node that went silent. |
+| 3 | `Objects` | `varint` | Copies of objects the volume keeps (referenced, protected by the dereference log, or staged under an open session) on the node. |
+| 4 | `Bytes` | `varint` | Plaintext bytes of those copies. |
+| 5 | `NeededForAck` | `varint` | Referenced objects whose copies on the other nodes that are up fall below their policy's acknowledgement copies or zones: removing this node would lose acknowledged durability. |
+| 6 | — | `extensions` | Terminal extension block. |
+
 #### `ObjectCopy`
 
 One server-side object copy of a `CopyObjectsMessage`.
@@ -2899,8 +2939,19 @@ One storage pool (mirrors the SDK's `DfsPoolInfo`).
 | 2 | `Nodes` | `list<string>` | Member node names (ordinal order). |
 | 3 | `Volumes` | `list<string>` | Names of volumes bound to the pool (ordinal order). |
 | 4 | `CapacityBytes` | `varint` | Sum of the members' configured capacities. |
-| 5 | `UsedBytes` | `varint` | Sum of the members' last reported usage (advisory). |
+| 5 | `UsedBytes` | `varint` | Plaintext bytes of the copies placed through the pool that its members hold, as the volume leaders last reported them to the control leader (advisory). |
 | 6 | — | `extensions` | Terminal extension block. |
+
+#### `PoolUsageReport`
+
+Stored bytes and replica health of the objects of one volume placed through one storage pool (part of `VolumeUsageReport`). An object is attributed to the pool of the strongest policy referencing it.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Pool` | `string` | Storage pool. |
+| 2 | `StoredBytes` | `varint` | Plaintext bytes of every copy of the volume's objects attributed to the pool that the pool's members hold (all copies the inventories report, garbage included). |
+| 3 | `Health` | `ReplicaHealthData` | Replica health of the referenced objects attributed to the pool, judged against the pool's members that are up; a copy outside the pool is a placement violation. |
+| 4 | — | `extensions` | Terminal extension block. |
 
 #### `RaftEnvelope`
 
@@ -3059,6 +3110,20 @@ One volume of the cluster map: identity, authority epoch, routing and policies.
 | 13 | `StoragePool` | `string` | Storage pool the volume is bound to (Addendum A). |
 | 14 | `EnforceTraverseChecking` | `bool` | True when the volume enforces Traverse on ancestor directories. |
 | 15 | — | `extensions` | Terminal extension block. |
+
+#### `VolumeUsageReport`
+
+Replica-state summary of one volume, computed by its leader from storage-node inventories, repair results and the applied volume state (part of `ReportUsageMessage`).
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Volume` | `VolumeId` | Summarized volume. |
+| 2 | `VolumeEpoch` | `varuint` | Volume epoch the leader serves (summaries of an older epoch are ignored). |
+| 3 | `PlacementEpoch` | `varuint` | Placement epoch the summary was computed under. |
+| 4 | `CompletedMigration` | `StoragePolicy?` | The default-policy migration target every default-policy object now meets (absent when no migration is pending or it is not complete); the control leader then makes the policy effective if it is still the pending target. |
+| 5 | `Pools` | `list<PoolUsageReport>` | Stored bytes and replica health per storage pool the volume places objects in. |
+| 6 | `Nodes` | `list<NodeHoldingReport>` | Holdings per node the leader has an inventory of (current, or last-known for a node that went silent); a pool member missing here has not reported yet. |
+| 7 | — | `extensions` | Terminal extension block. |
 
 
 ## 11. Errors

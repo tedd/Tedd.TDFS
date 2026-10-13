@@ -146,10 +146,11 @@ internal sealed partial class NodeRuntime
         }
 
         s.ObjectStore = await ObjectStore.OpenAsync(medium, s.DataPath(NodeServices.ObjectsDirectory),
-            new ObjectStoreOptions(ReservedBytes: options.ReservedBytes, MaxObjectSize: options.Timings.MaxObjectSize, Cipher: objectCipher)
+            new ObjectStoreOptions(SegmentSizeFor(options), options.ReservedBytes, options.Timings.MaxObjectSize, objectCipher)
             {
                 Mutations = options.Mutations,
                 NodeName = options.Name,
+                CapacityLimitBytes = options.CapacityBytes,
             }, s.Faults, ct);
         s.Metrics.SetStored(s.ObjectStore.ObjectCount, s.ObjectStore.LiveBytes);
         s.Objects = new ObjectService(s, new Capabilities(s.Keys, () => s.ClusterId, s.Time));

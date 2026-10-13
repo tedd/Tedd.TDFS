@@ -84,7 +84,7 @@ public sealed partial class ObjectStore
         if (damaged.Count > 0)
         {
             byte[] buffer = [.. damaged.SelectMany(r => BuildMarkerRecord(KindQuarantine, r.Header.Id, r.Header.Volume, r.Segment.Key, r.Offset))];
-            (SegmentFile segment, _) = await AppendLockedAsync(buffer, damaged.Count, mayRollOver: false, ct);
+            (SegmentFile segment, _) = await AppendMarkersLockedAsync(buffer, damaged.Count, ct);
             await FlushSegmentAsync(segment, ct);
         }
 
@@ -137,6 +137,8 @@ public sealed partial class ObjectStore
             {
                 scanned.Add(new ScannedRecord(h, segment, pos));
                 segment.RecordCount++;
+                if (h.Kind != KindObject)
+                    segment.MarkerBytes += h.RecordLength;
                 pos += h.RecordLength;
                 continue;
             }

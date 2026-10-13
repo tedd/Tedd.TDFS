@@ -45,7 +45,18 @@ public sealed record Superblock(int FormatVersion, Guid ClusterId, NodeId NodeId
     /// <summary>Durably creates a new superblock (incarnation 0).</summary>
     /// <exception cref="IOException">A superblock already exists at <paramref name="path"/>.</exception>
     /// <exception cref="ArgumentException">An identifier is empty or the name is blank.</exception>
-    public static async ValueTask<Superblock> CreateAsync(IStorageMedium medium, string path, Guid clusterId, NodeId nodeId, string nodeName, CancellationToken ct = default)
+    public static ValueTask<Superblock> CreateAsync(IStorageMedium medium, string path, Guid clusterId, NodeId nodeId, string nodeName, CancellationToken ct = default)
+        => CreateAsync(medium, path, clusterId, nodeId, nodeName, 0, ct);
+
+    /// <summary>
+    /// Durably creates a new superblock that continues an existing identity at <paramref name="incarnation"/>: a member
+    /// whose disk was replaced by an empty one (OFF-020) keeps its node id, and its next start must be newer than every
+    /// incarnation the cluster has registered for it.
+    /// </summary>
+    /// <exception cref="IOException">A superblock already exists at <paramref name="path"/>.</exception>
+    /// <exception cref="ArgumentException">An identifier is empty or the name is blank.</exception>
+    public static async ValueTask<Superblock> CreateAsync(IStorageMedium medium, string path, Guid clusterId, NodeId nodeId, string nodeName, ulong incarnation,
+        CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(medium);
         ArgumentException.ThrowIfNullOrWhiteSpace(nodeName);
@@ -55,7 +66,7 @@ public sealed record Superblock(int FormatVersion, Guid ClusterId, NodeId NodeId
             throw new ArgumentException("The node id must not be empty.", nameof(nodeId));
         if (await medium.ExistsAsync(path, ct))
             throw StorageErrors.FileExists(path);
-        var superblock = new Superblock(CurrentFormatVersion, clusterId, nodeId, nodeName, 0, SoftwareVersion);
+        var superblock = new Superblock(CurrentFormatVersion, clusterId, nodeId, nodeName, incarnation, SoftwareVersion);
         await AtomicFile.WriteAsync(medium, path, superblock.Encode(), ct);
         return superblock;
     }

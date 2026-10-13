@@ -69,16 +69,20 @@ internal sealed partial class AdminService
         switch (message.Op)
         {
             case AdminOp.ListPools:
+                RequireLeader(); // usage is aggregated by the control leader
                 return Result(message.Op, new AdminPoolListBody(PoolNames().Select(PoolInfo).ToArray()));
             case AdminOp.PoolStatus:
             {
                 string pool = message.ReadBody<AdminPoolNameBody>().Pool;
                 if (!State.PoolExists(pool))
                     throw new DfsException(DfsErrorCode.PoolNotFound, $"Pool '{pool}' does not exist.");
+                RequireLeader(); // replica health is aggregated by the control leader
                 ReplicaHealthData health = PoolHealthProvider?.Invoke(pool) ?? new ReplicaHealthData(0, 0, 0, 0, 0, 0, 0, 0, 0);
                 string[] draining = State.PoolMembers(pool)
                     .Where(m => m.Status is WireNodeStatus.Draining or WireNodeStatus.Drained)
-                    .Select(m => m.Name).Order(StringComparer.Ordinal).ToArray();
+                    .Select(m => m.Name)
+                    .Concat(PoolStrayHoldersProvider?.Invoke(pool) ?? [])
+                    .Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
                 return Result(message.Op, new AdminPoolStatusBody(PoolInfo(pool), health, draining));
             }
 
@@ -118,6 +122,8 @@ internal sealed partial class AdminService
             used = SaturatingAdd(used, m.UsedBytes);
         }
 
+        if (PoolUsageProvider?.Invoke(pool) is { } stored)
+            used = stored;
         return new PoolInfoData(pool, members.Select(m => m.Name).Order(StringComparer.Ordinal).ToArray(), volumes, capacity, used);
     }
 

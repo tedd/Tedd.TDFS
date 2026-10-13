@@ -100,6 +100,7 @@ public static class MessageTypes
         MessageType.GetObject or MessageType.GetObjectResult or MessageType.LocateObject or MessageType.LocateObjectResult
             => DfsOperationKind.ReadObject,
         MessageType.ReplicateObject or MessageType.ReplicateObjectResult or MessageType.InventoryReport or MessageType.InventoryReportResult
+            or MessageType.ReportUsage or MessageType.ReportUsageResult
             => DfsOperationKind.Repair,
         MessageType.DeleteObjects or MessageType.DeleteObjectsResult => DfsOperationKind.Gc,
         MessageType.CopyObjects or MessageType.CopyObjectsResult => DfsOperationKind.RestoreSnapshot,

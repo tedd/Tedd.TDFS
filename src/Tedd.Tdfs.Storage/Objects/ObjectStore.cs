@@ -157,7 +157,7 @@ public sealed partial class ObjectStore : IAsyncDisposable
     /// <exception cref="DfsIntegrityException">The id is stored with different content or volume.</exception>
     /// <exception cref="DfsCapacityException">Admission would consume the reserved capacity, or the device is full.</exception>
     public ValueTask<ObjectRecordInfo> PutAsync(ObjectId id, VolumeId volume, StagingId staging, ReadOnlyMemory<byte> plaintext, CancellationToken ct = default)
-        => PutAsync(id, volume, staging, plaintext, DfsOperationKind.PutObject, ct);
+        => PutAsync(id, volume, staging, plaintext, DfsOperationKind.PutObject, ObjectAdmission.Normal, ct);
 
     /// <inheritdoc cref="PutAsync(ObjectId, VolumeId, StagingId, ReadOnlyMemory{byte}, CancellationToken)"/>
     /// <param name="id">Object id.</param>
@@ -166,8 +166,20 @@ public sealed partial class ObjectStore : IAsyncDisposable
     /// <param name="plaintext">Payload.</param>
     /// <param name="operation">Operation kind reported by the object write fault sites (for example a restore's server-side copy).</param>
     /// <param name="ct">Cancellation.</param>
-    public async ValueTask<ObjectRecordInfo> PutAsync(ObjectId id, VolumeId volume, StagingId staging, ReadOnlyMemory<byte> plaintext, DfsOperationKind operation,
+    public ValueTask<ObjectRecordInfo> PutAsync(ObjectId id, VolumeId volume, StagingId staging, ReadOnlyMemory<byte> plaintext, DfsOperationKind operation,
         CancellationToken ct = default)
+        => PutAsync(id, volume, staging, plaintext, operation, ObjectAdmission.Normal, ct);
+
+    /// <inheritdoc cref="PutAsync(ObjectId, VolumeId, StagingId, ReadOnlyMemory{byte}, CancellationToken)"/>
+    /// <param name="id">Object id.</param>
+    /// <param name="volume">Owning volume.</param>
+    /// <param name="staging">Staging session the copy is bound to.</param>
+    /// <param name="plaintext">Payload.</param>
+    /// <param name="operation">Operation kind reported by the object write fault sites (for example a restore's server-side copy).</param>
+    /// <param name="admission">How much of the reserved capacity the put may use (<see cref="ObjectAdmission"/>).</param>
+    /// <param name="ct">Cancellation.</param>
+    public async ValueTask<ObjectRecordInfo> PutAsync(ObjectId id, VolumeId volume, StagingId staging, ReadOnlyMemory<byte> plaintext, DfsOperationKind operation,
+        ObjectAdmission admission, CancellationToken ct = default)
     {
         if (id.IsEmpty)
             throw new ArgumentException("The object id must not be empty.", nameof(id));
@@ -209,10 +221,10 @@ public sealed partial class ObjectStore : IAsyncDisposable
 
             byte[] record = BuildObjectRecord(id, volume, staging, plaintext.Span, checksum, out RecordHeader header);
             byte[] buffer = quarantine is null ? record : [.. quarantine, .. record];
-            EnsureCapacity(buffer.Length);
+            EnsureCapacity(buffer.Length, admission);
             SegmentFile target = await EnsureActiveSegmentAsync(buffer.Length, ct);
             failuresAtWrite = FlushFailuresOf(target);
-            (segment, long offset) = await AppendLockedAsync(buffer, quarantine is null ? 1 : 2, ct);
+            (segment, long offset) = await AppendLockedAsync(buffer, quarantine is null ? 1 : 2, mayRollOver: true, markerBytes: quarantine?.Length ?? 0, ct);
             if (quarantine is not null)
                 RetireDamaged(existing!, "copy failed verification during an idempotent put");
 
@@ -432,7 +444,7 @@ public sealed partial class ObjectStore : IAsyncDisposable
             return;
         byte[] tombstone = BuildMarkerRecord(KindTombstone, id, existing.Info.Volume);
         long failuresAtWrite = FlushFailuresOf(await EnsureActiveSegmentAsync(tombstone.Length, ct));
-        (SegmentFile segment, long offset) = await AppendLockedAsync(tombstone, 1, ct);
+        (SegmentFile segment, long offset) = await AppendLockedAsync(tombstone, 1, mayRollOver: true, markerBytes: tombstone.Length, ct);
         try
         {
             await FlushSegmentAsync(segment, ct);
@@ -440,7 +452,7 @@ public sealed partial class ObjectStore : IAsyncDisposable
         }
         catch
         {
-            await RollbackAppendAsync(segment, offset, tombstone.Length, 1);
+            await RollbackAppendAsync(segment, offset, tombstone.Length, 1, tombstone.Length);
             throw;
         }
 
@@ -530,11 +542,18 @@ public sealed partial class ObjectStore : IAsyncDisposable
     {
         ObjectId id = entry.Info.Id;
         if (_index.TryGetValue(id, out IndexEntry? previous))
+        {
             _liveBytes -= previous.RecordLength;
+            previous.Segment.LiveBytes -= previous.RecordLength;
+        }
         else
+        {
             _order.Add(id);
+        }
+
         _index[id] = entry;
         _liveBytes += entry.RecordLength;
+        entry.Segment.LiveBytes += entry.RecordLength;
     }
 
     private void RemoveLocked(ObjectId id)
@@ -542,6 +561,7 @@ public sealed partial class ObjectStore : IAsyncDisposable
         if (_index.Remove(id, out IndexEntry? previous))
         {
             _liveBytes -= previous.RecordLength;
+            previous.Segment.LiveBytes -= previous.RecordLength;
             _order.Remove(id);
         }
     }
@@ -559,23 +579,52 @@ public sealed partial class ObjectStore : IAsyncDisposable
         CountFailure();
     }
 
-    private void EnsureCapacity(long recordBytes)
+    /// <summary>Usable capacity: the medium's capacity, capped by <see cref="ObjectStoreOptions.CapacityLimitBytes"/>.</summary>
+    public long CapacityBytes => Math.Min(_medium.CapacityBytes, _options.CapacityLimitBytes ?? long.MaxValue);
+
+    /// <summary>Bytes in use on the medium (every file, not only object segments).</summary>
+    public long MediumUsedBytes => _medium.UsedBytes;
+
+    /// <summary>Medium bytes this admission class may fill up to (capacity minus the part of the reserve it must leave free).</summary>
+    public long AdmissionLimitBytes(ObjectAdmission admission)
+        => CapacityBytes - (admission == ObjectAdmission.Repair ? _options.EffectiveRepairFloorBytes : _options.ReservedBytes);
+
+    /// <summary>Bytes a put of the given admission class could still add before it is refused (never negative).</summary>
+    public long AvailableBytes(ObjectAdmission admission) => Math.Max(0, AdmissionLimitBytes(admission) - _medium.UsedBytes);
+
+    /// <summary>Bytes of segment files not referenced by the index (dead records, tombstones, quarantine records, damaged regions).</summary>
+    public long DeadBytes
+    {
+        get
+        {
+            lock (_sync)
+                return TotalBytesLocked() - _liveBytes - ((long)_segments.Count * SegmentHeaderSize);
+        }
+    }
+
+    private void EnsureCapacity(long recordBytes, ObjectAdmission admission)
     {
         SegmentFile? active = _active;
         bool rollover = active is null || (active.RecordCount > 0 && active.Length + recordBytes > _options.SegmentSize);
         long needed = recordBytes + (rollover ? SegmentHeaderSize : 0);
-        long limit = _medium.CapacityBytes - _options.ReservedBytes;
+        long limit = AdmissionLimitBytes(admission);
         long used = _medium.UsedBytes;
         if (needed > limit - used)
         {
+            long kept = CapacityBytes - limit;
             throw new DfsCapacityException(
-                $"Object store on '{_medium.Name}' cannot admit {needed} bytes: {used} of {_medium.CapacityBytes} bytes used and {_options.ReservedBytes} bytes reserved.");
+                $"Object store on '{_medium.Name}' cannot admit {needed} bytes ({admission} admission): {used} of {CapacityBytes} bytes used and {kept} bytes reserved.");
         }
     }
 
-    /// <summary>Appends records to the active segment. The caller holds the write gate; nothing is flushed.</summary>
-    private ValueTask<(SegmentFile Segment, long Offset)> AppendLockedAsync(byte[] buffer, int recordCount, CancellationToken ct)
-        => AppendLockedAsync(buffer, recordCount, mayRollOver: true, ct);
+    /// <summary>Appends marker records (tombstones, quarantine records) without rolling over. The caller holds the write gate.</summary>
+    /// <remarks>
+    /// Quarantine and void records go into the current active segment even when it is full: rolling over first would seal
+    /// the segment (it is then no longer payload-verified at open) before the record that retires a damaged record in it
+    /// is durable, so a crash in between would let the next open index the damaged record.
+    /// </remarks>
+    private ValueTask<(SegmentFile Segment, long Offset)> AppendMarkersLockedAsync(byte[] buffer, int recordCount, CancellationToken ct)
+        => AppendLockedAsync(buffer, recordCount, mayRollOver: false, markerBytes: buffer.Length, ct);
 
     /// <summary>Appends records to the active segment. The caller holds the write gate; nothing is flushed.</summary>
     /// <param name="buffer">Encoded records.</param>
@@ -585,8 +634,9 @@ public sealed partial class ObjectStore : IAsyncDisposable
     /// over first would seal the segment (it is then no longer payload-verified at open) before the record that retires
     /// a damaged record in it is durable, so a crash in between would let the next open index the damaged record.
     /// </param>
+    /// <param name="markerBytes">Bytes of <paramref name="buffer"/> that are tombstones or quarantine records (compaction accounting).</param>
     /// <param name="ct">Cancellation token.</param>
-    private async ValueTask<(SegmentFile Segment, long Offset)> AppendLockedAsync(byte[] buffer, int recordCount, bool mayRollOver, CancellationToken ct)
+    private async ValueTask<(SegmentFile Segment, long Offset)> AppendLockedAsync(byte[] buffer, int recordCount, bool mayRollOver, long markerBytes, CancellationToken ct)
     {
         SegmentFile segment = !mayRollOver && _active is { } current ? current : await EnsureActiveSegmentAsync(buffer.Length, ct);
         long offset = segment.Length;
@@ -606,13 +656,14 @@ public sealed partial class ObjectStore : IAsyncDisposable
         {
             segment.Length = offset + buffer.Length;
             segment.RecordCount += recordCount;
+            segment.MarkerBytes += markerBytes;
         }
 
         return (segment, offset);
     }
 
     /// <summary>Undoes an append whose flush failed (the caller still holds the write gate).</summary>
-    private async ValueTask RollbackAppendAsync(SegmentFile segment, long offset, int length, int recordCount)
+    private async ValueTask RollbackAppendAsync(SegmentFile segment, long offset, int length, int recordCount, long markerBytes)
     {
         lock (_sync)
         {
@@ -620,6 +671,7 @@ public sealed partial class ObjectStore : IAsyncDisposable
                 return;
             segment.Length = offset;
             segment.RecordCount -= recordCount;
+            segment.MarkerBytes -= markerBytes;
         }
 
         await TruncateQuietlyAsync(segment, offset);
@@ -705,14 +757,14 @@ public sealed partial class ObjectStore : IAsyncDisposable
                 }
 
                 byte[] marker = BuildMarkerRecord(KindQuarantine, entry.Info.Id, entry.Info.Volume, entry.Segment.Key, entry.Offset);
-                (SegmentFile segment, long offset) = await AppendLockedAsync(marker, 1, mayRollOver: false, CancellationToken.None);
+                (SegmentFile segment, long offset) = await AppendMarkersLockedAsync(marker, 1, CancellationToken.None);
                 try
                 {
                     await FlushSegmentAsync(segment, CancellationToken.None);
                 }
                 catch
                 {
-                    await RollbackAppendAsync(segment, offset, marker.Length, 1);
+                    await RollbackAppendAsync(segment, offset, marker.Length, 1, marker.Length);
                     throw;
                 }
             }
@@ -978,6 +1030,18 @@ public sealed partial class ObjectStore : IAsyncDisposable
 
         /// <summary>Number of failed flushes of this file (writes made before a failure may have been dropped).</summary>
         public long FlushFailures { get; set; }
+
+        /// <summary>Bytes of records in this file that the index references.</summary>
+        public long LiveBytes { get; set; }
+
+        /// <summary>Bytes of tombstones and quarantine records in this file.</summary>
+        public long MarkerBytes { get; set; }
+
+        /// <summary>
+        /// Bytes of object records (and damaged regions) the index no longer references: superseded, deleted or retired
+        /// copies. A segment without them is "clean": dropping a newer marker can resurrect nothing in it.
+        /// </summary>
+        public long DeadObjectBytes => Length - SegmentHeaderSize - LiveBytes - MarkerBytes;
     }
 
     /// <summary>Outcome of <see cref="TryAcquireCurrent"/>.</summary>
