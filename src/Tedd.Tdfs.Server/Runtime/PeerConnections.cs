@@ -124,6 +124,33 @@ internal sealed class PeerConnections
         }
     }
 
+    /// <summary>
+    /// A peer authenticated a connection to this node as <paramref name="incarnation"/>: pooled outbound connections that were
+    /// authenticated with an older incarnation of it lead to a dead process. Their close may never have arrived (it travels
+    /// like any frame, for example across a link that was cut while the peer crashed), and one-way sends on them vanish
+    /// silently, so they are dropped now and the next use connects to the running incarnation.
+    /// </summary>
+    public void OnPeerAuthenticated(NodeId peer, ulong incarnation)
+    {
+        if (_byNode.TryGetValue(peer, out Slot? slot))
+            DropIfOlder(slot, incarnation);
+        foreach (Slot endpointSlot in _byEndpoint.Values)
+        {
+            if (endpointSlot.PeerNode == peer)
+                DropIfOlder(endpointSlot, incarnation);
+        }
+    }
+
+    private static void DropIfOlder(Slot slot, ulong incarnation)
+    {
+        if (slot.Connection is not { } connection || slot.PeerIncarnation >= incarnation)
+            return;
+        slot.Connection = null;
+        slot.Failures = 0;
+        slot.RetryAfter = 0;
+        _ = connection.DisposeAsync().AsTask();
+    }
+
     /// <summary>Closes the pooled connection to <paramref name="peer"/> (it reconnects on next use).</summary>
     public void Reset(NodeId peer)
     {
@@ -237,6 +264,8 @@ internal sealed class PeerConnections
             }
 
             slot.Connection = opened;
+            slot.PeerNode = outcome.ServerIdentity.NodeId;
+            slot.PeerIncarnation = outcome.ServerIdentity.Incarnation;
             slot.Failures = 0;
             slot.RetryAfter = 0;
             return opened;
@@ -319,5 +348,11 @@ internal sealed class PeerConnections
         public long RetryAfter { get; set; }
 
         public int Failures { get; set; }
+
+        /// <summary>Node identity the open connection authenticated (its server side).</summary>
+        public NodeId? PeerNode { get; set; }
+
+        /// <summary>Incarnation the open connection authenticated.</summary>
+        public ulong PeerIncarnation { get; set; }
     }
 }

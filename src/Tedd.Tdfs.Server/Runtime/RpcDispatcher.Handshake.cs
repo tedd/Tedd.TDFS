@@ -114,6 +114,7 @@ internal sealed partial class RpcDispatcher
             state.Identity = new RpcPeerIdentity(hello.Name, id, hello.Incarnation, null, IsNode: true, IsBackup: false);
             state.Connection.Identity = state.Identity;
             state.Phase = HandshakePhase.Authenticated;
+            _s.Peers?.OnPeerAuthenticated(id, hello.Incarnation);
             return new HelloResultMessage(true, DfsErrorCode.None, string.Empty, hello.Name, DfsPermissions.None, capabilities,
                 HandshakeAuth.ComputeNodeServerMac(_s.Keys.NodeAuthKey, transcript));
         }
