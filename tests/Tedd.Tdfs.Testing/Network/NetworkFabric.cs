@@ -49,6 +49,7 @@ internal sealed class NetworkFabric
     private readonly Dictionary<string, HarnessTransportFactory> _factories = new(StringComparer.Ordinal);
     private readonly List<HarnessConnection> _connections = [];
     private readonly Dictionary<IRpcConnection, HarnessConnection> _serverConnections = new(ReferenceEqualityComparer.Instance);
+    private readonly Dictionary<IRpcConnection, HarnessConnection> _clientConnections = new(ReferenceEqualityComparer.Instance);
     private readonly List<MessageHold> _holds = [];
     private readonly List<ReadResultLimitRule> _readLimits = [];
     private readonly List<Action<string>> _traces = [];
@@ -283,7 +284,11 @@ internal sealed class NetworkFabric
     internal void AddConnection(HarnessConnection connection)
     {
         lock (_gate)
+        {
             _connections.Add(connection);
+            if (connection.IsClientSide)
+                _clientConnections[connection.Inner] = connection;
+        }
     }
 
     internal void RemoveConnection(HarnessConnection connection)
@@ -291,16 +296,25 @@ internal sealed class NetworkFabric
         lock (_gate)
         {
             _connections.Remove(connection);
-            if (!connection.IsClientSide)
+            if (connection.IsClientSide)
+                _clientConnections.Remove(connection.Inner);
+            else
                 _serverConnections.Remove(connection.Inner);
         }
     }
 
-    /// <summary>The server-side wrapper of an inbound inner connection (created on first sight).</summary>
+    /// <summary>
+    /// The wrapper a transport's handler sees for an inner connection a frame arrived on: the connection the transport opened
+    /// itself when the frame came back on it (connections carry messages both ways: a node reaches a peer over the
+    /// connection that peer opened, so the receiver must see the very connection it authenticated and registered),
+    /// otherwise the server-side wrapper of an accepted connection (created on first sight).
+    /// </summary>
     internal HarnessConnection GetServerConnection(HarnessTransport owner, IRpcConnection inner)
     {
         lock (_gate)
         {
+            if (_clientConnections.TryGetValue(inner, out HarnessConnection? opened))
+                return opened;
             if (_serverConnections.TryGetValue(inner, out HarnessConnection? existing))
                 return existing;
         }
