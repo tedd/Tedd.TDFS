@@ -410,17 +410,60 @@ public sealed class DfsStream : Stream, ILeaseHolder
             return;
         }
 
+        // One fetch per object per call: a fragmented map (small overwrites splitting an older object) maps several ranges of
+        // the call to the same object, and storage nodes answer whole verification units, so fetching each piece on its own
+        // would move the same units again for every fragment (read amplification, PERF-002/PERF-009).
         long end = position + target.Length;
+        var groups = new List<ObjectReadGroup>();
         foreach (ExtentData extent in range.Extents)
         {
             long start = Math.Max(position, extent.Offset);
             long stop = Math.Min(end, extent.Offset + extent.Length);
             if (stop <= start)
                 continue;
-            await _runtime.Data.ReadObjectAsync(scope, _volume, range.ReadCapability, extent.Object, extent.ObjectLength, extent.Checksum, extent.Encoding,
-                extent.PlacementEpoch, extent.Locations, extent.ObjectOffset + (start - extent.Offset),
-                target.Slice((int)(start - position), (int)(stop - start))).ConfigureAwait(false);
+            var piece = new ObjectReadPiece(extent.ObjectOffset + (start - extent.Offset), (int)(start - position), (int)(stop - start));
+            ObjectReadGroup? group = groups.Find(g => g.Extent.Object == extent.Object);
+            if (group is null)
+                groups.Add(group = new ObjectReadGroup(extent));
+            group.Pieces.Add(piece);
         }
+
+        foreach (ObjectReadGroup group in groups)
+        {
+            ExtentData extent = group.Extent;
+            long from = group.Pieces.Min(p => p.ObjectOffset);
+            long to = group.Pieces.Max(p => p.ObjectOffset + p.Length);
+            long useful = group.Pieces.Sum(p => (long)p.Length);
+            if (group.Pieces.Count == 1 || to - from > useful + MaxCoalescedReadGap)
+            {
+                foreach (ObjectReadPiece piece in group.Pieces)
+                {
+                    await _runtime.Data.ReadObjectAsync(scope, _volume, range.ReadCapability, extent.Object, extent.ObjectLength, extent.Checksum,
+                        extent.Encoding, extent.PlacementEpoch, extent.Locations, piece.ObjectOffset, target.Slice(piece.TargetOffset, piece.Length))
+                        .ConfigureAwait(false);
+                }
+
+                continue;
+            }
+
+            var covering = new byte[to - from];
+            await _runtime.Data.ReadObjectAsync(scope, _volume, range.ReadCapability, extent.Object, extent.ObjectLength, extent.Checksum, extent.Encoding,
+                extent.PlacementEpoch, extent.Locations, from, covering).ConfigureAwait(false);
+            foreach (ObjectReadPiece piece in group.Pieces)
+                covering.AsMemory((int)(piece.ObjectOffset - from), piece.Length).CopyTo(target.Slice(piece.TargetOffset, piece.Length));
+        }
+    }
+
+    /// <summary>Most bytes between the pieces of one object fetched along with them instead of fetching the pieces separately.</summary>
+    private const long MaxCoalescedReadGap = 128 * 1024;
+
+    /// <summary>A range of one object needed by a read call (object offset, offset in the call's destination, length).</summary>
+    private readonly record struct ObjectReadPiece(long ObjectOffset, int TargetOffset, int Length);
+
+    /// <summary>The pieces of one object needed by a read call (fetched once when they lie close together).</summary>
+    private sealed record ObjectReadGroup(ExtentData Extent)
+    {
+        public List<ObjectReadPiece> Pieces { get; } = [];
     }
 
     // ------------------------------------------------------------------------------------------------ writes
