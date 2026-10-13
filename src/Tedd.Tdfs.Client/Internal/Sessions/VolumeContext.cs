@@ -982,38 +982,62 @@ internal sealed class VolumeContext : IRpcRouter
     private static readonly TimeSpan StagingCleanupRetryDelay = TimeSpan.FromMilliseconds(500);
 
     /// <summary>
-    /// Runs a best-effort staging cleanup on its own short background scopes, retrying transient failures (a reset
-    /// connection or a brief partition at that moment) for a few seconds, so an abandoned staging session does not stay open
-    /// until its client session expires. Never throws.
+    /// Runs a best-effort staging cleanup on its own short background scope. Only the first attempt is awaited — a helper's
+    /// failure or cancellation is never held up by more than one cleanup attempt (as before retries existed). When that
+    /// attempt fails transiently (a reset connection or a brief partition at that moment), further attempts continue in the
+    /// background for a few seconds, so an abandoned staging session does not stay open until its client session expires.
+    /// Never throws.
     /// </summary>
     private async Task RunStagingCleanupAsync(Func<OperationScope, Task> cleanup, Func<Exception, string> describe)
     {
-        for (int attempt = 1; ; attempt++)
+        if (!await TryStagingCleanupAsync(cleanup, describe, retryable: true).ConfigureAwait(false))
+            _ = RetryStagingCleanupAsync(cleanup, describe);
+    }
+
+    /// <summary>Background attempts 2..<see cref="StagingCleanupAttempts"/> of a staging cleanup whose first attempt failed transiently.</summary>
+    private async Task RetryStagingCleanupAsync(Func<OperationScope, Task> cleanup, Func<Exception, string> describe)
+    {
+        for (int attempt = 2; attempt <= StagingCleanupAttempts; attempt++)
         {
             try
             {
-                using OperationScope scope = Runtime.BeginBackground(DfsOperationKind.CreateStaging, Name, Runtime.Options.ShutdownTimeout);
-                await cleanup(scope).ConfigureAwait(false);
-                return;
+                await Waits.DelayAsync(Runtime.Time, StagingCleanupRetryDelay, Runtime.KillToken).ConfigureAwait(false);
             }
-            catch (Exception ex) when (attempt < StagingCleanupAttempts && RpcInvoker.IsTransient(ex) && !Runtime.KillToken.IsCancellationRequested)
+            catch (OperationCanceledException)
             {
-                try
-                {
-                    await Waits.DelayAsync(Runtime.Time, StagingCleanupRetryDelay, Runtime.KillToken).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    return; // the client is shutting down: the session closes with it
-                }
+                return; // the client is shutting down: the session closes with it
             }
+
+            if (await TryStagingCleanupAsync(cleanup, describe, retryable: attempt < StagingCleanupAttempts).ConfigureAwait(false))
+                return;
+        }
+    }
+
+    /// <summary>
+    /// One attempt of a staging cleanup: true when it is finished (done, or failed for good — reported), false when it failed
+    /// transiently and <paramref name="retryable"/> allows another attempt. Every step of a cleanup is idempotent (an outcome
+    /// query, or closing a session that may already be closed), so an attempt whose own close request ended with an unknown
+    /// outcome (its connection reset or its link cut while it was in flight) is retried like any transient failure.
+    /// </summary>
+    private async Task<bool> TryStagingCleanupAsync(Func<OperationScope, Task> cleanup, Func<Exception, string> describe, bool retryable)
+    {
+        try
+        {
+            using OperationScope scope = Runtime.BeginBackground(DfsOperationKind.CreateStaging, Name, Runtime.Options.ShutdownTimeout);
+            await cleanup(scope).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex) when (retryable && (RpcInvoker.IsTransient(ex) || ex is DfsCommitOutcomeUnknownException)
+                                   && !Runtime.KillToken.IsCancellationRequested)
+        {
+            return false;
+        }
 #pragma warning disable CA1031 // Cleanup is best effort: the session also closes with its client session.
-            catch (Exception ex)
+        catch (Exception ex)
 #pragma warning restore CA1031
-            {
-                Runtime.Emit("staging.close-failed", describe(ex), volume: Name, exception: ex);
-                return;
-            }
+        {
+            Runtime.Emit("staging.close-failed", describe(ex), volume: Name, exception: ex);
+            return true;
         }
     }
 
@@ -1031,11 +1055,16 @@ internal sealed class VolumeContext : IRpcRouter
             if (result.Status != WireOutcomeStatus.Committed || result.ResultFrame.IsEmpty
                 || MessageCodec.Decode(result.ResultFrame.Span) is not CreateStagingResultMessage created)
             {
+                if (result.Status is WireOutcomeStatus.Committed or WireOutcomeStatus.Aborted)
+                    CurrentSession?.Complete(operation); // definite and nothing to close: the id need not stay unacknowledged
                 return;
             }
 
             await MutateAsync<CreateStagingResultMessage>(scope, "CreateStaging(close)", null,
                 header => CreateStagingMessage.CloseRequest(header, created.Staging), rebindable: false).ConfigureAwait(false);
+
+            // Acknowledged only once the session it created is closed (a retried cleanup queries the id again).
+            CurrentSession?.Complete(operation);
         }, ex => $"Closing the staging session of the unresolved request {operation} failed ({ex.GetType().Name}); it closes with its session.");
     }
 

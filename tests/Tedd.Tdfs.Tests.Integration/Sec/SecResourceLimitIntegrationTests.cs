@@ -1,20 +1,8 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Globalization;
-using System.Security.Cryptography;
-using System.Security.Cryptography.X509Certificates;
-using System.Text;
 using Tedd.Tdfs.Protocol;
-using Tedd.Tdfs.Server;
-using Tedd.Tdfs.Storage;
 using Tedd.Tdfs.Testing;
 
 namespace Tedd.Tdfs.Tests.Integration.Sec;
-
-/// <summary>
-/// SEC — authentication, authorization and confidentiality (FSD §§4, 7, 12, 14). Integration level: real QUIC transport,
-/// real disk storage, server-side enforcement exercised both through the SDK and through <see cref="RawProtocolClient"/>.
-/// </summary>
 
 /// <summary>The collection of SEC-014: it runs alone (allocation is measured process-wide).</summary>
 [CollectionDefinition(nameof(SecResourceLimitCollection), DisableParallelization = true)]
