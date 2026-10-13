@@ -33,16 +33,6 @@ internal sealed class HarnessLinkPolicy : ILinkPolicy
     /// <summary>Most frame bytes the log retains for predicate filters and operation ids (older frames are released first).</summary>
     private const long MaxRetainedFrameBytes = 256L << 20;
 
-    /// <summary>
-    /// Frames at least this large (object payloads, snapshot chunks) are retained under <see cref="MaxRetainedBulkFrameBytes"/>
-    /// instead: the log is part of the test process, and keeping hundreds of MiB of recent bulk data alive would make the
-    /// process's live memory follow the data moved rather than the product's buffers (PERF-003).
-    /// </summary>
-    private const int BulkFrameBytes = 16 << 10;
-
-    /// <summary>Most bytes of bulk frames the log retains (older bulk frames are released first).</summary>
-    private const long MaxRetainedBulkFrameBytes = 16L << 20;
-
     /// <summary>Most outstanding requests remembered per direction for reply attribution.</summary>
     private const int MaxOutstandingPerLink = 4096;
 
@@ -58,12 +48,10 @@ internal sealed class HarnessLinkPolicy : ILinkPolicy
     private readonly List<MessageRule> _rules = [];
     private readonly List<LogEntry> _log = [];
     private readonly Queue<LogEntry> _retained = new();
-    private readonly Queue<LogEntry> _retainedBulk = new();
     private readonly Dictionary<(string Requester, string Responder), LinkedList<Outstanding>> _outstanding = [];
     private LinkMesh _mesh = LinkMesh.Full;
     private long _sequence;
     private long _retainedBytes;
-    private long _retainedBulkBytes;
     private bool _applyLatency;
 
     public HarnessLinkPolicy(ClusterRuntime runtime)
@@ -356,8 +344,6 @@ internal sealed class HarnessLinkPolicy : ILinkPolicy
             _log.Clear();
             _retained.Clear();
             _retainedBytes = 0;
-            _retainedBulk.Clear();
-            _retainedBulkBytes = 0;
         }
     }
 
@@ -410,23 +396,15 @@ internal sealed class HarnessLinkPolicy : ILinkPolicy
         _log.Add(entry);
         if (entry.Frame is null)
             return;
-        if (entry.Frame.Length >= BulkFrameBytes)
-            Retain(_retainedBulk, ref _retainedBulkBytes, MaxRetainedBulkFrameBytes, entry);
-        else
-            Retain(_retained, ref _retainedBytes, MaxRetainedFrameBytes, entry);
-
-        static void Retain(Queue<LogEntry> queue, ref long retainedBytes, long budget, LogEntry entry)
+        _retained.Enqueue(entry);
+        _retainedBytes += entry.Frame.Length;
+        while (_retainedBytes > MaxRetainedFrameBytes && _retained.Count > 0)
         {
-            queue.Enqueue(entry);
-            retainedBytes += entry.Frame!.Length;
-            while (retainedBytes > budget && queue.Count > 0)
+            LogEntry oldest = _retained.Dequeue();
+            if (oldest.Frame is { } released)
             {
-                LogEntry oldest = queue.Dequeue();
-                if (oldest.Frame is { } released)
-                {
-                    retainedBytes -= released.Length;
-                    oldest.ReleaseFrame();
-                }
+                _retainedBytes -= released.Length;
+                oldest.ReleaseFrame();
             }
         }
     }
