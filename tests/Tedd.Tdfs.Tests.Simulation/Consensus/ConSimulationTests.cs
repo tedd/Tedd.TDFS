@@ -506,6 +506,9 @@ public sealed class ConSimulationTests
                 cluster.Faults.Arm(new FaultMatch(FaultSites.RpcReplySend, Operation: DfsOperationKind.WriteAll, Count: 1000), FaultAction.DropReply()),
                 cluster.Faults.Arm(new FaultMatch(FaultSites.RpcReplySend, Operation: DfsOperationKind.CreateDirectory, Count: 1000), FaultAction.DropReply()),
             ];
+
+            // The SDK's own outcome resolution must not deliver a decision either (premise: no reply reaches the client).
+            FaultArm dropQueries = ArmDropOutcomeQueryReplies(cluster);
             Exception? e1 = await CaptureAsync(() => lostVolume.Files.AppendAllBytesAsync("/log2", suffix2, WithId(kAppend), Ct));
             Exception? e2 = await CaptureAsync(() => lostVolume.Directories.CreateDirectoryAsync("/dd", WithId(kDir), Ct));
             Exception? e3 = await CaptureAsync(() => lostVolume.Files.WriteAllBytesAsync("/w", wBytes, WithId(kWrite), Ct));
@@ -520,6 +523,7 @@ public sealed class ConSimulationTests
             // change below, which would legitimately turn the retries into OperationExpired.
             foreach (FaultArm arm in dropReplies)
                 arm.Disarm();
+            dropQueries.Disarm();
 
             var before = new Dictionary<DfsOperationId, DfsOperationOutcome>();
             foreach (DfsOperationId id in new[] { kAppend, kWrite, kDir })
@@ -1541,9 +1545,11 @@ public sealed class ConSimulationTests
             DfsOperationId lostReply = await volume.NewOperationIdAsync(Ct);
             byte[] dedupSuffix = TestData.Bytes(0x1206, 250);
             FaultArm dropReply = cluster.Faults.Arm(new FaultMatch(FaultSites.RpcReplySend, Operation: DfsOperationKind.Append, Count: 1000), FaultAction.DropReply());
+            FaultArm dropQueries = ArmDropOutcomeQueryReplies(cluster);
             Exception? lostError = await CaptureAsync(() => volume.Files.AppendAllBytesAsync("/dedup-log", dedupSuffix, WithId(lostReply), Ct));
             cluster.Faults.AssertReached(dropReply);
             dropReply.Disarm();
+            dropQueries.Disarm();
             AssertUnknownOutcome(lostError, lostReply, "an executed append whose every reply was lost");
             DfsOperationOutcome lostOutcomeBefore = await volume.QueryOperationAsync(lostReply, resolve: false, Ct);
             Assert.Equal(DfsOutcomeStatus.Committed, lostOutcomeBefore.Status);
@@ -2533,9 +2539,11 @@ public sealed class ConSimulationTests
             DfsOperationId lostReply = await volume.NewOperationIdAsync(Ct);
             byte[] lostBytes = TestData.Bytes(0x200B, 5000);
             FaultArm drop = cluster.Faults.Arm(new FaultMatch(FaultSites.RpcReplySend, Operation: DfsOperationKind.WriteAll, Count: 1000), FaultAction.DropReply());
+            FaultArm dropQueries = ArmDropOutcomeQueryReplies(cluster);
             Exception? lostError = await CaptureAsync(() => volume.Files.WriteAllBytesAsync("/lost-reply", lostBytes, WithId(lostReply), Ct));
             cluster.Faults.AssertReached(drop);
             drop.Disarm();
+            dropQueries.Disarm();
             AssertUnknownOutcome(lostError, lostReply, "an executed WriteAll whose every reply was lost");
             DfsOperationOutcome lostOutcome = await volume.QueryOperationAsync(lostReply, resolve: false, Ct);
             Assert.Equal(DfsOutcomeStatus.Committed, lostOutcome.Status);
