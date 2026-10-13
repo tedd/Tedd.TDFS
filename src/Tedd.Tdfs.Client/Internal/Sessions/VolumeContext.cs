@@ -147,6 +147,9 @@ internal sealed class VolumeContext : IRpcRouter
     }
 
     /// <inheritdoc />
+    public bool RoutesToGroupLeader => !Runtime.IsBackupHost;
+
+    /// <inheritdoc />
     public void OnAnswered(string endpoint)
     {
         lock (_sync)

@@ -314,11 +314,12 @@ internal sealed class RpcInvoker
 
     /// <summary>
     /// The availability failure of a request that ran out of attempts or time (FSD Â§13: quorum unavailability is reported as
-    /// a distinct typed availability error, a deadline never as a bare <see cref="TimeoutException"/>). When a node of the
-    /// group answered without being its leader (none known, or a hinted leader that could then not be reached) or no
-    /// leader could be found at all, the last availability failure, whichever node it came from, is reported as
-    /// <see cref="DfsQuorumUnavailableException"/>: no leader with a quorum could be reached. Caller cancellation and
-    /// shutdown keep their own classification.
+    /// a distinct typed availability error, a deadline never as a bare <see cref="TimeoutException"/>). A request served by
+    /// a group leader (control or volume) that ran out of attempts or time without a leader answering it, or any request
+    /// for which a node answered without being the leader, could not reach a leader with a quorum: the last availability
+    /// failure, whichever node it came from (a leader that cannot commit without its quorum does not answer before the
+    /// deadline either), is reported as <see cref="DfsQuorumUnavailableException"/>. Caller cancellation and shutdown keep
+    /// their own classification.
     /// </summary>
     private static Exception? ClassifyExhausted(RpcRequest request, OperationScope scope, Exception? last, bool leaderless)
     {
@@ -328,7 +329,7 @@ internal sealed class RpcInvoker
             || last is DfsUnavailableException { ErrorCode: DfsErrorCode.NotLeader or DfsErrorCode.Unavailable or DfsErrorCode.NodeUnavailable or DfsErrorCode.Timeout };
         if (!availability || last is DfsPlacementUnavailableException or DfsCapacityException or DfsBackupNotReachedException)
             return last;
-        if (leaderless)
+        if (leaderless || request.Router.RoutesToGroupLeader)
         {
             return new DfsQuorumUnavailableException(
                 $"{request.Name}: no leader with a quorum of its group could be reached{(last is null ? "." : $" ({last.Message})")}", last);

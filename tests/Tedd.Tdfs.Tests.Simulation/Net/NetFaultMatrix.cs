@@ -307,14 +307,21 @@ internal static class NetFaultMatrix
 
     /// <summary>
     /// Restarts a node; when an armed fault crashes it during that very restart (recovery boundaries F16), the node is
-    /// restarted once more (the fault fires once), so the driver continues with a running node.
+    /// restarted once more (the fault fires once), so the driver continues with a running node. An injected I/O error
+    /// during recovery (journal replay, checkpoint install) must make the start fail cleanly: the node never serves with
+    /// partially recovered state (a durable record it could not read is never skipped, ARCHITECTURE §4) and is not running
+    /// afterwards; the next restart, without the fault, recovers it.
     /// </summary>
     private static async Task RestartToleratingInjectedCrashAsync(TestNode node)
     {
         Exception? error = await CaptureAsync(() => node.RestartAsync());
         if (error is null && node.State != TestNodeState.Crashed)
             return;
-        Assert.True(node.State == TestNodeState.Crashed, $"{node.Name}: restart failed without an injected crash: {error}");
+        bool injectedIoError = error is IOException { HResult: StorageErrors.IoDeviceHResult };
+        if (injectedIoError)
+            Assert.True(node.State == TestNodeState.Stopped, $"{node.Name}: a start that failed with an injected I/O error must leave the node down, not {node.State}");
+        else
+            Assert.True(node.State == TestNodeState.Crashed, $"{node.Name}: restart failed without an injected crash or I/O error: {error}");
         await node.RestartAsync();
     }
 

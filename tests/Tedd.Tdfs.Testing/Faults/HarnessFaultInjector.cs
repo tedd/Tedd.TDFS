@@ -91,7 +91,37 @@ internal sealed class HarnessFaultInjector : IFaultInjector
 
         if (triggered is null)
             return default;
-        return new ValueTask(RunActionsAsync(triggered, context, target, ct));
+        Task run = RunActionsAsync(triggered, context, target, ct);
+        return new ValueTask(run.IsCompleted ? run : CompleteOutsideContext(run));
+    }
+
+    /// <summary>
+    /// A fault action that finishes later (a delay, a block) finishes inside some simulated context; completing the task the
+    /// product awaits right there would queue the continuations of SDK code awaiting with <c>ConfigureAwait(false)</c> to the
+    /// thread pool, an uncontrolled dependency of a deterministic run (HAR-002). The returned relay is completed through
+    /// <see cref="ClusterRuntime.Complete"/> (without a synchronization context) instead; node code still resumes on its loop.
+    /// </summary>
+    private Task CompleteOutsideContext(Task run)
+    {
+        TaskCompletionSource relay = _faults.Runtime.CreateCompletion();
+        ClusterRuntime runtime = _faults.Runtime;
+        run.ContinueWith(finished => runtime.Complete(() =>
+        {
+            try
+            {
+                finished.GetAwaiter().GetResult();
+                relay.TrySetResult();
+            }
+            catch (OperationCanceledException canceled)
+            {
+                relay.TrySetCanceled(canceled.CancellationToken);
+            }
+            catch (Exception failure)
+            {
+                relay.TrySetException(failure);
+            }
+        }), CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        return relay.Task;
     }
 
     private Exception CrashedException(IFaultTarget target, in FaultContext context)
@@ -175,8 +205,14 @@ internal sealed class HarnessFaultInjector : IFaultInjector
             case FaultAction.DelayFault delay:
                 if (delay.Duration > TimeSpan.Zero)
                 {
+                    // The delay's completion must not run continuations under a synchronization context: SDK code awaiting
+                    // with ConfigureAwait(false) (client sites) would otherwise be resumed on the thread pool, an uncontrolled
+                    // dependency of a deterministic run (HAR-002). The timer completes the wait through Runtime.Complete.
                     TimeProvider clock = target?.Clock ?? _faults.Runtime.Time;
-                    await Task.Delay(delay.Duration, clock, CancellationToken.None);
+                    TaskCompletionSource elapsed = _faults.Runtime.CreateCompletion();
+                    using ITimer timer = clock.CreateTimer(static state => ((Action)state!)(),
+                        (Action)(() => _faults.Runtime.Complete(() => elapsed.TrySetResult())), delay.Duration, Timeout.InfiniteTimeSpan);
+                    await elapsed.Task;
                 }
 
                 return;

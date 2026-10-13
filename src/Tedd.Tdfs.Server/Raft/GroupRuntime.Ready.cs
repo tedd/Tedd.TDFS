@@ -134,7 +134,15 @@ internal sealed partial class GroupRuntime
             if (entry.Term != p.Term)
                 continue;
             p.LocalAppendReported = true;
-            await _s.HitAsync(FaultStage.F10, FaultSites.RaftAfterLocalAppend, VolumeName, p.Context.Operation, p.Context.OperationId, p.Context.Path);
+            try
+            {
+                await _s.HitAsync(FaultStage.F10, FaultSites.RaftAfterLocalAppend, VolumeName, p.Context.Operation, p.Context.OperationId, p.Context.Path);
+            }
+            catch (FaultReplyDroppedException)
+            {
+                p.DropReply = true; // the request executes; only its reply is lost
+            }
+
             if (_closed)
                 return;
         }
@@ -179,8 +187,18 @@ internal sealed partial class GroupRuntime
             if (_closed)
                 break;
             ProposalContext context = DescribeEntry(entry);
-            await _s.HitAsync(FaultStage.F11, FaultSites.RaftAfterCommitBeforeApply, VolumeName, context.Operation, context.OperationId, context.Path,
-                detail: entry.Index.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            try
+            {
+                await _s.HitAsync(FaultStage.F11, FaultSites.RaftAfterCommitBeforeApply, VolumeName, context.Operation, context.OperationId, context.Path,
+                    detail: entry.Index.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+            catch (FaultReplyDroppedException)
+            {
+                // The entry is applied regardless; a local proposer loses its reply (a follower has none to lose).
+                if (_proposals.TryGetValue((entry.Index, entry.Term), out PendingProposal? dropped))
+                    dropped.DropReply = true;
+            }
+
             if (_closed)
                 break;
 
@@ -273,7 +291,12 @@ internal sealed partial class GroupRuntime
                 continue;
             }
 
-            if (p.Term == entry.Term)
+            if (p.Term == entry.Term && p.DropReply)
+            {
+                var dropped = new FaultReplyDroppedException($"The reply to the proposal at index {p.Index} of group '{DisplayName}' was dropped by an injected fault.");
+                Defer(() => p.Completion.TrySetException(dropped));
+            }
+            else if (p.Term == entry.Term)
             {
                 Defer(() => p.Completion.TrySetResult(outcome));
             }
