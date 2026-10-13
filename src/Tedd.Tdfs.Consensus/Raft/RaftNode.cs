@@ -80,6 +80,10 @@ public sealed partial class RaftNode
     // Follower snapshot assembly.
     private IncomingSnapshot? _incoming;
 
+    // Rebuild after the loss of durable state: no votes and no campaigns until caught up with a leader's commit index.
+    private bool _rebuilding;
+    private ulong _rebuildTarget;
+
     // Ready bookkeeping.
     private List<RaftMessage> _msgs = [];
     private RaftHardState _prevHardState;
@@ -123,6 +127,7 @@ public sealed partial class RaftNode
         _random = random;
         _self = config.Self;
         _reachableQuorum = options.Mutations.QuorumFromReachableNodes;
+        _rebuilding = options.Rebuilding;
 
         RaftSnapshotMeta snapshot = log.Snapshot ?? throw new ArgumentException("The log view has no snapshot metadata.", nameof(log));
         if (log.FirstIndex != snapshot.Index + 1)
@@ -221,6 +226,12 @@ public sealed partial class RaftNode
     public NodeId? LeadTransferee => _leadTransferee;
 
     /// <summary>
+    /// True while a node started with <see cref="RaftNodeOptions.Rebuilding"/> has not yet caught up with the commit index
+    /// announced by the first leader that replicated to it (it rejects every vote request and never campaigns meanwhile).
+    /// </summary>
+    public bool IsRebuilding => _rebuilding;
+
+    /// <summary>
     /// True when this node is leader and cannot accept a configuration change yet: a change has not been committed, or the
     /// leader has not yet committed an entry of its own term (its election no-op).
     /// </summary>
@@ -239,7 +250,21 @@ public sealed partial class RaftNode
     /// (Raft dissertation §4.2.2): otherwise a leader that removed itself and lost its quorum before the removal committed
     /// could leave the remaining voters unable to elect anyone (it holds the newest log but would never campaign).
     /// </summary>
-    private bool Promotable => _conf.IsVoter(_self) || _confBase.IsVoter(_self);
+    private bool Promotable => !_rebuilding && (_conf.IsVoter(_self) || _confBase.IsVoter(_self));
+
+    /// <summary>
+    /// Tracks a rebuilding node's catch-up: the first leader append sets the target (that leader's commit index, which covers
+    /// every entry committed before the restart); the node votes again once its own commit index reaches it.
+    /// </summary>
+    private void NoteRebuildProgress(ulong leaderCommit)
+    {
+        if (!_rebuilding)
+            return;
+        if (_rebuildTarget == 0)
+            _rebuildTarget = leaderCommit;
+        if (_rebuildTarget > 0 && _log.Committed >= _rebuildTarget)
+            _rebuilding = false;
+    }
 
     /// <summary>Advances the logical clock by one tick (elections and heartbeats).</summary>
     public void Tick()

@@ -319,6 +319,14 @@ internal sealed partial class GroupRuntime
 
     private void AfterAdvance(RaftReady ready)
     {
+        if (_rebuilding && !_node.IsRebuilding)
+        {
+            _rebuilding = false;
+            string marker = StoragePath.Combine(Directory, RebuildMarkerFile);
+            _s.Jobs.Run("rebuild-complete", async () => await AtomicFile.DeleteAsync(_s.Env.Medium, marker, CancellationToken.None));
+            _s.Info("raft", NodeServices.Inv($"{Name}: caught up after rebuilding (applied {_appliedIndex}); voting again."));
+        }
+
         RaftRole role = _node.Role;
         NodeId? leader = _node.Leader;
         ulong term = _node.Term;

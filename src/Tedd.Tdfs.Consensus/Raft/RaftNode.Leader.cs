@@ -187,6 +187,18 @@ public sealed partial class RaftNode
             ulong hint = m.RejectHint;
             if (m.RejectHintTerm > 0)
                 hint = _log.FindConflictByTerm(m.RejectHint, m.RejectHintTerm).Index;
+            if (hint < pr.Match && pr.State != RaftProgressState.Snapshot)
+            {
+                // The follower no longer has entries it acknowledged: it lost its durable state (an empty-disk replacement
+                // keeping its identity). Probe again from what it has. Lowering the match is safe: the commit index never
+                // moves backwards and later commits only count what the follower acknowledges again. A delayed stale
+                // rejection of a healthy follower costs one extra probe round.
+                pr.Match = hint;
+                pr.BecomeProbe();
+                SendAppend(pr, sendIfEmpty: true);
+                return;
+            }
+
             if (pr.MaybeDecrTo(m.MatchIndex, hint))
             {
                 if (pr.State == RaftProgressState.Replicate)
