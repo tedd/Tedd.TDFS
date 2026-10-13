@@ -508,7 +508,11 @@ public sealed partial class DfsFileClient
             DfsStoragePolicy policy = known
                 ? await PolicyForAsync(path, options.StoragePolicy, entry, info, scope).ConfigureAwait(false)
                 : ContentLayout.ResolvePolicy(entry, options.StoragePolicy) ?? entry.DefaultPolicy;
-            bool inline = known && !inlineRejected && current + bytes.Length <= threshold && ContentLayout.InlinePermitted(entry, policy, LabelsOf);
+            // An application-supplied operation id may be retried by a later call (OUT-002, OUT-006), when the file has grown
+            // by this very append: its payload identity must not depend on the current length, so such an append is always
+            // uploaded as objects (the leader still stores the result inline when it fits).
+            bool inline = known && !inlineRejected && options.OperationId is null && current + bytes.Length <= threshold
+                && ContentLayout.InlinePermitted(entry, policy, LabelsOf);
             Payload payload = inline
                 ? Payload.Inline(bytes)
                 : await UploadAsync(bytes, 0, entry, policy, scope).ConfigureAwait(false);
