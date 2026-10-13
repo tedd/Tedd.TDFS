@@ -98,8 +98,22 @@ internal sealed partial class VolumeService
         string principal = context.Principal ?? string.Empty;
         if (GrantsOf(principal) == DfsPermissions.None)
             throw new UnauthorizedAccessException($"Principal '{principal}' has no grant on volume '{Name}'.");
-        await ReadBarrierAsync(ct);
         DfsOperationId target = request.Target;
+        if (!request.Resolve && !request.IsTransaction && _inFlight.TryGetValue(target, out InFlight? inFlight))
+        {
+            // An operation in flight on this node is answered from local knowledge, without a read barrier (which a stalled
+            // log could never pass): applied here means decided (committed outcomes and recorded refusals are final),
+            // otherwise it is Pending — never NotFound (OUT-014).
+            if (!string.Equals(inFlight.Principal, principal, StringComparison.Ordinal))
+                throw new DfsOperationIdMismatchException($"Operation {target} belongs to another principal.");
+            QueryOperationResultMessage local = VolumeStateMachine.QueryOutcome(State, target, principal, out _, out _);
+            if (local.Status is WireOutcomeStatus.Committed or WireOutcomeStatus.Aborted)
+                return local;
+            return new QueryOperationResultMessage(target, WireOutcomeStatus.Pending, CommitToken.None, DfsErrorCode.None, "The operation is in flight.",
+                inFlight.Operation, ReadOnlyMemory<byte>.Empty);
+        }
+
+        await ReadBarrierAsync(ct);
         if (_inFlight.TryGetValue(target, out InFlight? running))
         {
             if (!string.Equals(running.Principal, principal, StringComparison.Ordinal))

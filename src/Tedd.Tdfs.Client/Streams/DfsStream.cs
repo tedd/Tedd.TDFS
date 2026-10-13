@@ -230,6 +230,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
                 return ValueTask.FromResult(0);
             }
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // A token cancelled before anything started is reported through the returned task (Stream convention).
+            gate.Dispose();
+            return ValueTask.FromCanceled<int>(cancellationToken);
+        }
         catch
         {
             gate.Dispose();
@@ -519,6 +525,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
             if (offset > maximum - owned.Length)
                 throw new DfsLimitExceededException(nameof(DfsVolumeLimits.MaxFileLength), maximum, offset + owned.Length);
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // A token cancelled before anything started is reported through the returned task (Stream convention).
+            gate.Dispose();
+            return Task.FromCanceled(ct);
+        }
         catch
         {
             gate.Dispose();
@@ -635,6 +647,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
             ThrowIfFaulted();
             ct.ThrowIfCancellationRequested();
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // A token cancelled before anything started is reported through the returned task (Stream convention).
+            gate.Dispose();
+            return Task.FromCanceled(ct);
+        }
         catch
         {
             gate.Dispose();
@@ -688,6 +706,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
                 return ValueTask.FromResult(length);
             }
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // A token cancelled before anything started is reported through the returned task (Stream convention).
+            gate.Dispose();
+            return ValueTask.FromCanceled<long>(ct);
+        }
         catch
         {
             gate.Dispose();
@@ -724,6 +748,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
         {
             ThrowIfFaulted();
             ct.ThrowIfCancellationRequested();
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // A token cancelled before anything started is reported through the returned task (Stream convention).
+            gate.Dispose();
+            return ValueTask.FromCanceled<DfsFileInfo>(ct);
         }
         catch
         {
@@ -800,6 +830,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
                 return Task.CompletedTask;
             }
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // A token cancelled before anything started is reported through the returned task (Stream convention).
+            gate.Dispose();
+            return Task.FromCanceled(cancellationToken);
+        }
         catch
         {
             gate.Dispose();
@@ -830,6 +866,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
             Validation.MutationOptions(options, nameof(options));
             ThrowIfFaulted();
             ct.ThrowIfCancellationRequested();
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // A token cancelled before anything started is reported through the returned task (Stream convention).
+            gate.Dispose();
+            return Task.FromCanceled<CommitToken>(ct);
         }
         catch
         {
@@ -1130,6 +1172,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
                 throw new NotSupportedException("The destination stream is not writable.");
             ThrowIfFaulted();
             cancellationToken.ThrowIfCancellationRequested();
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // A token cancelled before anything started is reported through the returned task (Stream convention).
+            gate.Dispose();
+            return Task.FromCanceled(cancellationToken);
         }
         catch
         {

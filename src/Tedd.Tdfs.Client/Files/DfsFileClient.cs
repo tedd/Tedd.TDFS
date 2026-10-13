@@ -118,7 +118,7 @@ public sealed partial class DfsFileClient
             bound = await Context.MutateBoundAsync<OpenHandleResultMessage>(scope, "OpenHandle", options.OperationId,
                 header => new OpenHandleMessage(header, path, options.Mode, options.Access, options.Share, options.Options, pinned, writeThrough,
                     WirePolicy(options.StoragePolicy)),
-                path, TxId, binding: Bound).ConfigureAwait(false);
+                path, TxId, binding: Bound, grantsLease: true).ConfigureAwait(false);
         }
         catch (DfsCommitOutcomeUnknownException unknown) when (options.Mode == FileMode.Open && (options.Access & FileAccess.Write) == 0)
         {
@@ -439,9 +439,24 @@ public sealed partial class DfsFileClient
     private async Task<CommitToken> WriteAllCoreAsync(string path, ReadOnlyMemory<byte> bytes, DfsMutationOptions options, OperationScope scope)
     {
         VolumeEntry entry = await EntryAsync(scope).ConfigureAwait(false);
-        DfsStoragePolicy policy = await PolicyForAsync(path, options.StoragePolicy, entry, null, scope).ConfigureAwait(false);
         int threshold = ContentLayout.InlineThreshold(entry, Runtime.Capabilities);
-        bool inline = bytes.Length <= threshold && ContentLayout.InlinePermitted(entry, policy, LabelsOf);
+
+        // Content that every policy the file could have stores inline needs no lookup of the file's own policy (a
+        // linearizable read): the request is sent straight away, so a retry of a persisted id reaches the leader even
+        // while its log is stalled (OUT-002). The leader applies the file's own policy either way.
+        bool inline;
+        DfsStoragePolicy policy;
+        if (bytes.Length <= threshold && options.StoragePolicy is null && EveryPolicyPermitsInline(entry))
+        {
+            policy = entry.DefaultPolicy;
+            inline = true;
+        }
+        else
+        {
+            policy = await PolicyForAsync(path, options.StoragePolicy, entry, null, scope).ConfigureAwait(false);
+            inline = bytes.Length <= threshold && ContentLayout.InlinePermitted(entry, policy, LabelsOf);
+        }
+
         long length = bytes.Length;
         for (int attempt = 0; ; attempt++)
         {
@@ -625,6 +640,11 @@ public sealed partial class DfsFileClient
         && Context.Entry?.NamedPolicies.ContainsKey(name!) != true ? null : name;
 
     private DfsTopologyLabels? LabelsOf(NodeId node) => Runtime.Map.Node(node)?.Labels;
+
+    /// <summary>True when the volume's metadata group satisfies the default and every named policy for inline storage.</summary>
+    private bool EveryPolicyPermitsInline(VolumeEntry entry) =>
+        ContentLayout.InlinePermitted(entry, entry.DefaultPolicy, LabelsOf)
+        && entry.NamedPolicies.Values.All(policy => ContentLayout.InlinePermitted(entry, policy, LabelsOf));
 
     // ---- Namespace operations ---------------------------------------------------------------------------------
 

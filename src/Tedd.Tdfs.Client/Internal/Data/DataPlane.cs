@@ -79,6 +79,14 @@ internal sealed class DataPlane
         var failures = new List<Exception>();
         bool renewed = false;
         long? satisfiedAt = null;
+
+        // A target slower than one attempt timeout gets fallback targets started beside it, but it is never abandoned: its
+        // durable acknowledgement still counts when it arrives before the operation deadline (a slow disk is not a failed
+        // one, PUB-004). Each PutObject may therefore run until the deadline.
+        TimeSpan slowAfter = _runtime.Rpc.DefaultAttemptTimeout(scope);
+        long uploadStart = _runtime.Time.GetTimestamp();
+        long lastStart = uploadStart;
+        bool fallbacksExhausted = false;
         using var cancel = CancellationTokenSource.CreateLinkedTokenSource(scope.Token);
         try
         {
@@ -104,13 +112,28 @@ internal sealed class DataPlane
                     if (satisfied)
                     {
                         satisfiedAt ??= _runtime.Time.GetTimestamp();
-                        TimeSpan grace = Grace(scope, satisfiedAt.Value);
+                        TimeSpan grace = Grace(scope, uploadStart, satisfiedAt.Value);
                         if (grace <= TimeSpan.Zero || !await Waits.CompletesWithinAsync(any, grace, _runtime.Time, scope.Token).ConfigureAwait(false))
                             break;
                     }
-                    else
+                    else if (fallbacksExhausted)
                     {
                         await Waits.WaitAsync(any, scope.Token).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        TimeSpan wait = slowAfter - _runtime.Time.GetElapsedTime(lastStart);
+                        if (wait <= TimeSpan.Zero || !await Waits.CompletesWithinAsync(any, wait, _runtime.Time, scope.Token).ConfigureAwait(false))
+                        {
+                            // The pending targets are slow: add fallbacks for the missing copies and keep waiting for all.
+                            fallbacksExhausted = !StartFallbacks(Math.Max(1, requiredCopies - copies));
+                            lastStart = _runtime.Time.GetTimestamp();
+
+                            // Negative control (MUT-014): the timeout of the slow targets "relaxes" the policy below.
+                            if (fallbacksExhausted && _runtime.Mutations.RelaxPolicyOnTimeout && receipts.Count > 0)
+                                break;
+                            continue;
+                        }
                     }
                 }
                 catch (OperationCanceledException) when (scope.Token.IsCancellationRequested)
@@ -118,9 +141,12 @@ internal sealed class DataPlane
                     if (satisfied)
                         break;
 
-                    // Deadline, caller or shutdown: nothing was published; report what kept the copies from completing.
-                    throw scope.NotTransmittedFailure(failures.LastOrDefault()
-                        ?? new TimeoutException($"Object {obj} was not acknowledged by enough storage nodes before the deadline."));
+                    // Deadline, caller or shutdown: nothing was published. A caller's cancellation or the client's disposal
+                    // reports itself; at the deadline the policy could not be met (typed placement unavailability).
+                    if (scope.IsAbortedByCaller)
+                        throw scope.NotTransmittedFailure(failures.LastOrDefault());
+                    failures.Add(new TimeoutException($"Object {obj} was not acknowledged by enough storage nodes before the deadline."));
+                    break;
                 }
 
                 Task<IWireMessage> finished = any.Result;
@@ -157,7 +183,10 @@ internal sealed class DataPlane
                 }
                 catch (OperationCanceledException) when (scope.Token.IsCancellationRequested)
                 {
-                    throw scope.NotTransmittedFailure(failures.LastOrDefault());
+                    if (scope.IsAbortedByCaller)
+                        throw scope.NotTransmittedFailure(failures.LastOrDefault());
+                    failures.Add(new TimeoutException($"Object {obj} was not acknowledged by enough storage nodes before the deadline."));
+                    break;
                 }
                 catch (Exception ex) when (RpcInvoker.IsTransient(ex) || ex is DfsProtocolException or DfsClusterIdentityException or OperationCanceledException)
                 {
@@ -191,7 +220,7 @@ internal sealed class DataPlane
 
         if (achievedCopies < requiredCopies || achievedZones < requiredZones)
         {
-            if (scope.Token.IsCancellationRequested)
+            if (scope.IsAbortedByCaller)
                 throw scope.NotTransmittedFailure(failures.LastOrDefault());
             Exception? inner = failures.Count switch { 0 => null, 1 => failures[0], _ => new AggregateException(failures) };
             var placement = new DfsPlacementUnavailableException(
@@ -212,6 +241,7 @@ internal sealed class DataPlane
         void Restart(PlacementNode node)
         {
             pending.Add((SendPutAsync(scope, volume, lease, node, obj, data, checksum, chunkIndex, cancel.Token), node));
+            lastStart = _runtime.Time.GetTimestamp();
         }
 
         bool StartFallbacks(int count)
@@ -234,10 +264,11 @@ internal sealed class DataPlane
         return _runtime.Mutations.CountSameZoneTwice ? (copies, copies) : (copies, zones);
     }
 
-    private TimeSpan Grace(OperationScope scope, long satisfiedAt)
+    private TimeSpan Grace(OperationScope scope, long uploadStart, long satisfiedAt)
     {
-        // Remaining targets get as long again as the acknowledgement took (at least a short floor), within the deadline.
-        TimeSpan sinceStart = scope.Elapsed;
+        // Remaining targets get as long again as this object's acknowledgement took (at least a short floor), within the
+        // deadline. Measured per object: a slow earlier object of the same operation must not stretch every later one.
+        TimeSpan sinceStart = _runtime.Time.GetElapsedTime(uploadStart, satisfiedAt);
         TimeSpan waited = _runtime.Time.GetElapsedTime(satisfiedAt);
         TimeSpan grace = (sinceStart > MinimumGrace ? sinceStart : MinimumGrace) - waited;
         TimeSpan remaining = scope.Remaining;
@@ -280,7 +311,7 @@ internal sealed class DataPlane
             ?? throw new DfsUnavailableException(DfsErrorCode.NodeUnavailable, $"Node {node.Name} has no known endpoint.");
         var message = new PutObjectMessage(lease.Capability, volume.VolumeId, lease.Id, obj, checksum, data.Length, ObjectEncodings.Plain,
             lease.PlacementEpoch, data);
-        return await _runtime.Rpc.SendOnceAsync(endpoint, message, scope, _runtime.Rpc.DefaultAttemptTimeout(scope), obj: obj, occurrence: chunkIndex,
+        return await _runtime.Rpc.SendOnceAsync(endpoint, message, scope, ClientRuntime.Positive(scope.Remaining), obj: obj, occurrence: chunkIndex,
             token: token).ConfigureAwait(false);
     }
 
