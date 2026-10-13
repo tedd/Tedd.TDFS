@@ -90,7 +90,9 @@ internal static class OpenHelpers
         Task first = await Task.WhenAny(task, delay);
         if (first != task)
             return new Bounded<T>(false, default, null);
-        await cts.CancelAsync();
+        // Cancel synchronously: CancelAsync runs the delay's cancellation callback on the thread pool, an uncontrolled
+        // dependency of a deterministic run (HAR-002).
+        cts.Cancel();
         try
         {
             return new Bounded<T>(true, await task, null);

@@ -147,6 +147,8 @@ internal sealed partial class VolumeService
         // commit request's operation id.
         if (reply is ErrorReplyMessage { TransactionId: null } refused)
             reply = refused with { TransactionId = new DfsTransactionId(id) };
+        if (reply is ErrorReplyMessage { Code: DfsErrorCode.TransactionConflict })
+            _s.Metrics.TransactionConflict();
         return reply;
     }
 

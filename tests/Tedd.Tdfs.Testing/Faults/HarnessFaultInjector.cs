@@ -91,7 +91,59 @@ internal sealed class HarnessFaultInjector : IFaultInjector
 
         if (triggered is null)
             return default;
-        return new ValueTask(RunActionsAsync(triggered, context, target, ct));
+        if (_faults.Runtime.Scheduler is not { } scheduler)
+            return new ValueTask(RunActionsAsync(triggered, context, target, ct));
+
+        // Deterministic mode. SDK code reaches fault points from continuations inlined without a synchronization context;
+        // an action that waits (Block, Pause, Delay, a custom action awaiting a test's completion source) would then resume
+        // wherever its awaited task completes — on the thread pool when that happens inside a simulation work item. Running
+        // the actions on the hitting process's context keeps every resumption on a simulation lane.
+        SynchronizationContext? previous = SynchronizationContext.Current;
+        SynchronizationContext? home = previous is null ? scheduler.CurrentProcess?.Context : null;
+        Task actions;
+        if (home is not null)
+            SynchronizationContext.SetSynchronizationContext(home);
+        try
+        {
+            actions = RunActionsAsync(triggered, context, target, ct);
+        }
+        finally
+        {
+            if (home is not null)
+                SynchronizationContext.SetSynchronizationContext(previous);
+        }
+
+        return new ValueTask(actions.IsCompleted ? actions : CompleteOutsideContext(actions));
+    }
+
+    /// <summary>
+    /// A task that completes like <paramref name="actions"/>, but without a synchronization context installed (deterministic
+    /// mode). The actions resume on the context of the code that hit the fault point (a node loop or a client context), so
+    /// their own task completes inside a simulation work item; SDK code awaits the hit with <c>ConfigureAwait(false)</c>, and
+    /// the runtime would queue that continuation to the thread pool (an uncontrolled dependency, CLAUDE.md) instead of
+    /// inlining it on the simulation thread.
+    /// </summary>
+    private Task CompleteOutsideContext(Task actions)
+    {
+        TaskCompletionSource done = _faults.Runtime.CreateCompletion();
+        ClusterRuntime runtime = _faults.Runtime;
+        actions.ContinueWith(
+            completed => runtime.Complete(() =>
+            {
+                try
+                {
+                    completed.GetAwaiter().GetResult();
+                    done.TrySetResult();
+                }
+#pragma warning disable CA1031 // The exact failure (including an OperationCanceledException) is handed to the awaiting code.
+                catch (Exception ex)
+#pragma warning restore CA1031
+                {
+                    done.TrySetException(ex);
+                }
+            }),
+            CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        return done.Task;
     }
 
     private Exception CrashedException(IFaultTarget target, in FaultContext context)
