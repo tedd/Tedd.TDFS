@@ -5,11 +5,13 @@ namespace Tedd.Tdfs.Testing;
 // Additions for the FMT suite (docs/api-additions/fmt-ops-perf.md): running a live node as a specific software release.
 public sealed partial class TestNode
 {
+    private SoftwareVersionProfile? _softwareVersion;
+
     /// <summary>
     /// The release this node currently runs (or last ran, when it is stopped or crashed). Nodes started by the harness run
     /// <see cref="SoftwareVersionProfile.Current"/>.
     /// </summary>
-    public SoftwareVersionProfile SoftwareVersion => throw Stub.NotYet("TestNode.SoftwareVersion");
+    public SoftwareVersionProfile SoftwareVersion => _softwareVersion ?? SoftwareVersionProfile.Current;
 
     /// <summary>
     /// Restarts this node from its durable image as <paramref name="profile"/> (FMT-005..FMT-010; CHA-011 rolling upgrade
@@ -39,9 +41,29 @@ public sealed partial class TestNode
     /// registration). If an armed fault crashes the node during startup, the task completes (without throwing) once the node
     /// has crashed; <see cref="State"/> is then <see cref="TestNodeState.Crashed"/>.
     /// </para>
+    /// <para>
+    /// Implementation status: the node runtime has no release emulation (protocol range, feature set and disk format are
+    /// fixed by the build), so only <see cref="SoftwareVersionProfile.Current"/> can be run; any other profile is rejected with
+    /// <see cref="NotSupportedException"/> before the node is touched, rather than running the current build under another
+    /// release's name.
+    /// </para>
     /// </remarks>
     /// <param name="profile">The release to run.</param>
     /// <param name="reconfigure">Optional node-options transform applied before the start.</param>
-    public Task RestartAsSoftwareVersionAsync(SoftwareVersionProfile profile, Func<NodeOptions, NodeOptions>? reconfigure = null) =>
-        throw Stub.NotYet("TestNode.RestartAsSoftwareVersionAsync");
+    /// <exception cref="NotSupportedException"><paramref name="profile"/> is not the build under test.</exception>
+    public async Task RestartAsSoftwareVersionAsync(SoftwareVersionProfile profile, Func<NodeOptions, NodeOptions>? reconfigure = null)
+    {
+        ArgumentNullException.ThrowIfNull(profile);
+        if (!ReferenceEquals(profile, SoftwareVersionProfile.Current))
+        {
+            throw new NotSupportedException(
+                $"Node {Name} cannot run release '{profile.Name}': the node runtime has no release emulation (protocol range, features and disk format are fixed by the build).");
+        }
+
+        Cluster.Record($"node {Name}: restart as release {profile.Name}");
+        await RestartAsync(reconfigure);
+        _softwareVersion = profile;
+        if (State == TestNodeState.Running && !Cluster.Options.OutOfProcess)
+            await Cluster.WaitForRegistrationAsync(this, Cluster.RegistrationTimeout);
+    }
 }

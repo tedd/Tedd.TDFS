@@ -18,6 +18,10 @@ public sealed partial class TestCluster
     /// </remarks>
     /// <exception cref="ArgumentOutOfRangeException">No backup node with that index exists.</exception>
     /// <exception cref="ArgumentException"><paramref name="nodeName"/> is not a live node of this cluster.</exception>
-    public Task<RawProtocolClient> ConnectRawAsBackupAsync(int backupIndex, string nodeName, CancellationToken ct = default) =>
-        throw Stub.NotYet("TestCluster.ConnectRawAsBackupAsync");
+    public Task<RawProtocolClient> ConnectRawAsBackupAsync(int backupIndex, string nodeName, CancellationToken ct = default)
+    {
+        TestBackupNode backup = BackupAt(backupIndex);
+        TestNode node = FindNode(nodeName) ?? throw new ArgumentException($"The cluster has no live node named '{nodeName}'.", nameof(nodeName));
+        return RawProtocolClient.ConnectAsBackupAsync(this, backup, node.Name, node.Endpoint, ct);
+    }
 }

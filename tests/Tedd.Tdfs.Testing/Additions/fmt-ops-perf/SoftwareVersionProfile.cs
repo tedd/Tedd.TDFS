@@ -75,7 +75,7 @@ public sealed record SoftwareVersionProfile(
     /// disk format, and a feature set that includes <see cref="ProbeFeature"/> and <see cref="IrreversibleProbeFeature"/>.
     /// Nodes started by <see cref="TestCluster.StartAsync"/> run this profile.
     /// </summary>
-    public static SoftwareVersionProfile Current => throw Stub.NotYet("SoftwareVersionProfile.Current");
+    public static SoftwareVersionProfile Current => Profiles.Current;
 
     /// <summary>
     /// The oldest release inside the supported compatibility window. When the window contains only the current release,
@@ -83,14 +83,14 @@ public sealed record SoftwareVersionProfile(
     /// format whose <see cref="Features"/> lack <see cref="ProbeFeature"/> and <see cref="IrreversibleProbeFeature"/> and
     /// whose <see cref="MaxReadableDiskFormatVersion"/> is below the marker recorded by <see cref="IrreversibleProbeFeature"/>.
     /// </summary>
-    public static SoftwareVersionProfile Previous => throw Stub.NotYet("SoftwareVersionProfile.Previous");
+    public static SoftwareVersionProfile Previous => Profiles.Previous;
 
     /// <summary>
     /// A release older than the supported window: its <see cref="MaxReadableDiskFormatVersion"/> is lower than
     /// <see cref="Current"/>'s <see cref="DiskFormatVersion"/> (and its protocol range does not overlap the current one), so
     /// it must refuse every image written by <see cref="Current"/> (emulated when no such recorded build exists).
     /// </summary>
-    public static SoftwareVersionProfile BelowSupportedWindow => throw Stub.NotYet("SoftwareVersionProfile.BelowSupportedWindow");
+    public static SoftwareVersionProfile BelowSupportedWindow => Profiles.BelowSupportedWindow;
 
     /// <summary>
     /// Test-only irreversible feature flag understood only by <see cref="Next"/> (CHA-011). Activating it
@@ -111,10 +111,10 @@ public sealed record SoftwareVersionProfile(
     /// <see cref="Current"/> and <see cref="Next"/> negotiate <see cref="Current"/>'s protocol until every member runs
     /// <see cref="Next"/>. Not a member of <see cref="SupportedWindow"/> (it is newer than the build under test).
     /// </summary>
-    public static SoftwareVersionProfile Next => throw Stub.NotYet("SoftwareVersionProfile.Next");
+    public static SoftwareVersionProfile Next => Profiles.Next;
 
     /// <summary>Every supported release, oldest first; the last entry is <see cref="Current"/> and the first is <see cref="Previous"/>.</summary>
-    public static IReadOnlyList<SoftwareVersionProfile> SupportedWindow => throw Stub.NotYet("SoftwareVersionProfile.SupportedWindow");
+    public static IReadOnlyList<SoftwareVersionProfile> SupportedWindow => Profiles.Window;
 
     /// <summary>Resolves a built-in profile by name ("Current", "Previous", "BelowSupportedWindow" or "Next"), so theory data can stay serialisable.</summary>
     /// <exception cref="ArgumentException">Unknown name.</exception>
@@ -133,4 +133,44 @@ public sealed record SoftwareVersionProfile(
     /// <inheritdoc />
     public override string ToString() =>
         $"{Name}(protocol {ProtocolVersionMin}..{ProtocolVersionMax}, disk {DiskFormatVersion}/read<={MaxReadableDiskFormatVersion}{(IsEmulated ? ", emulated" : string.Empty)})";
+
+    /// <summary>
+    /// Disk-format version the build under test writes: the highest format version of its durable structures (superblock,
+    /// journal segments, checkpoints, object segments), taken from the storage layer itself so a format bump can never leave
+    /// the profile describing an older build.
+    /// </summary>
+    internal static readonly int CurrentDiskFormat = Math.Max(
+        Math.Max(Storage.Superblock.CurrentFormatVersion, (int)Storage.Journal.FormatVersion),
+        Math.Max((int)Storage.CheckpointStore.FormatVersion, (int)Storage.ObjectStore.FormatVersion));
+
+    /// <summary>Minimum-reader marker recorded once <see cref="IrreversibleProbeFeature"/> is active.</summary>
+    internal static readonly int IrreversibleProbeMarker = CurrentDiskFormat + 1;
+
+    /// <summary>Minimum-reader marker recorded once <see cref="NextFeature"/> is active.</summary>
+    internal static readonly int NextFeatureMarker = IrreversibleProbeMarker + 1;
+
+    /// <summary>The cached built-in profiles (one instance each, see the identity contract above).</summary>
+    private static class Profiles
+    {
+        private static readonly IReadOnlySet<string> CurrentFeatures = Set(ProbeFeature, IrreversibleProbeFeature);
+        private static readonly IReadOnlySet<string> CurrentIrreversible = Set(IrreversibleProbeFeature);
+
+        public static readonly SoftwareVersionProfile Current = new("Current", Protocol.ProtocolInfo.MinSupportedVersion, Protocol.ProtocolInfo.CurrentVersion,
+            CurrentDiskFormat, IrreversibleProbeMarker, CurrentFeatures, CurrentIrreversible, IsEmulated: false);
+
+        public static readonly SoftwareVersionProfile Previous = new("Previous", Protocol.ProtocolInfo.MinSupportedVersion, Protocol.ProtocolInfo.CurrentVersion,
+            CurrentDiskFormat, CurrentDiskFormat, Set(), Set(), IsEmulated: true);
+
+        public static readonly SoftwareVersionProfile BelowSupportedWindow = new("BelowSupportedWindow", 0, 0, CurrentDiskFormat - 1, CurrentDiskFormat - 1,
+            Set(), Set(), IsEmulated: true);
+
+        public static readonly SoftwareVersionProfile Next = new("Next", Protocol.ProtocolInfo.MinSupportedVersion, Protocol.ProtocolInfo.CurrentVersion + 1,
+            CurrentDiskFormat, NextFeatureMarker, Set(ProbeFeature, IrreversibleProbeFeature, NextFeature), Set(IrreversibleProbeFeature, NextFeature),
+            IsEmulated: true);
+
+        public static readonly IReadOnlyList<SoftwareVersionProfile> Window = [Previous, Current];
+
+        private static IReadOnlySet<string> Set(params string[] features) =>
+            System.Collections.Frozen.FrozenSet.ToFrozenSet(features, StringComparer.Ordinal);
+    }
 }

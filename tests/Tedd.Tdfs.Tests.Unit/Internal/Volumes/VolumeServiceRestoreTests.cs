@@ -120,14 +120,14 @@ public sealed class VolumeServiceRestoreTests
 
         await c.FailsAsync(DfsErrorCode.SnapshotNotFound, new RestoreSnapshotMessage(c.Op(), "missing", "r1"));
         await c.FailsAsync(DfsErrorCode.AlreadyExists, new RestoreSnapshotMessage(c.Op(), "s1", "vol"));
-        await c.FailsAsync(DfsErrorCode.PoolNotFound, new RestoreSnapshotMessage(c.Op(), "s1", "r1") { StoragePool = "nopool" });
+        await c.FailsAsync(DfsErrorCode.PoolNotFound, new RestoreSnapshotMessage(c.Op(), "s1", "r1").WithStoragePool("nopool"));
         await c.FailsAsync(DfsErrorCode.InvalidArgument, new RestoreSnapshotMessage(c.Op(), "s1", "bad/name"));
         await c.FailsAsync(DfsErrorCode.InvalidArgument, new RestoreSnapshotMessage(c.Header(), "s1", "r1"));
 
         // A two-node pool cannot hold the volume's three copies (POOL-03).
         RawClient control = await cluster.ConnectAsync(await cluster.WaitForLeaderAsync("control"));
         await control.AdminAsync<AdminPoolMembersBody, AdminEmptyBody>(AdminOp.CreatePool, new AdminPoolMembersBody("small", ["n1", "n2"]));
-        await c.FailsAsync(DfsErrorCode.InvalidPolicy, new RestoreSnapshotMessage(c.Op(), "s1", "r1") { StoragePool = "small" });
+        await c.FailsAsync(DfsErrorCode.InvalidPolicy, new RestoreSnapshotMessage(c.Op(), "s1", "r1").WithStoragePool("small"));
 
         // A volume administrator who is not a cluster administrator may not restore.
         await control.AdminAsync<AdminGrantBody, AdminEmptyBody>(AdminOp.Grant, new AdminGrantBody("vol", "reader", DfsPermissions.All & ~DfsPermissions.ClusterAdmin));
@@ -234,7 +234,7 @@ public sealed class VolumeServiceRestoreTests
         RawClient control = await cluster.ConnectAsync(await cluster.WaitForLeaderAsync("control"));
         await control.AdminAsync<AdminPoolMembersBody, AdminEmptyBody>(AdminOp.CreatePool, new AdminPoolMembersBody("p", ["n1", "n2", "n3"]));
 
-        var restored = await c.OkAsync<RestoreSnapshotResultMessage>(new RestoreSnapshotMessage(c.Op(), "s1", "pooled") { StoragePool = "p" });
+        var restored = await c.OkAsync<RestoreSnapshotResultMessage>(new RestoreSnapshotMessage(c.Op(), "s1", "pooled").WithStoragePool("p"));
         Assert.Equal("p", restored.Volume.StoragePool);
         var poolNodes = new HashSet<NodeId>(cluster.Running.Where(n => n.Name != "n0").Select(n => n.Id));
         Assert.All(restored.Volume.Voters, v => Assert.Contains(v, poolNodes));

@@ -654,7 +654,7 @@ public sealed class SimScheduler
     /// <summary>Queues an item on a lane (from simulated or harness code).</summary>
     internal void Enqueue(SimLane lane, SimWorkItem item, string operation)
     {
-        bool foreign = CheckThread(operation);
+        bool foreign = CheckThread(operation, lane.Owner?.Name);
         EnqueueCore(lane, item);
         if (foreign)
             _foreignWork.Set();
@@ -666,7 +666,7 @@ public sealed class SimScheduler
     /// <summary>Schedules a work item onto an existing lane at an absolute virtual time (FIFO network deliveries).</summary>
     internal void ScheduleOnLane(SimLane lane, long dueTicks, SimWorkItem item, string operation)
     {
-        bool foreign = CheckThread(operation);
+        bool foreign = CheckThread(operation, lane.Owner?.Name);
         lock (_lock)
             ScheduleLocked(new SimLaneEntry(lane, item), dueTicks);
         if (foreign)
@@ -676,7 +676,7 @@ public sealed class SimScheduler
     /// <summary>Schedules a work item onto a fresh transient lane of <paramref name="owner"/> at an absolute virtual time.</summary>
     internal void ScheduleOnNewLane(SimProcess? owner, string laneName, long dueTicks, SimWorkItem item, string operation)
     {
-        bool foreign = CheckThread(operation);
+        bool foreign = CheckThread(operation, owner?.Name);
         lock (_lock)
             ScheduleLocked(new SimActionEntry(owner, laneName, item), dueTicks);
         if (foreign)
@@ -717,7 +717,13 @@ public sealed class SimScheduler
     /// Verifies that the caller is allowed to touch the simulation; records a violation otherwise. Returns true when the
     /// caller is a foreign thread.
     /// </summary>
-    internal bool CheckThread(string operation)
+    internal bool CheckThread(string operation) => CheckThread(operation, null);
+
+    /// <summary>
+    /// As <see cref="CheckThread(string)"/>; <paramref name="target"/> names the process the attempted interaction addresses
+    /// (recorded as <see cref="SimViolation.Target"/>), null for the harness or the simulation as a whole.
+    /// </summary>
+    internal bool CheckThread(string operation, string? target)
     {
         int id = Environment.CurrentManagedThreadId;
         int driver = Volatile.Read(ref _driverThreadId);
@@ -725,7 +731,7 @@ public sealed class SimScheduler
         {
             if (id == driver)
                 return false;
-            RecordForeign(operation, $"the simulation is being driven by thread {driver}");
+            RecordForeign(operation, $"the simulation is being driven by thread {driver}", target);
             return true;
         }
 
@@ -734,7 +740,7 @@ public sealed class SimScheduler
         int home = Volatile.Read(ref _homeThreadId);
         if (id == home)
             return false;
-        RecordForeign(operation, $"the simulation belongs to thread {home}, which last drove it");
+        RecordForeign(operation, $"the simulation belongs to thread {home}, which last drove it", target);
         return true;
     }
 
@@ -1212,7 +1218,7 @@ public sealed class SimScheduler
         }
     }
 
-    private void RecordForeign(string operation, string detail)
+    private void RecordForeign(string operation, string detail, string? target = null)
     {
         Thread thread = Thread.CurrentThread;
         AddViolation(new SimViolation(
@@ -1223,7 +1229,7 @@ public sealed class SimScheduler
             thread.Name,
             thread.IsThreadPoolThread,
             Now,
-            Environment.StackTrace));
+            Environment.StackTrace) { Target = target });
         _foreignWork.Set();
     }
 

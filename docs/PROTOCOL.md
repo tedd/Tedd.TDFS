@@ -94,7 +94,7 @@ varuint count
 count × ( varuint32 fieldId, u8 flags, bytes value )      flags: bit 0 = Required, bits 1-7 must be 0
 ```
 
-* Field ids are unique within one block (duplicates are malformed). Version 1 defines **no** extension fields.
+* Field ids are unique within one block (duplicates are malformed). Version 1 defined **no** extension fields; fields added since are listed with their message (`RestoreSnapshot` field 1 `StoragePool`).
 * An **unknown optional** extension is preserved on the decoded record (`Extensions`) and re-emitted when the record is
   re-encoded (for example when a node forwards a request), and is otherwise ignored (FMT-003).
 * An **unknown required** extension makes the whole message fail with `Unsupported` (FMT-002): a receiver never
@@ -1634,8 +1634,13 @@ Restores a snapshot into a new volume (client → volume leader, which coordinat
 | 1 | `Header` | `RequestHeader` | Request header; `RequestHeader.Operation` identifies the restore. |
 | 2 | `Name` | `string` | Snapshot name. |
 | 3 | `NewVolumeName` | `string` | Name of the new volume. |
-| 4 | `StoragePool` | `string?` | Storage pool of the new volume (POOL-016); null = the source volume's pool. |
-| 5 | — | `extensions` | Terminal extension block. |
+| 4 | — | `extensions` | Terminal extension block (field 1, see below). |
+
+Extension fields (added after v1 shipped, §2.5):
+
+| Field id | Flags | Value | Meaning |
+|---|---|---|---|
+| 1 `StoragePool` | Required | UTF-8 pool name | Bind the new volume to this storage pool (Addendum A, POOL-02/POOL-016): data objects are copied only onto the pool's nodes and the metadata voters are chosen from them; the restored policies must be satisfiable by the pool (`InvalidPolicy`), an unknown pool is `PoolNotFound`. Absent: the new volume keeps the source volume's pool. Required so that a receiver that does not implement it refuses the request (`Unsupported`) instead of restoring into the wrong pool. Sent by the harness's `TestCluster.RestoreSnapshotToPoolAsync`. |
 
 #### `RestoreSnapshotResult` = 103 (`RestoreSnapshotResultMessage`)
 

@@ -495,11 +495,43 @@ public sealed record RestoreSnapshotMessage(
     string Name,
     string NewVolumeName) : IWireMessage<RestoreSnapshotMessage>, IVolumeRequest
 {
-    /// <summary>Storage pool of the new volume (POOL-016); null = the source volume's pool.</summary>
-    public string? StoragePool { get; init; }
+    /// <summary>
+    /// Extension field id of the target storage pool (Addendum A, POOL-016): a <b>required</b> extension whose value is the
+    /// UTF-8 pool name; the new volume is bound to that pool. Absent: the restored volume keeps the source volume's pool.
+    /// </summary>
+    public const uint StoragePoolExtension = 1;
 
-    /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
+    private static readonly System.Collections.Frozen.FrozenSet<uint> UnderstoodExtensions =
+        System.Collections.Frozen.FrozenSet.ToFrozenSet([StoragePoolExtension]);
+
+    /// <summary>Extensions preserved from the wire (re-emitted on encode), including <see cref="StoragePoolExtension"/>.</summary>
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
+
+    /// <summary>The target storage pool carried by <see cref="StoragePoolExtension"/>, or null for the source volume's pool.</summary>
+    public string? StoragePool
+    {
+        get
+        {
+            foreach (WireExtension extension in Extensions)
+            {
+                if (extension.FieldId == StoragePoolExtension)
+                    return System.Text.Encoding.UTF8.GetString(extension.Value.Span);
+            }
+
+            return null;
+        }
+    }
+
+    /// <summary>A copy that restores into <paramref name="pool"/> (sets the required <see cref="StoragePoolExtension"/>).</summary>
+    public RestoreSnapshotMessage WithStoragePool(string pool)
+    {
+        ArgumentNullException.ThrowIfNull(pool);
+        return this with
+        {
+            Extensions = [.. Extensions.Where(e => e.FieldId != StoragePoolExtension),
+                new WireExtension(StoragePoolExtension, Required: true, System.Text.Encoding.UTF8.GetBytes(pool))],
+        };
+    }
 
     /// <inheritdoc />
     public MessageType Type => WireType;
@@ -516,7 +548,6 @@ public sealed record RestoreSnapshotMessage(
         writer.WriteRecord(Header);
         writer.WriteString(Name);
         writer.WriteString(NewVolumeName);
-        writer.WriteOptionalString(StoragePool);
         writer.WriteExtensionBlock(Extensions);
     }
 
@@ -526,9 +557,10 @@ public sealed record RestoreSnapshotMessage(
         RequestHeader header = reader.ReadRecord<RequestHeader>();
         string name = reader.ReadString();
         string newVolumeName = reader.ReadString();
-        string? pool = reader.ReadOptionalString();
-        IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
-        return new RestoreSnapshotMessage(header, name, newVolumeName) { StoragePool = pool, Extensions = extensions };
+        List<WireExtension>? list = null;
+        reader.ReadExtensions(UnderstoodExtensions, e => (list ??= []).Add(e));
+        IReadOnlyList<WireExtension> extensions = list is null ? [] : list.ToArray();
+        return new RestoreSnapshotMessage(header, name, newVolumeName) { Extensions = extensions };
     }
 }
 

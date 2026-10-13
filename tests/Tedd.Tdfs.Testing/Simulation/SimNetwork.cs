@@ -416,7 +416,7 @@ public sealed class SimNetwork : IRpcTransportFactory
 
         LinkDirection direction = envelope.Kind switch
         {
-            SimEnvelopeKind.Request => LinkDirection.Request,
+            SimEnvelopeKind.Request or SimEnvelopeKind.RequestFragment => LinkDirection.Request,
             SimEnvelopeKind.Reply => LinkDirection.Reply,
             _ => LinkDirection.OneWay,
         };

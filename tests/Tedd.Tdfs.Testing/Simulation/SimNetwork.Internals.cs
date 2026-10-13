@@ -10,12 +10,18 @@ internal enum SimEnvelopeKind
     Reply,
     OneWay,
     Close,
+
+    /// <summary>A piece of a request (raw-protocol tests: one logical request written in several transport writes).</summary>
+    RequestFragment,
 }
 
 /// <summary>One frame on a simulated connection. The payload is a private copy taken at send time.</summary>
-internal sealed class SimEnvelope(SimEnvelopeKind kind, long correlation, byte[] payload, Exception? error = null)
+internal sealed class SimEnvelope(SimEnvelopeKind kind, long correlation, byte[] payload, Exception? error = null, bool isFinalFragment = false)
 {
     public SimEnvelopeKind Kind { get; } = kind;
+
+    /// <summary>For <see cref="SimEnvelopeKind.RequestFragment"/>: true for the piece that completes the request.</summary>
+    public bool IsFinalFragment { get; } = isFinalFragment;
 
     public long Correlation { get; } = correlation;
 
@@ -121,6 +127,7 @@ internal sealed class SimConnectionEnd : IRpcConnection
     private readonly object _sync = new();
     private readonly SimNetwork _network;
     private readonly SortedDictionary<long, PendingCall> _pending = [];
+    private readonly SortedDictionary<long, List<byte[]>> _fragments = [];
     private readonly CancellationTokenSource _handlerCts = new();
     private Action<IRpcConnection, Exception?>? _closedHandlers;
     private long _nextCorrelation;
@@ -203,6 +210,49 @@ internal sealed class SimConnectionEnd : IRpcConnection
         return call.Task;
     }
 
+    /// <summary>
+    /// Sends one logical request whose bytes travel as separate transport writes split at <paramref name="splitOffsets"/>
+    /// (strictly increasing, inside the frame); the receiver processes each piece in its own delivery and dispatches the
+    /// request once the last piece arrived. With <paramref name="closeAfterPieces"/> the final piece is never sent and the
+    /// connection closes after the pieces (a frame interrupted by end-of-stream): the returned task then fails like any call
+    /// on a closed connection unless the peer answered first.
+    /// </summary>
+    internal Task<ReadOnlyMemory<byte>> CallInPiecesAsync(ReadOnlyMemory<byte> request, IReadOnlyList<int> splitOffsets, TimeSpan timeout,
+        bool closeAfterPieces)
+    {
+        _network.CheckThread("CallInPiecesAsync");
+        PendingCall call;
+        lock (_sync)
+        {
+            if (_closed)
+                return Task.FromException<ReadOnlyMemory<byte>>(new RpcConnectionException($"{Describe()} is closed."));
+            call = new PendingCall(this, ++_nextCorrelation, timeout, CancellationToken.None);
+            _pending.Add(call.Correlation, call);
+        }
+
+        if (timeout != Timeout.InfiniteTimeSpan)
+        {
+            TimeProvider clock = _network.GetClock(Transport.LocalName);
+            call.Timer = clock.CreateTimer(static s => ((PendingCall)s!).OnTimeout(), call, timeout, Timeout.InfiniteTimeSpan);
+        }
+
+        int start = 0;
+        var bounds = new List<int>(splitOffsets) { request.Length };
+        for (int i = 0; i < bounds.Count; i++)
+        {
+            bool final = i == bounds.Count - 1;
+            if (final && closeAfterPieces)
+                break;
+            byte[] piece = request[start..bounds[i]].ToArray();
+            _network.Transmit(this, new SimEnvelope(SimEnvelopeKind.RequestFragment, call.Correlation, piece, isFinalFragment: final));
+            start = bounds[i];
+        }
+
+        if (closeAfterPieces)
+            CloseLocal(null, notifyPeer: true);
+        return call.Task;
+    }
+
     public ValueTask SendAsync(ReadOnlyMemory<byte> message, CancellationToken ct = default)
     {
         _network.CheckThread("SendAsync");
@@ -254,6 +304,10 @@ internal sealed class SimConnectionEnd : IRpcConnection
                 _network.CountDelivered();
                 Dispatch(envelope, expectsReply: false);
                 break;
+            case SimEnvelopeKind.RequestFragment:
+                _network.CountDelivered();
+                ReceiveFragment(envelope);
+                break;
             case SimEnvelopeKind.Reply:
                 _network.CountDelivered();
                 PendingCall? call;
@@ -286,6 +340,7 @@ internal sealed class SimConnectionEnd : IRpcConnection
             _closed = true;
             calls = [.. _pending.Values];
             _pending.Clear();
+            _fragments.Clear(); // an interrupted frame is discarded, never dispatched
             handlers = _closedHandlers;
             _closedHandlers = null;
         }
@@ -345,6 +400,32 @@ internal sealed class SimConnectionEnd : IRpcConnection
                 _network.ReportCallbackFailure(this, "Closed handler", ex);
             }
         }
+    }
+
+    /// <summary>Buffers one request piece; the final piece dispatches the reassembled request.</summary>
+    private void ReceiveFragment(SimEnvelope envelope)
+    {
+        byte[]? complete = null;
+        lock (_sync)
+        {
+            if (!_fragments.TryGetValue(envelope.Correlation, out List<byte[]>? pieces))
+                _fragments[envelope.Correlation] = pieces = [];
+            pieces.Add(envelope.Payload);
+            if (envelope.IsFinalFragment)
+            {
+                _fragments.Remove(envelope.Correlation);
+                complete = new byte[pieces.Sum(p => p.Length)];
+                int at = 0;
+                foreach (byte[] piece in pieces)
+                {
+                    piece.CopyTo(complete, at);
+                    at += piece.Length;
+                }
+            }
+        }
+
+        if (complete is not null)
+            Dispatch(new SimEnvelope(SimEnvelopeKind.Request, envelope.Correlation, complete), expectsReply: true);
     }
 
     private bool RemovePending(long correlation)

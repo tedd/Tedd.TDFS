@@ -31,7 +31,8 @@ public sealed class TestClock : TimeProvider
     private readonly TimeProvider _base;
     private readonly DateTimeOffset _wallEpoch;
     private readonly long _monoEpochTicks;
-    private readonly HashSet<ClockTimer> _armed = [];
+    // Ordered by creation sequence: rescheduling and firing must not depend on hash order (deterministic simulation).
+    private readonly SortedDictionary<long, ClockTimer> _armed = [];
     private long _baseAnchorTimestamp;
     private long _monoAnchorTicks;
     private long _lastMonoTicks;
@@ -75,6 +76,14 @@ public sealed class TestClock : TimeProvider
         }
     }
 
+    /// <summary>
+    /// Optional wrapper through which <see cref="Advance"/> runs the callbacks of timers it fires synchronously. The
+    /// deterministic simulation installs <c>SimScheduler.CompleteWithoutContext</c> here, so a callback that completes a task
+    /// awaited with <c>ConfigureAwait(false)</c> continues inline on the simulation thread instead of escaping to the thread
+    /// pool (the caller of <see cref="Advance"/> usually runs on a simulated synchronization context).
+    /// </summary>
+    internal Action<Action>? CallbackInvoker { get; set; }
+
     /// <inheritdoc />
     public override long TimestampFrequency => TimeSpan.TicksPerSecond;
 
@@ -115,7 +124,7 @@ public sealed class TestClock : TimeProvider
                 _lastMonoTicks = _monoAnchorTicks;
             long now = CurrentMonoTicksLocked();
 
-            foreach (ClockTimer timer in _armed.ToArray())
+            foreach (ClockTimer timer in _armed.Values.ToArray())
             {
                 if (timer.DueTicks <= now)
                 {
@@ -125,17 +134,21 @@ public sealed class TestClock : TimeProvider
                 }
             }
 
-            foreach (ClockTimer timer in _armed)
+            foreach (ClockTimer timer in _armed.Values)
                 ScheduleLocked(timer, now);
         }
 
         due.Sort(static (a, b) => a.Due != b.Due ? a.Due.CompareTo(b.Due) : a.Sequence.CompareTo(b.Sequence));
         List<Exception>? errors = null;
+        Action<Action>? invoker = CallbackInvoker;
         foreach ((ClockTimer timer, _, _) in due)
         {
             try
             {
-                timer.InvokeCallback();
+                if (invoker is null)
+                    timer.InvokeCallback();
+                else
+                    invoker(timer.InvokeCallback);
             }
             catch (Exception ex)
             {
@@ -164,7 +177,7 @@ public sealed class TestClock : TimeProvider
             ReAnchorLocked();
             _frozen = true;
             long now = CurrentMonoTicksLocked();
-            foreach (ClockTimer timer in _armed)
+            foreach (ClockTimer timer in _armed.Values)
                 ScheduleLocked(timer, now);
         }
     }
@@ -179,7 +192,7 @@ public sealed class TestClock : TimeProvider
             _baseAnchorTimestamp = _base.GetTimestamp();
             _frozen = false;
             long now = CurrentMonoTicksLocked();
-            foreach (ClockTimer timer in _armed)
+            foreach (ClockTimer timer in _armed.Values)
                 ScheduleLocked(timer, now);
         }
     }
@@ -195,7 +208,7 @@ public sealed class TestClock : TimeProvider
             ReAnchorLocked();
             _rate = rate;
             long now = CurrentMonoTicksLocked();
-            foreach (ClockTimer timer in _armed)
+            foreach (ClockTimer timer in _armed.Values)
                 ScheduleLocked(timer, now);
         }
     }
@@ -315,13 +328,13 @@ public sealed class TestClock : TimeProvider
                 {
                     DueTicks = long.MaxValue;
                     PeriodTicks = 0;
-                    _clock._armed.Remove(this);
+                    _clock._armed.Remove(Sequence);
                 }
                 else
                 {
                     DueTicks = SaturatingAdd(now, dueTime.Ticks);
                     PeriodTicks = period == Timeout.InfiniteTimeSpan || period == TimeSpan.Zero ? 0 : period.Ticks;
-                    _clock._armed.Add(this);
+                    _clock._armed[Sequence] = this;
                 }
 
                 _clock.ScheduleLocked(this, now);
@@ -340,7 +353,7 @@ public sealed class TestClock : TimeProvider
             else
             {
                 DueTicks = long.MaxValue;
-                _clock._armed.Remove(this);
+                _clock._armed.Remove(Sequence);
             }
         }
 
@@ -381,7 +394,7 @@ public sealed class TestClock : TimeProvider
                     return;
                 Disposed = true;
                 DueTicks = long.MaxValue;
-                _clock._armed.Remove(this);
+                _clock._armed.Remove(Sequence);
             }
 
             BaseTimer.Dispose();

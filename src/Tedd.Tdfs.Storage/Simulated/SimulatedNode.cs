@@ -30,4 +30,5 @@ internal sealed class SimulatedNode
 /// <param name="Offset">Write offset.</param>
 /// <param name="Data">Written bytes (copied), or null for a length change.</param>
 /// <param name="NewLength">New length for a length change.</param>
-internal readonly record struct PendingWrite(long Sequence, long Offset, byte[]? Data, long NewLength);
+/// <param name="Acknowledged">True once a dishonest flush reported this change durable although it is still volatile.</param>
+internal readonly record struct PendingWrite(long Sequence, long Offset, byte[]? Data, long NewLength, bool Acknowledged = false);

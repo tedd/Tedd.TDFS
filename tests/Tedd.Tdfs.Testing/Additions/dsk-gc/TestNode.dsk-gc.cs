@@ -14,7 +14,7 @@ public sealed partial class TestNode
     /// <para>Required behaviour: every object store of the node runs <c>ObjectStore.CompactAsync</c>; the pass is posted
     /// to the node loop (it runs on the node's own scheduler, so it interleaves with garbage collection, repair and client
     /// traffic exactly like a background pass, including in deterministic mode). Every segment that contains at least one
-    /// dead (deleted/tombstoned) record is compacted — including the currently active segment, which is sealed first — so a
+    /// dead (deleted/tombstoned) record — including the currently active segment, which is sealed first — is compacted, so a
     /// pass after any object deletion always exercises the copy, publish and delete steps: live records are copied to a new
     /// segment, the new segment is flushed and published, and the old segment is deleted. Every compaction fault site
     /// (<see cref="FaultSites.CompactionCopy"/>, <see cref="FaultSites.CompactionPublish"/>,
@@ -30,5 +30,15 @@ public sealed partial class TestNode
     /// </remarks>
     /// <param name="ct">Cancels waiting for the pass.</param>
     /// <exception cref="InvalidOperationException">The node is not <see cref="TestNodeState.Running"/> when called.</exception>
-    public Task CompactStorageAsync(CancellationToken ct = default) => throw Stub.NotYet("TestNode.CompactStorageAsync");
+    public async Task CompactStorageAsync(CancellationToken ct = default)
+    {
+        Server.NodeInspector inspector = Inspect;
+        Task pass = inspector.CompactObjectStoreAsync();
+        Cluster.Record($"node {Name}: compaction pass requested");
+        Task finished = ct.CanBeCanceled ? pass.WaitAsync(ct) : pass;
+        await finished;
+        if (State is TestNodeState.Crashed or TestNodeState.Stopped)
+            throw new InvalidOperationException($"Node {Name} went down ({State}) while its compaction pass ran; the pass is not complete.");
+        Cluster.Record($"node {Name}: compaction pass finished");
+    }
 }
