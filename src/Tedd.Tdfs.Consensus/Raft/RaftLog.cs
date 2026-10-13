@@ -21,6 +21,17 @@ internal sealed class RaftLog
         Applied = applied;
     }
 
+    /// <summary>
+    /// A copy of this log's volatile part (unstable tail, received snapshot, commit and applied indexes) over
+    /// <paramref name="stable"/>, which must hold the same durable entries as <see cref="Stable"/> (model checking).
+    /// </summary>
+    public RaftLog CloneOnto(IRaftLogView stable) => new(stable, Committed, Applied)
+    {
+        _unstable = [.. _unstable],
+        _offset = _offset,
+        _pendingSnapshot = _pendingSnapshot,
+    };
+
     /// <summary>Highest index known to be committed.</summary>
     public ulong Committed { get; private set; }
 

@@ -46,12 +46,16 @@ public sealed class ConModelsTests
         Assert.Null(initial.Violation);
 
         // The budgets make the reachable state space finite; the depth bound is far above the longest possible schedule
-        // so that only the budgets limit the exploration and the result can report completion.
+        // so that only the budgets limit the exploration and the result can report completion. States are merged by an
+        // abstract, symmetry-reduced key, messages that can never have an effect again are discarded, and states are pruned
+        // when an already visited state simulates them (see RaftModelCluster): every reachable node state and history is
+        // still covered. The state bound is a resource cap only (the largest row needs about 10 million states); a row
+        // that reaches it fails as incomplete.
         const int maxDepth = 400;
-        const long maxStates = 3_000_000;
-        ModelCheckResult result = ModelChecker.Explore(
+        const long maxStates = 20_000_000;
+        ModelCheckResult result = ModelChecker.ExploreParallelWithSubsumption(
             initial,
-            state => RaftModelCluster.Successors(bounds, seed, state),
+            RaftModelCluster.Successors,
             state => state.Violation,
             state => state.Key,
             maxDepth,
@@ -216,10 +220,12 @@ public sealed class ConModelsTests
 
     private static bool ContainsConfigurationChange(RaftModelBounds bounds, ulong seed)
     {
-        // Elect n0 as in ContainsElection, then let it propose the first enabled membership change and deliver everything.
+        // Elect n0 as in ContainsElection and deliver everything until quiescent (a new leader accepts a membership change
+        // only once an entry of its own term is committed), then let it propose the first enabled membership change and
+        // deliver everything.
         var cluster = new RaftModelCluster(bounds, seed);
         cluster.Apply("timeout n0");
-        for (int guard = 0; guard < 200 && !cluster.AnyLeader; guard++)
+        for (int guard = 0; guard < 400; guard++)
         {
             string? deliver = cluster.EnabledActions().FirstOrDefault(a => a.StartsWith("deliver ", StringComparison.Ordinal));
             if (deliver is null)

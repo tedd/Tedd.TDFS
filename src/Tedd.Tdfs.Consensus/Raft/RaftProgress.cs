@@ -138,6 +138,31 @@ internal sealed class RaftProgress
 
     public RaftPeerProgress ToPublic(bool isLearner) => new(Peer, Match, Next, State, RecentActive, isLearner);
 
+    /// <summary>An independent copy of the whole tracking state (model checking).</summary>
+    public RaftProgress Clone()
+    {
+        var copy = new RaftProgress(Peer, Next, _maxInflight, RecentActive)
+        {
+            Match = Match,
+            State = State,
+            ProbeSent = ProbeSent,
+            PendingSnapshot = PendingSnapshot,
+            Snapshot = Snapshot,
+            SnapshotOffset = SnapshotOffset,
+        };
+        foreach (ulong inflight in _inflights)
+            copy._inflights.Enqueue(inflight);
+        return copy;
+    }
+
+    /// <summary>
+    /// Canonical description of the whole tracking state (see <see cref="RaftNode.DescribeCanonicalState"/>); the peer is
+    /// written by <paramref name="name"/>.
+    /// </summary>
+    public string DescribeCanonicalState(Func<NodeId, string> name) =>
+        string.Create(System.Globalization.CultureInfo.InvariantCulture,
+            $"{name(Peer)}:{Match}/{Next}/{State}/{ProbeSent}/{PendingSnapshot}/{Snapshot?.Meta.Index}@{Snapshot?.Meta.Term}/{SnapshotOffset}/{RecentActive}/[{string.Join(" ", _inflights)}]");
+
     private void ResetState(RaftProgressState state)
     {
         State = state;
