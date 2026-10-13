@@ -23,6 +23,8 @@ internal sealed class ControlBarrier
     private long _requested;
     private long _completed;
     private Task? _running;
+    private NodeId? _unreachableLeader;
+    private long _unreachableUntil;
 
     public ControlBarrier(NodeServices services)
     {
@@ -77,9 +79,27 @@ internal sealed class ControlBarrier
         ControlHost control = _s.Control;
         if (control.Group is not { IsClosed: false } group || control.IsLeader || control.Leader is not { } leader || leader == _s.NodeId)
             return;
+
+        // The same control leader could not be reached by a barrier that just ran: proceed with the local state at once for
+        // one barrier timeout instead of making every request wait for the same unreachable leader again (a volume leader
+        // cut off from the control leader would otherwise add a whole barrier timeout to each of its proposals).
+        if (leader == _unreachableLeader && _s.Time.GetTimestamp() < _unreachableUntil)
+            return;
         ulong local = control.State.AppliedIndex;
         using CancellationTokenSource deadline = _s.CreateDeadline(Timeout);
-        IWireMessage reply = await _s.Peers.CallAsync(leader, new GetClusterMapMessage(local), Timeout, deadline.Token);
+        IWireMessage reply;
+        try
+        {
+            reply = await _s.Peers.CallAsync(leader, new GetClusterMapMessage(local), Timeout, deadline.Token);
+        }
+        catch (Exception ex) when (ex is DfsException or IOException or TimeoutException or OperationCanceledException or UnauthorizedAccessException
+                                       or Transport.RpcConnectionException)
+        {
+            _unreachableLeader = leader;
+            _unreachableUntil = _s.Time.GetTimestamp() + (long)(Timeout.TotalSeconds * _s.Time.TimestampFrequency);
+            throw;
+        }
+
         if (reply is not ClusterMapResultMessage result || result.ConfigIndex <= control.State.AppliedIndex)
             return;
         await group.WaitForAppliedAsync(result.ConfigIndex, deadline.Token);

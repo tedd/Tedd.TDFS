@@ -1010,8 +1010,10 @@ internal sealed class VolumeContext : IRpcRouter
     private static Exception StagingNotCreated(OperationScope scope, DfsCommitOutcomeUnknownException unknown)
         => scope.IsAbortedByCaller
             ? scope.NotTransmittedFailure(unknown.InnerException ?? unknown)
-            : new DfsUnavailableException(DfsErrorCode.Unavailable, "A staging session could not be created: the request was not answered.",
-                unknown.InnerException ?? unknown);
+            : unknown.InnerException is DfsQuorumUnavailableException quorum
+                ? new DfsQuorumUnavailableException("A staging session could not be created: " + quorum.Message, quorum)
+                : new DfsUnavailableException(DfsErrorCode.Unavailable, "A staging session could not be created: the request was not answered.",
+                    unknown.InnerException ?? unknown);
 
     /// <summary>Renews the capability of <paramref name="lease"/> (<c>CreateStaging</c> with <c>Renew</c>; no log entry).</summary>
     public async Task RenewStagingAsync(StagingLease lease, OperationScope scope)

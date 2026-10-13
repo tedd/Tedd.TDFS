@@ -13,9 +13,11 @@ internal sealed class ClientConnection
 {
     private int _poisoned;
     private int _closed;
+    private long _lastReply;
 
-    private ClientConnection(IRpcConnection raw, string endpoint, HelloChallengeMessage challenge, HelloResultMessage result)
+    private ClientConnection(IRpcConnection raw, string endpoint, HelloChallengeMessage challenge, HelloResultMessage result, long openedAt)
     {
+        _lastReply = openedAt;
         Raw = raw;
         Endpoint = endpoint;
         Challenge = challenge;
@@ -43,6 +45,22 @@ internal sealed class ClientConnection
 
     /// <summary>False once the transport closed or the connection was declared dead (stale pooled connection).</summary>
     public bool IsUsable => Volatile.Read(ref _poisoned) == 0 && Raw.IsOpen;
+
+    /// <summary>Time-provider timestamp of the last reply received on this connection (initially its handshake).</summary>
+    public long LastReply => Volatile.Read(ref _lastReply);
+
+    /// <summary>Records that a reply arrived on this connection at <paramref name="timestamp"/>.</summary>
+    public void NoteReply(long timestamp)
+    {
+        long current = Volatile.Read(ref _lastReply);
+        while (timestamp > current)
+        {
+            long seen = Interlocked.CompareExchange(ref _lastReply, timestamp, current);
+            if (seen == current)
+                return;
+            current = seen;
+        }
+    }
 
     /// <summary>
     /// Sends <paramref name="frame"/> and decodes the reply. Transport failures (<see cref="TimeoutException"/>,
@@ -153,6 +171,6 @@ internal sealed class ClientConnection
 
         raw.Identity = new RpcPeerIdentity(challenge.ServerName, challenge.ServerNodeId, challenge.ServerIncarnation, null,
             IsNode: challenge.ServerRole == PeerRole.Node, IsBackup: challenge.ServerRole == PeerRole.Backup);
-        return new ClientConnection(raw, endpoint, challenge, result);
+        return new ClientConnection(raw, endpoint, challenge, result, runtime.Time.GetTimestamp());
     }
 }
