@@ -164,6 +164,7 @@ internal sealed class RpcInvoker
                 break;
 
             byte[] frame = MessageCodec.Encode(message);
+            long attemptStarted = _runtime.Time.GetTimestamp();
             Task<ReadOnlyMemory<byte>> pending = connection.StartCall(frame, attemptTimeout, scope.Token);
 
             // A call refused before sending (connection closed) transmitted nothing. A call that completed as cancelled may
@@ -188,6 +189,17 @@ internal sealed class RpcInvoker
             }
             catch (OperationCanceledException) when (scope.Token.IsCancellationRequested)
             {
+                // The operation ended (deadline, caller or shutdown) while this attempt was outstanding. When the attempt had
+                // also run for its whole timeout, the connection did not answer in time: it is treated exactly like an attempt
+                // timeout (a silently dead link must not stay pooled), whichever of the two timers happened to fire first.
+                if (_runtime.Time.GetElapsedTime(attemptStarted) >= attemptTimeout)
+                {
+                    _runtime.Pool.Invalidate(connection);
+                    request.Router.OnUnreachable(endpoint);
+                    _runtime.Emit("rpc.attempt-failed", $"{request.Name} to {endpoint}: no reply within the attempt timeout ({attemptTimeout}).",
+                        request.Operation, request.Transaction, scope.Volume);
+                }
+
                 break;
             }
             catch (Exception ex) when (ex is TimeoutException or RpcConnectionException or IOException or ObjectDisposedException)
