@@ -1,3 +1,7 @@
+using Tedd.Tdfs.Client.Internal;
+using Tedd.Tdfs.Client.Internal.Facades;
+using Tedd.Tdfs.Protocol.Messages;
+
 namespace Tedd.Tdfs;
 
 // Addendum A administration: groups (ACL-01, ACL-08) and storage pools (POOL-01..POOL-05). Requires ClusterAdmin
@@ -6,57 +10,75 @@ public sealed partial class DfsAdminClient
 {
     // ---- Groups -----------------------------------------------------------------------------------------------
 
-    /// <summary>Creates an empty group (<see cref="DfsAlreadyExistsException"/> when it exists).</summary>
-    /// <exception cref="ArgumentException">The name is not a valid group name (<see cref="DfsIdentity.IsValidName"/>).</exception>
+    /// <summary>Creates a group.</summary>
     public Task CreateGroupAsync(string group, CancellationToken ct = default) =>
-        throw new NotImplementedException("DfsAdminClient.CreateGroupAsync: implemented in a later phase");
+        CallAsync<AdminGroupNameBody, AdminEmptyBody>(AdminOp.CreateGroup, () => new AdminGroupNameBody(Validation.Name(group, nameof(group))),
+            Runtime.ControlRouter, DfsOperationKind.Admin, ct);
 
-    /// <summary>Deletes a group; ACEs naming it remain and match nobody (<see cref="DfsErrorCode.GroupNotFound"/> when absent).</summary>
+    /// <summary>Deletes a group.</summary>
     public Task DeleteGroupAsync(string group, CancellationToken ct = default) =>
-        throw new NotImplementedException("DfsAdminClient.DeleteGroupAsync: implemented in a later phase");
+        CallAsync<AdminGroupNameBody, AdminEmptyBody>(AdminOp.DeleteGroup, () => new AdminGroupNameBody(Validation.Name(group, nameof(group))),
+            Runtime.ControlRouter, DfsOperationKind.Admin, ct);
 
-    /// <summary>Adds a principal to a group (idempotent); effective for operations authorized after the change commits (ACL-08).</summary>
-    /// <exception cref="DfsException"><see cref="DfsErrorCode.GroupNotFound"/> or <see cref="DfsErrorCode.PrincipalNotFound"/>.</exception>
+    /// <summary>Adds a principal to a group.</summary>
     public Task AddGroupMemberAsync(string group, string principal, CancellationToken ct = default) =>
-        throw new NotImplementedException("DfsAdminClient.AddGroupMemberAsync: implemented in a later phase");
+        CallAsync<AdminGroupMemberBody, AdminEmptyBody>(AdminOp.AddGroupMember, () =>
+            new AdminGroupMemberBody(Validation.Name(group, nameof(group)), Validation.Name(principal, nameof(principal))),
+            Runtime.ControlRouter, DfsOperationKind.Admin, ct);
 
-    /// <summary>Removes a principal from a group (idempotent).</summary>
-    /// <exception cref="DfsException"><see cref="DfsErrorCode.GroupNotFound"/>.</exception>
+    /// <summary>Removes a principal from a group.</summary>
     public Task RemoveGroupMemberAsync(string group, string principal, CancellationToken ct = default) =>
-        throw new NotImplementedException("DfsAdminClient.RemoveGroupMemberAsync: implemented in a later phase");
+        CallAsync<AdminGroupMemberBody, AdminEmptyBody>(AdminOp.RemoveGroupMember, () =>
+            new AdminGroupMemberBody(Validation.Name(group, nameof(group)), Validation.Name(principal, nameof(principal))),
+            Runtime.ControlRouter, DfsOperationKind.Admin, ct);
 
-    /// <summary>Lists groups (ordinal by name) with their members.</summary>
-    public Task<IReadOnlyList<DfsGroupInfo>> ListGroupsAsync(CancellationToken ct = default) =>
-        throw new NotImplementedException("DfsAdminClient.ListGroupsAsync: implemented in a later phase");
+    /// <summary>Lists the groups and their members.</summary>
+    public async Task<IReadOnlyList<DfsGroupInfo>> ListGroupsAsync(CancellationToken ct = default)
+    {
+        AdminGroupListBody body = await CallAsync<AdminEmptyBody, AdminGroupListBody>(AdminOp.ListGroups, () => new AdminEmptyBody(), Runtime.AnyNodeRouter,
+            DfsOperationKind.Admin, ct).ConfigureAwait(false);
+        return body.Groups.Select(g => new DfsGroupInfo(g.Name, g.Members)).ToArray();
+    }
 
     // ---- Storage pools ----------------------------------------------------------------------------------------
 
-    /// <summary>
-    /// Creates a pool of existing live nodes (POOL-01). An empty node list, an unknown node, an invalid name
-    /// (<see cref="DfsPoolNames"/>) or an existing name fails with a typed error.
-    /// </summary>
+    /// <summary>Creates a storage pool of the named nodes.</summary>
     public Task CreatePoolAsync(string pool, IReadOnlyList<string> nodeNames, CancellationToken ct = default) =>
-        throw new NotImplementedException("DfsAdminClient.CreatePoolAsync: implemented in a later phase");
+        CallAsync<AdminPoolMembersBody, AdminEmptyBody>(AdminOp.CreatePool, () => PoolMembers(pool, nodeNames), Runtime.ControlRouter,
+            DfsOperationKind.PolicyChange, ct);
 
-    /// <summary>
-    /// Replaces a pool's members (non-empty). Advances the placement epoch; removed nodes drain the pool's objects by
-    /// copy-before-delete (POOL-04). <see cref="DfsErrorCode.PoolNotFound"/> when absent.
-    /// </summary>
+    /// <summary>Replaces the members of a storage pool (data moves to the new members in the background).</summary>
     public Task SetPoolMembersAsync(string pool, IReadOnlyList<string> nodeNames, CancellationToken ct = default) =>
-        throw new NotImplementedException("DfsAdminClient.SetPoolMembersAsync: implemented in a later phase");
+        CallAsync<AdminPoolMembersBody, AdminEmptyBody>(AdminOp.SetPoolMembers, () => PoolMembers(pool, nodeNames), Runtime.ControlRouter,
+            DfsOperationKind.PolicyChange, ct);
 
-    /// <summary>
-    /// Deletes a pool; <see cref="DfsErrorCode.PoolInUse"/> while a volume or policy references it,
-    /// <see cref="DfsErrorCode.PoolNotFound"/> when absent; <c>default</c> cannot be deleted.
-    /// </summary>
+    /// <summary>Deletes an unused storage pool.</summary>
     public Task DeletePoolAsync(string pool, CancellationToken ct = default) =>
-        throw new NotImplementedException("DfsAdminClient.DeletePoolAsync: implemented in a later phase");
+        CallAsync<AdminPoolNameBody, AdminEmptyBody>(AdminOp.DeletePool, () => new AdminPoolNameBody(Validation.Name(pool, nameof(pool))),
+            Runtime.ControlRouter, DfsOperationKind.PolicyChange, ct);
 
-    /// <summary>Lists pools (ordinal by name, including <c>default</c>).</summary>
-    public Task<IReadOnlyList<DfsPoolInfo>> ListPoolsAsync(CancellationToken ct = default) =>
-        throw new NotImplementedException("DfsAdminClient.ListPoolsAsync: implemented in a later phase");
+    /// <summary>Lists the storage pools.</summary>
+    public async Task<IReadOnlyList<DfsPoolInfo>> ListPoolsAsync(CancellationToken ct = default)
+    {
+        AdminPoolListBody body = await CallAsync<AdminEmptyBody, AdminPoolListBody>(AdminOp.ListPools, () => new AdminEmptyBody(), Runtime.AnyNodeRouter,
+            DfsOperationKind.Admin, ct).ConfigureAwait(false);
+        return body.Pools.Select(WireConvert.ToPoolInfo).ToArray();
+    }
 
-    /// <summary>Reads per-pool capacity, usage and replica health (POOL-05); <see cref="DfsErrorCode.PoolNotFound"/> when absent.</summary>
-    public Task<DfsPoolStatus> GetPoolStatusAsync(string pool, CancellationToken ct = default) =>
-        throw new NotImplementedException("DfsAdminClient.GetPoolStatusAsync: implemented in a later phase");
+    /// <summary>Status of a storage pool (members, volumes, capacity, replica health, draining nodes).</summary>
+    public async Task<DfsPoolStatus> GetPoolStatusAsync(string pool, CancellationToken ct = default)
+    {
+        AdminPoolStatusBody body = await CallAsync<AdminPoolNameBody, AdminPoolStatusBody>(AdminOp.PoolStatus,
+            () => new AdminPoolNameBody(Validation.Name(pool, nameof(pool))), Runtime.AnyNodeRouter, DfsOperationKind.Admin, ct).ConfigureAwait(false);
+        return new DfsPoolStatus(WireConvert.ToPoolInfo(body.Info), WireConvert.ToReplicaHealth(body.Replicas), body.DrainingNodes);
+    }
+
+    private static AdminPoolMembersBody PoolMembers(string pool, IReadOnlyList<string> nodeNames)
+    {
+        Validation.Name(pool, nameof(pool));
+        ArgumentNullException.ThrowIfNull(nodeNames);
+        if (nodeNames.Any(string.IsNullOrEmpty))
+            throw new ArgumentException("Node names must not be null or empty.", nameof(nodeNames));
+        return new AdminPoolMembersBody(pool, nodeNames);
+    }
 }

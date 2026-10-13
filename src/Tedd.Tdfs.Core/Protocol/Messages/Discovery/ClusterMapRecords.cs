@@ -27,8 +27,17 @@ public sealed record NodeEntry(
     long CapacityBytes,
     long UsedBytes) : IWireRecord<NodeEntry>
 {
+    private static readonly IReadOnlySet<string> EmptyPools = System.Collections.Immutable.ImmutableSortedSet.Create<string>(StringComparer.Ordinal);
+
     /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
+
+    /// <summary>
+    /// Named storage pools the node belongs to (ordinal set; the implicit <c>default</c> pool, which contains every live
+    /// member, is not listed). Uploaders place objects only on the nodes of the file's pool (Addendum A POOL-02/03;
+    /// trailing field).
+    /// </summary>
+    public IReadOnlySet<string> Pools { get; init; } = EmptyPools;
 
     /// <inheritdoc />
     public static int MinEncodedSize => 16 + 1 + 5 + 1 + 1 + 1 + 4 + 1 + 1 + 1;
@@ -48,6 +57,7 @@ public sealed record NodeEntry(
         writer.WriteBool(PlacementEligible);
         writer.WriteVarInt(CapacityBytes);
         writer.WriteVarInt(UsedBytes);
+        writer.WriteStringSet(Pools);
         writer.WriteExtensionBlock(Extensions);
     }
 
@@ -66,9 +76,11 @@ public sealed record NodeEntry(
         bool eligible = reader.ReadBool();
         long capacity = reader.ReadVarInt();
         long used = reader.ReadVarInt();
+        IReadOnlySet<string> pools = reader.ReadStringSet();
         IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
         return new NodeEntry(id, name, labels, endpoints, status, incarnation, isBackup, isVoter, reachable, eligible, capacity, used)
         {
+            Pools = pools,
             Extensions = extensions,
         };
     }
