@@ -44,6 +44,7 @@ internal sealed class RpcInvoker
         bool mutation = request.Kind == CallKind.Mutation;
         bool transmitted = false;   // a mutation transmission may have been executed (it is not settled by a definite refusal)
         int unsettled = 0;
+        Exception? leaderless = null; // a node answered that it knows no leader
         int transmissions = 0;
         int failures = 0;
         int redirects = 0;
@@ -85,7 +86,9 @@ internal sealed class RpcInvoker
 
             if (endpoint is null)
             {
-                last ??= new DfsUnavailableException(DfsErrorCode.NotLeader, $"{request.Name}: no leader is currently known.");
+                // The nodes asked for the route know no leader (or none could be asked).
+                leaderless = new DfsUnavailableException(DfsErrorCode.NotLeader, $"{request.Name}: no leader is currently known.");
+                last ??= leaderless;
                 failures++;
                 if (!await BackoffAsync(failures, scope).ConfigureAwait(false))
                     break;
@@ -275,6 +278,7 @@ internal sealed class RpcInvoker
                     last = error.ToException(request.Path);
                     if (mutation && --unsettled == 0)
                         transmitted = false; // every transmission so far was refused before it was proposed
+                    leaderless = error.LeaderHint is { Length: > 0 } ? null : last; // a hint means a leader exists
                     request.Router.OnNotLeader(endpoint, error.LeaderHint);
                     if (error.LeaderHint is { Length: > 0 } hint && !string.Equals(hint, endpoint, StringComparison.Ordinal) && redirects < MaxRedirects)
                     {
@@ -311,6 +315,10 @@ internal sealed class RpcInvoker
         }
 
     Exhausted:
+        // When a node reported that no leader is known, that (not a later connection failure to a dead node) explains why
+        // the request could not be served: the group has no quorum (FSD §13, typed availability failures).
+        if (leaderless is not null && !Availability.IsLeaderless(last))
+            last = leaderless;
         return await FinishWithoutReplyAsync(request, scope, mutation && transmitted, last).ConfigureAwait(false);
     }
 

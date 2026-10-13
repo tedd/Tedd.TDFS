@@ -172,7 +172,7 @@ public sealed class DfsSnapshotClient
             // cancellation when the caller cancelled (an orphan pin expires).
             if (scope.IsAbortedByCaller)
                 throw scope.NotTransmittedFailure(unknown.InnerException ?? unknown);
-            throw new DfsUnavailableException(DfsErrorCode.Unavailable, $"Opening snapshot '{name}' did not complete.", unknown.InnerException ?? unknown);
+            throw Availability.Unanswered($"Opening snapshot '{name}' did not complete.", unknown.InnerException ?? unknown);
         }
 
         OpenSnapshotResultMessage opened = bound.Reply;

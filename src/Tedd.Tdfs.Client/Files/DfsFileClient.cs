@@ -126,7 +126,7 @@ public sealed partial class DfsFileClient
             // (or the client's disposal) or an availability failure. A handle it may have created expires with its lease.
             if (scope.IsAbortedByCaller)
                 throw scope.NotTransmittedFailure(unknown.InnerException ?? unknown);
-            throw new DfsUnavailableException(DfsErrorCode.Unavailable, $"Opening '{path}' for reading did not complete.", unknown.InnerException ?? unknown);
+            throw Availability.Unanswered($"Opening '{path}' for reading did not complete.", unknown.InnerException ?? unknown);
         }
 
         OpenHandleResultMessage opened = bound.Reply;
@@ -318,7 +318,7 @@ public sealed partial class DfsFileClient
             // cancellation when the caller cancelled (its handle, if any, expires with its lease).
             if (scope.IsAbortedByCaller)
                 throw scope.NotTransmittedFailure(unknown.InnerException ?? unknown);
-            throw new DfsUnavailableException(DfsErrorCode.Unavailable, $"Opening '{path}' for reading did not complete.", unknown.InnerException ?? unknown);
+            throw Availability.Unanswered($"Opening '{path}' for reading did not complete.", unknown.InnerException ?? unknown);
         }
     }
 
