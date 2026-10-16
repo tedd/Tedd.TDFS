@@ -20,6 +20,9 @@ internal sealed class ControlRouter : IRpcRouter
     public ControlRouter(ClientRuntime runtime) => _runtime = runtime;
 
     /// <inheritdoc />
+    public bool RoutesToGroupLeader => !_runtime.IsBackupHost;
+
+    /// <inheritdoc />
     public async ValueTask<string?> ResolveAsync(OperationScope scope, TimeSpan attemptTimeout)
     {
         if (_runtime.IsBackupHost)
@@ -127,6 +130,9 @@ internal sealed class AnyNodeRouter : IRpcRouter
     private readonly HashSet<string> _failed = new(StringComparer.Ordinal);
 
     public AnyNodeRouter(ClientRuntime runtime) => _runtime = runtime;
+
+    /// <inheritdoc />
+    public bool RoutesToGroupLeader => false;
 
     /// <inheritdoc />
     public ValueTask<string?> ResolveAsync(OperationScope scope, TimeSpan attemptTimeout)

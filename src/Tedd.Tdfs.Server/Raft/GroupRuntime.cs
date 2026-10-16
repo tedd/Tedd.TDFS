@@ -598,6 +598,13 @@ internal sealed partial class GroupRuntime
 
         public bool LocalAppendReported { get; set; }
 
+        /// <summary>
+        /// A fault injector dropped the reply at a Raft stage of this proposal (F10/F11): the entry is still replicated
+        /// and applied, but its proposer is completed with <see cref="FaultReplyDroppedException"/> (the request executed,
+        /// its reply is lost), never by failing the group.
+        /// </summary>
+        public bool DropReply { get; set; }
+
         public TaskCompletionSource<ApplyOutcome> Completion { get; } = new();
     }
 

@@ -178,11 +178,15 @@ internal sealed class VolumeRegistry
             }
             else
             {
-                // Keep participating until the group stopped counting this node. A node removed while it was cut off never
-                // learns of its removal, so it stops participating after a grace period, but it keeps its log then: a member
-                // the configuration may still count as a voter must never lose its log (re-listed later, it would rejoin
-                // with an empty log and could vote for a candidate lacking committed entries). The data is deleted only once
-                // the applied (committed) configuration no longer contains this node.
+                // Keep participating until the group stopped counting this node. A voter of the applied configuration keeps
+                // hosting the group however long the transition takes (its replacement may still be catching up): leaving
+                // would silently reduce the group's failure tolerance while the quorum denominator stays the same (RCV-01).
+                // A voter removed while it was cut off may never learn of its removal; it then keeps an idle group, which is
+                // harmless (members ignore a non-member's messages while they have a leader, and its log is behind theirs).
+                // A learner stops participating after a grace period, but it keeps its log then: a member the configuration
+                // may still count must never lose its log (re-listed later, it would rejoin with an empty log and could vote
+                // for a candidate lacking committed entries). The data is deleted only once the applied (committed)
+                // configuration no longer contains this node.
                 RaftConfState applied = host.Group.AppliedConf;
                 if (!_unlistedSince.TryGetValue(host.Id, out long since))
                 {
@@ -191,7 +195,7 @@ internal sealed class VolumeRegistry
                 }
 
                 bool counted = applied.Contains(_s.NodeId);
-                close = !counted || _s.Time.GetElapsedTime(since, now) > grace;
+                close = !counted || (!applied.IsVoter(_s.NodeId) && _s.Time.GetElapsedTime(since, now) > grace);
                 deleteData = !counted;
             }
 

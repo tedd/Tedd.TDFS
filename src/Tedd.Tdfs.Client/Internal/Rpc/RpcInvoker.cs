@@ -42,13 +42,10 @@ internal sealed class RpcInvoker
         bool mutation = request.Kind == CallKind.Mutation;
         bool transmitted = false;
         int transmissions = 0;
-
-        // Transmissions that may have taken effect: every transmission except those answered NotLeader (a node that is not
-        // the leader proposes nothing, and a proposal that lost its log index to another term never commits — PROTOCOL.md
-        // §11.1). Only these can hide an earlier commit behind a later rejection (OperationExpired, LeaseLost, EpochMismatch).
-        int effective = 0;
         int failures = 0;
         int redirects = 0;
+        bool leaderless = false;   // a node of the group answered without being its leader (or no leader could be found)
+        bool attempted = false;    // at least one attempt started before the time ran out
         Exception? last = null;
         if (mutation)
             scope.OperationId = request.Operation;
@@ -56,6 +53,7 @@ internal sealed class RpcInvoker
 
         while (!scope.Token.IsCancellationRequested && scope.Elapsed < budget && failures <= _runtime.Options.MaxRetryAttempts)
         {
+            attempted = true;
             TimeSpan attemptTimeout = request.AttemptTimeout is { } fixedTimeout
                 ? ClientRuntime.Positive(fixedTimeout < scope.Remaining ? fixedTimeout : scope.Remaining)
                 : DefaultAttemptTimeout(scope);
@@ -87,6 +85,7 @@ internal sealed class RpcInvoker
 
             if (endpoint is null)
             {
+                leaderless = true;
                 last ??= new DfsUnavailableException(DfsErrorCode.NotLeader, $"{request.Name}: no leader is currently known.");
                 failures++;
                 if (!await BackoffAsync(failures, scope).ConfigureAwait(false))
@@ -163,6 +162,7 @@ internal sealed class RpcInvoker
                 break;
 
             byte[] frame = MessageCodec.Encode(message);
+            long sentAt = _runtime.Time.GetTimestamp();
             Task<ReadOnlyMemory<byte>> pending = connection.StartCall(frame, attemptTimeout, scope.Token);
 
             // A call refused before sending (connection closed, token already cancelled) transmitted nothing.
@@ -170,7 +170,6 @@ internal sealed class RpcInvoker
             if (!refused)
             {
                 transmissions++;
-                effective++;
                 request.Transmissions = transmissions;
                 transmitted |= mutation;
             }
@@ -179,15 +178,21 @@ internal sealed class RpcInvoker
             try
             {
                 raw = await pending.ConfigureAwait(false);
+                connection.NoteReply(_runtime.Time.GetTimestamp(), sentAt, _runtime.Time);
             }
             catch (OperationCanceledException) when (scope.Token.IsCancellationRequested)
             {
+                // The deadline ended the attempt before the node answered: later requests (keep-alives, the next
+                // operation) must not keep waiting on it as the presumed leader (a paused or partitioned old leader).
+                if (!scope.IsAbortedByCaller)
+                    request.Router.OnUnreachable(endpoint);
                 break;
             }
             catch (Exception ex) when (ex is TimeoutException or RpcConnectionException or IOException or ObjectDisposedException)
             {
                 last = ex;
-                _runtime.Pool.Invalidate(connection);
+                if (ex is not TimeoutException || IsSilent(connection, attemptTimeout))
+                    _runtime.Pool.Invalidate(connection);
                 request.Router.OnUnreachable(endpoint);
                 _runtime.Emit("rpc.attempt-failed", $"{request.Name} to {endpoint}: {ex.GetType().Name}.", request.Operation, request.Transaction, scope.Volume,
                     exception: ex);
@@ -251,7 +256,7 @@ internal sealed class RpcInvoker
 
             request.Router.OnAnswered(endpoint);
             DfsOperationId? before = request.Operation;
-            if (request.OnError is not null && await request.OnError(error, scope, effective).ConfigureAwait(false))
+            if (request.OnError is not null && await request.OnError(error, scope, transmissions).ConfigureAwait(false))
             {
                 last = ErrorOf(error, request);
                 failures++;
@@ -260,7 +265,6 @@ internal sealed class RpcInvoker
                     // The hook replaced an id that was definitively rejected without effect: the new id starts afresh.
                     transmitted = false;
                     transmissions = 0;
-                    effective = 0;
                     request.Transmissions = 0;
                     scope.OperationId = request.Operation;
                 }
@@ -271,10 +275,16 @@ internal sealed class RpcInvoker
             switch (error.Code)
             {
                 case DfsErrorCode.NotLeader:
+                    // A node of the group answered without being its leader: if no leader is reached before the attempts
+                    // or the time run out (none known, or the one hinted at unreachable), no quorum could be reached.
+                    leaderless = true;
                     last = ErrorOf(error, request);
                     request.Router.OnNotLeader(endpoint, error.LeaderHint);
-                    effective--;
-                    transmitted = mutation && effective > 0;
+
+                    // A NotLeader answer does not settle the transmission: the network may deliver one request more than
+                    // once (test plan §3.1 fault model), and an earlier copy may have been proposed while this node still
+                    // led — its own reply lost — before this copy was refused. Only a resolution through the operation id
+                    // is definite; a transmitted mutation stays possibly executed.
                     if (error.LeaderHint is { Length: > 0 } hint && !string.Equals(hint, endpoint, StringComparison.Ordinal) && redirects < MaxRedirects)
                     {
                         redirects++;
@@ -290,6 +300,7 @@ internal sealed class RpcInvoker
                 case DfsErrorCode.NodeUnavailable:
                 case DfsErrorCode.QuorumUnavailable:
                 case DfsErrorCode.Timeout:
+                    leaderless |= error.Code == DfsErrorCode.QuorumUnavailable;
                     last = ErrorOf(error, request);
                     failures++;
                     if (!await BackoffAsync(failures, scope).ConfigureAwait(false))
@@ -310,7 +321,38 @@ internal sealed class RpcInvoker
         }
 
     Exhausted:
-        return await FinishWithoutReplyAsync(request, scope, mutation && transmitted, last).ConfigureAwait(false);
+        return await FinishWithoutReplyAsync(request, scope, mutation && transmitted, ClassifyExhausted(request, scope, last, leaderless, attempted))
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The availability failure of a request that ran out of attempts or time (FSD §13: quorum unavailability is reported as
+    /// a distinct typed availability error, a deadline never as a bare <see cref="TimeoutException"/>). A request served by
+    /// a group leader (control or volume) that ran out of attempts or time without a leader answering it, or any request
+    /// for which a node answered without being the leader, could not reach a leader with a quorum: the last availability
+    /// failure, whichever node it came from (a leader that cannot commit without its quorum does not answer before the
+    /// deadline either), is reported as <see cref="DfsQuorumUnavailableException"/>. Caller cancellation and shutdown keep
+    /// their own classification.
+    /// </summary>
+    private static Exception? ClassifyExhausted(RpcRequest request, OperationScope scope, Exception? last, bool leaderless, bool attempted)
+    {
+        // A request issued after its operation's time already ran out (an earlier step used it up) learned nothing about
+        // the group: it is reported as the operation's deadline, never as quorum loss.
+        if (scope.IsAbortedByCaller || last is DfsQuorumUnavailableException || !attempted)
+            return last;
+        bool availability = last is null or TimeoutException or RpcConnectionException or (IOException and not DfsException)
+            || last is DfsUnavailableException { ErrorCode: DfsErrorCode.NotLeader or DfsErrorCode.Unavailable or DfsErrorCode.NodeUnavailable or DfsErrorCode.Timeout };
+        if (!availability || last is DfsPlacementUnavailableException or DfsCapacityException or DfsBackupNotReachedException)
+            return last;
+        if (leaderless || request.Router.RoutesToGroupLeader)
+        {
+            return new DfsQuorumUnavailableException(
+                $"{request.Name}: no leader with a quorum of its group could be reached{(last is null ? "." : $" ({last.Message})")}", last);
+        }
+
+        return last is TimeoutException and not DfsBackupNotReachedException
+            ? new DfsUnavailableException(DfsErrorCode.Timeout, $"{request.Name}: {last.Message}", last)
+            : last;
     }
 
     /// <summary>
@@ -322,26 +364,52 @@ internal sealed class RpcInvoker
         DfsOperationKind? faultKind = null, ObjectId? obj = null, int occurrence = 0, CancellationToken token = default)
     {
         CancellationToken ct = token.CanBeCanceled ? token : scope.Token;
-        ClientConnection connection = await _runtime.Pool.GetAsync(endpoint, scope, timeout).ConfigureAwait(false);
+        ClientConnection connection;
+        try
+        {
+            connection = await _runtime.Pool.GetAsync(endpoint, scope, timeout).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is TimeoutException or RpcConnectionException || (ex is IOException and not DfsException))
+        {
+            // No connection: the node is down, partitioned or paused.
+            _runtime.NoteUnresponsive(endpoint);
+            throw;
+        }
+
         DfsOperationKind kind = faultKind ?? MessageTypes.OperationOf(message.Type);
         await scope.HitAsync(FaultStage.F03, FaultSites.ClientRequestSend, kind, null, occurrence, obj).ConfigureAwait(false);
         ct.ThrowIfCancellationRequested();
         ReadOnlyMemory<byte> raw;
+        long sentAt = _runtime.Time.GetTimestamp();
         try
         {
             raw = await connection.StartCall(MessageCodec.Encode(message), ClientRuntime.Positive(timeout), ct).ConfigureAwait(false);
+            connection.NoteReply(_runtime.Time.GetTimestamp(), sentAt, _runtime.Time);
         }
         catch (Exception ex) when (ex is TimeoutException or RpcConnectionException or IOException)
         {
-            _runtime.Pool.Invalidate(connection);
+            if (ex is not TimeoutException || IsSilent(connection, timeout))
+                _runtime.Pool.Invalidate(connection);
+            if (ex is TimeoutException)
+                _runtime.NoteUnresponsive(endpoint);
             throw;
         }
 
+        _runtime.NoteResponsive(endpoint);
         IWireMessage reply = MessageCodec.Decode(raw.Span);
         await scope.HitAsync(FaultStage.F14, FaultSites.ClientReplyReceived, kind, null, occurrence, obj).ConfigureAwait(false);
         _runtime.Map.MarkGood(endpoint);
         return reply;
     }
+
+    /// <summary>
+    /// True when <paramref name="connection"/> delivered no reply for one and a half attempt timeouts. A single reply timeout
+    /// does not show that a connection is dead: requests multiplexed on it can wait at a busy server (a leader waiting for its
+    /// quorum or its control barrier) while it keeps answering others, and closing it would fail every request in flight on
+    /// it. A connection that stays silent that long is declared dead and replaced (silently dead links, NET-016).
+    /// </summary>
+    private bool IsSilent(ClientConnection connection, TimeSpan attemptTimeout) =>
+        _runtime.Time.GetElapsedTime(connection.LastReply) >= attemptTimeout + (attemptTimeout / 2);
 
     private IWireMessage Succeeded(RpcRequest request, string endpoint, IWireMessage reply)
     {

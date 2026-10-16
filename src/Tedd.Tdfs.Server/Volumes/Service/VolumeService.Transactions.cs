@@ -94,7 +94,7 @@ internal sealed partial class VolumeService
             throw new ArgumentException("The transaction timeout must be positive.");
         TimeSpan limit = _sm.State.Config.Limits.MaxTransactionDuration;
         TimeSpan duration = request.Timeout is { } timeout && timeout < limit ? timeout : limit;
-        return await MutateAsync(context, request, DfsOperationKind.TxBegin,
+        IWireMessage reply = await MutateAsync(context, request, DfsOperationKind.TxBegin,
             (op, _) => Task.FromResult<VolumeCommand>(Stamp(new TxBeginCommand(request.Header.Session, _s.Time.GetUtcNow() + duration), op)),
             result =>
             {
@@ -110,6 +110,15 @@ internal sealed partial class VolumeService
                 return begun with { Capability = capability, CapabilityExpiry = expiry, PlacementEpoch = PlacementEpochForUploads() };
             },
             bindTransaction: false);
+
+        // F05: the transaction and its staging session are registered; no object of it has been written yet.
+        if (reply is TxBeginResultMessage)
+        {
+            await _s.HitAsync(FaultStage.F05, FaultSites.StagingRegistered, Name, DfsOperationKind.TxBegin,
+                request.Header.Operation.IsEmpty ? null : request.Header.Operation, ct: context.Cancellation);
+        }
+
+        return reply;
     }
 
     /// <summary>
@@ -122,7 +131,7 @@ internal sealed partial class VolumeService
         DfsOperationId id = (request.Header.Transaction ?? throw new ArgumentException("TxCommit names its transaction in the request header.")).Operation;
         if (request.SnapshotName is { } snapshot && SnapshotNames.GetError(snapshot) is { } snapshotError)
             throw new ArgumentException(snapshotError);
-        IWireMessage reply = await MutateAsync(context, request, DfsOperationKind.TxCommit, (op, _) =>
+        IWireMessage reply = await MutateAsync(context, request, DfsOperationKind.TxCommit, async (op, ct) =>
         {
             byte[] descriptor = [];
             if (_transactions.TryGetValue(id, out TxWork? tx))
@@ -130,6 +139,16 @@ internal sealed partial class VolumeService
                 if (!string.Equals(tx.Principal, principal, StringComparison.Ordinal))
                     throw new UnauthorizedAccessException($"Transaction {id} belongs to another principal.");
                 descriptor = tx.Describe().Encode();
+
+                // F09 of the commit (test plan §8.2: a publication path has its own stage instrumentation): the receipts of
+                // every data object the transaction publishes were validated when its writes were staged, and the commit
+                // decision is not proposed yet.
+                int occurrence = 0;
+                foreach ((ObjectId obj, string? path) in tx.DataObjects)
+                {
+                    await _s.HitAsync(FaultStage.F09, FaultSites.CommitReceiptValidated, Name, DfsOperationKind.TxCommit,
+                        request.Header.Operation.IsEmpty ? null : request.Header.Operation, path, obj, occurrence++, ct: ct);
+                }
             }
             else if (_sm.State.Transactions.TryGetValue(id, out TxRecord? record) && record.State == TxState.Active)
             {
@@ -138,8 +157,8 @@ internal sealed partial class VolumeService
                     $"Transaction {id} lost its private view in a leader change; it is aborted and must be retried.");
             }
 
-            return Task.FromResult<VolumeCommand>(Stamp(new TxCommitCommand(id, descriptor, request.SnapshotName), op));
-        }, bindTransaction: false);
+            return Stamp(new TxCommitCommand(id, descriptor, request.SnapshotName), op);
+        }, cleanup: true, bindTransaction: false);
         if (!(_sm.State.Transactions.TryGetValue(id, out TxRecord? after) && after.State == TxState.Active))
             DropTransaction(id);
 
@@ -157,7 +176,7 @@ internal sealed partial class VolumeService
     {
         DfsOperationId id = (request.Header.Transaction ?? throw new ArgumentException("TxAbort names its transaction in the request header.")).Operation;
         IWireMessage reply = await MutateAsync(context, request, DfsOperationKind.TxAbort,
-            (op, _) => Task.FromResult<VolumeCommand>(Stamp(new TxAbortCommand(id), op)), requireOperation: false, bindTransaction: false);
+            (op, _) => Task.FromResult<VolumeCommand>(Stamp(new TxAbortCommand(id), op)), requireOperation: false, cleanup: true, bindTransaction: false);
         if (reply is TxAbortResultMessage)
             DropTransaction(id);
         return reply;
@@ -365,7 +384,27 @@ internal sealed partial class VolumeService
             case CommitFileCommand or WriteAllCommand or AppendCommand or CopyCommand or MoveCommand or DeleteCommand or CreateDirectoryCommand
                 or SetPolicyCommand or SetAclCommand or SetOwnerCommand:
                 tx.Writes.Add(new TxWrite(CommandCodec.Encode(command), 0));
+                NoteDataObjects(tx, command);
                 break;
+        }
+    }
+
+    /// <summary>Records the data objects a publication publishes (their receipts were validated before it was applied).</summary>
+    private static void NoteDataObjects(TxWork tx, VolumeCommand command)
+    {
+        (PublishSpec? spec, string? path) = command switch
+        {
+            CommitFileCommand c => (c.Spec, (string?)null),
+            WriteAllCommand w => (w.Spec, w.TargetPath),
+            AppendCommand a => (a.Spec, a.TargetPath.Length > 0 ? a.TargetPath : null),
+            _ => (null, null),
+        };
+        if (spec is null || spec.Changes.IsDefault)
+            return;
+        foreach (StreamChange change in spec.Changes)
+        {
+            if (change is { ChangeKind: RangeChangeKind.Data, Extent: { } extent } && tx.DataObjectIds.Add(extent.Object))
+                tx.DataObjects.Add((extent.Object, path));
         }
     }
 
@@ -520,6 +559,11 @@ internal sealed partial class VolumeService
 
         /// <summary>Bytes published by the transaction's writes so far (MaxTransactionStagedBytes).</summary>
         public long StagedBytes { get; set; }
+
+        /// <summary>Data objects the transaction's writes publish, in write order (with the written path when known).</summary>
+        public List<(ObjectId Object, string? Path)> DataObjects { get; } = [];
+
+        public HashSet<ObjectId> DataObjectIds { get; } = [];
 
         /// <summary>Results of the transaction's operation ids (a retried transaction-bound request gets the same answer).</summary>
         public Dictionary<DfsOperationId, VolumeApplyResult> Results { get; } = [];

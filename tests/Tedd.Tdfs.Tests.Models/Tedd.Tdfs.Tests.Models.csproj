@@ -2,6 +2,9 @@
   <PropertyGroup>
     <!-- Tests run with full ICU globalization so culture-dependent behaviour (PATH-008) and NFC cross-checks are exercised. -->
     <InvariantGlobalization>false</InvariantGlobalization>
+    <!-- The bounded-exhaustive model checks (CON-001) explore millions of states on every core; the workstation GC
+         serializes their allocations. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="xunit.v3" />

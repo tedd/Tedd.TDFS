@@ -37,6 +37,19 @@ internal sealed class HarnessNodeLog : INodeLog
             return _recent.ToArray();
     }
 
+    /// <summary>
+    /// A client diagnostics sink that echoes the client's SDK events (with its clock's time) to the console when
+    /// <c>TDFS_TEST_LOG</c> is <c>debug</c> or <c>trace</c>; null otherwise.
+    /// </summary>
+    public static IDfsDiagnostics? ClientEcho(string client, TimeProvider clock) =>
+        EchoLevel is { } echo && echo <= NodeLogLevel.Debug ? new ClientEchoSink(client, clock) : null;
+
+    private sealed class ClientEchoSink(string client, TimeProvider clock) : IDfsDiagnostics
+    {
+        public void OnEvent(DfsDiagnosticEvent e) =>
+            Console.WriteLine($"[Client] {clock.GetUtcNow():HH:mm:ss.fffffff} {client} {e.Name}: {e.Message}{(e.Exception is { } ex ? $" ({ex.GetType().Name}: {ex.Message})" : string.Empty)}");
+    }
+
     private static NodeLogLevel? ParseEchoLevel(string? value) =>
         string.IsNullOrWhiteSpace(value) ? null : Enum.TryParse(value.Trim(), ignoreCase: true, out NodeLogLevel level) ? level : NodeLogLevel.Info;
 }

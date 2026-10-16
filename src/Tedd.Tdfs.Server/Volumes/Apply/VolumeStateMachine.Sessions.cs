@@ -213,8 +213,12 @@ internal sealed partial class VolumeStateMachine
         // flight and must never be fenced (a fence would report Aborted for a restore that later creates its volume).
         if (s.Restores.ContainsKey(target))
             return Status(target, WireOutcomeStatus.Pending, "The restore was accepted and is still running.");
-        if (session.State != SessionState.Active || target.Sequence <= session.RetiredWatermark)
+        if (session.State == SessionState.Retired || target.Sequence <= session.RetiredWatermark)
             return Status(target, WireOutcomeStatus.Expired, "The operation id is outside the retained outcome window.");
+
+        // An expired session keeps its outcome window until the outcome retention elapses (ARCHITECTURE.md §7): an id of it
+        // without outcome never executed and never can (the gate refuses every request of an expired session), so it is
+        // answered like any unseen id and a resolving query fences it into a definite abort.
         fenceable = true;
         return Status(target, WireOutcomeStatus.NotFound, "No outcome is recorded for the operation.");
     }

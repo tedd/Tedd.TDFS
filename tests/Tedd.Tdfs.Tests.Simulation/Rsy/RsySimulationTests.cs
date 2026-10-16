@@ -285,7 +285,7 @@ public sealed class RsySimulationTests
             if (cOldSession is not null)
                 Assert.True(cOldSession.Expired || cOldSession.RetiredWatermark >= idOld1.Sequence, "C must retain the old ids' retirement");
             IReadOnlySet<ObjectId> cReachable = cState.ReachableObjects();
-            Assert.Equal(leaderState.ReachableObjects().Order().ToArray(), cReachable.Order().ToArray());
+            Assert.Equal(leaderState.ReachableObjects().OrderBy(o => o.Value).ToArray(), cReachable.OrderBy(o => o.Value).ToArray());
             Assert.All(objectsOfI, o => Assert.DoesNotContain(o, cReachable));
 
             // ---- Stop A; service continues through B/C ----
@@ -1089,7 +1089,7 @@ public sealed class RsySimulationTests
             Assert.Equal(ls.Pins.OrderBy(p => p.Id).ToArray(), cs.Pins.OrderBy(p => p.Id).ToArray());
             Assert.Contains(cs.Pins, p => p.Snapshot == "s2" || p.Snapshot == s2.Id.Value.ToString());   // the reader pin survived catch-up
             IReadOnlySet<ObjectId> cReach = cs.ReachableObjects();
-            Assert.Equal(ls.ReachableObjects().Order().ToArray(), cReach.Order().ToArray());
+            Assert.Equal(ls.ReachableObjects().OrderBy(o => o.Value).ToArray(), cReach.OrderBy(o => o.Value).ToArray());
             Assert.All(protectedObjects, o => Assert.Contains(o, cReach));
             Assert.All(objV0, o => Assert.DoesNotContain(o, cReach));
 
@@ -1169,10 +1169,15 @@ public sealed class RsySimulationTests
             {
                 await using (kClient)
                 {
+                    // The window retires the lowest sequences, and the SDK draws its internal operation ids from blocks
+                    // reserved in advance: operations issued after id2 (an application id, reserved on its own) may use
+                    // sequences below it. Write until the window has moved past id2 (at least MaxOutcomesPerSession + 50
+                    // operations; bounded).
                     int count = Timings.MaxOutcomesPerSession + 50;
-                    for (int i = 0; i < count; i += 10)
+                    int bound = Timings.MaxOutcomesPerSession * 4;
+                    for (int i = 0; i < bound && (i < count || !await RetiredThroughAsync(cluster, id2)); i += 10)
                     {
-                        await Task.WhenAll(Enumerable.Range(i, Math.Min(10, count - i)).Select(n =>
+                        await Task.WhenAll(Enumerable.Range(i, 10).Select(n =>
                             k.Files.WriteAllBytesAsync($"/r/other{n:D4}", TestData.Bytes(10_100 + (ulong)n, 8), Ct)));
                     }
                 }
@@ -1211,6 +1216,13 @@ public sealed class RsySimulationTests
             Assert.Equal(t1.Sequence, (await z.Files.GetInfoAsync("/r/log", Ct)).Revision);
             Assert.Equal(t2.Sequence, (await z.Files.GetInfoAsync("/r/w", Ct)).Revision);
         });
+
+    /// <summary>True when the leader has retired <paramref name="id"/> and every earlier sequence of its session.</summary>
+    private static async Task<bool> RetiredThroughAsync(TestCluster cluster, DfsOperationId id)
+    {
+        VolumeStateInspection state = await cluster.Inspect.GetVolumeStateAsync(Volume);
+        return state.Sessions.SingleOrDefault(s => s.Id == id.Session) is { } session && (session.Expired || session.RetiredWatermark >= id.Sequence);
+    }
 
     // ------------------------------------------------------------------------------------------------------------
     // RSY-011
@@ -2362,15 +2374,18 @@ public sealed class RsySimulationTests
                 GroupInspection v = await cluster.Inspect.GetVolumeGroupAsync(Volume);
                 GroupInspection k = await cluster.Inspect.GetControlGroupAsync();
                 if (v.Term == volBefore.Term && v.Leader == volBefore.Leader && k.Term == controlBefore.Term && k.Leader == controlBefore.Leader
-                    && v.Voters.Order(StringComparer.Ordinal).SequenceEqual(volBefore.Voters.Order(StringComparer.Ordinal))
-                    && k.Voters.Order(StringComparer.Ordinal).SequenceEqual(controlBefore.Voters.Order(StringComparer.Ordinal)))
+                    && SameMembers(v, volBefore) && SameMembers(k, controlBefore))
                 {
                     break;
                 }
 
-                Assert.True(settle < 10, "terms/leaders did not settle after the membership change (before the stale node returned)");
+                Assert.True(settle < 10, "terms/leaders/members did not settle after the membership change (before the stale node returned)");
                 (volBefore, controlBefore) = (v, k);
             }
+
+            static bool SameMembers(GroupInspection a, GroupInspection b) =>
+                a.Voters.Order(StringComparer.Ordinal).SequenceEqual(b.Voters.Order(StringComparer.Ordinal), StringComparer.Ordinal)
+                && a.Learners.Order(StringComparer.Ordinal).SequenceEqual(b.Learners.Order(StringComparer.Ordinal), StringComparer.Ordinal);
 
             // The stale identity reappears with its old data.
             try
@@ -2816,7 +2831,7 @@ public sealed class RsySimulationTests
 
             await cluster.WaitForRepairAsync(Volume, RepairTimeout, Ct);
             var random = new SeededRandom(scheduleSeed);
-            ObjectId[] objectList = objects.Order().ToArray();
+            ObjectId[] objectList = objects.OrderBy(o => o.Value).ToArray();
             for (int step = 0; step < 9; step++)
             {
                 TestNode n = cluster[random.Next(cluster.Nodes.Count)];

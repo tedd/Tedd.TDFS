@@ -41,8 +41,7 @@ internal sealed class ControlService
     private async ValueTask<IWireMessage> GetVolumeRouteAsync(RpcContext context, IWireMessage request)
     {
         var message = (GetVolumeRouteMessage)request;
-        VolumeRecord volume = Control.State.FindVolumeByName(message.Volume)
-            ?? throw new DfsException(DfsErrorCode.VolumeNotFound, $"Volume '{message.Volume}' does not exist.");
+        VolumeRecord volume = Control.State.FindVolumeByName(message.Volume) ?? await ConfirmVolumeAbsentAsync(message.Volume, context.Cancellation);
         GroupRuntime? group = _s.Raft.TryGet(volume.GroupName);
         CommitToken last = CommitToken.None;
         if (message.RequireLeader)
@@ -58,6 +57,20 @@ internal sealed class ControlService
         NodeId? leader = group?.Leader;
         return new VolumeRouteResultMessage(Control.ToVolumeEntry(volume), leader, leader is { } id ? Control.ResolveEndpoint(id) : null,
             group?.Term ?? 0, last);
+    }
+
+    /// <summary>
+    /// "Does not exist" is a definite answer, so only a current view may give it: a control follower or learner can lag the
+    /// control log arbitrarily (on a partial link mesh it may never receive it), so it redirects to the control leader
+    /// (retryable <c>NotLeader</c>); the leader first confirms with a ReadIndex round that it still leads and has applied
+    /// everything committed before the request arrived (a volume created through a previous leader).
+    /// </summary>
+    private async Task<VolumeRecord> ConfirmVolumeAbsentAsync(string name, CancellationToken ct)
+    {
+        if (Control.Group is not { IsLeader: true } group)
+            throw Control.NotLeader();
+        await group.ReadIndexAsync(ct);
+        return Control.State.FindVolumeByName(name) ?? throw new DfsException(DfsErrorCode.VolumeNotFound, $"Volume '{name}' does not exist.");
     }
 
     private async ValueTask<IWireMessage> JoinClusterAsync(RpcContext context, IWireMessage request)

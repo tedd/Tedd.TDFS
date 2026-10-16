@@ -110,8 +110,50 @@ public sealed record HelloChallengeMessage(
     ReadOnlyMemory<byte> PrincipalSalt,
     int Pbkdf2Iterations) : IWireMessage<HelloChallengeMessage>
 {
-    /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
+    /// <summary>
+    /// Extension field id of <see cref="ServerBootId"/> (optional; value: the boot id as 16 bytes, little-endian). An
+    /// extension because the message shipped without it (INTERNALS.md §4): a peer that does not know it ignores it
+    /// (FMT-003), and a node that receives a challenge without it checks the server by incarnation only.
+    /// </summary>
+    public const uint ServerBootIdExtension = 1;
+
+    private static readonly System.Collections.Frozen.FrozenSet<uint> UnderstoodExtensions =
+        System.Collections.Frozen.FrozenSet.ToFrozenSet([ServerBootIdExtension]);
+
+    /// <summary>Extensions preserved from the wire (re-emitted on encode), including <see cref="ServerBootIdExtension"/>.</summary>
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
+
+    /// <summary>
+    /// Process boot id of a live node answering a node peer, from <see cref="ServerBootIdExtension"/> (0 when absent). Bound
+    /// into the transcript like every other byte of the challenge: a node that opened the connection tells a process started
+    /// from a cloned disk (registered incarnation, other boot id) apart from the registered one, exactly as the answering
+    /// side does with <see cref="HelloMessage.BootId"/> (<see cref="DfsErrorCode.StaleIncarnation"/>, RSY-021), also for
+    /// requests the answering node later sends back over this connection.
+    /// </summary>
+    public UInt128 ServerBootId
+    {
+        get
+        {
+            foreach (WireExtension extension in Extensions)
+            {
+                if (extension.FieldId == ServerBootIdExtension && extension.Value.Length == 16)
+                    return System.Buffers.Binary.BinaryPrimitives.ReadUInt128LittleEndian(extension.Value.Span);
+            }
+
+            return UInt128.Zero;
+        }
+    }
+
+    /// <summary>A copy that presents <paramref name="bootId"/> (sets <see cref="ServerBootIdExtension"/>; 0 removes it).</summary>
+    public HelloChallengeMessage WithServerBootId(UInt128 bootId)
+    {
+        WireExtension[] others = [.. Extensions.Where(e => e.FieldId != ServerBootIdExtension)];
+        if (bootId == UInt128.Zero)
+            return this with { Extensions = others };
+        byte[] value = new byte[16];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt128LittleEndian(value, bootId);
+        return this with { Extensions = [new WireExtension(ServerBootIdExtension, Required: false, value), .. others] };
+    }
 
     /// <inheritdoc />
     public MessageType Type => WireType;
@@ -152,10 +194,16 @@ public sealed record HelloChallengeMessage(
         ReadOnlyMemory<byte> nonce = reader.ReadFixedBytes(ProtocolInfo.NonceSize, nameof(ServerNonce));
         ReadOnlyMemory<byte> salt = reader.ReadBytesCopy();
         int iterations = reader.ReadVarInt32();
-        IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
+        List<WireExtension>? list = null;
+        reader.ReadExtensions(UnderstoodExtensions, e =>
+        {
+            if (e.FieldId == ServerBootIdExtension && e.Value.Length != 16)
+                throw WireReader.Malformed($"The server boot id extension must hold 16 bytes, not {e.Value.Length}.");
+            (list ??= []).Add(e);
+        });
         return new HelloChallengeMessage(cluster, clusterName, version, features, serverName, role, nodeId, incarnation, nonce, salt, iterations)
         {
-            Extensions = extensions,
+            Extensions = list is null ? [] : list.ToArray(),
         };
     }
 }

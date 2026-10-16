@@ -178,7 +178,7 @@ public sealed partial class TestCluster
             OperationTimeout = options.OperationTimeout ?? TimeSpan.FromSeconds(10),
             Security = new DfsTransportSecurity { PinnedSpkiSha256 = _trustedPins },
             TimeProvider = clock,
-            Diagnostics = options.Diagnostics ?? (TraceClientEvents ? new TraceDiagnostics(this, options.NetworkName) : null),
+            Diagnostics = options.Diagnostics ?? (TraceClientEvents ? new TraceDiagnostics(this, options.NetworkName) : HarnessNodeLog.ClientEcho(options.Name, clock)),
         };
         if (options.ConnectTimeout is { } connect)
             result = result with { ConnectTimeout = connect };

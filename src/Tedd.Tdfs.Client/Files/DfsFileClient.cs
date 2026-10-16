@@ -129,7 +129,7 @@ public sealed partial class DfsFileClient
             // (or the client's disposal) or an availability failure. A handle it may have created expires with its lease.
             if (scope.IsAbortedByCaller)
                 throw scope.NotTransmittedFailure(unknown.InnerException ?? unknown);
-            throw new DfsUnavailableException(DfsErrorCode.Unavailable, $"Opening '{path}' for reading did not complete.", unknown.InnerException ?? unknown);
+            throw ReadOpenFailure(path, unknown);
         }
 
         OpenHandleResultMessage opened = bound.Reply;
@@ -321,9 +321,18 @@ public sealed partial class DfsFileClient
             // cancellation when the caller cancelled (its handle, if any, expires with its lease).
             if (scope.IsAbortedByCaller)
                 throw scope.NotTransmittedFailure(unknown.InnerException ?? unknown);
-            throw new DfsUnavailableException(DfsErrorCode.Unavailable, $"Opening '{path}' for reading did not complete.", unknown.InnerException ?? unknown);
+            throw ReadOpenFailure(path, unknown);
         }
     }
+
+    /// <summary>
+    /// The availability failure of an unanswered read-only open: a quorum failure stays a quorum failure (FSD §13: distinct
+    /// typed availability errors), anything else is reported as <see cref="DfsErrorCode.Unavailable"/>.
+    /// </summary>
+    private static DfsUnavailableException ReadOpenFailure(string path, DfsCommitOutcomeUnknownException unknown) =>
+        unknown.InnerException is DfsQuorumUnavailableException quorum
+            ? new DfsQuorumUnavailableException($"Opening '{path}' for reading did not complete: {quorum.Message}", quorum)
+            : new DfsUnavailableException(DfsErrorCode.Unavailable, $"Opening '{path}' for reading did not complete.", unknown.InnerException ?? unknown);
 
     // ---- Whole-file writes ------------------------------------------------------------------------------------
 
@@ -507,6 +516,7 @@ public sealed partial class DfsFileClient
         // not depend on the length. (Transaction-bound appends keep the length-based choice: the transaction answers their
         // ids from its own results.)
         bool lengthIndependent = options.OperationId is not null && Transaction is null;
+        bool? representation = null;   // inline (true) or objects (false) forced after an OperationIdMismatch of a caller-supplied id
         while (true)
         {
             // Otherwise the current length decides the representation (and whether a text preamble is due). A principal may
@@ -532,7 +542,7 @@ public sealed partial class DfsFileClient
             DfsStoragePolicy policy;
             if (lengthIndependent)
             {
-                inline = bytes.Length <= threshold;
+                inline = representation ?? (bytes.Length <= threshold);
                 policy = inline ? ContentLayout.ResolvePolicy(entry, options.StoragePolicy) ?? entry.DefaultPolicy
                     : await AppendPolicyAsync(path, options.StoragePolicy, entry, scope).ConfigureAwait(false);
             }
@@ -541,9 +551,9 @@ public sealed partial class DfsFileClient
                 policy = known
                     ? await PolicyForAsync(path, options.StoragePolicy, entry, info, scope).ConfigureAwait(false)
                     : ContentLayout.ResolvePolicy(entry, options.StoragePolicy) ?? entry.DefaultPolicy;
-                inline = known && !inlineRejected && current + bytes.Length <= threshold && ContentLayout.InlinePermitted(entry, policy, LabelsOf);
+                inline = representation ?? (known && !inlineRejected && current + bytes.Length <= threshold
+                    && ContentLayout.InlinePermitted(entry, policy, LabelsOf));
             }
-
             Payload payload = inline
                 ? Payload.Inline(bytes)
                 : await UploadAsync(bytes, 0, entry, policy, scope).ConfigureAwait(false);
@@ -566,6 +576,18 @@ public sealed partial class DfsFileClient
             {
                 // As for WriteAll: the helper's staging session closed with its client session; upload again.
                 stagingReplaced = true;
+            }
+            catch (DfsOperationIdMismatchException) when (options.OperationId is not null && representation is null && !scope.IsAbortedByCaller)
+            {
+                // A caller-supplied id may be retried by a later call whose representation (inline or objects, PROTOCOL.md
+                // §5.2) differs from the one its stored outcome was recorded with: a transaction-bound append chose it from
+                // the current length, which this very append changed (OUT-002, OUT-006), or the original was sent by a client
+                // that chose it differently. The same content is described the other way once: a stored outcome of that
+                // identity answers it (the operation gate is consulted before anything is validated or applied), and a
+                // second mismatch is a genuine one (other content or arguments).
+                if (payload.Lease is not null)
+                    await Context.CloseUnboundStagingAsync(payload.Lease).ConfigureAwait(false);
+                representation = !inline;
             }
             catch (Exception) when (payload.Lease is not null)
             {

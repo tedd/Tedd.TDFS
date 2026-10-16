@@ -199,6 +199,34 @@ public sealed class ProtocolReviewTests
     }
 
     [Fact]
+    public void ServerBootIdTravelsAsAnOptionalChallengeExtension()
+    {
+        // HelloChallenge shipped without the server's boot id: it is the optional extension field 1, so a challenge without
+        // it (an older server) still decodes (boot id 0), and other optional extensions are preserved after it.
+        var plain = new HelloChallengeMessage(Guid.Empty, "c", 1, ImmutableSortedSet<string>.Empty, "n1", PeerRole.Node, null, 2, new byte[32],
+            ReadOnlyMemory<byte>.Empty, 0);
+        Assert.Equal(UInt128.Zero, MessageCodec.Decode<HelloChallengeMessage>(MessageCodec.Encode(plain)).ServerBootId);
+
+        var other = new WireExtension(1000, Required: false, new byte[] { 1, 2, 3 });
+        HelloChallengeMessage withBoot = (plain with { Extensions = [other] }).WithServerBootId(new UInt128(5, 6));
+        byte[] frame = MessageCodec.Encode(withBoot);
+        HelloChallengeMessage decoded = MessageCodec.Decode<HelloChallengeMessage>(frame);
+        Assert.Equal(new UInt128(5, 6), decoded.ServerBootId);
+        Assert.Equal([HelloChallengeMessage.ServerBootIdExtension, 1000u], decoded.Extensions.Select(e => e.FieldId).ToArray());
+        Assert.Equal(frame, MessageCodec.Encode(decoded));   // re-encoded identically (the transcript covers the frame)
+        Assert.Equal(UInt128.Zero, decoded.WithServerBootId(UInt128.Zero).ServerBootId);
+        Assert.Equal([1000u], decoded.WithServerBootId(UInt128.Zero).Extensions.Select(e => e.FieldId).ToArray());
+
+        // The field is optional, never required: a receiver that predates it ignores it.
+        Assert.False(Assert.Single(decoded.Extensions, e => e.FieldId == HelloChallengeMessage.ServerBootIdExtension).Required);
+
+        // A boot id that is not 16 bytes is malformed.
+        HelloChallengeMessage malformed = plain with { Extensions = [new WireExtension(HelloChallengeMessage.ServerBootIdExtension, Required: false, new byte[3])] };
+        var error = Assert.Throws<DfsProtocolException>(() => MessageCodec.Decode<HelloChallengeMessage>(MessageCodec.Encode(malformed)));
+        Assert.Equal(DfsErrorCode.ProtocolError, error.ErrorCode);
+    }
+
+    [Fact]
     public void GcDecisionsNameTheStagingSessionAndEpochTheyWereTakenFor()
     {
         // ARCHITECTURE §8: deletability is decided per (object, staging) inventory item. A copy that a later upload re-bound to

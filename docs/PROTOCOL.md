@@ -96,7 +96,7 @@ varuint count
 count × ( varuint32 fieldId, u8 flags, bytes value )      flags: bit 0 = Required, bits 1-7 must be 0
 ```
 
-* Field ids are unique within one block (duplicates are malformed). Version 1 defined **no** extension fields; fields added since are listed with their message (`RestoreSnapshot` field 1 `StoragePool`).
+* Field ids are unique within one block (duplicates are malformed). Version 1 defined **no** extension fields; fields added since are listed with their message (`RestoreSnapshot` field 1 `StoragePool`, `HelloChallenge` field 1 `ServerBootId`).
 * An **unknown optional** extension is preserved on the decoded record (`Extensions`) and re-emitted when the record is
   re-encoded (for example when a node forwards a request), and is otherwise ignored (FMT-003).
 * An **unknown required** extension makes the whole message fail with `Unsupported` (FMT-002): a receiver never
@@ -153,6 +153,10 @@ peer                                         server (live node or backup node)
     (K: a server-held key derived from the cluster or backup secret) with the default iteration count, and the proof then fails exactly like a wrong secret
     (`AuthenticationFailed`): principal existence is not disclosed. Clients refuse iteration counts outside
     `1..10 000 000`.
+  * A live node that has not yet applied the registration of its own incarnation (still catching up after a join or a
+    restart, its control view is behind the cluster's) cannot tell an unknown principal from one it has not learned
+    yet: it answers every failed proof with the retryable `NodeUnavailable` instead (alike for unknown principals and
+    wrong secrets, so existence is still not disclosed), and the client authenticates through another node.
 * **Nodes** (role `Node`, cluster secret): `NodeAuthKey = HKDF-SHA256(clusterSecret, info "tdfs/v1/node-auth")`
   (`KeyDerivation`); `Proof = HMAC(NodeAuthKey, "tdfs/node-proof/v1\0" ‖ T)`,
   `ServerMac = HMAC(NodeAuthKey, "tdfs/node-server/v1\0" ‖ T)` (distinct labels, so neither can be reflected). The
@@ -161,8 +165,11 @@ peer                                         server (live node or backup node)
   node id that is not (yet) a member but proves the cluster secret is accepted only for the seed-join flow
   (`GetClusterMap`, `GetVolumeRoute`, `JoinCluster`); every other request on such a connection is answered
   `AccessDenied`. An incarnation older than the registered one, or equal to it with a different boot id (a second
-  process started from a cloned disk), is rejected with `StaleIncarnation` (RSY-021). A newer, not yet registered
-  incarnation is accepted, **including its Raft traffic**: committing the registration needs a control quorum, and
+  process started from a cloned disk), is rejected with `StaleIncarnation` (RSY-021). The answering node presents its
+  own boot id in the `HelloChallenge` extension `ServerBootId`, so a node that opens a connection applies the same check to the server
+  (it refuses such a connection, and the receiver checks requests sent back over a connection it opened like those on
+  connections it accepted). A newer, not yet registered incarnation is accepted, **including its Raft traffic**:
+  committing the registration needs a control quorum, and
   after a full-cluster restart every voter is in that state. Its receipts are not trusted, and the node issues none,
   until `RegisterIncarnation` committed the (incarnation, boot id) pair (RCV-02).
 * **Lagging views**: membership is judged against the receiver's local applied control state, which may lag (a new
@@ -256,8 +263,9 @@ Every volume-scoped request (39 types, all implementing `IVolumeRequest`) starts
   the next allocation (so blocks are used up and their reservations retire). An SDK-allocated id whose **only**
   transmission is rejected with `LeaseLost` for an expired session (requests that refer to no handle, pin or staging
   session) or `EpochMismatch` for a re-created volume did not execute either; the SDK opens a new session (or binds to
-  the new volume) and continues under a fresh id. After more than one transmission that may have taken effect (a
-  transmission answered `NotLeader` proposed nothing that can commit and does not count) such a rejection
+  the new volume) and continues under a fresh id. After more than one transmission (every transmission counts, one
+  answered `NotLeader` included: the network may deliver a request twice, and an earlier copy may have been proposed
+  while that node still led, its reply lost) such a rejection
   (`OperationExpired`, `LeaseLost` or `EpochMismatch`, for SDK and application ids alike) makes the outcome unknown
   (`DfsCommitOutcomeUnknownException`), because an earlier transmission may have committed before its outcome was
   retired, its session expired or its volume was re-created. An unexpected (non-error) reply type to a transmitted
@@ -464,7 +472,12 @@ zeroes; missing objects never do (STR, DSK-016).
   first attempt saw, possibly while the original is still in flight on a stalled log) the representation depends on
   the appended bytes alone: inline when they fit `InlineThreshold`, objects otherwise; no length is read. The leader
   accepts `Inline` changes whose result is extent-based (or whose policy inline metadata does not satisfy) and stores
-  those bytes as objects meeting the file's policy before proposing (inline → extents below).
+  those bytes as objects meeting the file's policy before proposing (inline → extents below). A retry of an
+  application-supplied id may still describe the content in the other representation than its stored outcome (a
+  transaction-bound append chooses it from the current length, which the original grew, or the original came from a
+  client that chose differently): on `OperationIdMismatch` the SDK sends the same content once in the other
+  representation (inline ↔ objects), which the stored outcome answers when it was recorded that way (the operation gate
+  is checked before the request is validated); a second mismatch is reported.
 * **Extents → inline**: when a publication whose result is stored inline leaves bytes of objects inside the result —
   base bytes of an extent-based file (for example a truncation to below the threshold followed by small writes), or
   `Data` changes of objects a stream uploaded early and then truncated below the threshold — the leader
@@ -697,7 +710,13 @@ Server's answer to `HelloMessage`: cluster identity, the selected protocol versi
 | 9 | `ServerNonce` | `bytes[32]` | Fresh random nonce of exactly `ProtocolInfo.NonceSize` bytes. |
 | 10 | `PrincipalSalt` | `bytes` | PBKDF2 salt of the principal's verifier (empty for node peers). |
 | 11 | `Pbkdf2Iterations` | `varint32` | PBKDF2-SHA256 iteration count of the verifier (0 for node peers). |
-| 12 | — | `extensions` | Terminal extension block. |
+| 12 | — | `extensions` | Terminal extension block (field 1, see below). |
+
+Extension fields (added after v1 shipped, §2.5):
+
+| Field id | Flags | Value | Meaning |
+|---|---|---|---|
+| 1 `ServerBootId` | Optional | `u128` (16 bytes, little-endian) | Process boot id of a live node answering a node peer (absent for client and backup peers, and from a sender that predates the field). A node that opened the connection fences a process with the registered incarnation but another boot id (a cloned disk) exactly as the answering side does with `Hello.BootId` (`StaleIncarnation`, RSY-021): it refuses the connection and never accepts requests the answering node sends back over it. A server that presents no boot id (a version that predates the field) is checked by its incarnation only. Bound into the transcript with the rest of the challenge frame. |
 
 #### `HelloProof` = 12 (`HelloProofMessage`)
 
@@ -3278,9 +3297,9 @@ Messages never contain payload bytes or secrets.
     snapshot); the manifest is opaque to the protocol and owned by the backup module.
 17. **Structured error details** (`ErrorReply.Detail`, `ErrorDetailData`) carry the typed exception properties API.md
     defines (placement shortfall, limit, integrity object, adapter phase) instead of flattening them into the message.
-18. **Process boot ids** (`Hello`, `JoinCluster`, `RegisterIncarnation`): two processes started from a cloned disk pick
-    the same incarnation, so registration is keyed by (incarnation, boot id) and the second process is fenced
-    (RSY-021). Raft traffic of a newer, not yet registered incarnation is accepted, otherwise a full-cluster restart
+18. **Process boot ids** (`Hello`, `HelloChallenge`, `JoinCluster`, `RegisterIncarnation`): two processes started from a
+    cloned disk pick the same incarnation, so registration is keyed by (incarnation, boot id) and the second process is
+    fenced (RSY-021), whichever side opened the connection. Raft traffic of a newer, not yet registered incarnation is accepted, otherwise a full-cluster restart
     could never commit the registrations.
 19. **GC decisions are per (object, staging session)** (`ObjectStagingRef` in `DeleteObjects` and
     `InventoryReportResult`), matching ARCHITECTURE §8, and receipts are always bound to the uploading request's

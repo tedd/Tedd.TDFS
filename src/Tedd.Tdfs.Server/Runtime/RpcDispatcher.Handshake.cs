@@ -80,6 +80,11 @@ internal sealed partial class RpcDispatcher
         IReadOnlySet<string> features = control.Features.Where(hello.Features.Contains).ToHashSet(StringComparer.Ordinal);
         var challenge = new HelloChallengeMessage(_s.ClusterId, control.ClusterName, (ushort)high, features, _s.NodeName, PeerRole.Node, _s.NodeId,
             _s.Incarnation, _s.Random.NextBytes(ProtocolInfo.NonceSize), salt, iterations);
+
+        // A node peer learns this process's boot id, so that it fences a process started from a cloned disk on connections it
+        // opened too (RSY-021).
+        if (hello.Role == PeerRole.Node)
+            challenge = challenge.WithServerBootId(_s.BootId);
         byte[] challengeFrame = MessageCodec.Encode(challenge);
         state.Hello = hello;
         state.HelloFrame = frame;
@@ -122,7 +127,7 @@ internal sealed partial class RpcDispatcher
             state.Identity = new RpcPeerIdentity(hello.Name, id, hello.Incarnation, null, IsNode: true, IsBackup: false);
             state.Connection.Identity = state.Identity;
             state.Phase = HandshakePhase.Authenticated;
-            _s.Peers?.NotePeerIncarnation(id, hello.Incarnation);
+            _s.Peers?.OnPeerAuthenticated(id, hello.Incarnation);
             return new HelloResultMessage(true, DfsErrorCode.None, string.Empty, hello.Name, DfsPermissions.None, capabilities,
                 HandshakeAuth.ComputeNodeServerMac(_s.Keys.NodeAuthKey, transcript));
         }
@@ -130,7 +135,20 @@ internal sealed partial class RpcDispatcher
         PrincipalVerifier? verifier = state.Verifier;
         bool proven = verifier is not null && HandshakeAuth.VerifyClientProof(verifier, transcript, proof.Proof.Span);
         if (!proven || !state.PrincipalKnown || verifier is null)
+        {
+            // A node that has not applied its own registration yet (catching up after a join or a restart) has a control
+            // view behind the cluster's: it cannot tell an unknown principal from one it has not learned yet, so it refuses
+            // retryably and the client authenticates through another node (a definite AuthenticationFailed from a lagging
+            // new member failed the whole operation, MESH-015). Every failed proof is answered alike while unregistered, so
+            // the answer still discloses nothing about which principals exist.
+            if (!_s.Control.IsSelfRegistered)
+            {
+                return Refuse(state, DfsErrorCode.NodeUnavailable,
+                    "This node is still catching up with the cluster and cannot authenticate the principal; use another node.", hello.Principal);
+            }
+
             return Refuse(state, DfsErrorCode.AuthenticationFailed, "Authentication failed.", hello.Principal);
+        }
         string principal = hello.Principal!;
         bool isBackup = hello.Role == PeerRole.Backup;
         state.Identity = new RpcPeerIdentity(null, null, 0, principal, IsNode: false, IsBackup: isBackup);

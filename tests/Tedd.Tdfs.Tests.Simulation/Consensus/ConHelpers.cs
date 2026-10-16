@@ -1,4 +1,5 @@
 using Tedd.Tdfs.Consensus;
+using Tedd.Tdfs.Protocol;
 using Tedd.Tdfs.Server;
 using Tedd.Tdfs.Testing;
 
@@ -36,6 +37,22 @@ internal static class ConHelpers
     public static void Log(string message) => TestContext.Current.TestOutputHelper?.WriteLine(message);
 
     public static DfsMutationOptions WithId(DfsOperationId id) => new() { OperationId = id };
+
+    /// <summary>
+    /// Drops every reply of <c>QueryOperation</c> (until disarmed). The SDK resolves a mutation that got no reply through
+    /// <c>QueryOperation(resolve: true)</c> (ARCHITECTURE §7/§9.2) and then legitimately reports the decided outcome;
+    /// scenarios whose premise is that no decision ever reaches the caller (every reply lost) must therefore lose the
+    /// replies of that resolution channel too.
+    /// </summary>
+    public static FaultArm ArmDropOutcomeQueryReplies(TestCluster cluster) =>
+        cluster.Faults.Arm(new FaultMatch(FaultSites.RpcReplySend, Operation: DfsOperationKind.QueryOperation, Count: 100_000), FaultAction.DropReply());
+
+    /// <summary>
+    /// Network variant of <see cref="ArmDropOutcomeQueryReplies"/>: the replies of every <c>QueryOperation</c> the client
+    /// <paramref name="clientNet"/> sends are lost (until the rule is cancelled).
+    /// </summary>
+    public static MessageRule DropOutcomeQueryReplies(TestCluster cluster, string clientNet) =>
+        cluster.Network.DropReplies(new MessageFilter(From: clientNet, Type: MessageType.QueryOperation), 100_000);
 
     public static async Task<Exception?> CaptureAsync(Func<Task> action)
     {

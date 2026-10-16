@@ -46,12 +46,18 @@ public sealed class ConModelsTests
         Assert.Null(initial.Violation);
 
         // The budgets make the reachable state space finite; the depth bound is far above the longest possible schedule
-        // so that only the budgets limit the exploration and the result can report completion.
+        // so that only the budgets limit the exploration and the result can report completion. States are merged by an
+        // abstract, symmetry-reduced key, messages that can never have an effect again are discarded (each discarded answer is
+        // first delivered to a copy of its recipient, which must not change: the reduction never hides a defect of the core
+        // in handling such messages), and states are pruned
+        // when an already visited state simulates them (see RaftModelCluster): every reachable node state and history is
+        // still covered. The state bound is a resource cap only (the largest row needs about 10 million states); a row
+        // that reaches it fails as incomplete.
         const int maxDepth = 400;
-        const long maxStates = 3_000_000;
-        ModelCheckResult result = ModelChecker.Explore(
+        const long maxStates = 20_000_000;
+        ModelCheckResult result = ModelChecker.ExploreParallelWithSubsumption(
             initial,
-            state => RaftModelCluster.Successors(bounds, seed, state),
+            RaftModelCluster.Successors,
             state => state.Violation,
             state => state.Key,
             maxDepth,
@@ -73,6 +79,86 @@ public sealed class ConModelsTests
         // Configuration rows must actually reach a configuration change: an elected leader accepts the proposal.
         if (confChanges > 0)
             Assert.True(ContainsConfigurationChange(bounds, seed), $"Model {model}: no explored schedule proposed a configuration change; the bounds are vacuous.");
+    }
+
+    /// <summary>
+    /// The bounded exploration above merges states by <c>RaftNode.DescribeCanonicalState</c> and branches them with
+    /// <c>RaftNode.Clone</c> (RaftNode.Canonical.cs): a field of the core that neither describes nor copies would silently
+    /// merge states that behave differently, and the exploration would report completion without covering them. This
+    /// guard lists every instance field of the core's state types as reviewed for both; a new field fails it until it is
+    /// added to the description and the copy (or documented here as configuration that never differs between the states
+    /// of one node).
+    /// </summary>
+    [Fact, Catalog("CON-001", "M", "INV-03", "INV-18")]
+    public void CON_001_ElectionSafety_CanonicalStateCoversEveryCoreField()
+    {
+        // Configuration and identity, equal in every state of one node (the model builds every core of a node alike):
+        // _cfg, _options, _random (abstracted, see DescribeCanonicalState), _self, _reachableQuorum, RaftLog._stable (the
+        // host's durable log, described by the host), RaftProgress._maxInflight and Peer.
+        AssertFields(typeof(RaftNode),
+            "_cfg", "_options", "_random", "_log", "_self", "_reachableQuorum", "_term", "_vote", "_lead", "_state", "_electionElapsed",
+            "_heartbeatElapsed", "_randomizedElectionTimeout", "_tickCount", "_confBase", "_confBaseIndex", "_confHistory", "_conf", "_progress",
+            "_pendingConfIndex", "_leadTransferee", "_votes", "_readQueue", "_deferredReads", "_readSeq", "_readStates", "_lastHeard", "_incoming",
+            "_msgs", "_prevHardState", "_prevRole", "_prevLeader", "_outstanding");
+        AssertFields(typeof(RaftNode).Assembly.GetType("Tedd.Tdfs.Consensus.RaftLog", throwOnError: true)!,
+            "_stable", "_unstable", "_offset", "_pendingSnapshot", "Committed", "Applied");
+        AssertFields(typeof(RaftNode).Assembly.GetType("Tedd.Tdfs.Consensus.RaftProgress", throwOnError: true)!,
+            "_maxInflight", "_inflights", "Peer", "Match", "Next", "State", "ProbeSent", "PendingSnapshot", "Snapshot", "SnapshotOffset", "RecentActive");
+        AssertFields(typeof(RaftNode).GetNestedType("ReadRequest", System.Reflection.BindingFlags.NonPublic)!, "Seq", "Index", "Context", "Acks");
+        AssertFields(typeof(RaftNode).GetNestedType("IncomingSnapshot", System.Reflection.BindingFlags.NonPublic)!, "Term", "Meta", "Buffer");
+
+        static void AssertFields(Type type, params string[] reviewed)
+        {
+            const System.Reflection.BindingFlags Instance = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public
+                | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.DeclaredOnly;
+            string[] actual = type.GetFields(Instance)
+                .Select(f => f.Name.StartsWith('<') ? f.Name[1..f.Name.IndexOf('>', StringComparison.Ordinal)] : f.Name)
+                .Order(StringComparer.Ordinal).ToArray();
+            Assert.True(actual.SequenceEqual(reviewed.Order(StringComparer.Ordinal), StringComparer.Ordinal),
+                $"{type.Name} fields changed: [{string.Join(", ", actual)}]; review RaftNode.DescribeCanonicalState/Clone (CON-001) and update this list");
+        }
+    }
+
+    /// <summary>
+    /// The reduction may discard a message only if it can never have an effect again. A candidate can still win the term it
+    /// campaigns in, and the stale-leader answer a node sends with its newer term reaches a former leader that campaigns in
+    /// exactly that term: the answer must stay in flight while the recipient is that candidate and take effect once it
+    /// leads (it marks the follower recently active). Schedule: n0 leads term 1, its append to n2 is delayed; n1 moves n0
+    /// to term 2; n0 campaigns in term 3 and n2 joins term 3 by granting its vote; the delayed append reaches n2.
+    /// </summary>
+    [Fact, Catalog("CON-001", "M", "INV-03", "INV-18")]
+    public void CON_001_ElectionSafety_ReductionKeepsAnswersACandidateCanStillUse()
+    {
+        var bounds = new RaftModelBounds(3, PreVote: false, CheckQuorum: false, Timeouts: 3, Heartbeats: 0, Proposals: 0, Drops: 0, Duplicates: 0,
+            Crashes: 0);
+        var cluster = new RaftModelCluster(bounds, SeededRandom.DeriveSeed(0xC0_0001, "reduction-candidate-answer"));
+
+        cluster.Apply("timeout n0");
+        Deliver("VoteReq n0->n1 t1");
+        Deliver("VoteResp n1->n0 t1");
+        Assert.Equal(RaftRole.Leader, cluster.RoleOf(0));
+        cluster.Apply("timeout n1");
+        Deliver("VoteReq n1->n0 t2");          // n0 follows term 2 (n1's log is behind: no vote)
+        cluster.Apply("timeout n0");           // n0 campaigns in term 3
+        Assert.Equal(RaftRole.Candidate, cluster.RoleOf(0));
+        Deliver("VoteReq n0->n2 t3");          // n2 joins term 3 and grants its vote
+        Deliver("Append n0->n2 t1");           // the delayed append of term 1: n2 answers with term 3
+        Assert.Null(cluster.Violation);
+
+        const string answer = "AppendResp n2->n0 t3";
+        Assert.True(Find(answer) is not null, $"the answer of term 3 to the candidate of term 3 was discarded; in flight: {string.Join(" | ", cluster.EnabledActions())}");
+        Deliver("VoteResp n2->n0 t3");
+        Assert.Equal(RaftRole.Leader, cluster.RoleOf(0));
+        string before = cluster.DescribeCore(0);
+        Deliver(answer);
+        Assert.Null(cluster.Violation);
+        Assert.NotEqual(before, cluster.DescribeCore(0));   // the answer had an effect: it was not dead
+
+        string? Find(string prefix) =>
+            cluster.EnabledActions().FirstOrDefault(a => a.StartsWith("deliver " + prefix + " ", StringComparison.Ordinal));
+
+        void Deliver(string prefix) =>
+            cluster.Apply(Find(prefix) ?? throw new InvalidOperationException($"no '{prefix}' in flight: {string.Join(" | ", cluster.EnabledActions())}"));
     }
 
     public static TheoryData<int, ulong> RandomizedSeeds()
@@ -216,10 +302,12 @@ public sealed class ConModelsTests
 
     private static bool ContainsConfigurationChange(RaftModelBounds bounds, ulong seed)
     {
-        // Elect n0 as in ContainsElection, then let it propose the first enabled membership change and deliver everything.
+        // Elect n0 as in ContainsElection and deliver everything until quiescent (a new leader accepts a membership change
+        // only once an entry of its own term is committed), then let it propose the first enabled membership change and
+        // deliver everything.
         var cluster = new RaftModelCluster(bounds, seed);
         cluster.Apply("timeout n0");
-        for (int guard = 0; guard < 200 && !cluster.AnyLeader; guard++)
+        for (int guard = 0; guard < 400; guard++)
         {
             string? deliver = cluster.EnabledActions().FirstOrDefault(a => a.StartsWith("deliver ", StringComparison.Ordinal));
             if (deliver is null)

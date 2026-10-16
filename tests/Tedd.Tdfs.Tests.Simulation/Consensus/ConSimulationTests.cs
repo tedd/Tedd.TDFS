@@ -506,6 +506,9 @@ public sealed class ConSimulationTests
                 cluster.Faults.Arm(new FaultMatch(FaultSites.RpcReplySend, Operation: DfsOperationKind.WriteAll, Count: 1000), FaultAction.DropReply()),
                 cluster.Faults.Arm(new FaultMatch(FaultSites.RpcReplySend, Operation: DfsOperationKind.CreateDirectory, Count: 1000), FaultAction.DropReply()),
             ];
+
+            // The SDK's own outcome resolution must not deliver a decision either (premise: no reply reaches the client).
+            FaultArm dropQueries = ArmDropOutcomeQueryReplies(cluster);
             Exception? e1 = await CaptureAsync(() => lostVolume.Files.AppendAllBytesAsync("/log2", suffix2, WithId(kAppend), Ct));
             Exception? e2 = await CaptureAsync(() => lostVolume.Directories.CreateDirectoryAsync("/dd", WithId(kDir), Ct));
             Exception? e3 = await CaptureAsync(() => lostVolume.Files.WriteAllBytesAsync("/w", wBytes, WithId(kWrite), Ct));
@@ -520,6 +523,7 @@ public sealed class ConSimulationTests
             // change below, which would legitimately turn the retries into OperationExpired.
             foreach (FaultArm arm in dropReplies)
                 arm.Disarm();
+            dropQueries.Disarm();
 
             var before = new Dictionary<DfsOperationId, DfsOperationOutcome>();
             foreach (DfsOperationId id in new[] { kAppend, kWrite, kDir })
@@ -667,6 +671,12 @@ public sealed class ConSimulationTests
             TestNode leader = await cluster.GetLeaderAsync(Vol, Ct);
             TestNode[] followers = Others(cluster, leader);
 
+            // Before proposing a client mutation the volume leader synchronizes with the control leader (control barrier,
+            // SEC-006/ACL-026; it waits up to two election timeouts when the control leader is unreachable). A leader that
+            // can no longer send to its followers would lose its leadership during that wait, so the volume leader also
+            // leads the control group here: the barrier is then local.
+            await cluster.TransferLeadershipAsync(Control, leader.Name, ct: Ct);
+
             // The writer's session (and, should the SDK keep one per session, its staging session) is established while
             // replication still works: once replication is cut, nothing else can commit, so the faulted request must be
             // the only proposal it needs. All faulted payloads stay at or below the 4 KiB inline threshold, so no object
@@ -678,12 +688,6 @@ public sealed class ConSimulationTests
             DfsOperationId k = await writerVolume.NewOperationIdAsync(Ct);
             await cluster.WaitForReplicationAsync(Vol, Ct);
             int inodesBefore = (await cluster.Inspect.GetVolumeStateAsync(Vol, leader.Name)).InodeCount;
-
-            // The leader can no longer send to its followers: it appends the entry to its own journal but can never
-            // replicate or commit it. Once the entry is appended the writer is also confined to the leader, so no SDK
-            // retry can reach a new leader.
-            foreach (TestNode follower in followers)
-                cluster.Network.Cut(leader.Name, follower.Name);
 
             DfsOperationKind kind;
             Func<Task> invoke;
@@ -709,8 +713,18 @@ public sealed class ConSimulationTests
                     throw new ArgumentOutOfRangeException(nameof(operation));
             }
 
+            // The request is held at the leader right before it is proposed (after the SDK's own preparatory reads, such as
+            // the current length an append reads first, which need a heartbeat quorum). Then the leader can no longer send
+            // to its followers: it appends the entry to its own journal but can never replicate or commit it. Once the
+            // entry is appended the writer is also confined to the leader, so no SDK retry can reach a new leader.
+            FaultArm beforePropose = cluster.Faults.Arm(new FaultMatch(FaultSites.RaftBeforePropose, Node: leader.Name, Volume: Vol, Operation: kind),
+                FaultAction.Block());
             FaultArm appended = cluster.Faults.Arm(new FaultMatch(FaultSites.RaftAfterLocalAppend, Node: leader.Name, Volume: Vol, Operation: kind), FaultAction.Block());
             Task pending = invoke();
+            await beforePropose.WaitTriggeredAsync(ElectionBound);
+            foreach (TestNode follower in followers)
+                cluster.Network.Cut(leader.Name, follower.Name);
+            beforePropose.Release();
             await appended.WaitTriggeredAsync(ElectionBound);
             cluster.Faults.AssertReached(appended);
             foreach (TestNode follower in followers)
@@ -1358,6 +1372,11 @@ public sealed class ConSimulationTests
 
             TestNode leader = await cluster.GetLeaderAsync(Vol, Ct);
             TestNode[] followers = Others(cluster, leader);
+
+            // The isolated leader must still append client entries: it passes its control barrier (SEC-006, which waits up
+            // to two election timeouts for an unreachable control leader, longer than the isolated leader keeps its
+            // leadership) only when it leads the control group itself.
+            await cluster.TransferLeadershipAsync(Control, leader.Name, ct: Ct);
             await using DfsClient stale = await cluster.ConnectAsync(new TestClientOptions { Name = "stale", SeedNodes = [leader.Name], OperationTimeout = ShortOperationTimeout }, Ct);
             await using DfsClient freshClient = await cluster.ConnectAsync(new TestClientOptions { Name = "fresh", SeedNodes = Names(followers), OperationTimeout = ElectionBound }, Ct);
             DfsVolume staleVolume = stale.GetVolume(Vol);
@@ -1541,9 +1560,11 @@ public sealed class ConSimulationTests
             DfsOperationId lostReply = await volume.NewOperationIdAsync(Ct);
             byte[] dedupSuffix = TestData.Bytes(0x1206, 250);
             FaultArm dropReply = cluster.Faults.Arm(new FaultMatch(FaultSites.RpcReplySend, Operation: DfsOperationKind.Append, Count: 1000), FaultAction.DropReply());
+            FaultArm dropQueries = ArmDropOutcomeQueryReplies(cluster);
             Exception? lostError = await CaptureAsync(() => volume.Files.AppendAllBytesAsync("/dedup-log", dedupSuffix, WithId(lostReply), Ct));
             cluster.Faults.AssertReached(dropReply);
             dropReply.Disarm();
+            dropQueries.Disarm();
             AssertUnknownOutcome(lostError, lostReply, "an executed append whose every reply was lost");
             DfsOperationOutcome lostOutcomeBefore = await volume.QueryOperationAsync(lostReply, resolve: false, Ct);
             Assert.Equal(DfsOutcomeStatus.Committed, lostOutcomeBefore.Status);
@@ -1885,8 +1906,12 @@ public sealed class ConSimulationTests
 
             if (blockAtStep is null)
             {
-                await cluster.WaitUntilAsync(() => Task.FromResult(drain.IsCompleted), TimeSpan.FromSeconds(60), "the voter replacement must complete", Ct);
+                await cluster.WaitUntilAsync(() => Task.FromResult(drain.IsCompleted), TimeSpan.FromSeconds(60), "the drain request must complete", Ct);
                 await drain;
+
+                // DrainNode only marks the node Draining (PROTOCOL.md AdminOp.DrainNode); the membership manager then
+                // replaces its voter seat asynchronously, one single-server change at a time.
+                await WaitForTransitionDoneAsync(cluster, "the voter replacement must complete");
                 GroupInspection done = await cluster.Inspect.GetVolumeGroupAsync(Vol);
                 Assert.Equal(["n1", "n2", "n3"], done.Voters.Order(StringComparer.Ordinal).ToArray());
                 return arm.Hits;
@@ -1933,8 +1958,9 @@ public sealed class ConSimulationTests
             }
 
             cluster.Network.Heal();
-            await cluster.WaitUntilAsync(() => Task.FromResult(drain.IsCompleted), TimeSpan.FromSeconds(60), "the transition must complete once healed", Ct);
+            await cluster.WaitUntilAsync(() => Task.FromResult(drain.IsCompleted), TimeSpan.FromSeconds(60), "the drain request must complete once healed", Ct);
             await drain;
+            await WaitForTransitionDoneAsync(cluster, "the transition must complete once healed");
             await RecoverAndConvergeAsync(cluster);
             GroupInspection group = await cluster.Inspect.GetVolumeGroupAsync(Vol);
             Assert.Equal(["n1", "n2", "n3"], group.Voters.Order(StringComparer.Ordinal).ToArray());
@@ -1961,6 +1987,14 @@ public sealed class ConSimulationTests
             return arm.Hits;
         }, Ct);
     }
+
+    /// <summary>Waits (bounded) until the volume group's voters are {n1,n2,n3} and n0 is no longer a member.</summary>
+    private static Task WaitForTransitionDoneAsync(TestCluster cluster, string because) =>
+        cluster.WaitUntilAsync(async () =>
+        {
+            GroupInspection g = await cluster.Inspect.GetVolumeGroupAsync(Vol);
+            return g.Voters.Order(StringComparer.Ordinal).SequenceEqual(["n1", "n2", "n3"]) && !g.Learners.Contains("n0");
+        }, TimeSpan.FromSeconds(60), because, Ct);
 
     // ------------------------------------------------------------------------------------------------------------
     // CON-015 NewReplicaCannotVotePrematurely
@@ -1999,6 +2033,11 @@ public sealed class ConSimulationTests
                 if (group is null)
                     continue;
                 Assert.DoesNotContain(joiner.Name, group.Voters);
+
+                // The replacement itself has received neither log nor checkpoint yet (the install is held), so it has no
+                // configuration at all (it can neither vote nor count votes); every replica with a configuration keeps n0.
+                if (group.Voters.Count == 0 && group.Learners.Count == 0 && node == joiner)
+                    continue;
                 Assert.Contains("n0", group.Voters);
             }
 
@@ -2037,8 +2076,15 @@ public sealed class ConSimulationTests
             await n2.RestartAsync();
             holdCatchUp.Release();
             holdCatchUp.Disarm();
-            await cluster.WaitUntilAsync(() => Task.FromResult(drain.IsCompleted), TimeSpan.FromSeconds(90), "the drain completes once the replacement caught up", Ct);
+            await cluster.WaitUntilAsync(() => Task.FromResult(drain.IsCompleted), TimeSpan.FromSeconds(90), "the drain request completes", Ct);
             await drain;
+
+            // DrainNode only marks n0 Draining (PROTOCOL.md AdminOp.DrainNode); the voter seat moves asynchronously.
+            await cluster.WaitUntilAsync(async () =>
+            {
+                GroupInspection g = await cluster.Inspect.GetVolumeGroupAsync(Vol);
+                return g.Voters.Contains(joiner.Name) && !g.Voters.Contains("n0");
+            }, TimeSpan.FromSeconds(90), "the replacement becomes a voter once it caught up", Ct);
 
             // Admitted only after catch-up: now a voter, holding the complete state.
             GroupInspection after = await cluster.Inspect.GetVolumeGroupAsync(Vol);
@@ -2533,9 +2579,11 @@ public sealed class ConSimulationTests
             DfsOperationId lostReply = await volume.NewOperationIdAsync(Ct);
             byte[] lostBytes = TestData.Bytes(0x200B, 5000);
             FaultArm drop = cluster.Faults.Arm(new FaultMatch(FaultSites.RpcReplySend, Operation: DfsOperationKind.WriteAll, Count: 1000), FaultAction.DropReply());
+            FaultArm dropQueries = ArmDropOutcomeQueryReplies(cluster);
             Exception? lostError = await CaptureAsync(() => volume.Files.WriteAllBytesAsync("/lost-reply", lostBytes, WithId(lostReply), Ct));
             cluster.Faults.AssertReached(drop);
             drop.Disarm();
+            dropQueries.Disarm();
             AssertUnknownOutcome(lostError, lostReply, "an executed WriteAll whose every reply was lost");
             DfsOperationOutcome lostOutcome = await volume.QueryOperationAsync(lostReply, resolve: false, Ct);
             Assert.Equal(DfsOutcomeStatus.Committed, lostOutcome.Status);

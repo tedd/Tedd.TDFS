@@ -4,13 +4,16 @@ using Tedd.Tdfs.Transport;
 
 namespace Tedd.Tdfs.Testing;
 
-/// <summary>Captures matching messages until they are released or dropped.</summary>
+/// <summary>Holds matching messages until they are released or dropped, and captures them until disposed.</summary>
 /// <remarks>
 /// A held message has been delivered by the network to its receiver, which does not process it until it is released:
 /// requests and one-way messages are held before the receiving node's handler runs, replies after the responder produced
 /// them and before they are sent back. Every transmission matching <see cref="Filter"/> is held (SDK retries included)
-/// until <see cref="ReleaseAll"/>, <see cref="DropAll"/> or <see cref="Dispose"/>, which also end the hold.
-/// <see cref="Captured"/> keeps every frame captured during the hold's lifetime (for <see cref="TestNetwork.ReplayAsync"/>).
+/// until <see cref="ReleaseAll"/>, <see cref="DropAll"/> or <see cref="Dispose"/>, which end the holding. Capturing goes on
+/// after <see cref="ReleaseAll"/> and <see cref="DropAll"/> (later matching transmissions pass through unheld) until
+/// <see cref="Dispose"/>: <see cref="Captured"/> is cumulative, keeping every frame captured during the hold's lifetime,
+/// released ones included (for <see cref="TestNetwork.ReplayAsync"/>; api-additions bak.md, rsy.md: RSY-026 captures
+/// checkpoint chunks while letting them through).
 /// </remarks>
 public sealed class MessageHold : IDisposable
 {
@@ -19,7 +22,8 @@ public sealed class MessageHold : IDisposable
     private readonly List<CapturedMessage> _captured = [];
     private readonly NetworkFabric? _fabric;
     private TaskCompletionSource? _changed;
-    private bool _active = true;
+    private bool _active = true;   // capturing (until Dispose)
+    private bool _holding = true;  // holding captured messages (until ReleaseAll, DropAll or Dispose)
 
     internal MessageHold(MessageFilter filter)
         : this(filter, null)
@@ -56,7 +60,7 @@ public sealed class MessageHold : IDisposable
         }
     }
 
-    /// <summary>True while the hold captures new messages.</summary>
+    /// <summary>True while the hold captures new messages (holding them or, after a release, letting them pass).</summary>
     internal bool IsActive
     {
         get
@@ -95,22 +99,24 @@ public sealed class MessageHold : IDisposable
         }
     }
 
-    /// <summary>Delivers all held messages (optionally in reverse order) and stops holding.</summary>
-    public void ReleaseAll(bool reverseOrder = false) => Finish(deliver: true, reverseOrder);
+    /// <summary>Delivers all held messages (optionally in reverse order) and stops holding (capturing goes on until disposed).</summary>
+    public void ReleaseAll(bool reverseOrder = false) => Finish(deliver: true, reverseOrder, stopCapturing: false);
 
-    /// <summary>Discards all held messages and stops holding.</summary>
-    public void DropAll() => Finish(deliver: false, reverseOrder: false);
+    /// <summary>Discards all held messages and stops holding (capturing goes on until disposed).</summary>
+    public void DropAll() => Finish(deliver: false, reverseOrder: false, stopCapturing: false);
 
-    /// <summary>Releases remaining messages and stops holding.</summary>
-    public void Dispose() => Finish(deliver: true, reverseOrder: false);
+    /// <summary>Releases remaining messages and stops holding and capturing.</summary>
+    public void Dispose() => Finish(deliver: true, reverseOrder: false, stopCapturing: true);
 
     /// <summary>
-    /// Captures a message when the hold is active and its filter matches; the returned entry is decided by
-    /// <see cref="ReleaseAll"/> (true) or <see cref="DropAll"/> (false).
+    /// Captures a message when the hold is active and its filter matches (<paramref name="captured"/>); while the hold is
+    /// still holding, the returned entry is decided by <see cref="ReleaseAll"/> (true) or <see cref="DropAll"/> (false),
+    /// otherwise null is returned and the message passes.
     /// </summary>
     internal HeldMessage? TryCapture(string from, string to, LinkDirection direction, ReadOnlySpan<byte> frame, Func<TaskCompletionSource<bool>> createDecision,
-        object? origin)
+        object? origin, out CapturedMessage? captured)
     {
+        captured = null;
         if (!Filter.Matches(from, to, direction, frame))
             return null;
         TaskCompletionSource? changed;
@@ -120,10 +126,12 @@ public sealed class MessageHold : IDisposable
             if (!_active)
                 return null;
             MessageType type = frame.Length >= 2 ? (MessageType)System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(frame) : 0;
-            var captured = new CapturedMessage(from, to, direction, type, frame.ToArray());
+            captured = new CapturedMessage(from, to, direction, type, frame.ToArray());
+            _captured.Add(captured);
+            if (!_holding)
+                return null;
             held = new HeldMessage(captured, createDecision(), origin);
             _held.Add(held);
-            _captured.Add(captured);
             changed = _changed;
             _changed = null;
         }
@@ -133,15 +141,17 @@ public sealed class MessageHold : IDisposable
         return held;
     }
 
-    private void Finish(bool deliver, bool reverseOrder)
+    private void Finish(bool deliver, bool reverseOrder, bool stopCapturing)
     {
         List<HeldMessage> held;
         TaskCompletionSource? changed;
         lock (_gate)
         {
-            if (!_active && _held.Count == 0)
+            if (stopCapturing)
+                _active = false;
+            if (!_holding && _held.Count == 0)
                 return;
-            _active = false;
+            _holding = false;
             held = [.. _held];
             _held.Clear();
             changed = _changed;

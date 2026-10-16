@@ -49,6 +49,7 @@ internal sealed class NetworkFabric
     private readonly Dictionary<string, HarnessTransportFactory> _factories = new(StringComparer.Ordinal);
     private readonly List<HarnessConnection> _connections = [];
     private readonly Dictionary<IRpcConnection, HarnessConnection> _serverConnections = new(ReferenceEqualityComparer.Instance);
+    private readonly Dictionary<IRpcConnection, HarnessConnection> _clientConnections = new(ReferenceEqualityComparer.Instance);
     private readonly List<MessageHold> _holds = [];
     private readonly List<ReadResultLimitRule> _readLimits = [];
     private readonly List<Action<string>> _traces = [];
@@ -283,7 +284,11 @@ internal sealed class NetworkFabric
     internal void AddConnection(HarnessConnection connection)
     {
         lock (_gate)
+        {
             _connections.Add(connection);
+            if (connection.IsClientSide)
+                _clientConnections[connection.Inner] = connection;
+        }
     }
 
     internal void RemoveConnection(HarnessConnection connection)
@@ -291,16 +296,25 @@ internal sealed class NetworkFabric
         lock (_gate)
         {
             _connections.Remove(connection);
-            if (!connection.IsClientSide)
+            if (connection.IsClientSide)
+                _clientConnections.Remove(connection.Inner);
+            else
                 _serverConnections.Remove(connection.Inner);
         }
     }
 
-    /// <summary>The server-side wrapper of an inbound inner connection (created on first sight).</summary>
+    /// <summary>
+    /// The wrapper a transport's handler sees for an inner connection a frame arrived on: the connection the transport opened
+    /// itself when the frame came back on it (connections carry messages both ways: a node reaches a peer over the
+    /// connection that peer opened, so the receiver must see the very connection it authenticated and registered),
+    /// otherwise the server-side wrapper of an accepted connection (created on first sight).
+    /// </summary>
     internal HarnessConnection GetServerConnection(HarnessTransport owner, IRpcConnection inner)
     {
         lock (_gate)
         {
+            if (_clientConnections.TryGetValue(inner, out HarnessConnection? opened))
+                return opened;
             if (_serverConnections.TryGetValue(inner, out HarnessConnection? existing))
                 return existing;
         }
@@ -387,7 +401,10 @@ internal sealed class NetworkFabric
         Interlocked.Increment(ref _activeHolds);
     }
 
-    /// <summary>Captures a message into the first active hold whose filter matches; null when no hold takes it.</summary>
+    /// <summary>
+    /// Offers a message to the active holds whose filters match: each captures it, and the first one still holding holds it
+    /// (returned); null when no hold holds it.
+    /// </summary>
     internal HeldMessage? TryHold(string from, string to, LinkDirection direction, ReadOnlySpan<byte> frame, HarnessConnection origin)
     {
         if (Volatile.Read(ref _activeHolds) == 0)
@@ -402,13 +419,15 @@ internal sealed class NetworkFabric
 
         foreach (MessageHold hold in holds)
         {
-            HeldMessage? held = hold.TryCapture(from, to, direction, frame, static () => new TaskCompletionSource<bool>(), origin);
-            if (held is not null)
+            HeldMessage? held = hold.TryCapture(from, to, direction, frame, static () => new TaskCompletionSource<bool>(), origin, out CapturedMessage? captured);
+            if (captured is not null)
             {
                 lock (_gate)
-                    _origins.AddOrUpdate(held.Message, origin);
-                return held;
+                    _origins.AddOrUpdate(captured, origin);
             }
+
+            if (held is not null)
+                return held;
         }
 
         return null;
@@ -470,7 +489,10 @@ internal sealed class NetworkFabric
 
     /// <summary>
     /// Re-delivers a captured frame from its original sender identity: on an open connection of that sender to the receiver
-    /// (preferably the one it was captured on), else on a fresh connection authenticated like the original one.
+    /// (preferably the one it was captured on), else on a fresh connection authenticated like the original one. A node
+    /// sender cannot be impersonated on a fresh connection: when none of its connections to the receiver is usable (the
+    /// receiver restarted a moment ago and the sender has not reconnected yet, or the chosen connection turns out dead),
+    /// the replay waits, within <paramref name="timeout"/>, for the sender's own peer connection to the receiver.
     /// </summary>
     public async Task<DfsErrorCode> ReplayAsync(CapturedMessage message, TimeSpan timeout)
     {
@@ -493,16 +515,42 @@ internal sealed class NetworkFabric
         // client end, which observed the handshake) and the sender's authenticated identity are resolved from it.
         HarnessConnection? sender = origin is null ? null : origin.IsClientSide ? origin : CounterpartOf(origin);
         ReplayIdentity? identity = origin is null ? null : IdentityOf(sender, origin);
-        HarnessConnection? connection = FindReplayConnection(message.From, message.To, sender, identity);
-        HarnessTransport? fresh = null;
-        if (connection is null && identity is not null)
-            (connection, fresh) = await OpenReplayConnectionAsync(message.From, message.To, sender, identity, timeout);
-        if (connection is null)
+        long started = Runtime.Time.GetTimestamp();
+        var failed = new HashSet<HarnessConnection>();
+        while (true)
         {
-            Trace($"replay of {message.Type} {message.From}->{message.To} impossible: no authenticated connection of the sender remains");
-            return DfsErrorCode.Unavailable;
-        }
+            HarnessConnection? connection = FindReplayConnection(message.From, message.To, sender, identity, failed);
+            HarnessTransport? fresh = null;
+            if (connection is null && identity is not null)
+                (connection, fresh) = await OpenReplayConnectionAsync(message.From, message.To, sender, identity, timeout);
+            if (connection is null)
+            {
+                if (identity is { Role: PeerRole.Node } && Runtime.Time.GetElapsedTime(started) < timeout)
+                {
+                    await Runtime.DelayAsync(ReplayRetryDelay);
+                    continue;
+                }
 
+                Trace($"replay of {message.Type} {message.From}->{message.To} impossible: no authenticated connection of the sender remains");
+                return DfsErrorCode.Unavailable;
+            }
+
+            DfsErrorCode? code = await ReplayOnAsync(connection, fresh, message, timeout);
+            if (code is { } done)
+                return done;
+
+            // The connection was dead: try another one (a node sender's peer connection reappears when it reconnects).
+            failed.Add(connection);
+            if (Runtime.Time.GetElapsedTime(started) >= timeout)
+                return DfsErrorCode.Unavailable;
+        }
+    }
+
+    private static readonly TimeSpan ReplayRetryDelay = TimeSpan.FromMilliseconds(10);
+
+    /// <summary>Replays on <paramref name="connection"/>; null when it turned out dead before an answer.</summary>
+    private async Task<DfsErrorCode?> ReplayOnAsync(HarnessConnection connection, HarnessTransport? fresh, CapturedMessage message, TimeSpan timeout)
+    {
         Trace($"replayed {message.Direction} {message.Type} {message.From}->{message.To}");
         try
         {
@@ -521,11 +569,11 @@ internal sealed class NetworkFabric
         }
         catch (RpcConnectionException)
         {
-            return DfsErrorCode.Unavailable;
+            return null;
         }
         catch (ObjectDisposedException)
         {
-            return DfsErrorCode.Unavailable;
+            return null;
         }
         finally
         {
@@ -584,14 +632,15 @@ internal sealed class NetworkFabric
     }
 
     /// <summary>An open, authenticated connection of the sender to <paramref name="to"/> presenting <paramref name="identity"/>.</summary>
-    private HarnessConnection? FindReplayConnection(string from, string to, HarnessConnection? sender, ReplayIdentity? identity)
+    private HarnessConnection? FindReplayConnection(string from, string to, HarnessConnection? sender, ReplayIdentity? identity,
+        HashSet<HarnessConnection> failed)
     {
-        if (sender is { IsOpen: true, SilentlyDead: false, IsClientSide: true }
+        if (sender is { IsOpen: true, SilentlyDead: false, IsClientSide: true } && !failed.Contains(sender)
             && string.Equals(sender.LocalName, from, StringComparison.Ordinal) && string.Equals(sender.RemoteName, to, StringComparison.Ordinal))
             return sender;
         foreach (HarnessConnection connection in SnapshotConnections())
         {
-            if (connection.IsClientSide && connection.IsOpen && !connection.SilentlyDead && connection.IsAuthenticated
+            if (connection.IsClientSide && connection.IsOpen && !connection.SilentlyDead && connection.IsAuthenticated && !failed.Contains(connection)
                 && string.Equals(connection.LocalName, from, StringComparison.Ordinal) && string.Equals(connection.RemoteName, to, StringComparison.Ordinal)
                 && (identity is null || Presents(connection, identity)))
                 return connection;

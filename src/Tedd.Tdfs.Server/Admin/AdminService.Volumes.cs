@@ -97,6 +97,7 @@ internal sealed partial class AdminService
             throw new ArgumentException("The permissions contain undefined bits or are empty.");
         if ((body.Permissions & DfsPermissions.ClusterAdmin) != 0 && !State.IsClusterAdmin(principal))
             throw new UnauthorizedAccessException("Only cluster administrators may grant ClusterAdmin.");
+        RequireLeader();   // "does not exist" is only answered from the leader's view (a follower's may lag)
         if (State.FindPrincipal(body.Principal) is null)
             throw new DfsException(DfsErrorCode.PrincipalNotFound, $"Principal '{body.Principal}' does not exist.");
         bool revoke = message.Op == AdminOp.Revoke;

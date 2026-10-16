@@ -38,6 +38,12 @@ internal interface IRpcRouter
 
     /// <summary>The node at <paramref name="endpoint"/> answered.</summary>
     void OnAnswered(string endpoint);
+
+    /// <summary>
+    /// True when requests are served by the leader of a consensus group (control or volume): exhausting every attempt
+    /// without reaching a leader that answers then means that no leader with a quorum could be reached.
+    /// </summary>
+    bool RoutesToGroupLeader { get; }
 }
 
 /// <summary>One logical request executed by <see cref="RpcInvoker"/> (possibly over several attempts).</summary>
@@ -79,8 +85,8 @@ internal sealed class RpcRequest
     /// <summary>
     /// Called for error replies before the generic handling; returns true when the request should be retried (for example
     /// after re-binding to a re-created volume or replacing a never-used expired operation id). The count passed is the
-    /// number of transmissions that may have taken effect, the answered one included (transmissions answered
-    /// <c>NotLeader</c> proposed nothing that can commit and are not counted).
+    /// number of transmissions of the current id, the answered one included; every transmission counts, also one answered
+    /// <c>NotLeader</c> (a duplicated delivery of it may have been proposed while that node still led).
     /// </summary>
     public Func<ErrorReplyMessage, OperationScope, int, ValueTask<bool>>? OnError { get; init; }
 

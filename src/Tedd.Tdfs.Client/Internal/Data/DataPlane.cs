@@ -30,13 +30,15 @@ internal sealed class DataCapabilityRejectedException : Exception
 /// <summary>
 /// Object uploads and verified object reads (PROTOCOL.md §7, ARCHITECTURE §6): HRW placement over the pool's nodes from
 /// the cluster map with fallback down the HRW order, parallel <c>PutObject</c> until the policy's acknowledgement
-/// requirement (distinct hosts and zones) is met (remaining targets get a short grace), and range reads that verify
+/// requirement (distinct hosts and zones) is met (remaining targets get a short grace; a target far slower than the first
+/// acknowledgement gets a fallback started alongside it), and range reads that verify
 /// object length, whole-object XxHash128 or per-unit CRC32C, fail over across replicas and a <c>LocateObject</c>
 /// broadcast, and never substitute zeroes for missing data.
 /// </summary>
 internal sealed class DataPlane
 {
     private static readonly TimeSpan MinimumGrace = TimeSpan.FromMilliseconds(50);
+    private static readonly TimeSpan MinimumHedge = TimeSpan.FromMilliseconds(100);
     private readonly ClientRuntime _runtime;
 
     public DataPlane(ClientRuntime runtime)
@@ -80,13 +82,17 @@ internal sealed class DataPlane
         bool renewed = false;
         long? satisfiedAt = null;
 
-        // A target slower than one attempt timeout gets fallback targets started beside it, but it is never abandoned: its
-        // durable acknowledgement still counts when it arrives before the operation deadline (a slow disk is not a failed
-        // one, PUB-004). Each PutObject may therefore run until the deadline.
+        // A slow target gets fallback targets started beside it, but it is never abandoned: its durable acknowledgement still
+        // counts when it arrives before the operation deadline (a slow disk is not a failed one, PUB-004). Each PutObject may
+        // therefore run until the deadline. A target far slower than the first acknowledged put (before any, silent for a
+        // quarter of the attempt timeout) is presumably unavailable (paused, partitioned): a fallback starts alongside it
+        // instead of every chunk waiting out the silent target's whole attempt timeout (OFF-007).
         TimeSpan slowAfter = _runtime.Rpc.DefaultAttemptTimeout(scope);
         long uploadStart = _runtime.Time.GetTimestamp();
-        long lastStart = uploadStart;
-        bool fallbacksExhausted = false;
+        TimeSpan? firstAck = null;          // how long the first acknowledged put took
+        long lastProgress = uploadStart;    // the last acknowledgement or hedge
+        bool hedging = true;
+        TimeSpan silentHedge = slowAfter / 4;
         using var cancel = CancellationTokenSource.CreateLinkedTokenSource(scope.Token);
         try
         {
@@ -130,24 +136,28 @@ internal sealed class DataPlane
                         if (grace <= TimeSpan.Zero || !await Waits.CompletesWithinAsync(any, grace, _runtime.Time, scope.Token).ConfigureAwait(false))
                             break;
                     }
-                    else if (fallbacksExhausted)
+                    else if (hedging)
                     {
-                        await Waits.WaitAsync(any, scope.Token).ConfigureAwait(false);
+                        // More copies are needed and the pending targets have been slow: add a fallback (the slow puts keep
+                        // running and still count) and keep waiting for all.
+                        TimeSpan delay = firstAck is { } took ? (took * 2 > MinimumHedge ? took * 2 : MinimumHedge) : silentHedge;
+                        TimeSpan hedge = delay - _runtime.Time.GetElapsedTime(lastProgress);
+                        if (!await Waits.CompletesWithinAsync(any, hedge, _runtime.Time, scope.Token).ConfigureAwait(false))
+                        {
+                            lastProgress = _runtime.Time.GetTimestamp();
+                            if (StartFallbacks(1))
+                                continue;
+                            hedging = false;
+
+                            // Negative control (MUT-014): the slowness of the remaining targets "relaxes" the policy below.
+                            if (_runtime.Mutations.RelaxPolicyOnTimeout && receipts.Count > 0)
+                                break;
+                            await Waits.WaitAsync(any, scope.Token).ConfigureAwait(false);
+                        }
                     }
                     else
                     {
-                        TimeSpan wait = slowAfter - _runtime.Time.GetElapsedTime(lastStart);
-                        if (wait <= TimeSpan.Zero || !await Waits.CompletesWithinAsync(any, wait, _runtime.Time, scope.Token).ConfigureAwait(false))
-                        {
-                            // The pending targets are slow: add fallbacks for the missing copies and keep waiting for all.
-                            fallbacksExhausted = !StartFallbacks(Math.Max(1, requiredCopies - copies));
-                            lastStart = _runtime.Time.GetTimestamp();
-
-                            // Negative control (MUT-014): the timeout of the slow targets "relaxes" the policy below.
-                            if (fallbacksExhausted && _runtime.Mutations.RelaxPolicyOnTimeout && receipts.Count > 0)
-                                break;
-                            continue;
-                        }
+                        await Waits.WaitAsync(any, scope.Token).ConfigureAwait(false);
                     }
                 }
                 catch (OperationCanceledException) when (scope.Token.IsCancellationRequested)
@@ -165,7 +175,7 @@ internal sealed class DataPlane
 
                 Task<IWireMessage> finished = any.Result;
                 int index = pending.FindIndex(p => ReferenceEquals(p.Task, finished));
-                PlacementNode node = pending[index].Node;
+                (_, PlacementNode node, long putStarted) = pending[index];
                 pending.RemoveAt(index);
                 bool ok = false;
                 try
@@ -176,6 +186,8 @@ internal sealed class DataPlane
                         case PutObjectResultMessage put when Matches(put.Receipt, obj, checksum, data.Length, lease.Id):
                             receipts.Add(put.Receipt);
                             holders.Add(_runtime.Map.Node(put.Receipt.Node)?.Labels ?? node.Labels);
+                            firstAck ??= _runtime.Time.GetElapsedTime(putStarted);
+                            lastProgress = _runtime.Time.GetTimestamp();
                             ok = true;
                             break;
                         case PutObjectResultMessage put:
@@ -264,8 +276,7 @@ internal sealed class DataPlane
 
         void Restart(PlacementNode node)
         {
-            lastStart = _runtime.Time.GetTimestamp();
-            pending.Add((SendPutAsync(scope, volume, lease, node, obj, data, checksum, chunkIndex, cancel.Token), node, lastStart));
+            pending.Add((SendPutAsync(scope, volume, lease, node, obj, data, checksum, chunkIndex, cancel.Token), node, _runtime.Time.GetTimestamp()));
         }
 
         bool StartFallbacks(int count)
@@ -294,10 +305,11 @@ internal sealed class DataPlane
     private TimeSpan Grace(OperationScope scope, long uploadStart, long satisfiedAt)
     {
         // Remaining targets get as long again as this object's acknowledgement took (at least a short floor), within the
-        // deadline. Measured per object: a slow earlier object of the same operation must not stretch every later one.
-        TimeSpan sinceStart = _runtime.Time.GetElapsedTime(uploadStart, satisfiedAt);
+        // deadline. Measured from the object's upload, not the operation's start: a multi-chunk write must not give every
+        // later chunk's silent target an ever longer grace (OFF-007).
+        TimeSpan took = _runtime.Time.GetElapsedTime(uploadStart, satisfiedAt);
         TimeSpan waited = _runtime.Time.GetElapsedTime(satisfiedAt);
-        TimeSpan grace = (sinceStart > MinimumGrace ? sinceStart : MinimumGrace) - waited;
+        TimeSpan grace = (took > MinimumGrace ? took : MinimumGrace) - waited;
         TimeSpan remaining = scope.Remaining;
         return grace < remaining ? grace : remaining;
     }
@@ -377,7 +389,12 @@ internal sealed class DataPlane
         foreach (PlacementNode node in Placement.FallbackOrder(obj, placementEpoch, storage))
             AddCandidate(node.Id);
 
+        // Replicas on nodes that recently let a request time out are tried last (stable order otherwise): waiting out a
+        // silent node first would delay every read and can outlive the read capability (OFF-002).
+        candidates = [.. candidates.OrderBy(c => _runtime.Map.EndpointOf(c) is { } e && _runtime.IsRecentlyUnresponsive(e) ? 1 : 0)];
+
         bool located = false;
+        var reconnected = new HashSet<NodeId>();
         for (int i = 0; ; i++)
         {
             if (i >= candidates.Count)
@@ -419,6 +436,11 @@ internal sealed class DataPlane
                                            or DfsException)
             {
                 failures.Add(ex);
+
+                // A pooled connection that turned out dead (reset or closed under the request) says nothing about the
+                // replica: ask it once more on a new connection (NET-005).
+                if (ex is RpcConnectionException && reconnected.Add(candidate) && !scope.Token.IsCancellationRequested)
+                    i--;
             }
         }
 

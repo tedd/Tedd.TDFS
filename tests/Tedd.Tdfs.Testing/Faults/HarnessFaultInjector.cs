@@ -135,7 +135,11 @@ internal sealed class HarnessFaultInjector : IFaultInjector
                     completed.GetAwaiter().GetResult();
                     done.TrySetResult();
                 }
-#pragma warning disable CA1031 // The exact failure (including an OperationCanceledException) is handed to the awaiting code.
+                catch (OperationCanceledException canceled)
+                {
+                    done.TrySetCanceled(canceled.CancellationToken);
+                }
+#pragma warning disable CA1031 // The exact failure is handed to the awaiting code.
                 catch (Exception ex)
 #pragma warning restore CA1031
                 {
@@ -227,8 +231,14 @@ internal sealed class HarnessFaultInjector : IFaultInjector
             case FaultAction.DelayFault delay:
                 if (delay.Duration > TimeSpan.Zero)
                 {
+                    // The delay's completion must not run continuations under a synchronization context: SDK code awaiting
+                    // with ConfigureAwait(false) (client sites) would otherwise be resumed on the thread pool, an uncontrolled
+                    // dependency of a deterministic run (HAR-002). The timer completes the wait through Runtime.Complete.
                     TimeProvider clock = target?.Clock ?? _faults.Runtime.Time;
-                    await Task.Delay(delay.Duration, clock, CancellationToken.None);
+                    TaskCompletionSource elapsed = _faults.Runtime.CreateCompletion();
+                    using ITimer timer = clock.CreateTimer(static state => ((Action)state!)(),
+                        (Action)(() => _faults.Runtime.Complete(() => elapsed.TrySetResult())), delay.Duration, Timeout.InfiniteTimeSpan);
+                    await elapsed.Task;
                 }
 
                 return;

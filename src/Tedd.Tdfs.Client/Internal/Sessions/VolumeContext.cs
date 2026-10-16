@@ -33,6 +33,7 @@ internal sealed class VolumeContext : IRpcRouter
     public const int SequenceBlockSize = 64;
 
     private static readonly TimeSpan SuspectDuration = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan MinimumRouteHedge = TimeSpan.FromMilliseconds(100);
 
     private readonly Lock _sync = new();
     private readonly AsyncLock _sessionLock = new();
@@ -47,6 +48,7 @@ internal sealed class VolumeContext : IRpcRouter
     private VolumeId _volumeId;
     private ulong _epoch;
     private string? _leader;
+    private string? _lastLeader;   // the last endpoint known as leader (kept while the route is being rediscovered)
     private VolumeSession? _session;
     private StagingLease? _helperStaging;
     private ITimer? _timer;
@@ -126,6 +128,7 @@ internal sealed class VolumeContext : IRpcRouter
             if (hint is { Length: > 0 } && !string.Equals(hint, endpoint, StringComparison.Ordinal))
             {
                 _leader = hint;
+                _lastLeader = hint;
                 return;
             }
 
@@ -147,6 +150,9 @@ internal sealed class VolumeContext : IRpcRouter
     }
 
     /// <inheritdoc />
+    public bool RoutesToGroupLeader => !Runtime.IsBackupHost;
+
+    /// <inheritdoc />
     public void OnAnswered(string endpoint)
     {
         lock (_sync)
@@ -163,7 +169,9 @@ internal sealed class VolumeContext : IRpcRouter
 
     /// <summary>
     /// Asks the volume's voters (then any live node) for the volume's route with <c>GetVolumeRoute</c>, updates the
-    /// binding and returns the leader endpoint, or null when no node currently knows a leader.
+    /// binding and returns the leader endpoint, or null when no node currently knows a leader. A candidate that does not
+    /// answer within a short hedge delay gets the next one asked alongside it (the first route naming a leader wins), so
+    /// one paused or partitioned voter does not hold up discovery for a whole attempt timeout.
     /// </summary>
     public async Task<string?> RefreshRouteAsync(OperationScope scope, TimeSpan attemptTimeout)
     {
@@ -175,76 +183,136 @@ internal sealed class VolumeContext : IRpcRouter
 
         // Suspects last (they may have recovered, but healthy candidates answer first).
         List<string> ordered = OrderBySuspicion(queue);
+        TimeSpan hedge = RouteHedgeDelay(attemptTimeout);
+        var probes = new List<(Task<IWireMessage> Task, string Endpoint)>();
+        int next = 0;
+        long lastStart = 0;
         Exception? last = null;
-        for (int i = 0; i < ordered.Count; i++)
+        using var cancel = CancellationTokenSource.CreateLinkedTokenSource(scope.Token);
+        try
         {
-            if (scope.Token.IsCancellationRequested)
-                break;
-            string endpoint = ordered[i];
-            IWireMessage reply;
-            try
+            while (!scope.Token.IsCancellationRequested)
             {
-                TimeSpan timeout = attemptTimeout < scope.Remaining ? attemptTimeout : scope.Remaining;
-                reply = await Runtime.Rpc.SendOnceAsync(endpoint, new GetVolumeRouteMessage(Name), scope, ClientRuntime.Positive(timeout)).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (scope.Token.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception ex) when (RpcInvoker.IsTransient(ex) || ex is DfsClusterIdentityException or DfsProtocolException)
-            {
-                last = ex;
-                OnUnreachable(endpoint);
-                continue;
-            }
+                if (probes.Count == 0)
+                {
+                    if (next >= ordered.Count)
+                        break;
+                    StartProbe(ordered[next++]);
+                    continue;
+                }
 
-            switch (reply)
-            {
-                case VolumeRouteResultMessage route:
-                    OnAnswered(endpoint);
-                    Bind(route.Volume);
-                    string? leader = route.LeaderEndpoint;
-                    if (leader is null && route.Leader is { } leaderId)
-                        leader = Runtime.Map.EndpointOf(leaderId);
-                    if (leader is not null)
+                Task<Task<IWireMessage>> any = Task.WhenAny(probes.Select(p => p.Task));
+                try
+                {
+                    if (next >= ordered.Count)
                     {
-                        lock (_sync)
+                        await Waits.WaitAsync(any, scope.Token).ConfigureAwait(false);
+                    }
+                    else if (!await Waits.CompletesWithinAsync(any, hedge - Runtime.Time.GetElapsedTime(lastStart), Runtime.Time, scope.Token)
+                                 .ConfigureAwait(false))
+                    {
+                        StartProbe(ordered[next++]);
+                        continue;
+                    }
+                }
+                catch (OperationCanceledException) when (scope.Token.IsCancellationRequested)
+                {
+                    break;
+                }
+
+                Task<IWireMessage> finished = any.Result;
+                int index = probes.FindIndex(p => ReferenceEquals(p.Task, finished));
+                string endpoint = probes[index].Endpoint;
+                probes.RemoveAt(index);
+                IWireMessage reply;
+                try
+                {
+                    reply = await finished.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (scope.Token.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex) when (RpcInvoker.IsTransient(ex) || ex is DfsClusterIdentityException or DfsProtocolException)
+                {
+                    last = ex;
+                    OnUnreachable(endpoint);
+                    continue;
+                }
+
+                switch (reply)
+                {
+                    case VolumeRouteResultMessage route:
+                        OnAnswered(endpoint);
+                        Bind(route.Volume);
+                        string? leader = route.LeaderEndpoint;
+                        if (leader is null && route.Leader is { } leaderId)
+                            leader = Runtime.Map.EndpointOf(leaderId);
+                        if (leader is not null)
                         {
-                            _leader = leader;
-                            _suspects.Remove(leader);
+                            lock (_sync)
+                            {
+                                _leader = leader;
+                                _lastLeader = leader;
+                                _suspects.Remove(leader);
+                            }
+
+                            // Candidates still silent while another answered are tried last next time.
+                            foreach ((_, string silent) in probes)
+                                OnUnreachable(silent);
+                            return leader;
                         }
 
-                        return leader;
-                    }
+                        // This node does not host the group: ask the voters it names.
+                        int before = ordered.Count;
+                        var extra = new List<string>();
+                        EnqueueVoters(extra, tried, route.Volume);
+                        ordered.InsertRange(next, extra);
+                        if (ordered.Count == before)
+                            last = new DfsUnavailableException(DfsErrorCode.NotLeader, $"Volume '{Name}' currently has no known leader.");
+                        break;
 
-                    // This node does not host the group: ask the voters it names.
-                    int before = ordered.Count;
-                    var extra = new List<string>();
-                    EnqueueVoters(extra, tried, route.Volume);
-                    ordered.InsertRange(i + 1, extra);
-                    if (ordered.Count == before)
-                        last = new DfsUnavailableException(DfsErrorCode.NotLeader, $"Volume '{Name}' currently has no known leader.");
-                    break;
+                    case ErrorReplyMessage { Code: DfsErrorCode.VolumeNotFound } missing:
+                        throw missing.ToException();
 
-                case ErrorReplyMessage { Code: DfsErrorCode.VolumeNotFound } missing:
-                    throw missing.ToException();
+                    case ErrorReplyMessage { Code: DfsErrorCode.AccessDenied or DfsErrorCode.AuthenticationFailed } denied:
+                        throw denied.ToException();
 
-                case ErrorReplyMessage { Code: DfsErrorCode.AccessDenied or DfsErrorCode.AuthenticationFailed } denied:
-                    throw denied.ToException();
+                    case ErrorReplyMessage error:
+                        last = error.ToException();
+                        break;
 
-                case ErrorReplyMessage error:
-                    last = error.ToException();
-                    break;
-
-                default:
-                    last = new DfsProtocolException($"Expected VolumeRouteResult from {endpoint}, received {reply.Type}.");
-                    break;
+                    default:
+                        last = new DfsProtocolException($"Expected VolumeRouteResult from {endpoint}, received {reply.Type}.");
+                        break;
+                }
             }
+        }
+        finally
+        {
+            ContextFree.Cancel(cancel);
+            foreach ((Task<IWireMessage> task, _) in probes)
+                Waits.ObserveQuietly(task);
         }
 
         if (last is not null)
             Runtime.Emit("volume.route-unknown", $"No leader of volume '{Name}' is currently known ({last.GetType().Name}).", volume: Name, exception: last);
         return null;
+
+        void StartProbe(string endpoint)
+        {
+            TimeSpan timeout = attemptTimeout < scope.Remaining ? attemptTimeout : scope.Remaining;
+            lastStart = Runtime.Time.GetTimestamp();
+            probes.Add((Runtime.Rpc.SendOnceAsync(endpoint, new GetVolumeRouteMessage(Name), scope, ClientRuntime.Positive(timeout), token: cancel.Token), endpoint));
+        }
+    }
+
+    /// <summary>How long a route candidate may stay silent before the next one is asked alongside it.</summary>
+    private static TimeSpan RouteHedgeDelay(TimeSpan attemptTimeout)
+    {
+        TimeSpan eighth = attemptTimeout / 8;
+        TimeSpan hedge = eighth > MinimumRouteHedge ? eighth : MinimumRouteHedge;
+        return hedge < attemptTimeout ? hedge : attemptTimeout;
     }
 
     private List<string> OrderBySuspicion(List<string> candidates)
@@ -1034,6 +1102,12 @@ internal sealed class VolumeContext : IRpcRouter
             bound = await MutateBoundAsync<CreateStagingResultMessage>(scope, "CreateStaging", null,
                 header => new CreateStagingMessage(header, handle, default), rebindable: false, binding: binding).ConfigureAwait(false);
         }
+        catch (DfsCommitOutcomeUnknownException unknown) when (!scope.IsAbortedByCaller && unknown.InnerException is DfsLeaseLostException lost)
+        {
+            // A retry was answered that the handle is no longer active: whether an earlier transmission created a session or
+            // not, the handle's writer authority is gone, so nothing can be staged or published through it any more.
+            throw new DfsLeaseLostException("A staging session could not be created: " + lost.Message, lost);
+        }
         catch (DfsCommitOutcomeUnknownException unknown)
         {
             throw StagingNotCreated(scope, unknown);
@@ -1059,7 +1133,7 @@ internal sealed class VolumeContext : IRpcRouter
         // without an answer (an availability failure with the Timeout code — never a bare transport timeout).
         return cause switch
         {
-            DfsQuorumUnavailableException => cause,
+            DfsQuorumUnavailableException quorum => new DfsQuorumUnavailableException("A staging session could not be created: " + quorum.Message, quorum),
             TimeoutException => new DfsUnavailableException(DfsErrorCode.Timeout,
                 "A staging session could not be created before the deadline: the request was not answered.", cause),
             _ => new DfsUnavailableException(DfsErrorCode.Unavailable, "A staging session could not be created: the request was not answered.", cause),
@@ -1259,6 +1333,10 @@ internal sealed class VolumeContext : IRpcRouter
                     ReplyType = MessageType.KeepAliveResult,
                     Kind = CallKind.Idempotent,
                     Router = this,
+
+                    // Several attempts fit in one renewal: a leader that stopped answering (paused, partitioned) is left
+                    // for its successor well within the lease, instead of spending the whole renewal waiting on it.
+                    AttemptTimeout = KeepAliveAttemptTimeout(),
                     Build = _ => ValueTask.FromResult<IWireMessage>(new KeepAliveMessage(Header(session), handles, updates, pins)),
                 };
                 try
@@ -1287,6 +1365,28 @@ internal sealed class VolumeContext : IRpcRouter
         {
             Volatile.Write(ref _keepAliveRunning, 0);
         }
+    }
+
+    /// <summary>
+    /// Half a renewal period (at least 50 ms), so that several attempts fit in one renewal; but never below three round trips
+    /// of the current leader's connection: a leader that answers slowly (high-latency link) is still renewed with, while a
+    /// silent one (paused, partitioned) is left for its successor within the lease.
+    /// </summary>
+    private TimeSpan KeepAliveAttemptTimeout()
+    {
+        TimeSpan period;
+        string? leader;
+        lock (_sync)
+        {
+            period = _timerPeriod;
+            leader = _leader ?? _lastLeader;
+        }
+
+        TimeSpan half = period / 2;
+        TimeSpan attempt = half > TimeSpan.FromMilliseconds(50) ? half : TimeSpan.FromMilliseconds(50);
+        if (leader is not null && Runtime.Pool.TryGetOpen(leader, out ClientConnection connection) && connection.RoundTrip * 3 > attempt)
+            attempt = connection.RoundTrip * 3;
+        return attempt;
     }
 
     private TimeSpan KeepAliveTimeout()

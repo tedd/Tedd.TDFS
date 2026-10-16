@@ -124,6 +124,33 @@ internal sealed class PeerConnections
         }
     }
 
+    /// <summary>
+    /// A peer authenticated a connection to this node as <paramref name="incarnation"/>: pooled outbound connections that were
+    /// authenticated with an older incarnation of it lead to a dead process. Their close may never have arrived (it travels
+    /// like any frame, for example across a link that was cut while the peer crashed), and one-way sends on them vanish
+    /// silently, so they are dropped now and the next use connects to the running incarnation.
+    /// </summary>
+    public void OnPeerAuthenticated(NodeId peer, ulong incarnation)
+    {
+        if (_byNode.TryGetValue(peer, out Slot? slot))
+            DropIfOlder(slot, incarnation);
+        foreach (Slot endpointSlot in _byEndpoint.Values)
+        {
+            if (endpointSlot.PeerNode == peer)
+                DropIfOlder(endpointSlot, incarnation);
+        }
+    }
+
+    private static void DropIfOlder(Slot slot, ulong incarnation)
+    {
+        if (slot.Connection is not { } connection || slot.PeerIncarnation >= incarnation)
+            return;
+        slot.Connection = null;
+        slot.Failures = 0;
+        slot.RetryAfter = 0;
+        _ = connection.DisposeAsync().AsTask();
+    }
+
     /// <summary>Closes the pooled connection to <paramref name="peer"/> (it reconnects on next use).</summary>
     public void Reset(NodeId peer)
     {
@@ -223,7 +250,8 @@ internal sealed class PeerConnections
             connection = await transport.ConnectAsync(endpoint, ct);
             HandshakeOutcome outcome = await HandshakeClient.AuthenticateNodeAsync(connection, _s.CreateNodeCredentials(), expectedPeer, _s.Random,
                 DefaultCallTimeout, ct);
-            _s.Rpc.RegisterOutbound(connection, outcome.ServerIdentity);
+            RefuseStaleServer(outcome);
+            _s.Rpc.RegisterOutbound(connection, outcome.ServerIdentity, outcome.Challenge.ServerBootId);
             IRpcConnection opened = connection;
             connection.Closed += (c, _) => _s.Loop.Post(() =>
             {
@@ -237,6 +265,8 @@ internal sealed class PeerConnections
             }
 
             slot.Connection = opened;
+            slot.PeerNode = outcome.ServerIdentity.NodeId;
+            slot.PeerIncarnation = outcome.ServerIdentity.Incarnation;
             slot.Failures = 0;
             slot.RetryAfter = 0;
             return opened;
@@ -264,6 +294,26 @@ internal sealed class PeerConnections
         }
     }
 
+    /// <summary>
+    /// The answering process is an older incarnation of its member, or the registered incarnation started from a cloned disk
+    /// (another boot id): it is fenced exactly as the answering side fences such a peer (RSY-021), so nothing is sent to it
+    /// (it would otherwise receive the log and its answers would count) and the connect backs off. A server that presents no
+    /// boot id (a version that predates the challenge extension) is checked by its incarnation only.
+    /// </summary>
+    private void RefuseStaleServer(HandshakeOutcome outcome)
+    {
+        if (outcome.ServerIdentity.NodeId is not { } id || _s.Control?.State.FindMember(id) is not { } member)
+            return;
+        ulong incarnation = outcome.ServerIdentity.Incarnation;
+        if (incarnation < member.Incarnation
+            || (incarnation == member.Incarnation && member.BootId != UInt128.Zero && outcome.Challenge.ServerBootId != UInt128.Zero
+                && outcome.Challenge.ServerBootId != member.BootId))
+        {
+            throw new DfsException(DfsErrorCode.StaleIncarnation,
+                NodeServices.Inv($"Incarnation {incarnation} of {member.Name} is stale (registered {member.Incarnation}) or runs from a cloned disk."));
+        }
+    }
+
     private static async Task<IWireMessage> CallOnAsync(IRpcConnection connection, IWireMessage request, TimeSpan timeout, Action drop, CancellationToken ct)
     {
         ReadOnlyMemory<byte> reply;
@@ -281,20 +331,6 @@ internal sealed class PeerConnections
         if (message is ErrorReplyMessage error)
             throw error.ToException();
         return message;
-    }
-
-    /// <summary>
-    /// A member authenticated a connection with <paramref name="incarnation"/>: a pooled connection to an older incarnation
-    /// of it is half-open (the member restarted; a crash while the link was cut leaves the old connection looking open, and
-    /// one-way sends on it vanish), so it is dropped and the next send reconnects to the current incarnation.
-    /// </summary>
-    public void NotePeerIncarnation(NodeId peer, ulong incarnation)
-    {
-        if (_byNode.TryGetValue(peer, out Slot? slot) && slot.Connection is { } connection && connection.Identity is { IsNode: true } identity
-            && identity.Incarnation < incarnation)
-        {
-            Drop(peer, connection);
-        }
     }
 
     private void Drop(NodeId peer, IRpcConnection connection)
@@ -333,5 +369,11 @@ internal sealed class PeerConnections
         public long RetryAfter { get; set; }
 
         public int Failures { get; set; }
+
+        /// <summary>Node identity the open connection authenticated (its server side).</summary>
+        public NodeId? PeerNode { get; set; }
+
+        /// <summary>Incarnation the open connection authenticated.</summary>
+        public ulong PeerIncarnation { get; set; }
     }
 }

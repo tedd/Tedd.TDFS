@@ -151,11 +151,16 @@ internal sealed partial class RpcDispatcher : IRpcHandler
     /// <summary>True when a handler for <paramref name="type"/> is registered.</summary>
     public bool IsRegistered(MessageType type) => _handlers.ContainsKey(type);
 
-    /// <summary>Records an outbound connection authenticated by this node as a trusted channel for inbound messages.</summary>
-    public void RegisterOutbound(IRpcConnection connection, RpcPeerIdentity identity)
+    /// <summary>
+    /// Records an outbound connection authenticated by this node as a trusted channel for inbound messages;
+    /// <paramref name="bootId"/> is the boot id the server presented in its (authenticated) challenge, checked like an
+    /// inbound peer's (RSY-021).
+    /// </summary>
+    public void RegisterOutbound(IRpcConnection connection, RpcPeerIdentity identity, UInt128 bootId)
     {
         ConnectionState state = GetState(connection, outbound: true);
         state.Identity = identity;
+        state.BootId = bootId;
         state.Phase = HandshakePhase.Authenticated;
     }
 
@@ -292,10 +297,27 @@ internal sealed partial class RpcDispatcher : IRpcHandler
         {
             if (!expectsReply || state.Outbound)
                 return null;
-            IWireMessage reply = type == MessageType.Hello
-                ? HandleHello(state, (HelloMessage)message, frame)
-                : HandleProof(state, (HelloProofMessage)message);
-            return MessageCodec.Encode(reply);
+
+            // Request-path stages of the handshake (operation Authenticate): F04 once the complete request is accepted,
+            // F13 before the reply leaves (a dropped reply leaves the peer's handshake unanswered).
+            int step = type == MessageType.Hello ? 0 : 1;
+            try
+            {
+                await _s.HitAsync(FaultStage.F04, FaultSites.RpcRequestAccepted, operation: DfsOperationKind.Authenticate, occurrence: step, ct: ct);
+                IWireMessage reply = type == MessageType.Hello
+                    ? HandleHello(state, (HelloMessage)message, frame)
+                    : HandleProof(state, (HelloProofMessage)message);
+                await _s.HitAsync(FaultStage.F13, FaultSites.RpcReplySend, operation: DfsOperationKind.Authenticate, occurrence: step, ct: ct);
+                return MessageCodec.Encode(reply);
+            }
+            catch (FaultReplyDroppedException)
+            {
+                return null;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return null;
+            }
         }
 
         if (state.Phase != HandshakePhase.Authenticated || state.Identity is null)
@@ -311,7 +333,7 @@ internal sealed partial class RpcDispatcher : IRpcHandler
             return expectsReply ? Error(denied) : null;
 
         _s.Metrics.RpcHandled();
-        DfsOperationKind operation = MessageTypes.OperationOf(type);
+        DfsOperationKind operation = FaultOperationOf(type, message);
         bool observed = IsObservedForFaults(type);
         DfsOperationId? operationId = Volumes.Service.RequestFaultInfo.OperationOf(message);
         string? volume = (message as IVolumeRequest)?.Header.Volume;
@@ -387,8 +409,12 @@ internal sealed partial class RpcDispatcher : IRpcHandler
                 return new ErrorReplyMessage(DfsErrorCode.AccessDenied, $"Node {member.Name} was removed from the cluster.");
             }
 
+            // The boot id is known in both directions (the opener's Hello, the server's challenge extension): a process started
+            // from a cloned disk is fenced whichever side opened the connection (RSY-021). A server that presented no boot id
+            // (a version that predates the extension) is checked by its incarnation only.
+            bool bootIdKnown = !state.Outbound || state.BootId != UInt128.Zero;
             if (identity.Incarnation < member.Incarnation
-                || (!state.Outbound && identity.Incarnation == member.Incarnation && member.BootId != UInt128.Zero && state.BootId != member.BootId))
+                || (bootIdKnown && identity.Incarnation == member.Incarnation && member.BootId != UInt128.Zero && state.BootId != member.BootId))
             {
                 Reject(state);
                 return new ErrorReplyMessage(DfsErrorCode.StaleIncarnation,
@@ -431,7 +457,21 @@ internal sealed partial class RpcDispatcher : IRpcHandler
 
     private static ReadOnlyMemory<byte> Error(ErrorReplyMessage error) => MessageCodec.Encode(error);
 
-    /// <summary>Consensus and handshake traffic is not reported at request-path fault sites (it is not an operation).</summary>
+    /// <summary>
+    /// The operation kind of a request at the request-path fault sites, as the SDK reports it at its wire sites: a
+    /// transaction-bound request (other than the transaction's own begin/commit/abort and outcome queries) is a
+    /// <see cref="DfsOperationKind.TxOp"/> operation, everything else the kind of its message type.
+    /// </summary>
+    private static DfsOperationKind FaultOperationOf(MessageType type, IWireMessage message) =>
+        message is IVolumeRequest { Header.Transaction: not null }
+        && type is not (MessageType.TxBegin or MessageType.TxCommit or MessageType.TxAbort or MessageType.QueryOperation)
+            ? DfsOperationKind.TxOp
+            : MessageTypes.OperationOf(type);
+
+    /// <summary>
+    /// Consensus traffic is not reported at request-path fault sites (it is not an operation, INTERNALS.md). The handshake
+    /// reports its own request-path stages (operation <see cref="DfsOperationKind.Authenticate"/>) before this check.
+    /// </summary>
     private static bool IsObservedForFaults(MessageType type)
         => type is not (MessageType.RaftBatch or MessageType.RaftSnapshotChunk);
 

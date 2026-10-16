@@ -307,14 +307,21 @@ internal static class NetFaultMatrix
 
     /// <summary>
     /// Restarts a node; when an armed fault crashes it during that very restart (recovery boundaries F16), the node is
-    /// restarted once more (the fault fires once), so the driver continues with a running node.
+    /// restarted once more (the fault fires once), so the driver continues with a running node. An injected I/O error
+    /// during recovery (journal replay, checkpoint install) must make the start fail cleanly: the node never serves with
+    /// partially recovered state (a durable record it could not read is never skipped, ARCHITECTURE §4) and is not running
+    /// afterwards; the next restart, without the fault, recovers it.
     /// </summary>
     private static async Task RestartToleratingInjectedCrashAsync(TestNode node)
     {
         Exception? error = await CaptureAsync(() => node.RestartAsync());
         if (error is null && node.State != TestNodeState.Crashed)
             return;
-        Assert.True(node.State == TestNodeState.Crashed, $"{node.Name}: restart failed without an injected crash: {error}");
+        bool injectedIoError = error is IOException { HResult: StorageErrors.IoDeviceHResult };
+        if (injectedIoError)
+            Assert.True(node.State == TestNodeState.Stopped, $"{node.Name}: a start that failed with an injected I/O error must leave the node down, not {node.State}");
+        else
+            Assert.True(node.State == TestNodeState.Crashed, $"{node.Name}: restart failed without an injected crash or I/O error: {error}");
         await node.RestartAsync();
     }
 
@@ -364,7 +371,8 @@ internal static class NetFaultMatrix
             FromMutation(DfsOperationKind.CreateStaging, "stream-commit", Sites(ClientWire, ServerWire, Propose, [FaultSites.StagingRegistered])),
             FromMutation(DfsOperationKind.CommitFile, "stream-commit", Sites(ClientStart, ClientWire, ServerWire, Propose, [FaultSites.CommitReceiptValidated])),
             FromMutation(DfsOperationKind.WriteAll, "write-all", Sites(ClientStart, ClientWire, ServerWire, Propose, [FaultSites.CommitReceiptValidated, FaultSites.CleanupRelease])),
-            FromMutation(DfsOperationKind.Append, "append", Sites(ClientStart, ClientWire, ServerWire, Propose, [FaultSites.CommitReceiptValidated])),
+            // Receipt validation (F09) exists only for an append published as objects: the case appends beyond the inline threshold.
+            FromMutation(DfsOperationKind.Append, "append-objects", Sites(ClientStart, ClientWire, ServerWire, Propose, [FaultSites.CommitReceiptValidated])),
             FromMutation(DfsOperationKind.Copy, "copy", Sites(ClientStart, ClientWire, ServerWire, Propose)),
             FromMutation(DfsOperationKind.Move, "move", Sites(ClientStart, ClientWire, ServerWire, Propose)),
             FromMutation(DfsOperationKind.Delete, "delete", Sites(ClientStart, ClientWire, ServerWire, Propose, [FaultSites.CleanupRelease])),

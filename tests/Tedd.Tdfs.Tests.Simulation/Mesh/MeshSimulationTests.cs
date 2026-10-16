@@ -55,7 +55,12 @@ public sealed class MeshSimulationTests
             foreach (TestNodeSpec spec in cfg.NodeSpecs())
             {
                 DfsNodeInfo info = Assert.Single(listed, i => i.Name == spec.Name);
-                Assert.Equal(DfsNodeStatus.Active, info.Status);
+                // PROTOCOL.md (WireNodeStatus.Unreachable, same values as DfsNodeStatus): an active member the control
+                // leader currently cannot reach is listed Unreachable, which a partial mesh legitimately produces.
+                if (cfg.Mesh == LinkMesh.Full || info.IsReachable)
+                    Assert.Equal(DfsNodeStatus.Active, info.Status);
+                else
+                    Assert.Equal(DfsNodeStatus.Unreachable, info.Status);
                 Assert.Equal(spec.ToLabels(), info.Labels);
                 Assert.Equal(cluster.Node(spec.Name).Id, info.Id);
                 Assert.True(info.IsControlVoter == s.ControlVoters.Contains(spec.Name), $"{spec.Name} control-voter flag disagrees with the committed configuration");
@@ -424,17 +429,20 @@ public sealed class MeshSimulationTests
 
             // Acknowledgements the victims sent before crashing are legitimate evidence and may still be delivered, and
             // followers learn an earlier commit index from heartbeats: let that settle, then nothing new may commit.
+            // A survivor that does not host the group (on a partial mesh a voter without a link to the control leader may never
+            // learn that it hosts the volume) has committed nothing.
             string[] survivors = s.VolumeVoters.Except(victims).ToArray();
             await cluster.DelayAsync(s.ElectionWindow * 2, Ct);
             ulong settled = 0;
             foreach (string survivor in survivors)
-                settled = Math.Max(settled, (await cluster.Node(survivor).Inspect.GetGroupAsync(Vol))!.CommitIndex);
+                settled = Math.Max(settled, (await cluster.Node(survivor).Inspect.GetGroupAsync(Vol))?.CommitIndex ?? 0);
 
             await s.ProbeAsync("beyond-tolerance");
             await s.AssertSafetyAsync("beyond-tolerance");
             foreach (string survivor in survivors)
             {
-                GroupInspection g = (await cluster.Node(survivor).Inspect.GetGroupAsync(Vol))!;
+                if (await cluster.Node(survivor).Inspect.GetGroupAsync(Vol) is not { } g)
+                    continue;
                 Assert.True(g.CommitIndex <= settled,
                     $"surviving voter {survivor} reached commit index {g.CommitIndex} > {settled} (the highest index committed before the majority was lost) " +
                     $"with only [{string.Join(",", survivors)}] of the configured voters [{string.Join(",", s.VolumeVoters)}] alive (CON-007, MUT-004)");
@@ -782,7 +790,11 @@ public sealed class MeshSimulationTests
 
             await cluster.DelayAsync(s.ElectionWindow * 2 + s.Timings.LeaseDuration * 2, Ct);
             await s.AssertSafetyAsync("paused");
-            ulong termDuring = (await cluster.Inspect.GetVolumeGroupAsync(Vol)).Term;
+
+            // The term of the successor elected during the pause; only when the remaining voters can elect one (otherwise
+            // the volume group has no leader until the paused node returns, and there is nothing to compare against).
+            bool successorExpected = target == volumeLeader && quorum.Outcome == MeshTri.Must;
+            ulong termDuring = successorExpected ? (await cluster.Inspect.GetVolumeGroupAsync(Vol)).Term : 0;
             await s.ResumeAsync(target);
             await cluster.DelayAsync(s.ElectionWindow * 3, Ct);
             await cluster.Inspect.AssertNoSplitBrainAsync();
@@ -800,7 +812,7 @@ public sealed class MeshSimulationTests
                     Assert.True(why is null, "write queued at the paused node: " + why);
                 }
             }
-            if (target == volumeLeader && quorum.Outcome == MeshTri.Must)
+            if (successorExpected)
             {
                 // The remaining voters had a connected majority, so they elected a successor in a higher term while the
                 // old leader was frozen; on its return it must follow that term, never resume its own.

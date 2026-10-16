@@ -191,8 +191,17 @@ internal sealed partial class AdminService
             throw new UnauthorizedAccessException($"Principal '{principal}' may not administer volume '{volume.Name}'.");
     }
 
+    /// <summary>
+    /// The named volume of the applied control state. Only the control leader answers "does not exist": another node's
+    /// view may lag the control log, so it redirects (retryable <c>NotLeader</c>) instead of a stale definite answer.
+    /// </summary>
     private VolumeRecord RequireVolume(string name)
-        => State.FindVolumeByName(name) ?? throw new DfsException(DfsErrorCode.VolumeNotFound, $"Volume '{name}' does not exist.");
+    {
+        if (State.FindVolumeByName(name) is { } volume)
+            return volume;
+        RequireLeader();
+        throw new DfsException(DfsErrorCode.VolumeNotFound, $"Volume '{name}' does not exist.");
+    }
 
     private MemberRecord RequireMember(string name)
         => State.FindMemberByName(name) is { IsLive: true } m ? m : throw new ArgumentException($"Node '{name}' is not a live member.");

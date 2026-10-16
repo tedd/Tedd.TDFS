@@ -60,10 +60,16 @@ public sealed class NetSimulationTests
             else
             {
                 // The SDK transmitted the request and cannot know that it was lost in the network: it must not report a
-                // definite failure, only that the commit may have happened.
-                NetHelpers.AssertUnknownWithIdentity(m, error, id, "a transmitted request without any reply");
+                // definite failure, only that the commit may have happened, unless it established the abort itself:
+                // QueryOperation(resolve: true) fences an identity without outcome, an authoritative decision that the
+                // operation can never commit (ARCHITECTURE §7/§9.2, FSD §13). Such a failure must resolve as Aborted.
                 drop.Cancel();
                 DfsOperationOutcome seen = await m.QueryAsync(volume, id, false);
+                if (IsUnknownOutcome(error))
+                    NetHelpers.AssertUnknownWithIdentity(m, error, id, "a transmitted request without any reply");
+                else
+                    Assert.True(seen.Status == DfsOutcomeStatus.Aborted,
+                        $"{m}: a transmitted request without any reply was reported as a definite failure ({error.GetType().Name}: {error.Message}) but its identity is {seen.Status}, not an authoritative (fenced) abort");
                 if (m.SupportsRetry && seen.Status == DfsOutcomeStatus.NotFound)
                 {
                     // Never executed and not fenced: the caller's retry with the same identity executes exactly once.
@@ -155,12 +161,15 @@ public sealed class NetSimulationTests
             }
             else
             {
+                // Every reply to the caller is lost, including those of the SDK's own outcome resolution (QueryOperation).
+                MessageRule queries = DropOutcomeQueryReplies(cluster, ClientNet("c0"));
                 (CommitToken _, Exception? error) = await CaptureValueAsync(() => m.InvokeAsync(volume, id, Ct));
                 Assert.True(drop.Matched >= 1, "the reply drop must have been reached");
 
                 // Every reply was lost: the caller must learn that the commit may have happened, carrying the identity.
                 NetHelpers.AssertUnknownWithIdentity(m, error, id, "no reply was ever delivered");
                 drop.Cancel();
+                queries.Cancel();
             }
 
             DfsOperationOutcome committed = await m.QueryAsync(resolver, id, false);
@@ -633,10 +642,18 @@ public sealed class NetSimulationTests
                 Task<Exception?> pending = CaptureAsync(() => volume.Files.WriteAllBytesAsync("/trunc", TestData.Bytes(0x7002, 2000), WithId(id), Ct));
                 await hold.WaitForAsync(1, ElectionBound);
                 CapturedMessage captured = hold.Captured[0];
+
+                // DropAll ends the hold (MessageHold docs), so the SDK's retries and its outcome query (which would fence
+                // the identity, ARCHITECTURE §7) are dropped before delivery by rules installed first: no complete copy of
+                // the request ever arrives and the identity stays unresolved.
+                MessageRule retries = cluster.Network.DropNext(new MessageFilter(From: ClientNet("c0"), Type: MessageType.WriteAll), 100_000);
+                MessageRule queries = cluster.Network.DropNext(new MessageFilter(From: ClientNet("c0"), Type: MessageType.QueryOperation), 100_000);
                 hold.DropAll();
                 Exception? error = await pending;
                 hold.DropAll();   // retries captured meanwhile are discarded too, never released by Dispose
                 hold.Dispose();
+                retries.Cancel();
+                queries.Cancel();
 
                 // The SDK transmitted the request and never heard back: it cannot know the request was lost.
                 AssertUnknownOutcome(error, id, "a transmitted WriteAll that never arrived");
@@ -894,7 +911,9 @@ public sealed class NetSimulationTests
                     byte[] v1 = TestData.Bytes(0x9011, 3000);
                     byte[] v2 = TestData.Bytes(0x9012, 3000);
                     MessageHold hold = cluster.Network.Hold(new MessageFilter(To: ClientNet("c0"), Type: MessageType.WriteAllResult));
+                    MessageRule queries = DropOutcomeQueryReplies(cluster, ClientNet("c0"));   // no decision reaches the caller
                     (CommitToken _, Exception? e1) = await CaptureValueAsync(() => volume.Files.WriteAllBytesAsync("/w", v1, WithId(k1), Ct));
+                    queries.Cancel();
                     Assert.True(hold.Count >= 1, "the first write's reply must have been captured");
 
                     // The first write was delivered and executed, but no reply reached the caller.
@@ -1796,9 +1815,11 @@ public sealed class NetSimulationTests
             DfsOperationId reserved = await staleVolume.NewOperationIdAsync(Ct);
             DfsOperationId executed = await staleVolume.NewOperationIdAsync(Ct);
             MessageRule lostReply = cluster.Network.DropReplies(new MessageFilter(From: ClientNet("stale"), Type: MessageType.Append), 10_000);
+            MessageRule lostQueries = DropOutcomeQueryReplies(cluster, ClientNet("stale"));
             Exception? executedError = await CaptureAsync(() => staleVolume.Files.AppendAllBytesAsync("/log", logSuffix, WithId(executed), Ct));
             AssertUnknownOutcome(executedError, executed, "an executed append whose every reply was lost");
             lostReply.Cancel();
+            lostQueries.Cancel();
 
             // The client disappears long enough for its leases, session and retained outcomes to expire
             // (Fast timings: lease 2 s, session 10 s, outcome retention 30 s).

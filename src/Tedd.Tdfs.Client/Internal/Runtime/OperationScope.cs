@@ -124,7 +124,9 @@ internal sealed class OperationScope : IDisposable
     /// <summary>
     /// The failure to report when the operation ends without a result and nothing that could take effect was transmitted:
     /// <see cref="OperationCanceledException"/> for caller cancellation, <see cref="ObjectDisposedException"/> for client
-    /// shutdown, and otherwise the last availability failure (or a <see cref="TimeoutException"/>) for the deadline.
+    /// shutdown, and otherwise the last availability failure for the deadline: always a typed <see cref="DfsException"/> (FSD §13),
+    /// a timeout as <see cref="DfsUnavailableException"/> with <see cref="DfsErrorCode.Timeout"/> carrying the
+    /// <see cref="TimeoutException"/> as its cause, never a bare <see cref="TimeoutException"/>.
     /// </summary>
     public Exception NotTransmittedFailure(Exception? lastFailure)
     {
@@ -132,15 +134,18 @@ internal sealed class OperationScope : IDisposable
             return new OperationCanceledException($"{Kind} was cancelled by the caller.", lastFailure, UserToken);
         if (IsKilled)
             return new ObjectDisposedException($"{Kind} was cancelled because the DfsClient was disposed.", lastFailure);
-        if (lastFailure is DfsException or TimeoutException or ObjectDisposedException)
+        if (lastFailure is DfsException or ObjectDisposedException or DfsBackupNotReachedException)
             return lastFailure;
+        if (lastFailure is TimeoutException timeout)
+            return new DfsUnavailableException(DfsErrorCode.Timeout, $"{Kind} failed: {timeout.Message}", timeout);
         if (lastFailure is not null && lastFailure is not OperationCanceledException)
         {
             // Transport-level failures surface as the typed availability error (never as end of stream or success).
             return new DfsUnavailableException(DfsErrorCode.Unavailable, $"{Kind} failed: the cluster could not be reached ({lastFailure.Message})", lastFailure);
         }
 
-        return new TimeoutException($"{Kind} did not complete within its {Timeout} deadline.", lastFailure);
+        string message = $"{Kind} did not complete within its {Timeout} deadline.";
+        return new DfsUnavailableException(DfsErrorCode.Timeout, message, new TimeoutException(message, lastFailure));
     }
 
     /// <summary>True when the scope's token fired for a reason other than the deadline (caller or shutdown).</summary>
