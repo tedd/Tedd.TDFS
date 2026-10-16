@@ -27,19 +27,33 @@ public sealed record Superblock(int FormatVersion, Guid ClusterId, NodeId NodeId
     /// <summary>Superblock format version written by this software.</summary>
     public const int CurrentFormatVersion = 1;
 
-    /// <summary>Storage software version of this build (compared with <see cref="MinSoftwareVersion"/>).</summary>
-    public const int SoftwareVersion = 1;
+    /// <summary>
+    /// Storage software version of this build: the highest <see cref="MinSoftwareVersion"/> marker it can open. It is one
+    /// above <see cref="BaseSoftwareVersion"/> because this build implements an irreversible format feature that raises the
+    /// marker (FMT-006); a release lacking that feature (version <see cref="BaseSoftwareVersion"/>) is refused such images.
+    /// </summary>
+    public const int SoftwareVersion = 2;
+
+    /// <summary>
+    /// The <see cref="MinSoftwareVersion"/> a new superblock carries: every release of the current format can open it until an
+    /// irreversible format feature raises the marker (<see cref="RaiseMinSoftwareVersionAsync"/>).
+    /// </summary>
+    public const int BaseSoftwareVersion = 1;
 
     /// <summary>Conventional file name of the superblock inside a node data directory.</summary>
     public const string DefaultFileName = "superblock";
 
     /// <summary>Loads the superblock at <paramref name="path"/>; null when absent.</summary>
+    /// <param name="medium">Storage medium.</param>
+    /// <param name="path">Superblock path.</param>
+    /// <param name="ct">Cancellation.</param>
+    /// <param name="softwareVersion">Software version of the reader (default: this build, <see cref="SoftwareVersion"/>).</param>
     /// <exception cref="DfsIntegrityException">The file is torn or corrupt.</exception>
     /// <exception cref="DfsProtocolException">The superblock requires a newer format or software version.</exception>
-    public static async ValueTask<Superblock?> LoadAsync(IStorageMedium medium, string path, CancellationToken ct = default)
+    public static async ValueTask<Superblock?> LoadAsync(IStorageMedium medium, string path, CancellationToken ct = default, int softwareVersion = SoftwareVersion)
     {
         byte[]? content = await AtomicFile.ReadAsync(medium, path, ct);
-        return content is null ? null : Decode(content, path);
+        return content is null ? null : Decode(content, path, softwareVersion);
     }
 
     /// <summary>Durably creates a new superblock (incarnation 0).</summary>
@@ -66,16 +80,17 @@ public sealed record Superblock(int FormatVersion, Guid ClusterId, NodeId NodeId
             throw new ArgumentException("The node id must not be empty.", nameof(nodeId));
         if (await medium.ExistsAsync(path, ct))
             throw StorageErrors.FileExists(path);
-        var superblock = new Superblock(CurrentFormatVersion, clusterId, nodeId, nodeName, incarnation, SoftwareVersion);
+        var superblock = new Superblock(CurrentFormatVersion, clusterId, nodeId, nodeName, incarnation, BaseSoftwareVersion);
         await AtomicFile.WriteAsync(medium, path, superblock.Encode(), ct);
         return superblock;
     }
 
     /// <summary>Durably increments the incarnation and returns the new superblock (durable before return).</summary>
     /// <exception cref="FileNotFoundException">No superblock exists at <paramref name="path"/>.</exception>
-    public static async ValueTask<Superblock> BumpIncarnationAsync(IStorageMedium medium, string path, CancellationToken ct = default)
+    public static async ValueTask<Superblock> BumpIncarnationAsync(IStorageMedium medium, string path, CancellationToken ct = default,
+        int softwareVersion = SoftwareVersion)
     {
-        Superblock current = await LoadAsync(medium, path, ct)
+        Superblock current = await LoadAsync(medium, path, ct, softwareVersion)
             ?? throw new FileNotFoundException($"No superblock exists at '{path}'.", path);
         if (current.Incarnation == ulong.MaxValue)
             throw new InvalidOperationException("The node incarnation counter is exhausted.");
@@ -88,11 +103,12 @@ public sealed record Superblock(int FormatVersion, Guid ClusterId, NodeId NodeId
     /// Durably raises <see cref="MinSoftwareVersion"/> (irreversible format activation that blocks downgrades).
     /// Lowering is ignored.
     /// </summary>
-    public static async ValueTask<Superblock> RaiseMinSoftwareVersionAsync(IStorageMedium medium, string path, int minSoftwareVersion, CancellationToken ct = default)
+    public static async ValueTask<Superblock> RaiseMinSoftwareVersionAsync(IStorageMedium medium, string path, int minSoftwareVersion, CancellationToken ct = default,
+        int softwareVersion = SoftwareVersion)
     {
-        if (minSoftwareVersion > SoftwareVersion)
-            throw new ArgumentOutOfRangeException(nameof(minSoftwareVersion), $"This software (version {SoftwareVersion}) cannot require version {minSoftwareVersion}.");
-        Superblock current = await LoadAsync(medium, path, ct)
+        if (minSoftwareVersion > softwareVersion)
+            throw new ArgumentOutOfRangeException(nameof(minSoftwareVersion), $"This software (version {softwareVersion}) cannot require version {minSoftwareVersion}.");
+        Superblock current = await LoadAsync(medium, path, ct, softwareVersion)
             ?? throw new FileNotFoundException($"No superblock exists at '{path}'.", path);
         if (minSoftwareVersion <= current.MinSoftwareVersion)
             return current;
@@ -118,9 +134,12 @@ public sealed record Superblock(int FormatVersion, Guid ClusterId, NodeId NodeId
     }
 
     /// <summary>Parses a superblock payload.</summary>
+    /// <param name="payload">Payload.</param>
+    /// <param name="path">Path (diagnostics).</param>
+    /// <param name="softwareVersion">Software version of the reader (default: this build, <see cref="SoftwareVersion"/>).</param>
     /// <exception cref="DfsIntegrityException">The payload is malformed.</exception>
     /// <exception cref="DfsProtocolException">The payload requires a newer format or software version.</exception>
-    public static Superblock Decode(ReadOnlySpan<byte> payload, string path = "superblock")
+    public static Superblock Decode(ReadOnlySpan<byte> payload, string path = "superblock", int softwareVersion = SoftwareVersion)
     {
         try
         {
@@ -135,10 +154,10 @@ public sealed record Superblock(int FormatVersion, Guid ClusterId, NodeId NodeId
             }
 
             ulong minSoftware = reader.ReadVarUInt();
-            if (minSoftware > SoftwareVersion)
+            if (minSoftware > (ulong)Math.Max(0, softwareVersion))
             {
                 throw new DfsProtocolException(DfsErrorCode.Unsupported,
-                    $"Superblock '{path}' requires software version {minSoftware}; this software is version {SoftwareVersion}.");
+                    $"Superblock '{path}' requires software version {minSoftware}; this software is version {softwareVersion}.");
             }
 
             Guid clusterId = reader.ReadGuid();

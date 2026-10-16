@@ -35,4 +35,10 @@ public sealed class NodeEnvironment
     /// (<c>VolumeHost.ResolveDefaultFactory</c>).
     /// </summary>
     internal Volumes.IVolumeStateMachineFactory? VolumeStateMachines { get; init; }
+
+    /// <summary>
+    /// Software release emulation (tests): the protocol range, cluster features and readable image formats the node runs
+    /// with; null runs this build (<see cref="Runtime.NodeRelease.Current"/>).
+    /// </summary>
+    internal Runtime.NodeRelease? Release { get; init; }
 }

@@ -166,6 +166,17 @@ internal sealed partial class ControlStateMachine
         return ApplyOutcome.Success(updated);
     }
 
+    private ApplyOutcome ApplySetMemberRelease(SetMemberReleaseCommand c)
+    {
+        MemberRecord? m = State.FindMember(c.Id);
+        if (m is null || !m.IsLive)
+            return Fail(DfsErrorCode.InvalidArgument, $"Node {c.Id} is not a live member.");
+        string[] features = c.Features.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+        MemberRecord updated = m with { ProtocolMax = c.ProtocolMax, Features = features };
+        State.Members[c.Id] = updated;
+        return ApplyOutcome.Success(updated);
+    }
+
     private ApplyOutcome ApplySetMemberLabels(SetMemberLabelsCommand c)
     {
         MemberRecord? m = State.FindMember(c.Id);

@@ -195,7 +195,7 @@ internal sealed class ControlHost
     Task<ApplyOutcome> ProposeAsync(ControlCommand command, CancellationToken ct = default);
     DfsUnavailableException NotLeader(); string? ResolveEndpoint(NodeId node); string NameOf(NodeId node);
     ClusterMapData BuildClusterMap(); DfsServerCapabilities BuildCapabilities(); bool IsReachable(NodeId node);
-    void ReportSecurityEvent(string operation, string outcome, string scope, string principal = "-"); // rate limited audit
+    void ReportSecurityEvent(string operation, string outcome, string scope, string principal = "-"); // rate limited audit (forwarded to the control leader, AuditEvent)
 }
 // ControlStateMachine.Changed (event Action<ulong>, the applied index) fires after each applied command or restored checkpoint.
 

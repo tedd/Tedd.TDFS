@@ -60,12 +60,20 @@ internal sealed partial class VolumeService
         return new ListSnapshotsResultMessage(snapshots, Token(applied));
     }
 
-    /// <summary><c>DeleteSnapshot</c>: removes the retention reference (RetentionProtected while held or unexpired).</summary>
-    public Task<IWireMessage> DeleteSnapshotAsync(RpcContext context, DeleteSnapshotMessage request)
+    /// <summary>
+    /// <c>DeleteSnapshot</c>: removes the retention reference (RetentionProtected while held or unexpired). Deleting a recovery
+    /// point is a security-relevant administrative action (FSD §14): the decision is audited with its outcome (SEC-016).
+    /// </summary>
+    public async Task<IWireMessage> DeleteSnapshotAsync(RpcContext context, DeleteSnapshotMessage request)
     {
-        RequireGrant(context.Principal ?? string.Empty, DfsPermissions.Snapshot, "delete snapshot");
-        return MutateAsync(context, request, DfsOperationKind.DeleteSnapshot,
+        string principal = context.Principal ?? string.Empty;
+        RequireGrant(principal, DfsPermissions.Snapshot, "delete snapshot");
+        IWireMessage reply = await MutateAsync(context, request, DfsOperationKind.DeleteSnapshot,
             (op, _) => Task.FromResult<VolumeCommand>(Stamp(new DeleteSnapshotCommand(request.Name), op)), cleanup: true);
+        // Answered once the record is in the audit log (read-your-writes for the deleting administrator's auditor).
+        await _s.Control.ReportSecurityEventAndWaitAsync("volume:delete snapshot", reply is ErrorReplyMessage error ? "failed:" + error.Code : "ok",
+            "volume=" + Name + " snapshot=" + request.Name, principal);
+        return reply;
     }
 
     /// <summary><c>SetRetention</c>: shortening or removing a hold requires RetentionAdmin.</summary>

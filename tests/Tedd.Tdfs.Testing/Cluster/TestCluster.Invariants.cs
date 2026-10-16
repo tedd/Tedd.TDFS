@@ -62,7 +62,9 @@ public sealed partial class TestCluster
     {
         try
         {
-            return await host.Inspect.ObserveLeadershipAsync(OnLeadership);
+            // Only this cluster's leaderships: a node re-bootstrapped under a foreign cluster identity leads that cluster's
+            // groups, whose names ("control") and terms collide with this cluster's (SEC-001).
+            return await host.Inspect.ObserveLeadershipAsync(OnLeadership, ClusterId);
         }
         catch (Exception ex) when (IsNodeGone(ex))
         {

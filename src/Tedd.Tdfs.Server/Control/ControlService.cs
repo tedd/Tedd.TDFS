@@ -7,7 +7,8 @@ namespace Tedd.Tdfs.Server.Control;
 
 /// <summary>
 /// Discovery and membership RPCs served from the control state (PROTOCOL.md §9.2): <c>GetClusterMap</c>,
-/// <c>GetVolumeRoute</c>, <c>JoinCluster</c> (seed join; control leader only) and <c>RegisterIncarnation</c>.
+/// <c>GetVolumeRoute</c>, <c>JoinCluster</c> (seed join; control leader only), <c>RegisterIncarnation</c> and
+/// <c>AuditEvent</c> (security events forwarded to the control leader).
 /// </summary>
 internal sealed class ControlService
 {
@@ -28,6 +29,23 @@ internal sealed class ControlService
         rpc.Register<GetVolumeRouteMessage>(GetVolumeRouteAsync, RpcAccess.Any | RpcAccess.JoiningNode);
         rpc.Register<JoinClusterMessage>(JoinClusterAsync, RpcAccess.Node | RpcAccess.JoiningNode);
         rpc.Register<RegisterIncarnationMessage>(RegisterIncarnationAsync, RpcAccess.Node);
+        rpc.Register<AuditEventMessage>(AuditEventAsync, RpcAccess.Node);
+    }
+
+    /// <summary>Longest field of a forwarded audit record (longer values are cut; records never carry payload or secrets).</summary>
+    private const int MaxAuditFieldLength = 512;
+
+    /// <summary><c>AuditEvent</c> (member → control leader): records a security event another node observed (SEC-016).</summary>
+    private async ValueTask<IWireMessage> AuditEventAsync(RpcContext context, IWireMessage request)
+    {
+        var message = (AuditEventMessage)request;
+        if (!Control.IsLeader)
+            throw Control.NotLeader();
+        bool accepted = await Control.RecordForwardedSecurityEventAsync(new AuditEventMessage(Cut(message.Operation), Cut(message.Outcome), Cut(message.Scope),
+            Cut(message.Principal)));
+        return new AuditEventResultMessage(accepted);
+
+        static string Cut(string value) => value.Length <= MaxAuditFieldLength ? value : value[..MaxAuditFieldLength];
     }
 
     private ValueTask<IWireMessage> GetClusterMapAsync(RpcContext context, IWireMessage request)
@@ -46,6 +64,19 @@ internal sealed class ControlService
         CommitToken last = CommitToken.None;
         if (message.RequireLeader)
         {
+            // The leader variant backs DfsVolume.GetInfoAsync: it discloses the volume's last commit, so a client principal
+            // needs the Read grant on the volume (SEC-003); plain routing stays open to every authenticated peer, as the
+            // route carries nothing beyond the cluster map.
+            if (!context.IsNode)
+            {
+                string principal = context.Principal ?? string.Empty;
+                if ((Control.State.GetPermissions(principal, volume.Id) & DfsPermissions.Read) == 0 && !Control.State.IsClusterAdmin(principal))
+                {
+                    Control.ReportSecurityEvent("volume:get info", "denied", "volume=" + volume.Name, principal);
+                    throw new UnauthorizedAccessException($"Principal '{principal}' lacks the Read grant on volume '{volume.Name}' (get info).");
+                }
+            }
+
             if (group is null)
                 throw new DfsUnavailableException(DfsErrorCode.NotLeader, $"{_s.NodeName} does not host volume '{volume.Name}'.");
             if (!group.IsLeader)
@@ -101,8 +132,45 @@ internal sealed class ControlService
         if (!Control.IsLeader)
             throw Control.NotLeader();
         MemberRecord member = await RegisterAsync(message.Node, message.Incarnation, message.BootId, message.Labels, message.Endpoints, message.CapacityBytes,
-            context.Cancellation);
+            context.Cancellation, ReadRelease(message.Extensions));
         return new RegisterIncarnationResultMessage(true, member.Incarnation, member.Status, Control.State.AppliedIndex, Control.State.PlacementEpoch);
+    }
+
+    /// <summary>Optional extension of <c>RegisterIncarnation</c> carrying the registering node's release (varint32 protocol max, string list features).</summary>
+    public const uint ReleaseExtension = 1;
+
+    /// <summary>The release extension describing <paramref name="release"/>.</summary>
+    public static WireExtension EncodeRelease(NodeRelease release)
+    {
+        ArgumentNullException.ThrowIfNull(release);
+        var buffer = new System.Buffers.ArrayBufferWriter<byte>(64);
+        var writer = new WireWriter(buffer);
+        writer.WriteVarInt32(release.ProtocolMax);
+        writer.WriteStringList(release.Features.Order(StringComparer.Ordinal).ToArray());
+        return new WireExtension(ReleaseExtension, Required: false, buffer.WrittenSpan.ToArray());
+    }
+
+    /// <summary>The release carried by a registration's extensions, or null (older senders omit it).</summary>
+    private static (int ProtocolMax, IReadOnlyList<string> Features)? ReadRelease(IReadOnlyList<WireExtension> extensions)
+    {
+        foreach (WireExtension extension in extensions)
+        {
+            if (extension.FieldId != ReleaseExtension)
+                continue;
+            try
+            {
+                var reader = new WireReader(extension.Value.Span, WireLimits.Default);
+                int protocolMax = reader.ReadVarInt32();
+                IReadOnlyList<string> features = reader.ReadStringList();
+                return (protocolMax, features);
+            }
+            catch (DfsProtocolException)
+            {
+                return null; // malformed optional extension: treated as absent
+            }
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -119,10 +187,23 @@ internal sealed class ControlService
         }
     }
 
-    /// <summary>Proposes an incarnation registration (control leader) and returns the registered member.</summary>
+    /// <summary>
+    /// Proposes an incarnation registration (control leader) and returns the registered member. When the registering process
+    /// runs another software release than the member record lists (<paramref name="release"/>: protocol maximum and
+    /// understood features), the release is recorded first, so feature eligibility (FMT-009) reflects the restarted node
+    /// as soon as it counts as registered.
+    /// </summary>
     public async Task<MemberRecord> RegisterAsync(NodeId node, ulong incarnation, UInt128 bootId, DfsTopologyLabels labels, IReadOnlyList<string> endpoints,
-        long capacityBytes, CancellationToken ct)
+        long capacityBytes, CancellationToken ct, (int ProtocolMax, IReadOnlyList<string> Features)? release = null)
     {
+        if (release is { } r && Control.State.FindMember(node) is { IsLive: true } known
+            && (known.ProtocolMax != r.ProtocolMax || !known.Features.SequenceEqual(r.Features.Order(StringComparer.Ordinal), StringComparer.Ordinal)))
+        {
+            ApplyOutcome recorded = await Control.ProposeAsync(new SetMemberReleaseCommand(Control.NewHeader(), node, r.ProtocolMax, r.Features), ct);
+            if (!recorded.IsSuccess)
+                throw recorded.ToException();
+        }
+
         var command = new RegisterIncarnationCommand(Control.NewHeader(), node, incarnation, bootId, labels, endpoints, capacityBytes);
         ApplyOutcome outcome = await Control.ProposeAsync(command, ct);
         if (!outcome.IsSuccess)

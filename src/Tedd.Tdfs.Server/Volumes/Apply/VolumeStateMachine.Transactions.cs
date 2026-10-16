@@ -139,9 +139,13 @@ internal sealed partial class VolumeStateMachine
             throw Fail(DfsErrorCode.InvalidArgument, "Malformed transaction descriptor: " + ex.Message);
         }
 
-        // Validation: everything the transaction read is unchanged at the commit index.
+        // Validation: everything the transaction read is unchanged at the commit index. The SkipPredicateValidation negative
+        // control (MUT-007) leaves out the predicates: names found absent and directory entries the transaction enumerated.
+        bool skipPredicates = ctx.Op is { } validating && (validating.Flags & CommandFlags.SkipPredicates) != 0;
         foreach (TxLookup lookup in descriptor.Lookups)
         {
+            if (skipPredicates && lookup.Child == 0)
+                continue;
             ulong now = s.Find(lookup.Directory) is { IsDirectory: true } directory ? directory.Children.GetValueOrDefault(lookup.Name) : ulong.MaxValue;
             if (now != lookup.Child)
             {
@@ -152,6 +156,8 @@ internal sealed partial class VolumeStateMachine
 
         foreach (TxRead read in descriptor.Reads)
         {
+            if (skipPredicates && s.Find(read.Inode) is { IsDirectory: true })
+                continue;
             if (s.Find(read.Inode)?.Revision != read.Revision)
                 return Abandon(s, tx, ctx, DfsErrorCode.TransactionConflict, $"Transaction {tx.Id} conflicts: inode {read.Inode} changed after the transaction read it.");
         }

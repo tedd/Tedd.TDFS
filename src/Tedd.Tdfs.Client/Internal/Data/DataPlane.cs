@@ -11,6 +11,12 @@ namespace Tedd.Tdfs.Client.Internal.Data;
 /// <summary>A storage node rejected a data capability (expired or revoked): the caller re-acquires it and retries.</summary>
 internal sealed class DataCapabilityRejectedException : Exception
 {
+    /// <summary>
+    /// Bytes at the start of the read's destination that already hold verified object data when the capability was rejected
+    /// (a fetch made of many short results can outlive its capability): the caller keeps them instead of starting over.
+    /// </summary>
+    public int Filled { get; init; }
+
     public DataCapabilityRejectedException()
         : this("A storage node rejected the data capability.")
     {
@@ -367,7 +373,10 @@ internal sealed class DataPlane
     /// </summary>
     /// <exception cref="DfsIntegrityException">No replica returned verifiable data and at least one returned corrupt or no data.</exception>
     /// <exception cref="DfsUnavailableException">No replica could be reached.</exception>
-    /// <exception cref="DataCapabilityRejectedException">The capability was rejected (re-acquire it and retry).</exception>
+    /// <exception cref="DataCapabilityRejectedException">
+    /// The capability was rejected (re-acquire it and retry); <see cref="DataCapabilityRejectedException.Filled"/> bytes at the
+    /// start of <paramref name="destination"/> were already read and verified.
+    /// </exception>
     public async Task ReadObjectAsync(OperationScope scope, VolumeContext volume, ReadOnlyMemory<byte> capability, ObjectId obj, long objectLength,
         UInt128 checksum, byte encoding, ulong placementEpoch, IReadOnlyList<NodeId> locations, long objectOffset, Memory<byte> destination)
     {
@@ -495,7 +504,8 @@ internal sealed class DataPlane
                     filled += copied;
                     break;
                 case ErrorReplyMessage { Code: DfsErrorCode.AccessDenied } denied:
-                    throw new DataCapabilityRejectedException(denied.Message, denied.ToException());
+                    // The bytes verified so far stay valid (objects are immutable): the caller keeps them.
+                    throw new DataCapabilityRejectedException(denied.Message, denied.ToException()) { Filled = filled };
                 case ErrorReplyMessage { Code: DfsErrorCode.Integrity } corrupt:
                     throw new DfsIntegrityException(obj, corrupt.Message);
                 case ErrorReplyMessage error:

@@ -13,6 +13,7 @@ internal enum ControlCommandKind : ushort
     AdmitMember = 12,
     SetMemberStatus = 13,
     SetMemberLabels = 14,
+    SetMemberRelease = 15,
     CreateVolume = 20,
     DeleteVolume = 21,
     SetVolumeVoters = 22,
@@ -100,6 +101,17 @@ internal sealed record SetMemberStatusCommand(CommandHeader Header, NodeId Id, W
 internal sealed record SetMemberLabelsCommand(CommandHeader Header, NodeId Id, DfsTopologyLabels Labels) : ControlCommand(Header)
 {
     public override ControlCommandKind Kind => ControlCommandKind.SetMemberLabels;
+}
+
+/// <summary>
+/// Records the software release a member runs (protocol range and understood features) after it restarted on another
+/// release: feature activation is eligible only while every live member understands the feature (FMT-009, CHA-011).
+/// </summary>
+internal sealed record SetMemberReleaseCommand(CommandHeader Header, NodeId Id, int ProtocolMax, IReadOnlyList<string> Features) : ControlCommand(Header)
+{
+    public override ControlCommandKind Kind => ControlCommandKind.SetMemberRelease;
+
+    public override DfsOperationKind FaultOperation => DfsOperationKind.MembershipChange;
 }
 
 internal sealed record CreateVolumeCommand(CommandHeader Header, VolumeCreation Creation, ReadOnlyMemory<byte> WrappedDataKey) : ControlCommand(Header)
@@ -291,6 +303,11 @@ internal static class ControlCommandCodec
                 w.WriteNodeId(c.Id);
                 w.WriteTopologyLabels(c.Labels);
                 break;
+            case SetMemberReleaseCommand c:
+                w.WriteNodeId(c.Id);
+                w.WriteVarInt32(c.ProtocolMax);
+                w.WriteStringList(c.Features);
+                break;
             case CreateVolumeCommand c:
                 ControlCodec.WriteCreation(ref w, c.Creation);
                 w.WriteBytes(c.WrappedDataKey.Span);
@@ -419,6 +436,9 @@ internal static class ControlCommandCodec
                 break;
             case ControlCommandKind.SetMemberLabels:
                 command = new SetMemberLabelsCommand(header, r.ReadNodeId(), r.ReadTopologyLabels());
+                break;
+            case ControlCommandKind.SetMemberRelease:
+                command = new SetMemberReleaseCommand(header, r.ReadNodeId(), r.ReadVarInt32(), r.ReadStringList());
                 break;
             case ControlCommandKind.CreateVolume:
                 command = new CreateVolumeCommand(header, ControlCodec.ReadCreation(ref r), r.ReadBytesCopy());

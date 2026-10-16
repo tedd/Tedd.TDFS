@@ -365,8 +365,13 @@ internal sealed partial class VolumeService
             ReceiptEvaluation evaluation = Receipts.Evaluate(own, _s.Keys.ReceiptKey, control, obj, c.Checksum, c.ObjectLength, c.Encoding, Record.Id,
                 staging, pool);
             await _s.HitAsync(FaultStage.F09, FaultSites.CommitReceiptValidated, Name, kind, opId.IsEmpty ? null : opId, path, obj, occurrence++, ct: ct);
-            if (!_s.Mutations.CommitMetadataBeforeData
-                && (evaluation.Copies < policy.DurableCopiesBeforeAck || evaluation.Zones < policy.DurableZonesBeforeAck))
+
+            // Negative controls (MUT-012, MUT-014): the leader's own policy check counts every host as a zone, or accepts
+            // whatever copies a client that relaxed the policy after a timeout publishes.
+            int zones = _s.Mutations.CountSameZoneTwice ? evaluation.Copies : evaluation.Zones;
+            bool relaxed = _s.Mutations.RelaxPolicyOnTimeout && evaluation.Copies > 0;
+            if (!_s.Mutations.CommitMetadataBeforeData && !relaxed
+                && (evaluation.Copies < policy.DurableCopiesBeforeAck || zones < policy.DurableZonesBeforeAck))
             {
                 throw new DfsPlacementUnavailableException(
                     $"Object {obj} has {evaluation.Copies} durable copies in {evaluation.Zones} zones; the policy requires {policy.DurableCopiesBeforeAck} in {policy.DurableZonesBeforeAck}.",

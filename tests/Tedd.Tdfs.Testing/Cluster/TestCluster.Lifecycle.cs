@@ -126,7 +126,7 @@ public sealed partial class TestCluster
         {
             // The seed bootstraps a single-member cluster; the configured control voter count travels with it so the
             // control leader promotes joined learners until that many voters exist (clipped to the live members).
-            ClusterBootstrap single = BuildStaticBootstrap(planned.Take(1).ToList(), 1) with { ControlVoterTarget = o.ControlVoters };
+            ClusterBootstrap single = BuildStaticBootstrap(planned.Take(1).ToList(), 1) with { ControlVoterTarget = o.EffectiveControlVoters };
             IReadOnlyList<IReadOnlyList<int>> seeds = BuildSeedGraph(o.Seeds, planned.Count);
             for (int i = 0; i < planned.Count; i++)
                 AddLiveNode(planned[i], i == 0 ? single : null, seeds[i].Select(j => planned[j].Endpoint).ToArray());
@@ -369,15 +369,50 @@ public sealed partial class TestCluster
         return new NodeEnvironment
         {
             Medium = medium,
-            TransportFactory = node.TransportFactory ?? throw new InvalidOperationException($"Node {node.Name} has no transport factory."),
+            TransportFactory = TransportFactoryFor(node),
             Time = node.Clock,
             Random = _random.Fork(string.Create(CultureInfo.InvariantCulture, $"node:{node.Name}/start:{start}")),
             Faults = Faults.Injector,
             Log = log,
             LoopFactory = Runtime.CreateLoopFactory(log),
             VolumeStateMachines = StartOptions.VolumeStateMachines,
+            Release = ReleaseOf(node.SoftwareVersion),
         };
     }
+
+    /// <summary>The node-runtime release emulating <paramref name="profile"/> (null for the build under test).</summary>
+    internal static Server.Runtime.NodeRelease? ReleaseOf(SoftwareVersionProfile profile) =>
+        ReferenceEquals(profile, SoftwareVersionProfile.Current)
+            ? null
+            : new Server.Runtime.NodeRelease(profile.Name, profile.ProtocolVersionMin, profile.ProtocolVersionMax, profile.Features,
+                profile.MaxReadableDiskFormatVersion);
+
+    /// <summary>
+    /// The transport factory of one start of a live node. Over QUIC a node whose options name a certificate
+    /// (<see cref="NodeOptions.CertificatePath"/>, as the host process honours it) presents that certificate instead of the
+    /// cluster's development certificate — so a member restarted with an unknown or expired certificate is refused by its
+    /// pinning peers exactly as an out-of-process host would be (SEC-001).
+    /// </summary>
+    private IRpcTransportFactory TransportFactoryFor(TestNode node)
+    {
+        IRpcTransportFactory factory = node.TransportFactory ?? throw new InvalidOperationException($"Node {node.Name} has no transport factory.");
+        if (node.Options.CertificatePath is not { } path || Options.Transport != TransportKind.Quic)
+            return factory;
+        X509Certificate2 certificate = Host.DevelopmentCertificates.Load(File.ReadAllBytes(path), null);
+        lock (_gate)
+            _nodeCertificates.Add(certificate);
+        return Fabric.CreateFactory(new TransportIdentity
+        {
+            Owner = this,
+            Clock = node.Clock,
+            ClusterId = ClusterId,
+            Certificate = certificate,
+            TrustedPins = _trustedPins,
+        });
+    }
+
+    /// <summary>Certificates loaded for nodes started with <see cref="NodeOptions.CertificatePath"/> (disposed with the cluster).</summary>
+    private readonly List<X509Certificate2> _nodeCertificates = [];
 
     /// <summary>The environment of one start of a backup node.</summary>
     internal NodeEnvironment CreateBackupEnvironment(TestBackupNode node, IStorageMedium medium, int start)
@@ -722,6 +757,16 @@ public sealed partial class TestCluster
 
         _liveCertificate?.Certificate.Dispose();
         _backupCertificate?.Certificate.Dispose();
+        X509Certificate2[] nodeCertificates;
+        lock (_gate)
+            nodeCertificates = [.. _nodeCertificates];
+        foreach (X509Certificate2 certificate in nodeCertificates)
+        {
+            string? key = Host.DevelopmentCertificates.PersistedKeyName(certificate);
+            certificate.Dispose();
+            if (key is not null)
+                Host.DevelopmentCertificates.DeletePersistedKey(key);
+        }
 
         if (!KeepData && Directory.Exists(DataRoot))
             DeleteDataRoot();

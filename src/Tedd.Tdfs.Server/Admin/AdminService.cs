@@ -82,6 +82,12 @@ internal sealed partial class AdminService
                 AdminOp.PoolStatus or AdminOp.DeletePool => op + " pool=" + message.ReadBody<AdminPoolNameBody>().Pool,
                 AdminOp.CreatePool or AdminOp.SetPoolMembers => op + " pool=" + message.ReadBody<AdminPoolMembersBody>().Pool,
                 AdminOp.ListPools => op + " pool=*",
+                AdminOp.SetDefaultPolicy => op + " volume=" + message.ReadBody<AdminSetDefaultPolicyBody>().Volume,
+                AdminOp.DefinePolicy => op + " volume=" + message.ReadBody<AdminDefinePolicyBody>().Volume
+                    + " policy=" + message.ReadBody<AdminDefinePolicyBody>().PolicyName,
+                AdminOp.Grant or AdminOp.Revoke => op + " volume=" + message.ReadBody<AdminGrantBody>().Volume
+                    + " principal=" + message.ReadBody<AdminGrantBody>().Principal,
+                AdminOp.DeleteVolume or AdminOp.RotateDataKey => op + " volume=" + message.ReadBody<AdminVolumeNameBody>().Volume,
                 _ => op,
             };
         }

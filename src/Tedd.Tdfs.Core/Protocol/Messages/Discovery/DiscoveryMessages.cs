@@ -360,3 +360,74 @@ public sealed record RegisterIncarnationResultMessage(
         return new RegisterIncarnationResultMessage(accepted, registered, status, configIndex, placementEpoch) { Extensions = extensions };
     }
 }
+
+/// <summary>
+/// A security event (denied request, failed authentication) observed by a node that does not lead the control group,
+/// forwarded to the control leader, which records it in the audit log (node → control leader; SEC-016). Never carries
+/// payload bytes or secrets.
+/// </summary>
+/// <param name="Operation">Operation that was refused (for example <c>volume:write</c>, <c>authenticate</c>).</param>
+/// <param name="Outcome">Outcome (for example <c>denied</c>).</param>
+/// <param name="Scope">Scope of the event (volume, peer, required permission).</param>
+/// <param name="Principal">Principal the event concerns (<c>-</c> when unknown).</param>
+public sealed record AuditEventMessage(string Operation, string Outcome, string Scope, string Principal) : IWireMessage<AuditEventMessage>
+{
+    /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
+    public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
+
+    /// <inheritdoc />
+    public MessageType Type => WireType;
+
+    /// <inheritdoc />
+    public static MessageType WireType => MessageType.AuditEvent;
+
+    /// <inheritdoc />
+    public void Write(ref WireWriter writer)
+    {
+        writer.WriteString(Operation);
+        writer.WriteString(Outcome);
+        writer.WriteString(Scope);
+        writer.WriteString(Principal);
+        writer.WriteExtensionBlock(Extensions);
+    }
+
+    /// <inheritdoc />
+    public static AuditEventMessage Read(ref WireReader reader)
+    {
+        string operation = reader.ReadString();
+        string outcome = reader.ReadString();
+        string scope = reader.ReadString();
+        string principal = reader.ReadString();
+        IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
+        return new AuditEventMessage(operation, outcome, scope, principal) { Extensions = extensions };
+    }
+}
+
+/// <summary>Reply to <see cref="AuditEventMessage"/>.</summary>
+/// <param name="Accepted">True when the control leader queued the record (false when its flood bound dropped it).</param>
+public sealed record AuditEventResultMessage(bool Accepted) : IWireMessage<AuditEventResultMessage>
+{
+    /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
+    public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
+
+    /// <inheritdoc />
+    public MessageType Type => WireType;
+
+    /// <inheritdoc />
+    public static MessageType WireType => MessageType.AuditEventResult;
+
+    /// <inheritdoc />
+    public void Write(ref WireWriter writer)
+    {
+        writer.WriteBool(Accepted);
+        writer.WriteExtensionBlock(Extensions);
+    }
+
+    /// <inheritdoc />
+    public static AuditEventResultMessage Read(ref WireReader reader)
+    {
+        bool accepted = reader.ReadBool();
+        IReadOnlyList<WireExtension> extensions = reader.ReadExtensionBlock();
+        return new AuditEventResultMessage(accepted) { Extensions = extensions };
+    }
+}

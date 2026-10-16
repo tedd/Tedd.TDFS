@@ -39,6 +39,9 @@ internal sealed class RaftProgress
     /// <summary>The peer responded since the last CheckQuorum interval started.</summary>
     public bool RecentActive { get; set; }
 
+    /// <summary>The peer responded during the previous CheckQuorum interval (reporting only, see <see cref="ToPublic"/>).</summary>
+    public bool ActiveInPreviousInterval { get; set; }
+
     public int InflightCount => _inflights.Count;
 
     public bool InflightsFull => _inflights.Count >= _maxInflight;
@@ -136,7 +139,11 @@ internal sealed class RaftProgress
             _inflights.Dequeue();
     }
 
-    public RaftPeerProgress ToPublic(bool isLearner) => new(Peer, Match, Next, State, RecentActive, isLearner);
+    /// <summary>
+    /// The public view. Activity covers the current and the previous CheckQuorum interval, so a peer that answers every
+    /// heartbeat is never reported inactive merely because the interval was just reset.
+    /// </summary>
+    public RaftPeerProgress ToPublic(bool isLearner) => new(Peer, Match, Next, State, RecentActive || ActiveInPreviousInterval, isLearner);
 
     /// <summary>An independent copy of the whole tracking state (model checking).</summary>
     public RaftProgress Clone()
@@ -149,6 +156,7 @@ internal sealed class RaftProgress
             PendingSnapshot = PendingSnapshot,
             Snapshot = Snapshot,
             SnapshotOffset = SnapshotOffset,
+            ActiveInPreviousInterval = ActiveInPreviousInterval,
         };
         foreach (ulong inflight in _inflights)
             copy._inflights.Enqueue(inflight);
@@ -157,7 +165,8 @@ internal sealed class RaftProgress
 
     /// <summary>
     /// Canonical description of the whole tracking state (see <see cref="RaftNode.DescribeCanonicalState"/>); the peer is
-    /// written by <paramref name="name"/>.
+    /// written by <paramref name="name"/>. <see cref="ActiveInPreviousInterval"/> is not described: it only feeds the public
+    /// progress report (<see cref="ToPublic"/>) and no transition of the core reads it.
     /// </summary>
     public string DescribeCanonicalState(Func<NodeId, string> name) =>
         string.Create(System.Globalization.CultureInfo.InvariantCulture,

@@ -1807,7 +1807,8 @@ public sealed class ChaSimulationTests
             SafetyMonitor election = SafetyMonitor.Start(cluster, "cha011-election-safety", TimeSpan.FromMilliseconds(200),
                 () => SampleLeadersAsync(cluster, leaders));
             using var stopLoad = new CancellationTokenSource();
-            Task<int> load = RunRegisterLoadAsync(cluster, "load", register, stopLoad.Token);
+            var loadProgress = new System.Runtime.CompilerServices.StrongBox<int>();
+            Task<int> load = RunRegisterLoadAsync(cluster, "load", register, stopLoad.Token, loadProgress);
 
             TestNode leader = await cluster.GetLeaderAsync(Vol, ct);
             TestNode[] followers = cluster.Nodes.Where(n => n.Name != leader.Name).ToArray();
@@ -1878,8 +1879,14 @@ public sealed class ChaSimulationTests
             }
 
             Assert.Contains(SoftwareVersionProfile.NextFeature, (await cluster.Admin.GetClusterStatusAsync(ct)).ActiveFeatures);
-            // Synchronous cancellation: CancelAsync runs the registered callbacks on the thread pool, an uncontrolled
-            // dependency of a deterministic run (HAR-002).
+
+            // The evidence bound is a number of completed operations, not a duration: when the steps above finish quickly
+            // (an old build refused at start) the load keeps running until it has done enough work (or stalls, and fails).
+            await cluster.WaitUntilAsync(() => Task.FromResult(Volatile.Read(ref loadProgress.Value) >= 10 || load.IsCompleted), TimeSpan.FromSeconds(60),
+                "the register load completes at least 10 operations", ct);
+
+            // Cancel inline on the simulation thread: CancelAsync runs the token callbacks (cancelled Task.Delay waits, their
+            // timers and continuations) on the thread pool, an uncontrolled dependency of the deterministic run (HAR-002).
             stopLoad.Cancel();
             int completed = await load;
             Assert.True(completed >= 10, $"the register load completed only {completed} operations");
@@ -1895,7 +1902,8 @@ public sealed class ChaSimulationTests
     }
 
     /// <summary>Sequential writes and reads of one register file, recorded in the cluster history; returns the number of Ok operations.</summary>
-    private static async Task<int> RunRegisterLoadAsync(TestCluster cluster, string name, string path, CancellationToken stop)
+    private static async Task<int> RunRegisterLoadAsync(TestCluster cluster, string name, string path, CancellationToken stop,
+        System.Runtime.CompilerServices.StrongBox<int>? progress = null)
     {
         await using DfsClient client = await ConnectAsync(cluster, name, operationTimeout: TimeSpan.FromSeconds(2));
         DfsFileClient files = client.GetVolume(Vol).Files;
@@ -1907,8 +1915,12 @@ public sealed class ChaSimulationTests
             {
                 await cluster.History.RecordAsync(name, "write", path, value, () => files.WriteAllBytesAsync(path, value, Ct));
                 ok++;
+                if (progress is not null)
+                    Volatile.Write(ref progress.Value, ok);
                 await cluster.History.RecordAsync(name, "read", path, null, () => TryReadAllAsync(files, path));
                 ok++;
+                if (progress is not null)
+                    Volatile.Write(ref progress.Value, ok);
             }
             catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)
             {
@@ -2002,6 +2014,7 @@ public sealed class ChaSimulationTests
             var ids = new DfsOperationId[clientCount];
             var historyIds = new long[clientCount];
             var originals = new List<DfsClient>();
+            var networkNames = new string[clientCount];
             var rules = new List<MessageRule>();
             var attempts = new Task<CommitToken>[clientCount];
             for (int i = 0; i < clientCount; i++)
@@ -2009,28 +2022,40 @@ public sealed class ChaSimulationTests
                 var options = new TestClientOptions { Name = $"orig{i}", OperationTimeout = TimeSpan.FromSeconds(3) };
                 DfsClient original = await cluster.ConnectAsync(options, ct);
                 originals.Add(original);
+                networkNames[i] = options.NetworkName;
                 ids[i] = await original.GetVolume(Vol).NewOperationIdAsync(ct);
                 var filter = new MessageFilter(From: options.NetworkName, Type: MessageType.Append);
                 rules.Add(i % 2 == 0 ? cluster.Network.DropReplies(filter, 10_000) : cluster.Network.DropNext(filter, 10_000));
-                historyIds[i] = cluster.History.Invoke(options.Name, "append", log, Record(i), ids[i]);
-                attempts[i] = original.GetVolume(Vol).Files.AppendAllBytesAsync(log, Record(i), new DfsMutationOptions { OperationId = ids[i] }, ct);
             }
 
+            // All appends start together, once every client is connected, so none reaches its deadline before all are sent.
             for (int i = 0; i < clientCount; i++)
             {
-                try
-                {
-                    CommitToken token = await attempts[i];
-                    cluster.History.Complete(historyIds[i], OpOutcome.Ok, token);
-                }
-                catch (Exception ex)
-                {
-                    cluster.History.Complete(historyIds[i], HistoryRecorder.Classify(ex), ex);
-                }
+                historyIds[i] = cluster.History.Invoke($"orig{i}", "append", log, Record(i), ids[i]);
+                attempts[i] = originals[i].GetVolume(Vol).Files.AppendAllBytesAsync(log, Record(i), new DfsMutationOptions { OperationId = ids[i] }, ct);
+            }
+
+            // Every client dies while its append is outstanding (transmitted; the reply lost or the request dropped): the
+            // process never learns the outcome, so it never resolves (and so never fences) the saved id its restarted
+            // incarnation retries below. Awaiting the attempts instead would let each SDK resolve its id after the deadline.
+            for (int i = 0; i < clientCount; i++)
+            {
+                var transmitted = new MessageFilter(From: networkNames[i], Type: MessageType.Append, Direction: LinkDirection.Request);
+                await cluster.WaitUntilAsync(() => Task.FromResult(cluster.Network.GetMessageAttempts(transmitted).Count > 0), TimeSpan.FromSeconds(30),
+                    $"client orig{i} transmitted its append", ct);
             }
 
             foreach (DfsClient original in originals)
                 cluster.KillClient(original);
+            for (int i = 0; i < clientCount; i++)
+            {
+                if (attempts[i].IsCompletedSuccessfully)
+                    cluster.History.Complete(historyIds[i], OpOutcome.Ok, attempts[i].Result);
+                else if (attempts[i].IsCompleted)
+                    cluster.History.Complete(historyIds[i], HistoryRecorder.Classify(attempts[i].Exception!.InnerException!), attempts[i].Exception);
+                else
+                    cluster.History.Complete(historyIds[i], OpOutcome.Unknown);
+            }
             foreach (MessageRule rule in rules)
                 rule.Cancel();
 
@@ -2138,7 +2163,8 @@ public sealed class ChaSimulationTests
 
     /// <summary>
     /// The old leader and writer A are cut off with all their traffic captured (old-term appends/heartbeats/votes, A's
-    /// renewals, uploads and commit). The majority elects a new leader, A's lease expires, writer B commits two revisions.
+    /// renewals and commit; A's staged chunks were uploaded before the cut, so its stale receipts travel inside the captured
+    /// commit). The majority elects a new leader, A's lease expires, writer B commits two revisions.
     /// The captured traffic is then delivered in adversarial order and replayed again as delayed duplicates. Old votes,
     /// leases, receipts and outcomes never overwrite the new state: election safety and commit-index monotonicity hold
     /// throughout, A's commit is rejected, B's revision and generation stay authoritative on every replica.
@@ -2157,7 +2183,6 @@ public sealed class ChaSimulationTests
         {
             const string path = "/cha013/f";
             byte[] r1 = TestData.Bytes(13_001, MultiExtentLength);
-            byte[] aStaged = TestData.Bytes(13_002, MultiExtentLength + 30_000);
             byte[] r2 = TestData.Bytes(13_003, MultiExtentLength - 7_000);
             byte[] r3 = TestData.Bytes(13_004, MultiExtentLength - 9_000);
 
@@ -2167,6 +2192,12 @@ public sealed class ChaSimulationTests
             var bOptions = new TestClientOptions { Name = "wb", SeedNodes = Names(rest) };
             DfsClient a = await cluster.ConnectAsync(aOptions, ct);
             DfsVolume av = a.GetVolume(Vol);
+
+            // Whole logical update units: a stream uploads complete chunks early (ARCHITECTURE §9.3) and keeps a partial tail
+            // buffered until its publication, so only whole chunks make "uploaded, unpublished" true and leave the commit
+            // itself as the stale message the cut captures (a buffered tail would have to be uploaded through the cut first,
+            // and that upload, not the commit, would fail).
+            byte[] aStaged = TestData.Bytes(13_002, 4 * a.Capabilities.ChunkSize);
             await av.Directories.CreateDirectoryAsync("/cha013", ct);
             DfsStream writerA = await av.Files.OpenAsync(path, new DfsOpenOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write, Share = FileShare.Read }, ct);
             ulong generationA = writerA.WriterGeneration;
@@ -2224,6 +2255,7 @@ public sealed class ChaSimulationTests
             Log($"captured: fromOld={fromOld.Count} toOld={toOld.Count} fromA={fromA.Count}; new leader {newLeader.Name}");
 
             CapturedMessage[] captured = [.. fromA.Captured, .. fromOld.Captured, .. toOld.Captured];
+            Assert.Contains(captured, m => m.From == aOptions.NetworkName && m.Type == MessageType.CommitFile);   // the stale commit itself is delayed
             if (reverseOrder)
             {
                 fromA.ReleaseAll(reverseOrder: true);

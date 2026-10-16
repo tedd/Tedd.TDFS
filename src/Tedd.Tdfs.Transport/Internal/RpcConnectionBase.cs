@@ -207,6 +207,8 @@ internal abstract class RpcConnectionBase : IRpcConnection
         }
 
         call.Arm(Time, ct);
+        if (call.Task.IsCompleted)
+            return call.Task; // cancelled (or closed) while the call was being registered: nothing is transmitted
         try
         {
             ValueTask transmitted = TransmitAsync(RpcMessageKind.Request, correlation, request, awaitTransmission: false);

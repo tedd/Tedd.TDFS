@@ -459,13 +459,14 @@ public sealed class ClientReviewTests
 
             // The complete chunks were uploaded while writing (bounded memory, ARCHITECTURE 9.3); the last object finds the
             // node full: nothing is published.
+            Assert.True(Count(cluster, MessageType.PutObject) > 0, "the readable writer uploads staged bytes beyond its buffer early");
             cluster.PutsBeforeFailure = 0;
             Exception? flush = await Record.ExceptionAsync(() => stream.FlushAsync());
             Assert.IsType<DfsCapacityException>(flush);
             Assert.False(stream.IsFaulted);
             Assert.Empty(cluster.Content("/rw")!);
 
-            // The writer still reads exactly its staged bytes ...
+            // The writer still reads exactly its staged bytes (the early uploads with its staging capability) ...
             stream.Position = 0;
             byte[] back = new byte[data.Length];
             await stream.ReadExactlyAsync(back);

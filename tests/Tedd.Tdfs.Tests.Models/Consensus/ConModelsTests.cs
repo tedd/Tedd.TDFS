@@ -94,7 +94,8 @@ public sealed class ConModelsTests
     {
         // Configuration and identity, equal in every state of one node (the model builds every core of a node alike):
         // _cfg, _options, _random (abstracted, see DescribeCanonicalState), _self, _reachableQuorum, RaftLog._stable (the
-        // host's durable log, described by the host), RaftProgress._maxInflight and Peer.
+        // host's durable log, described by the host), RaftProgress._maxInflight and Peer. RaftProgress.ActiveInPreviousInterval is
+        // copied but not described: it only feeds the public progress report (ToPublic), which no transition of the core reads.
         AssertFields(typeof(RaftNode),
             "_cfg", "_options", "_random", "_log", "_self", "_reachableQuorum", "_term", "_vote", "_lead", "_state", "_electionElapsed",
             "_heartbeatElapsed", "_randomizedElectionTimeout", "_tickCount", "_confBase", "_confBaseIndex", "_confHistory", "_conf", "_progress",
@@ -103,7 +104,8 @@ public sealed class ConModelsTests
         AssertFields(typeof(RaftNode).Assembly.GetType("Tedd.Tdfs.Consensus.RaftLog", throwOnError: true)!,
             "_stable", "_unstable", "_offset", "_pendingSnapshot", "Committed", "Applied");
         AssertFields(typeof(RaftNode).Assembly.GetType("Tedd.Tdfs.Consensus.RaftProgress", throwOnError: true)!,
-            "_maxInflight", "_inflights", "Peer", "Match", "Next", "State", "ProbeSent", "PendingSnapshot", "Snapshot", "SnapshotOffset", "RecentActive");
+            "_maxInflight", "_inflights", "Peer", "Match", "Next", "State", "ProbeSent", "PendingSnapshot", "Snapshot", "SnapshotOffset", "RecentActive",
+            "ActiveInPreviousInterval");
         AssertFields(typeof(RaftNode).GetNestedType("ReadRequest", System.Reflection.BindingFlags.NonPublic)!, "Seq", "Index", "Context", "Acks");
         AssertFields(typeof(RaftNode).GetNestedType("IncomingSnapshot", System.Reflection.BindingFlags.NonPublic)!, "Term", "Meta", "Buffer");
 

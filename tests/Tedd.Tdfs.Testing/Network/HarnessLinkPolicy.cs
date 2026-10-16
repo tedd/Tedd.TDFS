@@ -33,6 +33,16 @@ internal sealed class HarnessLinkPolicy : ILinkPolicy
     /// <summary>Most frame bytes the log retains for predicate filters and operation ids (older frames are released first).</summary>
     private const long MaxRetainedFrameBytes = 256L << 20;
 
+    /// <summary>
+    /// Frames at least this large (object payloads, snapshot chunks) are retained under <see cref="MaxRetainedBulkFrameBytes"/>
+    /// instead: the log is part of the test process, and keeping hundreds of MiB of recent bulk data alive would make the
+    /// process's live memory follow the data moved rather than the product's buffers (PERF-003).
+    /// </summary>
+    private const int BulkFrameBytes = 16 << 10;
+
+    /// <summary>Most bytes of bulk frames the log retains (older bulk frames are released first).</summary>
+    private const long MaxRetainedBulkFrameBytes = 8L << 20;
+
     /// <summary>Most outstanding requests remembered per direction for reply attribution.</summary>
     private const int MaxOutstandingPerLink = 4096;
 
@@ -48,10 +58,12 @@ internal sealed class HarnessLinkPolicy : ILinkPolicy
     private readonly List<MessageRule> _rules = [];
     private readonly List<LogEntry> _log = [];
     private readonly Queue<LogEntry> _retained = new();
+    private readonly Queue<LogEntry> _retainedBulk = new();
     private readonly Dictionary<(string Requester, string Responder), LinkedList<Outstanding>> _outstanding = [];
     private LinkMesh _mesh = LinkMesh.Full;
     private long _sequence;
     private long _retainedBytes;
+    private long _retainedBulkBytes;
     private bool _applyLatency;
 
     public HarnessLinkPolicy(ClusterRuntime runtime)
@@ -344,6 +356,8 @@ internal sealed class HarnessLinkPolicy : ILinkPolicy
             _log.Clear();
             _retained.Clear();
             _retainedBytes = 0;
+            _retainedBulk.Clear();
+            _retainedBulkBytes = 0;
         }
     }
 
@@ -396,15 +410,23 @@ internal sealed class HarnessLinkPolicy : ILinkPolicy
         _log.Add(entry);
         if (entry.Frame is null)
             return;
-        _retained.Enqueue(entry);
-        _retainedBytes += entry.Frame.Length;
-        while (_retainedBytes > MaxRetainedFrameBytes && _retained.Count > 0)
+        if (entry.Frame.Length >= BulkFrameBytes)
+            Retain(_retainedBulk, ref _retainedBulkBytes, MaxRetainedBulkFrameBytes, entry);
+        else
+            Retain(_retained, ref _retainedBytes, MaxRetainedFrameBytes, entry);
+
+        static void Retain(Queue<LogEntry> queue, ref long retainedBytes, long budget, LogEntry entry)
         {
-            LogEntry oldest = _retained.Dequeue();
-            if (oldest.Frame is { } released)
+            queue.Enqueue(entry);
+            retainedBytes += entry.Frame!.Length;
+            while (retainedBytes > budget && queue.Count > 0)
             {
-                _retainedBytes -= released.Length;
-                oldest.ReleaseFrame();
+                LogEntry oldest = queue.Dequeue();
+                if (oldest.Frame is { } released)
+                {
+                    retainedBytes -= released.Length;
+                    oldest.ReleaseFrame();
+                }
             }
         }
     }
@@ -503,6 +525,16 @@ internal sealed class HarnessLinkPolicy : ILinkPolicy
         LinkDecisionKind Decision, byte[]? InitialFrame, DfsOperationId? ReplyOperation, bool KnownReplyOperation)
     {
         private byte[]? _frame = InitialFrame;
+
+        /// <summary>
+        /// The observed frame, stored only in the releasable field: a compiler-generated positional property would keep a
+        /// second reference, and <see cref="ReleaseFrame"/> would then never free the bytes (the retention bound was moot).
+        /// </summary>
+        public byte[]? InitialFrame
+        {
+            get => _frame;
+            init => _frame = value;
+        }
 
         public byte[]? Frame => Volatile.Read(ref _frame);
 

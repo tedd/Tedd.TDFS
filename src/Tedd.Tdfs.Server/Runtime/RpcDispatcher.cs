@@ -183,7 +183,24 @@ internal sealed partial class RpcDispatcher : IRpcHandler
     public ValueTask<ReadOnlyMemory<byte>?> HandleAsync(IRpcConnection connection, ReadOnlyMemory<byte> request, bool expectsReply, CancellationToken ct)
     {
         byte[] frame = request.ToArray();
-        return new ValueTask<ReadOnlyMemory<byte>?>(_s.Loop.InvokeAsync(() => DispatchAsync(connection, frame, expectsReply, ct)));
+        return new ValueTask<ReadOnlyMemory<byte>?>(DispatchOnLoopAsync(connection, frame, expectsReply, ct));
+    }
+
+    private async Task<ReadOnlyMemory<byte>?> DispatchOnLoopAsync(IRpcConnection connection, byte[] frame, bool expectsReply, CancellationToken ct)
+    {
+        try
+        {
+            return await _s.Loop.InvokeAsync(() => DispatchAsync(connection, frame, expectsReply, ct));
+        }
+        catch (NodeLoopStoppedException)
+        {
+            // The node stopped (shutdown or crash) before the request could be handled to completion: answered like a request
+            // that reaches a stopping node (retryable unavailability; a retry of a mutation reuses its id), not as an
+            // internal error.
+            return expectsReply
+                ? Error(new ErrorReplyMessage(DfsErrorCode.Unavailable, $"{_s.NodeName} is stopping.", Retryable: true))
+                : null;
+        }
     }
 
     /// <summary>Completes once no request is being handled (graceful stop).</summary>

@@ -328,6 +328,14 @@ public sealed class RecordingSnapshotAdapter : IDfsSnapshotAdapter
         }
         catch (OperationCanceledException ex)
         {
+            // Cancellation callbacks run last-registered first: a phase that ends because of the cancellation can complete
+            // (inline) and dispose the observing registration above before it ran, so the observation is recorded here too.
+            if (ct.IsCancellationRequested)
+            {
+                lock (_lock)
+                    _cancellationObserved = true;
+            }
+
             Timeline.Record(Id, phase + ".cancelled", ex.GetType().Name);
             throw;
         }

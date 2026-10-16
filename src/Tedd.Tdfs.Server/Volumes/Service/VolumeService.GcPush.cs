@@ -118,7 +118,7 @@ internal sealed partial class VolumeService
 
         if (candidates.Count == 0)
             return;
-        HashSet<ObjectId> reachable = VolumeStateMachine.Reachable(s);
+        HashSet<ObjectId> reachable = VolumeStateMachine.Reachable(s, _s.Mutations.IgnoreSnapshotPins);
         HashSet<ObjectId> protectedObjects = VolumeStateMachine.Protected(s, VolumeStateMachine.Watermark(s, _s.Mutations.IgnoreSnapshotPins));
         ControlState control = _s.Control.State;
         var holders = new SortedSet<NodeId>(Comparer<NodeId>.Create(static (a, b) => a.Value.CompareTo(b.Value)));

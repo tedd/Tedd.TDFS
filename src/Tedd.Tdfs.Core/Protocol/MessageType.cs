@@ -36,6 +36,10 @@ public enum MessageType : ushort
     RegisterIncarnation = 20,
     /// <summary>Register node incarnation reply.</summary>
     RegisterIncarnationResult = 21,
+    /// <summary>Security event forwarded to the control leader for the audit log.</summary>
+    AuditEvent = 22,
+    /// <summary>Security event reply.</summary>
+    AuditEventResult = 23,
 
     // sessions / outcomes
 

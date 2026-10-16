@@ -70,7 +70,8 @@ public static class LinearizabilityChecker
                 model.Initial,
                 model.Key,
                 (TState state, int item, out TState next) => model.Step(state, ops[item], out next),
-                maxStates - explored);
+                maxStates - explored,
+                model is IPrunableSequentialModel<TState> prunable ? (state, item) => prunable.CanStillSatisfy(state, ops[item]) : null);
             explored += result.StatesExplored;
 
             switch (result.Status)

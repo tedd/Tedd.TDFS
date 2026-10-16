@@ -87,7 +87,13 @@ internal static class ControlBootstrap
     }
 
     /// <summary>The initial control log: membership of the control group, then the bootstrap command.</summary>
-    public static IReadOnlyList<RaftEntry> BuildEntries(ClusterBootstrap bootstrap, KeyHierarchy keys)
+    /// <param name="bootstrap">The bootstrap description.</param>
+    /// <param name="keys">Keys derived from the cluster secret.</param>
+    /// <param name="memberFeatures">
+    /// Features of the bootstrapping release (every initial member runs it; default: this build's), recorded for each member
+    /// (feature eligibility, FMT-009).
+    /// </param>
+    public static IReadOnlyList<RaftEntry> BuildEntries(ClusterBootstrap bootstrap, KeyHierarchy keys, IReadOnlySet<string>? memberFeatures = null)
     {
         ArgumentNullException.ThrowIfNull(bootstrap);
         ArgumentNullException.ThrowIfNull(keys);
@@ -95,7 +101,7 @@ internal static class ControlBootstrap
         NodeId[] voters = bootstrap.ControlVoters.Select(n => byName[n].Id).ToArray();
         NodeId[] learners = bootstrap.Members.Where(m => !voters.Contains(m.Id)).Select(m => m.Id).ToArray();
         int target = bootstrap.ControlVoterTarget is { } configured
-            ? Math.Max(configured, bootstrap.ControlVoters.Count)
+            ? Math.Max(Math.Max(1, configured), bootstrap.ControlVoters.Count)
             : bootstrap.Members.Count == 1 ? Math.Max(DefaultControlVoters, bootstrap.ControlVoters.Count) : bootstrap.ControlVoters.Count;
 
         var principals = new List<PrincipalData>();
@@ -112,7 +118,7 @@ internal static class ControlBootstrap
             target,
             bootstrap.Members.Select(m => new BootstrapMemberData(m.Id, m.Name, m.Labels, m.Endpoints ?? [])).ToArray(),
             principals,
-            ProtocolFeatures.Supported.Order(StringComparer.Ordinal).ToArray());
+            (memberFeatures ?? ProtocolFeatures.Supported).Order(StringComparer.Ordinal).ToArray());
         return RaftBootstrap.BuildEntries(voters, learners, [ControlCommandCodec.Encode(command)]);
     }
 }

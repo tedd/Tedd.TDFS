@@ -40,9 +40,25 @@ internal sealed partial class GroupRuntime
         }
     }
 
-    /// <summary>Writes a local checkpoint and compacts the log once enough entries were applied since the last one.</summary>
+    /// <summary>
+    /// Applied index after which the entries replayed from the local journal at start are checkpointed (null when there was
+    /// nothing to replay or the recovery checkpoint was written).
+    /// </summary>
+    private ulong? _recoveryCheckpointAt;
+
+    /// <summary>
+    /// Writes a local checkpoint and compacts the log once enough entries were applied since the last one, and once after
+    /// the local replay of a restart.
+    /// </summary>
     private async Task MaybeCheckpointAsync()
     {
+        if (_recoveryCheckpointAt is { } replayed && _appliedIndex >= replayed)
+        {
+            _recoveryCheckpointAt = null;
+            await WriteCheckpointAsync();
+            return;
+        }
+
         ulong snapshotIndex = _view.Snapshot.Index;
         if (_appliedIndex <= snapshotIndex || _appliedIndex - snapshotIndex <= (ulong)_s.Timings.RaftSnapshotThreshold)
             return;

@@ -1896,7 +1896,7 @@ public sealed class NetSimulationTests
             byte[] data = TestData.Bytes(0x1902, 6 * 64 * 1024);
             DfsStream stream = await volume.Files.OpenAsync("/batch", new DfsOpenOptions { Mode = FileMode.Open, Access = FileAccess.ReadWrite, Share = FileShare.Read }, Ct);
             Exception? flushError;
-            bool written = false;
+            bool staged = false;   // the whole new content is staged (a failed write leaves the staged state as before it, FSD §6.4)
 
             if (variant == "client-cut-after-receipts")
             {
@@ -1912,8 +1912,8 @@ public sealed class NetSimulationTests
                 flushError = await CaptureAsync(async () =>
                 {
                     await stream.WriteAsync(data, Ct);
-                    written = true;
                     await stream.SetLengthAsync(data.Length, Ct);
+                    staged = true;
                     await stream.FlushAsync(Ct);
                 });
                 cluster.Faults.AssertReached(arm);
@@ -1927,8 +1927,8 @@ public sealed class NetSimulationTests
                 // or crashes; the coordinator must only count receipts that are still valid and durable.
                 MessageHold commitHold = cluster.Network.Hold(new MessageFilter(From: ClientNet("c0"), Type: MessageType.CommitFile));
                 await stream.WriteAsync(data, Ct);
-                written = true;
                 await stream.SetLengthAsync(data.Length, Ct);
+                staged = true;
                 Task<Exception?> flush = CaptureAsync(() => stream.FlushAsync(Ct));
                 await commitHold.WaitForAsync(1, ElectionBound);
                 TestNode leader = await cluster.GetLeaderAsync(Vol, Ct);
@@ -1951,18 +1951,19 @@ public sealed class NetSimulationTests
             }
 
             // Retry the publication through the same handle if the stream is not faulted; it publishes all or nothing. A write
-            // call that failed was rolled back privately (PUB-022): its bytes are not staged, so the retry repeats the call.
+            // that failed (its early chunk uploads cut off) was rolled back rather than faulting the stream, so the retry stages
+            // the content again first.
             if (flushError is not null && !stream.IsFaulted)
             {
                 flushError = await CaptureAsync(async () =>
                 {
-                    if (!written)
+                    if (!staged)
                     {
-                        stream.Position = 0;
+                        stream.Seek(0, SeekOrigin.Begin);
                         await stream.WriteAsync(data, Ct);
+                        await stream.SetLengthAsync(data.Length, Ct);
                     }
 
-                    await stream.SetLengthAsync(data.Length, Ct);
                     await stream.FlushAsync(Ct);
                 });
             }

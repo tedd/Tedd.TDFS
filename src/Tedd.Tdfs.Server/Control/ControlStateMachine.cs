@@ -54,6 +54,7 @@ internal sealed partial class ControlStateMachine : IReplicatedStateMachine, ICo
             AdmitMemberCommand c => ApplyAdmitMember(c, index),
             SetMemberStatusCommand c => ApplySetMemberStatus(c),
             SetMemberLabelsCommand c => ApplySetMemberLabels(c),
+            SetMemberReleaseCommand c => ApplySetMemberRelease(c),
             CreateVolumeCommand c => ApplyCreateVolume(c.Creation, c.WrappedDataKey, WireVolumeState.Active, index),
             CreateRestoringVolumeCommand c => ApplyCreateVolume(c.Creation, c.WrappedDataKey, WireVolumeState.Restoring, index),
             FinishRestoringVolumeCommand c => ApplyFinishRestoringVolume(c),
@@ -162,7 +163,13 @@ internal sealed partial class ControlStateMachine : IReplicatedStateMachine, ICo
 
     private void Audit(ControlCommand cmd, ApplyOutcome outcome, string scope, ulong index)
     {
-        string operation = cmd is AppendAuditCommand a ? a.Operation : cmd.Kind.ToString();
+        string operation = cmd switch
+        {
+            AppendAuditCommand a => a.Operation,
+            SetGrantCommand g => g.Revoke ? "Revoke" : "Grant",
+            AddDataKeyCommand => "RotateDataKey",   // a volume's first key is part of CreateVolume; every later one rotates it
+            _ => cmd.Kind.ToString(),
+        };
         string result = cmd is AppendAuditCommand au ? au.Outcome : outcome.IsSuccess ? "ok" : "failed:" + outcome.Code;
         State.AppendAudit(new AuditEntry(index, cmd.Header.Time, cmd.Header.Principal, operation, result, scope));
     }

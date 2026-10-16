@@ -332,7 +332,7 @@ public sealed partial class DfsFileClient
     private static DfsUnavailableException ReadOpenFailure(string path, DfsCommitOutcomeUnknownException unknown) =>
         unknown.InnerException is DfsQuorumUnavailableException quorum
             ? new DfsQuorumUnavailableException($"Opening '{path}' for reading did not complete: {quorum.Message}", quorum)
-            : new DfsUnavailableException(DfsErrorCode.Unavailable, $"Opening '{path}' for reading did not complete.", unknown.InnerException ?? unknown);
+            : Availability.Unanswered($"Opening '{path}' for reading did not complete.", unknown.InnerException ?? unknown);
 
     // ---- Whole-file writes ------------------------------------------------------------------------------------
 

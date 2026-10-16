@@ -73,7 +73,7 @@ internal sealed partial class VolumeService
         _inventories.Remove(key);
         VolumeState s = State;
         RecordInventory(request.Node, request.Incarnation, accumulator.Items, accumulator.StartedAt);
-        HashSet<ObjectId> reachable = VolumeStateMachine.Reachable(s);
+        HashSet<ObjectId> reachable = VolumeStateMachine.Reachable(s, _s.Mutations.IgnoreSnapshotPins);
         HashSet<ObjectId> protectedObjects = VolumeStateMachine.Protected(s, VolumeStateMachine.Watermark(s, _s.Mutations.IgnoreSnapshotPins));
         var delete = new List<ObjectStagingRef>();
         var unknown = new List<ObjectId>();

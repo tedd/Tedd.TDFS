@@ -204,7 +204,10 @@ internal sealed partial class VolumeStateMachine : IReplicatedStateMachine, ICom
         VolumeState restored = StateCodec.ReadCheckpoint(data.IsSingleSegment ? data.FirstSpan : data.ToArray());
         if (restored.Config.Id != Creation.Id)
             throw new DfsIntegrityException($"The checkpoint belongs to volume {restored.Config.Id}, not {Creation.Id}.");
-        _state = restored with { AppliedIndex = index };
+        // The image carries the index of the last applied volume command; the checkpoint position may be a later
+        // configuration or no-op entry. Keeping the serialized value (instead of overwriting it with the position) keeps the
+        // state byte-identical on replicas that installed the image and on replicas that applied the log.
+        _state = restored;
         _transactionRoots.Clear();
         Changed?.Invoke(_state);
     }

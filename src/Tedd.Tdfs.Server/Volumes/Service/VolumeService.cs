@@ -127,7 +127,7 @@ internal sealed partial class VolumeService
     {
         if ((GrantsOf(principal) & permission) != permission)
         {
-            _s.Control.ReportSecurityEvent("volume:" + what, "denied", "volume=" + Name, principal);
+            _s.Control.ReportSecurityEvent("volume:" + what, "denied", "volume=" + Name + " requires=" + permission, principal);
             throw new UnauthorizedAccessException($"Principal '{principal}' lacks the {permission} grant on volume '{Name}' ({what}).");
         }
     }
@@ -187,6 +187,8 @@ internal sealed partial class VolumeService
             flags |= CommandFlags.ForgetWatermark;
         if (_s.Mutations.SkipFencingCheck)
             flags |= CommandFlags.SkipFencing;
+        if (_s.Mutations.SkipPredicateValidation)
+            flags |= CommandFlags.SkipPredicates;
         return flags;
     }
 

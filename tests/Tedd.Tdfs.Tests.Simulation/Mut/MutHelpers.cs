@@ -559,9 +559,11 @@ internal static class MutHelpers
             foreach ((string holder, List<ObjectId> objects) in byHolder)
             {
                 TestNode node = cluster.Node(holder);
-                await node.CrashAsync();
+                // TestDisk.DeleteObjectAsync goes through the running node's store (silent local loss), so the copies are
+                // dropped first and the node then crashes and returns with a new incarnation.
                 foreach (ObjectId obj in objects)
                     await node.Disk.DeleteObjectAsync(obj);
+                await node.CrashAsync();
                 await node.RestartAsync();
                 await cluster.WaitForStableAsync(TimeSpan.FromSeconds(60), Ct);
             }
@@ -672,9 +674,19 @@ internal static class MutHelpers
             v.Check(minorityAcks == 0, ViolationKind.MinorityAuthority, $"the 2-of-5 minority acknowledged {minorityAcks} writes");
 
             cluster.Network.Heal();
-            await cluster.WaitForStableAsync(TimeSpan.FromSeconds(60), Ct);
-            await RecordReadAsync(cluster, "pa", key, af);
-            await RecordReadAsync(cluster, "pb", key, bf);
+            try
+            {
+                await cluster.WaitForStableAsync(TimeSpan.FromSeconds(60), Ct);
+                await RecordReadAsync(cluster, "pa", key, af);
+                await RecordReadAsync(cluster, "pb", key, bf);
+            }
+            catch (TimeoutException ex)
+            {
+                // Two leaders of one term never step down for each other, so a split brain can outlive the partition; the
+                // history recorded so far is still checked (and the baseline still fails on the error).
+                v.Error($"the cluster did not stabilize after the partition healed: {ex.Message}");
+            }
+
             v.History(LinearizabilityChecker.Check(cluster.History.Operations.Where(o => o.Key == key).ToArray(), new RegisterModel()),
                 ViolationKind.NonLinearizableHistory, "register history across the 2/3 partition");
         });
@@ -771,6 +783,11 @@ internal static class MutHelpers
 
             v.Reached(lostWrite.Matched >= 1, "write executed with its reply lost");
 
+            // The rules target the first write only: transaction-bound writes travel as WriteAll too, and losing their
+            // replies would abort the transaction's setup instead of exercising its commit.
+            lostWrite.Cancel();
+            lostQuery.Cancel();
+
             DfsTransaction tx = await vol.Transactions.BeginAsync(ct: Ct);
             await tx.Files.WriteAllTextAsync("/mut-outcome-tx", "committed", ct: Ct);
             MessageRule lostCommit = cluster.Network.DropReplies(new MessageFilter(From: options.NetworkName, Type: MessageType.TxCommit), 10_000);
@@ -787,8 +804,6 @@ internal static class MutHelpers
             }
 
             v.Reached(lostCommit.Matched >= 1, "transaction commit executed with its reply lost");
-            lostWrite.Cancel();
-            lostQuery.Cancel();
             lostCommit.Cancel();
 
             await using DfsClient check = await cluster.ConnectAsync(Client("check", m), Ct);
@@ -934,6 +949,13 @@ internal static class MutHelpers
             await RecordAsync(cluster, "rb", "write", key, v1, () => bf.WriteAllBytesAsync(key, v1, Ct));
             await RecordReadAsync(cluster, "ra", key, af);
 
+            // Opening a file is a log entry (ARCHITECTURE §5.3), which a deposed leader can never commit; what it can serve
+            // is a read through a live handle opened before the partition, ordered only by the ReadIndex barrier.
+            DfsStream live = await af.OpenAsync(key, new DfsOpenOptions
+            {
+                Mode = FileMode.Open, Access = FileAccess.Read, Share = FileShare.ReadWrite | FileShare.Delete, ReadView = DfsReadView.Live,
+            }, Ct);
+
             oldLeader.Clock.Freeze();
             cluster.Network.Partition([oldLeader.Name, aOptions.NetworkName], [.. Names(rest), bOptions.NetworkName]);
             bool elected = await TryWaitUntilAsync(cluster, async () =>
@@ -949,7 +971,22 @@ internal static class MutHelpers
             }, TimeSpan.FromSeconds(30), "the majority elects a new leader");
             v.Reached(elected, "new leader elected while the old one still believes it leads");
             await RecordAsync(cluster, "rb", "write", key, v2, () => bf.WriteAllBytesAsync(key, v2, Ct));
-            byte[]? seen = await RecordReadAsync(cluster, "ra", key, af);
+            byte[]? seen = null;
+            try
+            {
+                seen = await cluster.History.RecordAsync("ra", "read", key, null, async () =>
+                {
+                    live.Seek(0, SeekOrigin.Begin);
+                    var buffer = new MemoryStream();
+                    await live.CopyToAsync(buffer, Ct);
+                    return buffer.ToArray();
+                });
+            }
+            catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)
+            {
+                // A failed live read is recorded in the history; the checker decides.
+            }
+
             if (seen is not null && seen.AsSpan().SequenceEqual(v1))
                 v.Violation(ViolationKind.StaleLiveRead, "the deposed leader served the pre-partition value as a live read after a newer write completed");
 
@@ -960,6 +997,7 @@ internal static class MutHelpers
             await RecordReadAsync(cluster, "rb", key, bf);
             v.History(LinearizabilityChecker.Check(cluster.History.Operations.Where(o => o.Key == key).ToArray(), new RegisterModel()),
                 ViolationKind.StaleLiveRead, "live-read history across the partition");
+            await CaptureAsync(() => live.DisposeAsync().AsTask());   // its lease expired during the partition
         });
 
     // ------------------------------------------------------------------------------------------------------------------
@@ -1277,8 +1315,21 @@ internal static class MutHelpers
             capture.Dispose();
             await append;
 
-            for (int i = 0; i < NodeTimings.Fast.MaxOutcomesPerSession + 40; i++)
+            // Exceed the outcome window. Only retained outcomes count toward MaxOutcomesPerSession (ARCHITECTURE §5.2 step 4):
+            // the SDK keeps drawing internal ids from its pre-reserved block, whose sequences are below the application id and
+            // are retired early by the acknowledgement watermark (PROTOCOL.md §5.1), so write until the id is retired.
+            bool retired = false;
+            for (int i = 0; i < 4 * NodeTimings.Fast.MaxOutcomesPerSession && !retired; i++)
+            {
                 await vol.Files.WriteAllBytesAsync($"/mut-x/fill{i % 4}", TestData.Bytes(21_400 + (ulong)i, 64), Ct);
+                if (i >= NodeTimings.Fast.MaxOutcomesPerSession + 40 && i % 16 == 0)
+                {
+                    retired = (await cluster.Inspect.GetVolumeStateAsync(Vol)).Sessions
+                        .Any(s => s.Id == id.Session && s.RetiredWatermark >= id.Sequence);
+                }
+            }
+
+            v.Reached(retired, "the append's id retired by the per-session outcome window");
             await cluster.DelayAsync(NodeTimings.Fast.OutcomeRetention + TimeSpan.FromSeconds(5), Ct);
             foreach (TestNode node in cluster.Nodes)
                 await node.CrashAsync();
@@ -1298,6 +1349,9 @@ internal static class MutHelpers
 
             foreach (CapturedMessage frame in frames)
             {
+                // The duplicate goes to the node the original was sent to; after the whole-cluster restart it may be a follower
+                // (which answers NotLeader without consulting the operation gate), so it leads the volume again first.
+                await cluster.TransferLeadershipAsync(Vol, frame.To, TimeSpan.FromSeconds(60), ct: Ct);
                 DfsErrorCode code = await cluster.Network.ReplayAsync(frame);
                 v.Check(code != DfsErrorCode.None, ViolationKind.ExpiredIdReplayed, "a delayed duplicate of the retired request was executed");
                 if (code is not DfsErrorCode.None and not DfsErrorCode.OperationExpired)

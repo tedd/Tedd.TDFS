@@ -164,8 +164,11 @@ public sealed class FmtIntegrationTests
                 return true;
             }, TimeSpan.FromSeconds(30), "every node must durably record the activation and raise its minimum-reader marker", Ct);
 
-            DfsException deactivate = await AssertEx.ThrowsDfsAsync<DfsException>(() => admin.SetFeatureAsync(feature, false, Ct));
-            Assert.Contains(deactivate.ErrorCode, new[] { DfsErrorCode.Unsupported, DfsErrorCode.InvalidArgument });
+            // Unsupported/InvalidArgument surface as NotSupportedException/ArgumentException (API.md A.2 canonical mapping, pinned
+            // by FMT-011), hence DfsErrors.ToCode rather than a DfsException type check.
+            Exception? deactivate = await Record.ExceptionAsync(() => admin.SetFeatureAsync(feature, false, Ct));
+            Assert.NotNull(deactivate);
+            Assert.Contains(DfsErrors.ToCode(deactivate), new[] { DfsErrorCode.Unsupported, DfsErrorCode.InvalidArgument });
             Assert.Contains(feature, (await admin.GetClusterStatusAsync(Ct)).ActiveFeatures);
 
             foreach (TestNode node in cluster.Nodes.ToArray())

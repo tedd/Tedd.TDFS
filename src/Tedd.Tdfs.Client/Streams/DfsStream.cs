@@ -331,33 +331,8 @@ public sealed class DfsStream : Stream, ILeaseHolder
                 }
 
                 case StagedSource.Uploaded:
-                {
-                    // Staged data uploaded early (bounded memory) is read back from its holders with the staging capability,
-                    // which authorizes reading the objects stored under its own staging session (PROTOCOL.md §7.3).
-                    StagedSegment segment = piece.Segment!;
-                    UploadedObject uploaded = segment.Object!;
-                    StagingLease staging = _staging ?? throw new InvalidOperationException("Staged data was uploaded without a staging session.");
-                    long objectOffset = segment.ObjectOffset + (piece.Offset - segment.Offset);
-                    NodeId[] holders = [.. uploaded.Receipts.Select(r => r.Node).Distinct()];
-                    for (int attempt = 0; ; attempt++)
-                    {
-                        if (staging.NeedsRenewal(_runtime.Time.GetUtcNow()))
-                            await _volume.RenewStagingAsync(staging, scope).ConfigureAwait(false);
-                        try
-                        {
-                            await _runtime.Data.ReadObjectAsync(scope, _volume, staging.Capability, uploaded.Id, uploaded.Length, uploaded.Checksum,
-                                ObjectEncodings.Plain, staging.PlacementEpoch, holders, objectOffset, target).ConfigureAwait(false);
-                            break;
-                        }
-                        catch (DataCapabilityRejectedException) when (attempt == 0)
-                        {
-                            // The capability expired on the node's clock: renew it once and read again.
-                            await _volume.RenewStagingAsync(staging, scope).ConfigureAwait(false);
-                        }
-                    }
-
+                    await ReadUploadedAsync(piece, target, scope).ConfigureAwait(false);
                     break;
-                }
 
                 case StagedSource.Base:
                 {
@@ -387,6 +362,46 @@ public sealed class DfsStream : Stream, ILeaseHolder
         }
 
         return (temp, filled);
+    }
+
+    /// <summary>
+    /// Reads the bytes of <paramref name="piece"/>, a range of an object this writer uploaded early and has not published
+    /// (bounded memory, FSD §6.3/§15), from its holders with the staging capability, which authorizes reading the objects
+    /// stored under its own staging session (PROTOCOL.md §7.3). A capability rejected during a long fetch (many short results)
+    /// keeps the verified bytes (the object is immutable): the rest is read after renewing the capability. A rejection without
+    /// any progress is retried once.
+    /// </summary>
+    private async Task ReadUploadedAsync(StagedPiece piece, Memory<byte> target, OperationScope scope)
+    {
+        StagedSegment segment = piece.Segment!;
+        UploadedObject uploaded = segment.Object ?? throw new InvalidOperationException("An uploaded staged range has no object.");
+        StagingLease staging = _staging ?? throw new InvalidOperationException("Staged data was uploaded without a staging session.");
+        long objectOffset = segment.ObjectOffset + (piece.Offset - segment.Offset);
+        NodeId[] holders = [.. uploaded.Receipts.Select(r => r.Node).Distinct()];
+        int done = 0;
+        bool retried = false;
+        while (true)
+        {
+            if (staging.NeedsRenewal(_runtime.Time.GetUtcNow()))
+                await _volume.RenewStagingAsync(staging, scope).ConfigureAwait(false);
+            try
+            {
+                await _runtime.Data.ReadObjectAsync(scope, _volume, staging.Capability, uploaded.Id, uploaded.Length, uploaded.Checksum,
+                    ObjectEncodings.Plain, staging.PlacementEpoch, holders, objectOffset + done, target[done..]).ConfigureAwait(false);
+                return;
+            }
+            catch (DataCapabilityRejectedException ex) when (ex.Filled > 0 || !retried)
+            {
+                // The capability expired on the node's clock before the fetch ended: renew it and read the rest.
+                retried = ex.Filled == 0;
+                done += ex.Filled;
+                await _volume.RenewStagingAsync(staging, scope).ConfigureAwait(false);
+            }
+            catch (DataCapabilityRejectedException ex)
+            {
+                throw new UnauthorizedAccessException("Storage nodes rejected the staging capability of this stream's staged data.", ex);
+            }
+        }
     }
 
     /// <summary>
@@ -430,6 +445,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
                 await FillAsync(range, position, target, scope).ConfigureAwait(false);
                 return count;
             }
+            catch (DataCapabilityRejectedException ex) when (ex.Filled > 0)
+            {
+                // The capability expired during a long fetch (many short results): the verified bytes at the start of the range
+                // belong to this call's one revision and are returned as a short read (FSD §6.2); the next call asks again.
+                return ex.Filled;
+            }
             catch (DataCapabilityRejectedException) when (attempt == 0)
             {
                 // The read capability expired between the reply and the object fetch: ask again.
@@ -451,17 +472,107 @@ public sealed class DfsStream : Stream, ILeaseHolder
             return;
         }
 
+        // One fetch per object per call: a fragmented map (small overwrites splitting an older object) maps several ranges of
+        // the call to the same object, and storage nodes answer whole verification units, so fetching each piece on its own
+        // would move the same units again for every fragment (read amplification, PERF-002/PERF-009).
         long end = position + target.Length;
+        var pieces = new List<ObjectReadPiece>();
+        var groups = new List<ObjectReadGroup>();
         foreach (ExtentData extent in range.Extents)
         {
             long start = Math.Max(position, extent.Offset);
             long stop = Math.Min(end, extent.Offset + extent.Length);
             if (stop <= start)
                 continue;
-            await _runtime.Data.ReadObjectAsync(scope, _volume, range.ReadCapability, extent.Object, extent.ObjectLength, extent.Checksum, extent.Encoding,
-                extent.PlacementEpoch, extent.Locations, extent.ObjectOffset + (start - extent.Offset),
-                target.Slice((int)(start - position), (int)(stop - start))).ConfigureAwait(false);
+            ObjectReadGroup? group = groups.Find(g => g.Extent.Object == extent.Object);
+            if (group is null)
+                groups.Add(group = new ObjectReadGroup(extent));
+            group.Pieces.Add(pieces.Count);
+            pieces.Add(new ObjectReadPiece(extent.ObjectOffset + (start - extent.Offset), (int)(start - position), (int)(stop - start)));
         }
+
+        // Verified bytes of every piece so far: when a capability rejection interrupts the fetch, the caller learns how much
+        // of the start of the range (holes included: they read as zeroes) already holds the revision's bytes.
+        int[] done = new int[pieces.Count];
+        try
+        {
+            foreach (ObjectReadGroup group in groups)
+            {
+                ExtentData extent = group.Extent;
+                long from = group.Pieces.Min(p => pieces[p].ObjectOffset);
+                long to = group.Pieces.Max(p => pieces[p].ObjectOffset + pieces[p].Length);
+                long useful = group.Pieces.Sum(p => (long)pieces[p].Length);
+                if (group.Pieces.Count == 1 || to - from > useful + MaxCoalescedReadGap)
+                {
+                    foreach (int p in group.Pieces)
+                    {
+                        ObjectReadPiece piece = pieces[p];
+                        try
+                        {
+                            await _runtime.Data.ReadObjectAsync(scope, _volume, range.ReadCapability, extent.Object, extent.ObjectLength, extent.Checksum,
+                                extent.Encoding, extent.PlacementEpoch, extent.Locations, piece.ObjectOffset, target.Slice(piece.TargetOffset, piece.Length))
+                                .ConfigureAwait(false);
+                            done[p] = piece.Length;
+                        }
+                        catch (DataCapabilityRejectedException ex)
+                        {
+                            done[p] = ex.Filled;
+                            throw;
+                        }
+                    }
+
+                    continue;
+                }
+
+                var covering = new byte[to - from];
+                try
+                {
+                    await _runtime.Data.ReadObjectAsync(scope, _volume, range.ReadCapability, extent.Object, extent.ObjectLength, extent.Checksum,
+                        extent.Encoding, extent.PlacementEpoch, extent.Locations, from, covering).ConfigureAwait(false);
+                }
+                catch (DataCapabilityRejectedException ex)
+                {
+                    CopyCovered(group, covering, from, ex.Filled);
+                    throw;
+                }
+
+                CopyCovered(group, covering, from, covering.Length);
+            }
+        }
+        catch (DataCapabilityRejectedException ex)
+        {
+            int prefix = target.Length;
+            for (int p = 0; p < pieces.Count; p++)
+            {
+                if (done[p] < pieces[p].Length)
+                    prefix = Math.Min(prefix, pieces[p].TargetOffset + done[p]);
+            }
+
+            throw new DataCapabilityRejectedException(ex.Message, ex) { Filled = prefix };
+        }
+
+        void CopyCovered(ObjectReadGroup group, byte[] covering, long from, int fetched)
+        {
+            foreach (int p in group.Pieces)
+            {
+                ObjectReadPiece piece = pieces[p];
+                int valid = (int)Math.Clamp(from + fetched - piece.ObjectOffset, 0, piece.Length);
+                covering.AsMemory((int)(piece.ObjectOffset - from), valid).CopyTo(target.Slice(piece.TargetOffset, valid));
+                done[p] = valid;
+            }
+        }
+    }
+
+    /// <summary>Most bytes between the pieces of one object fetched along with them instead of fetching the pieces separately.</summary>
+    private const long MaxCoalescedReadGap = 128 * 1024;
+
+    /// <summary>A range of one object needed by a read call (object offset, offset in the call's destination, length).</summary>
+    private readonly record struct ObjectReadPiece(long ObjectOffset, int TargetOffset, int Length);
+
+    /// <summary>The pieces of one object needed by a read call (indexes into the call's pieces; fetched once when they lie close together).</summary>
+    private sealed record ObjectReadGroup(ExtentData Extent)
+    {
+        public List<int> Pieces { get; } = [];
     }
 
     // ------------------------------------------------------------------------------------------------ writes

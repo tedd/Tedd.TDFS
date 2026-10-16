@@ -151,6 +151,7 @@ public sealed class AppIntegrationTests
         {
             await using DfsClient client = await cluster.ConnectAsync(null, ct);
             DfsVolume vol = client.GetVolume(Volume);
+            await vol.Directories.CreateDirectoryAsync("/app", ct);
             await vol.Files.WriteAllBytesAsync("/app/state", TestData.Bytes(0xA004_0001, 5000), ct);
             var timeline = new AdapterTimeline(TimeProvider.System);
             RecordingSnapshotAdapter[] adapters = Enumerable.Range(0, 3)
@@ -240,6 +241,7 @@ public sealed class AppIntegrationTests
         {
             await using DfsClient client = await cluster.ConnectAsync(new TestClientOptions { OperationTimeout = operationTimeout }, ct);
             DfsVolume vol = client.GetVolume(Volume);
+            await vol.Directories.CreateDirectoryAsync("/app", ct);
             await vol.Files.WriteAllBytesAsync("/app/state", TestData.Bytes(0xA005_0001, 3000), ct);
             var timeline = new AdapterTimeline(TimeProvider.System);
             var first = new RecordingSnapshotAdapter("first", timeline);
@@ -498,6 +500,7 @@ public sealed class AppIntegrationTests
             var timeline = new AdapterTimeline(TimeProvider.System);
             var checkpoints = new Dictionary<int, (byte[] Bytes, CommitToken Token)>();
             var adapters = new RecordingSnapshotAdapter[count];
+            await vol.Directories.CreateDirectoryAsync("/coop", ct);
             for (int i = 0; i < count; i++)
             {
                 int index = i;
@@ -840,6 +843,7 @@ public sealed class AppIntegrationTests
             DfsVolume vol = client.GetVolume(Volume);
             DfsVolume snapVol = snapClient.GetVolume(Volume);
             var oracle = new CommitHistoryOracle();
+            await vol.Directories.CreateDirectoryAsync("/pair", ct);
             oracle.Record(await vol.Files.WriteAllBytesAsync("/pair/a", PairValue(1), ct), "/pair/a", PairValue(1));
             oracle.Record(await vol.Files.WriteAllBytesAsync("/pair/b", PairValue(1), ct), "/pair/b", PairValue(1));
 
@@ -927,6 +931,7 @@ public sealed class AppIntegrationTests
             DfsVolume vol = client.GetVolume(Volume);
             DfsVolume snapVol = snapClient.GetVolume(Volume);
             var oracle = new CommitHistoryOracle();
+            await vol.Directories.CreateDirectoryAsync("/pair", ct);
             oracle.Record(await PairTransactionAsync(vol, 1, null, ct), PairWrites(1));
 
             switch (scenario)

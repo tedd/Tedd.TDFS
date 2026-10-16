@@ -40,7 +40,7 @@ internal sealed class RpcInvoker
     public async Task<IWireMessage> InvokeAsync(RpcRequest request, OperationScope scope)
     {
         bool mutation = request.Kind == CallKind.Mutation;
-        bool transmitted = false;
+        bool transmitted = false;   // a mutation transmission may have been executed
         int transmissions = 0;
         int failures = 0;
         int redirects = 0;
@@ -165,8 +165,10 @@ internal sealed class RpcInvoker
             long sentAt = _runtime.Time.GetTimestamp();
             Task<ReadOnlyMemory<byte>> pending = connection.StartCall(frame, attemptTimeout, scope.Token);
 
-            // A call refused before sending (connection closed, token already cancelled) transmitted nothing.
-            bool refused = pending.IsCanceled || (pending.IsFaulted && pending.Exception?.GetBaseException() is RpcConnectionException);
+            // A call refused before sending (connection closed) transmitted nothing. A call that completed as cancelled may
+            // already have handed its frame to the transport (the caller's token can fire while the call starts), so it
+            // counts as transmitted: its id is never reused for another request (the token was checked just above).
+            bool refused = pending.IsFaulted && pending.Exception?.GetBaseException() is RpcConnectionException;
             if (!refused)
             {
                 transmissions++;
@@ -182,10 +184,23 @@ internal sealed class RpcInvoker
             }
             catch (OperationCanceledException) when (scope.Token.IsCancellationRequested)
             {
-                // The deadline ended the attempt before the node answered: later requests (keep-alives, the next
-                // operation) must not keep waiting on it as the presumed leader (a paused or partitioned old leader).
-                if (!scope.IsAbortedByCaller)
+                // The operation ended (deadline, caller or shutdown) while this attempt was outstanding. When the attempt had
+                // also run for its whole timeout, the connection did not answer in time: it is treated exactly like an attempt
+                // timeout (a silently dead link must not stay pooled), whichever of the two timers happened to fire first.
+                if (_runtime.Time.GetElapsedTime(sentAt) >= attemptTimeout)
+                {
+                    _runtime.Pool.Invalidate(connection);
                     request.Router.OnUnreachable(endpoint);
+                    _runtime.Emit("rpc.attempt-failed", $"{request.Name} to {endpoint}: no reply within the attempt timeout ({attemptTimeout}).",
+                        request.Operation, request.Transaction, scope.Volume);
+                }
+                else if (!scope.IsAbortedByCaller)
+                {
+                    // The deadline ended the attempt before the node answered: later requests (keep-alives, the next
+                    // operation) must not keep waiting on it as the presumed leader (a paused or partitioned old leader).
+                    request.Router.OnUnreachable(endpoint);
+                }
+
                 break;
             }
             catch (Exception ex) when (ex is TimeoutException or RpcConnectionException or IOException or ObjectDisposedException)

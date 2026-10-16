@@ -96,7 +96,8 @@ varuint count
 count × ( varuint32 fieldId, u8 flags, bytes value )      flags: bit 0 = Required, bits 1-7 must be 0
 ```
 
-* Field ids are unique within one block (duplicates are malformed). Version 1 defined **no** extension fields; fields added since are listed with their message (`RestoreSnapshot` field 1 `StoragePool`, `HelloChallenge` field 1 `ServerBootId`).
+* Field ids are unique within one block (duplicates are malformed). Version 1 defined **no** extension fields; fields added since are listed with their message (`RestoreSnapshot` field 1 `StoragePool`, `HelloChallenge` field 1 `ServerBootId`,
+  `RegisterIncarnation` field 1 `Release`).
 * An **unknown optional** extension is preserved on the decoded record (`Extensions`) and re-emitted when the record is
   re-encoded (for example when a node forwards a request), and is otherwise ignored (FMT-003).
 * An **unknown required** extension makes the whole message fail with `Unsupported` (FMT-002): a receiver never
@@ -187,7 +188,7 @@ peer                                         server (live node or backup node)
 | Messages | Served by | Peer roles allowed |
 |---|---|---|
 | `Hello*`, `GetClusterMap`, `GetVolumeRoute` (without `RequireLeader`) | any live node; backup nodes serve their own map | all |
-| `JoinCluster`, `RegisterIncarnation` | control leader | Node |
+| `JoinCluster`, `RegisterIncarnation`, `AuditEvent` | control leader | Node |
 | `AdminRequest` | control leader (cluster/node/principal/feature ops) or volume leader (volume-scoped ops), §8.8 | Client (ClusterAdmin / VolumeAdmin) |
 | volume requests (those with a `RequestHeader`) | volume leader; backup nodes for read-only snapshot traffic and their own sessions/pins | Client |
 | `PutObject`, `GetObject`, `LocateObject` | any storage node (live node), backup node for its own objects | Client, Node |
@@ -314,6 +315,7 @@ carry an operation id; **opt** = may carry one (then retries are deduplicated); 
 | `GetClusterMap`, `GetVolumeRoute` | — | — | Read. |
 | `JoinCluster` | `AddMember` (control) | — | Idempotent per (node id, name). |
 | `RegisterIncarnation` | control registration | — | Idempotent per (node, incarnation). |
+| `AuditEvent` | `AppendAudit` (control) | — | Not deduplicated (an audit record; a retry may record the event twice). |
 | `OpenSession` | `OpenSession` | — | Same `Nonce` → same session while retained; otherwise a spare session that simply expires. |
 | `KeepAlive` | `KeepAlive` | — | Naturally idempotent. |
 | `QueryOperation` | `FenceOperation` when `Resolve` | — | Idempotent; resolved answers are definite. |
@@ -482,8 +484,9 @@ zeroes; missing objects never do (STR, DSK-016).
   base bytes of an extent-based file (for example a truncation to below the threshold followed by small writes), or
   `Data` changes of objects a stream uploaded early and then truncated below the threshold — the leader
   materializes those bytes from the objects into the inline image before proposing; the client never reads the base
-  (or its own staged objects) to rewrite it. The SDK uploads staged data early (bounded memory, PUB-002) for every
-  writable stream; a readable writer reads those ranges back with its staging capability (§7.3).
+  (or its own staged objects) to rewrite it. The SDK uploads staged data early for every writable stream, keeping client
+  memory bounded by its buffer (FSD §6.3, §15, PUB-002); a readable writer reads those uploaded, unpublished ranges back
+  with its staging capability (§7.3).
 * **Inline → extents**: when a publication turns an inline file into an extent-based one, bytes of the new content not
   covered by the change set are taken from the old inline bytes; the leader materializes them (and any `Inline` changes
   of the request) as objects with receipts meeting the file's policy, before proposing, under a staging session it
@@ -768,7 +771,7 @@ Requests the route of one volume (any authenticated peer → any live node).
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
 | 1 | `Volume` | `string` | Volume name. |
-| 2 | `RequireLeader` | `bool` | When true the request must be served by the volume leader after a ReadIndex barrier, and the reply carries the volume's last applied commit (used by `DfsVolume.GetInfoAsync`). A non-leader answers `DfsErrorCode.NotLeader` with a leader hint. |
+| 2 | `RequireLeader` | `bool` | When true the request must be served by the volume leader after a ReadIndex barrier, and the reply carries the volume's last applied commit (used by `DfsVolume.GetInfoAsync`). A non-leader answers `DfsErrorCode.NotLeader` with a leader hint. Because the reply discloses the volume's last commit, a client principal needs the volume's `Read` grant (or `ClusterAdmin`) for this variant (`AccessDenied`, audited, SEC-003); plain routing (`false`) stays open to every authenticated peer. |
 | 3 | — | `extensions` | Terminal extension block. |
 
 #### `VolumeRouteResult` = 17 (`VolumeRouteResultMessage`)
@@ -826,7 +829,13 @@ Registers a restarted node's new incarnation with the control group (node → co
 | 5 | `Endpoints` | `list<string>` | Current listen endpoints. |
 | 6 | `CapacityBytes` | `varint` | Configured capacity. |
 | 7 | `BootId` | `u128` | Process boot id (see `HelloMessage.BootId`). |
-| 8 | — | `extensions` | Terminal extension block. |
+| 8 | — | `extensions` | Terminal extension block (field 1, see below). |
+
+Extension fields (added after v1 shipped, §2.5):
+
+| Field id | Flags | Value | Meaning |
+|---|---|---|---|
+| 1 `Release` | Optional | `varint32` protocol maximum, `list<string>` understood cluster features (ordinal order) | The software release the registering process runs. When it differs from the member record, the control leader commits a `SetMemberRelease` control entry before the registration, so feature activation (`SetFeature`, refused with `Unsupported` while any live member does not understand the feature) and the cluster protocol version reflect the restarted node (rolling upgrades, FMT-009, CHA-011). Absent (older senders) or malformed: the record keeps what `JoinCluster`/the bootstrap recorded. |
 
 #### `RegisterIncarnationResult` = 21 (`RegisterIncarnationResultMessage`)
 
@@ -840,6 +849,32 @@ Reply to `RegisterIncarnationMessage` (sent after the registration is committed 
 | 4 | `ConfigIndex` | `varuint` | Control config index containing the registration. |
 | 5 | `PlacementEpoch` | `varuint` | Current placement epoch. |
 | 6 | — | `extensions` | Terminal extension block. |
+
+#### `AuditEvent` = 22 (`AuditEventMessage`)
+
+A security or administrative event (denied request, failed authentication, snapshot deletion) observed by a node that does
+not lead the control group, forwarded to the control leader, which records it as an `AppendAudit` control entry (node →
+control leader; members only; SEC-016). Every node bounds what it reports and forwards with the same token bucket as the
+leader's own audit records (bursts of 20, 10 per second); floods are dropped, and a forwarding failure drops the node's
+backlog (best effort). The leader cuts each field to 512 characters. Records never carry payload bytes or secrets.
+Errors: NotLeader (with a hint), AccessDenied (not a member).
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Operation` | `string` | Operation refused or performed (for example `volume:stage uploads`, `authenticate`, `volume:delete snapshot`). |
+| 2 | `Outcome` | `string` | Outcome (for example `denied`, `ok`, `failed:<code>`). |
+| 3 | `Scope` | `string` | Scope (volume, peer, snapshot, required permission). |
+| 4 | `Principal` | `string` | Principal concerned (`-` when unknown). |
+| 5 | — | `extensions` | Terminal extension block. |
+
+#### `AuditEventResult` = 23 (`AuditEventResultMessage`)
+
+Reply to `AuditEventMessage`, sent once the record is applied (or dropped).
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Accepted` | `bool` | True when the record was committed to the audit log (false: dropped by the flood bound or not committed in time). |
+| 2 | — | `extensions` | Terminal extension block. |
 
 ### 9.3 Sessions and outcomes
 
@@ -860,7 +895,7 @@ Reply to `OpenSessionMessage`.
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
-| 1 | `Session` | `varuint` | Server-issued session number (never reused within the volume epoch). |
+| 1 | `Session` | `varuint` | Server-issued session number (never reused within the volume epoch). Numbers start at a base derived from the volume id and epoch (in [2^40, 2^40 + 2^48), in steps of 2^16; handle ids likewise) so that an operation id issued by one volume authority — an earlier volume of the same name, the source of a restore, another volume or cluster — does not name a session of another (§5.1, SEC-010, RST-008/011); a number the volume never issued is refused with `InvalidArgument`, a retired one with `OperationExpired`/`LeaseLost`. Volumes that numbered their sessions from 1 keep doing so. |
 | 2 | `FirstSequence` | `varuint` | First operation sequence the client may allocate (sequences are monotonic per session). |
 | 3 | `LeaseDuration` | `duration` | Handle lease duration; renew with `KeepAlive` every third of it. |
 | 4 | `SessionTimeout` | `duration` | Session expires after this long without a `KeepAlive`. |

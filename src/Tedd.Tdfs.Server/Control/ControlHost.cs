@@ -21,7 +21,9 @@ internal sealed class ControlHost
 
     private readonly NodeServices _s;
     private readonly Queue<AppendAuditCommand> _pendingAudits = new();
+    private readonly Queue<AuditEventMessage> _forwardedAudits = new();
     private bool _auditing;
+    private bool _forwarding;
     private double _auditTokens = AuditBurst;
     private long _auditRefilled;
 
@@ -91,10 +93,21 @@ internal sealed class ControlHost
     public DfsServerCapabilities BuildCapabilities()
     {
         NodeTimings t = _s.Timings;
+        NodeRelease release = _s.Release;
+
+        // The cluster speaks the newest version every live member speaks (mixed releases negotiate the older one during a
+        // rolling upgrade), and only active features this node's release understands are advertised.
+        int version = release.ProtocolMax;
+        foreach (MemberRecord member in State.Members.Values)
+        {
+            if (member.IsLive && !member.PendingAdmission && member.ProtocolMax > 0)
+                version = Math.Min(version, member.ProtocolMax);
+        }
+
         return new DfsServerCapabilities
         {
-            ProtocolVersion = ProtocolInfo.CurrentVersion,
-            Features = State.Features.ToHashSet(StringComparer.Ordinal),
+            ProtocolVersion = Math.Max(version, release.ProtocolMin),
+            Features = State.Features.Where(release.Supports).ToHashSet(StringComparer.Ordinal),
             ChunkSize = t.ChunkSize,
             MaxObjectSize = t.MaxObjectSize,
             LeaseDuration = t.LeaseDuration,
@@ -171,35 +184,126 @@ internal sealed class ControlHost
     }
 
     /// <summary>
-    /// Records a security event (failed authentication, denied access) in the replicated audit log when this node leads the
-    /// control group; best effort and bounded (floods are dropped).
+    /// Records a security event (failed authentication, denied access) in the replicated audit log: the control leader
+    /// proposes it, any other node forwards it to the control leader (<see cref="AuditEventMessage"/>), so an event is audited
+    /// whichever node observed it (SEC-016). Best effort and bounded on every node (floods are dropped).
     /// </summary>
     public void ReportSecurityEvent(string operation, string outcome, string scope, string principal = "-")
     {
-        if (!IsLeader || _pendingAudits.Count >= MaxPendingAudits || !TakeAuditToken())
+        string who = string.IsNullOrEmpty(principal) ? "-" : principal;
+        if (IsLeader)
+        {
+            if (_pendingAudits.Count >= MaxPendingAudits || !TakeAuditToken())
+                return;
+            _pendingAudits.Enqueue(new AppendAuditCommand(NewHeader(default, who), operation, outcome, scope));
+            if (!_auditing)
+                _ = DrainAuditsAsync();
             return;
-        _pendingAudits.Enqueue(new AppendAuditCommand(NewHeader(default, string.IsNullOrEmpty(principal) ? "-" : principal), operation, outcome, scope));
-        if (!_auditing)
-            _ = DrainAuditsAsync();
+        }
+
+        if (Leader is null || _forwardedAudits.Count >= MaxPendingAudits || !TakeAuditToken())
+            return;
+        _forwardedAudits.Enqueue(new AuditEventMessage(operation, outcome, scope, who));
+        if (!_forwarding)
+            _ = ForwardAuditsAsync();
     }
 
     /// <summary>
     /// Like <see cref="ReportSecurityEvent"/>, but returns once the audit record is applied (or dropped): an administrative
-    /// denial is answered only after it is visible in the audit log (read-your-writes for the denied caller's auditor).
+    /// denial is answered only after it is visible in the audit log (read-your-writes for the denied caller's auditor). On a
+    /// node that does not lead the control group it returns once the control leader applied the forwarded record.
     /// Same flood bound; never throws.
     /// </summary>
     public async Task ReportSecurityEventAndWaitAsync(string operation, string outcome, string scope, string principal = "-")
     {
-        if (!IsLeader || _pendingAudits.Count >= MaxPendingAudits || !TakeAuditToken())
+        string who = string.IsNullOrEmpty(principal) ? "-" : principal;
+        if (!IsLeader)
+        {
+            if (Leader is { } leader && leader != _s.NodeId && TakeAuditToken())
+                await ForwardAsync(leader, new AuditEventMessage(operation, outcome, scope, who), AuditWait);
+            return;
+        }
+
+        if (_pendingAudits.Count >= MaxPendingAudits || !TakeAuditToken())
             return;
         try
         {
-            using CancellationTokenSource deadline = _s.CreateDeadline();
-            await ProposeAsync(new AppendAuditCommand(NewHeader(default, string.IsNullOrEmpty(principal) ? "-" : principal), operation, outcome, scope),
-                deadline.Token);
+            using CancellationTokenSource deadline = _s.CreateDeadline(AuditWait);
+            await ProposeAsync(new AppendAuditCommand(NewHeader(default, who), operation, outcome, scope), deadline.Token);
         }
         catch (Exception ex) when (ex is DfsException or OperationCanceledException)
         {
+        }
+    }
+
+    /// <summary>
+    /// Records an event another node forwarded (<see cref="AuditEventMessage"/>, control leader only), under this node's flood
+    /// bound, and completes once it is applied (the forwarding node answers its own caller after that, read-your-writes as for
+    /// local events). False when it was dropped or could not be committed; never throws.
+    /// </summary>
+    public async Task<bool> RecordForwardedSecurityEventAsync(AuditEventMessage message)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        if (!IsLeader || _pendingAudits.Count >= MaxPendingAudits || !TakeAuditToken())
+            return false;
+        try
+        {
+            using CancellationTokenSource deadline = _s.CreateDeadline();
+            ApplyOutcome outcome = await ProposeAsync(new AppendAuditCommand(NewHeader(default, string.IsNullOrEmpty(message.Principal) ? "-" : message.Principal),
+                message.Operation, message.Outcome, message.Scope), deadline.Token);
+            return outcome.IsSuccess;
+        }
+        catch (Exception ex) when (ex is DfsException or OperationCanceledException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Sends forwarded security events to the control leader, one at a time (best effort: a failure drops the backlog).</summary>
+    private async Task ForwardAuditsAsync()
+    {
+        _forwarding = true;
+        try
+        {
+            while (_forwardedAudits.Count > 0 && !_s.IsStopping)
+            {
+                if (Leader is not { } leader || leader == _s.NodeId)
+                {
+                    // No other control leader to forward to (unknown, or this node took over meanwhile and audits locally).
+                    _forwardedAudits.Clear();
+                    break;
+                }
+
+                if (!await ForwardAsync(leader, _forwardedAudits.Dequeue(), null))
+                    _forwardedAudits.Clear();
+            }
+        }
+        finally
+        {
+            _forwarding = false;
+        }
+    }
+
+    /// <summary>
+    /// Longest wait of a caller for its audit record (<see cref="ReportSecurityEventAndWaitAsync"/>): a few election timeouts
+    /// (at least a second), so an unavailable control group delays the audited reply only briefly.
+    /// </summary>
+    private TimeSpan AuditWait => TimeSpan.FromTicks(Math.Max(TimeSpan.FromSeconds(1).Ticks, _s.Timings.Tick.Ticks * _s.Timings.ElectionTicksMax * 4));
+
+    /// <summary>Forwards one security event to the control leader (within <paramref name="timeout"/>, default the peer call timeout); false when it could not be delivered.</summary>
+    private async Task<bool> ForwardAsync(NodeId leader, AuditEventMessage message, TimeSpan? timeout)
+    {
+        try
+        {
+            using CancellationTokenSource deadline = _s.CreateDeadline(timeout);
+            await _s.Peers.CallAsync(leader, message, timeout, deadline.Token);
+            return true;
+        }
+        catch (Exception ex) when (ex is DfsException or IOException or TimeoutException or UnauthorizedAccessException or OperationCanceledException
+                                       or ObjectDisposedException)
+        {
+            _s.Debug("control", NodeServices.Inv($"Forwarding the audit record '{message.Operation}' to the control leader failed: {ex.Message}"));
+            return false;
         }
     }
 
