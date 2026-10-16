@@ -2568,6 +2568,11 @@ public sealed class RsySimulationTests
             var (client, vol) = await ConnectAsync(cluster, "w");
             await using var clientScope = client;
             await vol.Files.WriteAllBytesAsync("/x", TestData.Bytes(22_000, 2 * Chunk), Ct);
+
+            // The capacity limits below are set relative to what the returning node stores at that moment; a snapshot keeps the
+            // old revision of /x referenced, so garbage collection cannot reclaim its copies on the full node meanwhile (that
+            // would legitimately make room, and the checkpoint or object would then fit).
+            await vol.Snapshots.CreateAsync("rsy022-keep", null, Ct);
             await cluster.WaitForReplicationAsync(Volume, Ct);
             VolumeStateInspection oldState = await LeaderStateAsync(cluster);
 
