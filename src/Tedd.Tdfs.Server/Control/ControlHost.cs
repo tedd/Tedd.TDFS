@@ -16,8 +16,16 @@ internal sealed class ControlHost
     /// <summary>Directory name of the control group's data.</summary>
     public const string Directory = "control";
 
-    private const int MaxPendingAudits = 64;
-    private const int AuditBurst = 20;
+    private const int MaxPendingAudits = 128;
+
+    /// <summary>
+    /// Security events a node may audit in a burst (then <see cref="AuditRefillPerSecond"/>): an administrator's session of
+    /// denied attempts is recorded completely (SEC-018), while a flood (failed authentications, malformed requests) stays
+    /// bounded and cannot swamp the control log.
+    /// </summary>
+    private const int AuditBurst = 100;
+
+    private const double AuditRefillPerSecond = 20;
 
     private readonly NodeServices _s;
     private readonly Queue<AppendAuditCommand> _pendingAudits = new();
@@ -312,7 +320,7 @@ internal sealed class ControlHost
     {
         long now = _s.Time.GetTimestamp();
         if (_auditRefilled != 0)
-            _auditTokens = Math.Min(AuditBurst, _auditTokens + (_s.Time.GetElapsedTime(_auditRefilled, now).TotalSeconds * 10));
+            _auditTokens = Math.Min(AuditBurst, _auditTokens + (_s.Time.GetElapsedTime(_auditRefilled, now).TotalSeconds * AuditRefillPerSecond));
         _auditRefilled = now;
         if (_auditTokens < 1)
             return false;

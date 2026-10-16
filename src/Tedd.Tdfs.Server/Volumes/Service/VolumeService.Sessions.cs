@@ -17,7 +17,11 @@ internal sealed partial class VolumeService
         await EnsureLeaderReadyAsync(ct);
         string principal = context.Principal ?? string.Empty;
         if (GrantsOf(principal) == DfsPermissions.None)
+        {
+            // Every volume operation of such a principal ends here (it needs a session first): the denial is audited (SEC-018).
+            _s.Control.ReportSecurityEvent("volume:open session", "denied", "volume=" + Name + " requires=any grant", principal);
             throw new UnauthorizedAccessException($"Principal '{principal}' has no grant on volume '{Name}'.");
+        }
         OperationHeader op = Header(context, request, DfsOperationKind.OpenSession, default);
         NodeTimings t = _s.Timings;
         var command = Stamp(new OpenSessionCommand(request.ClientName, request.Nonce, t.LeaseDuration, t.SessionTimeout, t.MaxOutcomesPerSession,
