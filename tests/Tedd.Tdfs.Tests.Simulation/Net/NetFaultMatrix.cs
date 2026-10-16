@@ -371,7 +371,8 @@ internal static class NetFaultMatrix
             FromMutation(DfsOperationKind.CreateStaging, "stream-commit", Sites(ClientWire, ServerWire, Propose, [FaultSites.StagingRegistered])),
             FromMutation(DfsOperationKind.CommitFile, "stream-commit", Sites(ClientStart, ClientWire, ServerWire, Propose, [FaultSites.CommitReceiptValidated])),
             FromMutation(DfsOperationKind.WriteAll, "write-all", Sites(ClientStart, ClientWire, ServerWire, Propose, [FaultSites.CommitReceiptValidated, FaultSites.CleanupRelease])),
-            FromMutation(DfsOperationKind.Append, "append", Sites(ClientStart, ClientWire, ServerWire, Propose, [FaultSites.CommitReceiptValidated])),
+            // Receipt validation (F09) exists only for an append published as objects: the case appends beyond the inline threshold.
+            FromMutation(DfsOperationKind.Append, "append-objects", Sites(ClientStart, ClientWire, ServerWire, Propose, [FaultSites.CommitReceiptValidated])),
             FromMutation(DfsOperationKind.Copy, "copy", Sites(ClientStart, ClientWire, ServerWire, Propose)),
             FromMutation(DfsOperationKind.Move, "move", Sites(ClientStart, ClientWire, ServerWire, Propose)),
             FromMutation(DfsOperationKind.Delete, "delete", Sites(ClientStart, ClientWire, ServerWire, Propose, [FaultSites.CleanupRelease])),

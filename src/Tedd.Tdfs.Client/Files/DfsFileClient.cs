@@ -487,6 +487,7 @@ public sealed partial class DfsFileClient
         int threshold = ContentLayout.InlineThreshold(entry, Runtime.Capabilities);
         bool inlineRejected = false;
         bool stagingReplaced = false;
+        bool? representation = null;   // inline (true) or objects (false) forced after an OperationIdMismatch of a caller-supplied id
         while (true)
         {
             // The current length decides the representation (and whether a text preamble is due). A principal may hold
@@ -508,11 +509,8 @@ public sealed partial class DfsFileClient
             DfsStoragePolicy policy = known
                 ? await PolicyForAsync(path, options.StoragePolicy, entry, info, scope).ConfigureAwait(false)
                 : ContentLayout.ResolvePolicy(entry, options.StoragePolicy) ?? entry.DefaultPolicy;
-            // An application-supplied operation id may be retried by a later call (OUT-002, OUT-006), when the file has grown
-            // by this very append: its payload identity must not depend on the current length, so such an append is always
-            // uploaded as objects (the leader still stores the result inline when it fits).
-            bool inline = known && !inlineRejected && options.OperationId is null && current + bytes.Length <= threshold
-                && ContentLayout.InlinePermitted(entry, policy, LabelsOf);
+            bool inline = representation ?? (known && !inlineRejected && current + bytes.Length <= threshold
+                && ContentLayout.InlinePermitted(entry, policy, LabelsOf));
             Payload payload = inline
                 ? Payload.Inline(bytes)
                 : await UploadAsync(bytes, 0, entry, policy, scope).ConfigureAwait(false);
@@ -535,6 +533,17 @@ public sealed partial class DfsFileClient
             {
                 // As for WriteAll: the helper's staging session closed with its client session; upload again.
                 stagingReplaced = true;
+            }
+            catch (DfsOperationIdMismatchException) when (options.OperationId is not null && representation is null && !scope.IsAbortedByCaller)
+            {
+                // A caller-supplied id may be retried by a later call after the file grew, by this very append (OUT-002,
+                // OUT-006): the representation chosen from the current length (inline or objects, PROTOCOL.md §5.2) then
+                // differs from the one its stored outcome was recorded with. The same content is described the other way
+                // once: a stored outcome of that identity answers it (the operation gate is consulted before anything is
+                // validated or applied), and a second mismatch is a genuine one (other content or arguments).
+                if (payload.Lease is not null)
+                    await Context.CloseUnboundStagingAsync(payload.Lease).ConfigureAwait(false);
+                representation = !inline;
             }
             catch (Exception) when (payload.Lease is not null)
             {

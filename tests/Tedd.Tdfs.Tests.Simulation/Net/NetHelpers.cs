@@ -109,6 +109,25 @@ internal static class NetHelpers
                 };
             }
 
+            case "append-objects":
+            {
+                // An append whose result exceeds the inline threshold (4 KiB): it is published as objects with receipts, so
+                // its publication path has the receipt-validation stage (F09) that an inline append does not have.
+                byte[] prefix = TestData.Bytes(0x5014, 1000);
+                byte[] suffix = TestData.Bytes(0x5015, 6000);
+                return new MutationCase
+                {
+                    Name = name,
+                    RequestType = MessageType.Append,
+                    Operation = DfsOperationKind.Append,
+                    SetupAsync = v => v.Files.WriteAllBytesAsync("/apo", prefix, Ct),
+                    InvokeAsync = (v, id, ct) => v.Files.AppendAllBytesAsync("/apo", suffix, WithId(id), ct),
+                    InvokeChangedAsync = (v, id) => v.Files.AppendAllBytesAsync("/apo", TestData.Bytes(0x5016, 6000), WithId(id), Ct),
+                    AssertAppliedOnceAsync = v => AssertContentAsync(v, "/apo", Concat(prefix, suffix), "append applied exactly once"),
+                    AssertNotAppliedAsync = v => AssertContentAsync(v, "/apo", prefix, "append not applied"),
+                };
+            }
+
             case "create-directory":
                 return new MutationCase
                 {

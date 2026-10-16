@@ -165,15 +165,23 @@ public sealed class RuntimeReviewTests
         await RuntimeCluster.WaitUntilAsync(async () => await drained.Host!.InvokeAsync(s =>
             s.Control.State.FindVolume(volume.Id) is { } record && !record.Voters.Contains(drained.Id)), "the record no longer lists the drained voter");
 
-        // After the registry's grace period the drained node stops participating ...
-        await RuntimeCluster.WaitUntilAsync(async () => await drained.Host!.Inspect.GetGroupAsync("vol") is null,
-            "the drained node left the volume group", TimeSpan.FromSeconds(30));
-        RuntimeNode currentLeader = await cluster.WaitForLeaderAsync("vol", cluster.Nodes.Where(n => n != outsider && n != drained));
+        // The drained node is still a voter of the applied configuration: it keeps hosting the group however long the
+        // transition takes, well past the registry's grace period for unlisted learners (leaving would reduce the group's
+        // failure tolerance while its quorum still counts this voter, RCV-01; INTERNALS.md §1.3) ...
+        TimeSpan grace = await drained.Host!.InvokeAsync(s => s.Timings.Tick * s.Timings.ElectionTicksMax * 10);
+        DateTime until = DateTime.UtcNow + grace + grace;
+        while (DateTime.UtcNow < until)
+        {
+            Assert.True(await drained.Host!.Inspect.GetGroupAsync("vol") is not null, "the drained node left the group while it was still a voter");
+            await Task.Delay(100, Ct);
+        }
+
+        RuntimeNode currentLeader = await cluster.WaitForLeaderAsync("vol", cluster.Nodes.Where(n => n != outsider));
         GroupInspection leaderView = (await currentLeader.Host!.Inspect.GetGroupAsync("vol"))!;
         Assert.Contains(drained.Name, leaderView.Voters);
         Assert.DoesNotContain(outsider.Name, leaderView.Voters);
 
-        // ... but a member the configuration still counts as a voter must never lose its log.
+        // ... and a member the configuration still counts as a voter never loses its log.
         Assert.True(await drained.Medium.ExistsAsync(groupDirectory + "/log", Ct), "the drained voter's log was deleted while it was still a voter");
     }
 

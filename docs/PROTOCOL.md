@@ -153,6 +153,10 @@ peer                                         server (live node or backup node)
     (K: a server-held key derived from the cluster or backup secret) with the default iteration count, and the proof then fails exactly like a wrong secret
     (`AuthenticationFailed`): principal existence is not disclosed. Clients refuse iteration counts outside
     `1..10 000 000`.
+  * A live node that has not yet applied the registration of its own incarnation (still catching up after a join or a
+    restart, its control view is behind the cluster's) cannot tell an unknown principal from one it has not learned
+    yet: it answers every failed proof with the retryable `NodeUnavailable` instead (alike for unknown principals and
+    wrong secrets, so existence is still not disclosed), and the client authenticates through another node.
 * **Nodes** (role `Node`, cluster secret): `NodeAuthKey = HKDF-SHA256(clusterSecret, info "tdfs/v1/node-auth")`
   (`KeyDerivation`); `Proof = HMAC(NodeAuthKey, "tdfs/node-proof/v1\0" ‖ T)`,
   `ServerMac = HMAC(NodeAuthKey, "tdfs/node-server/v1\0" ‖ T)` (distinct labels, so neither can be reflected). The
@@ -447,9 +451,10 @@ zeroes; missing objects never do (STR, DSK-016).
   operation carry the same payload identity. `Append` offsets are relative to the end of file; the SDK appends inline
   only when the file's current length plus the appended bytes fit the threshold, and otherwise (or when the leader
   rejects an inline append because the file grew meanwhile, with a new operation id) as objects. An `Append` with an
-  application-supplied operation id is always sent as objects: it may be retried by a later call after the file grew
-  (by this very append), and its payload identity must not depend on the length the client saw (the leader still stores
-  a result that fits inline inline, see "Extents → inline").
+  application-supplied operation id may be retried by a later call after the file grew (by this very append), when the
+  current length selects the other representation: on `OperationIdMismatch` the SDK sends the same content once in the
+  other representation (inline ↔ objects), which the stored outcome answers when it was recorded that way (the operation
+  gate is checked before the request is validated); a second mismatch is reported.
 * **Extents → inline**: when a publication whose result is stored inline leaves bytes of objects inside the result —
   base bytes of an extent-based file (for example a truncation to below the threshold followed by small writes), or
   `Data` changes of objects a write-only stream uploaded early and then truncated below the threshold — the leader
