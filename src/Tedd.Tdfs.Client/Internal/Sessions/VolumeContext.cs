@@ -766,6 +766,8 @@ internal sealed class VolumeContext : IRpcRouter
         {
             IWireMessage reply = await Runtime.Rpc.InvokeAsync(request, scope).ConfigureAwait(false);
             Finish(request, sdkAllocated, keepProtected);
+            // Every completed mutation is traced under its stable operation id, however many transmissions it took (OPS-007).
+            Runtime.Emit("operation.completed", $"{name} completed after {request.Transmissions} transmission(s).", request.Operation, transaction, Name);
             return new Bound<TReply>((TReply)reply, pinned ?? default, sent);
         }
         catch (DfsCommitOutcomeUnknownException)
