@@ -1057,6 +1057,14 @@ public interface IRpcTransportControl
     int OpenConnectionCount { get; }
     void ResetConnections(string? remoteName = null);   // abortive; both ends see Closed(exception); listening continues
 }
+// The QUIC transport also implements IRpcTransportIdentity (its listener certificate and the pins it trusts; SEC-001).
+public sealed record RpcCertificateInfo(byte[] SpkiSha256, DateTimeOffset NotBefore, DateTimeOffset NotAfter);
+public interface IRpcTransportIdentity
+{
+    RpcCertificateInfo? LocalCertificate { get; }   // null for a connect-only transport
+    bool PinsPeers { get; }                         // TrustedSpkiPins non-empty
+    bool TrustsPin(ReadOnlySpan<byte> spkiSha256);
+}
 // InMemoryNetwork: + InMemoryNetwork(ILinkPolicy? policy, TimeProvider timeProvider); TimeProvider TimeProvider { get; };
 //                  IReadOnlyList<string> Endpoints { get; }; void ResetConnections(string name);   // every connection with `name` at either end
 // QuiclyTransportFactory: + QuiclyTransportOptions Options { get; }; static X509Certificate2 CreateDevelopmentCertificate();
