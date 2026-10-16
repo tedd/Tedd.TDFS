@@ -371,19 +371,24 @@ public sealed class DfsStream : Stream, ILeaseHolder
         long objectOffset = segment.ObjectOffset + (piece.Offset - segment.Offset);
         NodeId[] locations = uploaded.Receipts.Select(r => r.Node).Distinct().ToArray();
         ulong placementEpoch = uploaded.Receipts.Count == 0 ? 0 : uploaded.Receipts.Max(r => r.PlacementEpoch);
-        for (int attempt = 0; ; attempt++)
+        int done = 0;
+        bool retried = false;
+        while (true)
         {
             if (grant is null || !grant.Objects.Contains(uploaded.Id))
                 grant = await GrantStagedReadAsync(pieces, index, scope).ConfigureAwait(false);
             try
             {
                 await _runtime.Data.ReadObjectAsync(scope, _volume, grant.Capability, uploaded.Id, uploaded.Length, uploaded.Checksum, ObjectEncodings.Plain,
-                    placementEpoch, locations, objectOffset, target).ConfigureAwait(false);
+                    placementEpoch, locations, objectOffset + done, target[done..]).ConfigureAwait(false);
                 return grant;
             }
-            catch (DataCapabilityRejectedException) when (attempt == 0)
+            catch (DataCapabilityRejectedException ex) when (ex.Filled > 0 || !retried)
             {
-                // The capability expired between the grant and the fetch: ask again.
+                // The capability expired between the grant and the end of the fetch: the verified bytes are kept (the object is
+                // immutable) and the rest is read with a new grant. A rejection without any progress is retried once.
+                retried = ex.Filled == 0;
+                done += ex.Filled;
                 grant = null;
             }
             catch (DataCapabilityRejectedException ex)
@@ -455,6 +460,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
                 await FillAsync(range, position, target, scope).ConfigureAwait(false);
                 return count;
             }
+            catch (DataCapabilityRejectedException ex) when (ex.Filled > 0)
+            {
+                // The capability expired during a long fetch (many short results): the verified bytes at the start of the range
+                // belong to this call's one revision and are returned as a short read (FSD §6.2); the next call asks again.
+                return ex.Filled;
+            }
             catch (DataCapabilityRejectedException) when (attempt == 0)
             {
                 // The read capability expired between the reply and the object fetch: ask again.
@@ -480,6 +491,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
         // the call to the same object, and storage nodes answer whole verification units, so fetching each piece on its own
         // would move the same units again for every fragment (read amplification, PERF-002/PERF-009).
         long end = position + target.Length;
+        var pieces = new List<ObjectReadPiece>();
         var groups = new List<ObjectReadGroup>();
         foreach (ExtentData extent in range.Extents)
         {
@@ -487,36 +499,82 @@ public sealed class DfsStream : Stream, ILeaseHolder
             long stop = Math.Min(end, extent.Offset + extent.Length);
             if (stop <= start)
                 continue;
-            var piece = new ObjectReadPiece(extent.ObjectOffset + (start - extent.Offset), (int)(start - position), (int)(stop - start));
             ObjectReadGroup? group = groups.Find(g => g.Extent.Object == extent.Object);
             if (group is null)
                 groups.Add(group = new ObjectReadGroup(extent));
-            group.Pieces.Add(piece);
+            group.Pieces.Add(pieces.Count);
+            pieces.Add(new ObjectReadPiece(extent.ObjectOffset + (start - extent.Offset), (int)(start - position), (int)(stop - start)));
         }
 
-        foreach (ObjectReadGroup group in groups)
+        // Verified bytes of every piece so far: when a capability rejection interrupts the fetch, the caller learns how much
+        // of the start of the range (holes included: they read as zeroes) already holds the revision's bytes.
+        int[] done = new int[pieces.Count];
+        try
         {
-            ExtentData extent = group.Extent;
-            long from = group.Pieces.Min(p => p.ObjectOffset);
-            long to = group.Pieces.Max(p => p.ObjectOffset + p.Length);
-            long useful = group.Pieces.Sum(p => (long)p.Length);
-            if (group.Pieces.Count == 1 || to - from > useful + MaxCoalescedReadGap)
+            foreach (ObjectReadGroup group in groups)
             {
-                foreach (ObjectReadPiece piece in group.Pieces)
+                ExtentData extent = group.Extent;
+                long from = group.Pieces.Min(p => pieces[p].ObjectOffset);
+                long to = group.Pieces.Max(p => pieces[p].ObjectOffset + pieces[p].Length);
+                long useful = group.Pieces.Sum(p => (long)pieces[p].Length);
+                if (group.Pieces.Count == 1 || to - from > useful + MaxCoalescedReadGap)
                 {
-                    await _runtime.Data.ReadObjectAsync(scope, _volume, range.ReadCapability, extent.Object, extent.ObjectLength, extent.Checksum,
-                        extent.Encoding, extent.PlacementEpoch, extent.Locations, piece.ObjectOffset, target.Slice(piece.TargetOffset, piece.Length))
-                        .ConfigureAwait(false);
+                    foreach (int p in group.Pieces)
+                    {
+                        ObjectReadPiece piece = pieces[p];
+                        try
+                        {
+                            await _runtime.Data.ReadObjectAsync(scope, _volume, range.ReadCapability, extent.Object, extent.ObjectLength, extent.Checksum,
+                                extent.Encoding, extent.PlacementEpoch, extent.Locations, piece.ObjectOffset, target.Slice(piece.TargetOffset, piece.Length))
+                                .ConfigureAwait(false);
+                            done[p] = piece.Length;
+                        }
+                        catch (DataCapabilityRejectedException ex)
+                        {
+                            done[p] = ex.Filled;
+                            throw;
+                        }
+                    }
+
+                    continue;
                 }
 
-                continue;
+                var covering = new byte[to - from];
+                try
+                {
+                    await _runtime.Data.ReadObjectAsync(scope, _volume, range.ReadCapability, extent.Object, extent.ObjectLength, extent.Checksum,
+                        extent.Encoding, extent.PlacementEpoch, extent.Locations, from, covering).ConfigureAwait(false);
+                }
+                catch (DataCapabilityRejectedException ex)
+                {
+                    CopyCovered(group, covering, from, ex.Filled);
+                    throw;
+                }
+
+                CopyCovered(group, covering, from, covering.Length);
+            }
+        }
+        catch (DataCapabilityRejectedException ex)
+        {
+            int prefix = target.Length;
+            for (int p = 0; p < pieces.Count; p++)
+            {
+                if (done[p] < pieces[p].Length)
+                    prefix = Math.Min(prefix, pieces[p].TargetOffset + done[p]);
             }
 
-            var covering = new byte[to - from];
-            await _runtime.Data.ReadObjectAsync(scope, _volume, range.ReadCapability, extent.Object, extent.ObjectLength, extent.Checksum, extent.Encoding,
-                extent.PlacementEpoch, extent.Locations, from, covering).ConfigureAwait(false);
-            foreach (ObjectReadPiece piece in group.Pieces)
-                covering.AsMemory((int)(piece.ObjectOffset - from), piece.Length).CopyTo(target.Slice(piece.TargetOffset, piece.Length));
+            throw new DataCapabilityRejectedException(ex.Message, ex) { Filled = prefix };
+        }
+
+        void CopyCovered(ObjectReadGroup group, byte[] covering, long from, int fetched)
+        {
+            foreach (int p in group.Pieces)
+            {
+                ObjectReadPiece piece = pieces[p];
+                int valid = (int)Math.Clamp(from + fetched - piece.ObjectOffset, 0, piece.Length);
+                covering.AsMemory((int)(piece.ObjectOffset - from), valid).CopyTo(target.Slice(piece.TargetOffset, valid));
+                done[p] = valid;
+            }
         }
     }
 
@@ -526,10 +584,10 @@ public sealed class DfsStream : Stream, ILeaseHolder
     /// <summary>A range of one object needed by a read call (object offset, offset in the call's destination, length).</summary>
     private readonly record struct ObjectReadPiece(long ObjectOffset, int TargetOffset, int Length);
 
-    /// <summary>The pieces of one object needed by a read call (fetched once when they lie close together).</summary>
+    /// <summary>The pieces of one object needed by a read call (indexes into the call's pieces; fetched once when they lie close together).</summary>
     private sealed record ObjectReadGroup(ExtentData Extent)
     {
-        public List<ObjectReadPiece> Pieces { get; } = [];
+        public List<int> Pieces { get; } = [];
     }
 
     // ------------------------------------------------------------------------------------------------ writes

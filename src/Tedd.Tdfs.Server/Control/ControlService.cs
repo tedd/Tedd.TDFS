@@ -7,7 +7,8 @@ namespace Tedd.Tdfs.Server.Control;
 
 /// <summary>
 /// Discovery and membership RPCs served from the control state (PROTOCOL.md §9.2): <c>GetClusterMap</c>,
-/// <c>GetVolumeRoute</c>, <c>JoinCluster</c> (seed join; control leader only) and <c>RegisterIncarnation</c>.
+/// <c>GetVolumeRoute</c>, <c>JoinCluster</c> (seed join; control leader only), <c>RegisterIncarnation</c> and
+/// <c>AuditEvent</c> (security events forwarded to the control leader).
 /// </summary>
 internal sealed class ControlService
 {
@@ -28,6 +29,23 @@ internal sealed class ControlService
         rpc.Register<GetVolumeRouteMessage>(GetVolumeRouteAsync, RpcAccess.Any | RpcAccess.JoiningNode);
         rpc.Register<JoinClusterMessage>(JoinClusterAsync, RpcAccess.Node | RpcAccess.JoiningNode);
         rpc.Register<RegisterIncarnationMessage>(RegisterIncarnationAsync, RpcAccess.Node);
+        rpc.Register<AuditEventMessage>(AuditEventAsync, RpcAccess.Node);
+    }
+
+    /// <summary>Longest field of a forwarded audit record (longer values are cut; records never carry payload or secrets).</summary>
+    private const int MaxAuditFieldLength = 512;
+
+    /// <summary><c>AuditEvent</c> (member → control leader): records a security event another node observed (SEC-016).</summary>
+    private async ValueTask<IWireMessage> AuditEventAsync(RpcContext context, IWireMessage request)
+    {
+        var message = (AuditEventMessage)request;
+        if (!Control.IsLeader)
+            throw Control.NotLeader();
+        bool accepted = await Control.RecordForwardedSecurityEventAsync(new AuditEventMessage(Cut(message.Operation), Cut(message.Outcome), Cut(message.Scope),
+            Cut(message.Principal)));
+        return new AuditEventResultMessage(accepted);
+
+        static string Cut(string value) => value.Length <= MaxAuditFieldLength ? value : value[..MaxAuditFieldLength];
     }
 
     private ValueTask<IWireMessage> GetClusterMapAsync(RpcContext context, IWireMessage request)

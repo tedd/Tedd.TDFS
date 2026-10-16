@@ -51,6 +51,7 @@ public static class MessageTypes
             => DfsOperationKind.Discover,
         MessageType.JoinCluster or MessageType.JoinClusterResult or MessageType.RegisterIncarnation or MessageType.RegisterIncarnationResult
             => DfsOperationKind.MembershipChange,
+        MessageType.AuditEvent or MessageType.AuditEventResult => DfsOperationKind.Admin,
 
         MessageType.OpenSession or MessageType.OpenSessionResult or MessageType.ReserveOperationIds or MessageType.ReserveOperationIdsResult
             => DfsOperationKind.OpenSession,

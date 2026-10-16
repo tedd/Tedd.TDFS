@@ -16,8 +16,6 @@ namespace Tedd.Tdfs.Client.Internal.Rpc;
 /// otherwise <see cref="DfsCommitOutcomeUnknownException"/> carrying the operation (and transaction) id — never a definite
 /// abort (unless the <see cref="SafetyMutations.TreatUnknownAsAborted"/> negative control is enabled).</item>
 /// </list>
-/// A transmission answered with <c>NotLeader</c> is settled (the node refuses before proposing, nothing was executed): a
-/// mutation whose every transmission was refused that way failed definitively.
 /// </summary>
 internal sealed class RpcInvoker
 {
@@ -42,8 +40,7 @@ internal sealed class RpcInvoker
     public async Task<IWireMessage> InvokeAsync(RpcRequest request, OperationScope scope)
     {
         bool mutation = request.Kind == CallKind.Mutation;
-        bool transmitted = false;   // a mutation transmission may have been executed (it is not settled by a definite refusal)
-        int unsettled = 0;
+        bool transmitted = false;   // a mutation transmission may have been executed
         Exception? leaderless = null; // a node answered that it knows no leader
         int transmissions = 0;
         int failures = 0;
@@ -175,11 +172,7 @@ internal sealed class RpcInvoker
             {
                 transmissions++;
                 request.Transmissions = transmissions;
-                if (mutation)
-                {
-                    unsettled++;
-                    transmitted = true;
-                }
+                transmitted |= mutation;
             }
 
             ReadOnlyMemory<byte> raw;
@@ -277,7 +270,6 @@ internal sealed class RpcInvoker
                 {
                     // The hook replaced an id that was definitively rejected without effect: the new id starts afresh.
                     transmitted = false;
-                    unsettled = 0;
                     transmissions = 0;
                     request.Transmissions = 0;
                     scope.OperationId = request.Operation;
@@ -289,9 +281,10 @@ internal sealed class RpcInvoker
             switch (error.Code)
             {
                 case DfsErrorCode.NotLeader:
+                    // A NotLeader answer does not settle the transmission: the network may deliver one request more than once
+                    // (test plan §3.1 fault model), and an earlier copy may have been proposed while this node still led — its
+                    // own reply lost — before this copy was refused. Only a resolution through the operation id is definite.
                     last = error.ToException(request.Path);
-                    if (mutation && --unsettled == 0)
-                        transmitted = false; // every transmission so far was refused before it was proposed
                     leaderless = error.LeaderHint is { Length: > 0 } ? null : last; // a hint means a leader exists
                     request.Router.OnNotLeader(endpoint, error.LeaderHint);
                     if (error.LeaderHint is { Length: > 0 } hint && !string.Equals(hint, endpoint, StringComparison.Ordinal) && redirects < MaxRedirects)

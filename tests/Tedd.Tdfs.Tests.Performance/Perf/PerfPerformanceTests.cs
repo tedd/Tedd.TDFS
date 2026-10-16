@@ -1191,7 +1191,10 @@ public sealed class PerfPerformanceTests
     public async Task PERF_014_BackpressureAtBandwidthLimit()
     {
         const long linkBytesPerSecond = 2L << 20;
-        await ClusterTest.RunAsync(PerfHelpers.Realtime(), async cluster =>
+        // Node data on the real filesystem (as PERF-003): the live-memory probe is process-wide, and a stream keeps its memory
+        // bounded by uploading staged chunks to the storage nodes during the writes (FSD §6.3/§15) — with simulated media those
+        // stored copies would sit in this process's managed heap and be counted as client memory.
+        await ClusterTest.RunAsync(PerfHelpers.RealtimeOnDisk(), async cluster =>
         {
             await using DfsClient client = await cluster.ConnectAsync(new TestClientOptions { Name = "c0", OperationTimeout = TimeSpan.FromSeconds(30) }, Ct);
             DfsVolume vol = client.GetVolume(Vol);

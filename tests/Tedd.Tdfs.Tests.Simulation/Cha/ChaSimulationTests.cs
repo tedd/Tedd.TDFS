@@ -2163,7 +2163,8 @@ public sealed class ChaSimulationTests
 
     /// <summary>
     /// The old leader and writer A are cut off with all their traffic captured (old-term appends/heartbeats/votes, A's
-    /// renewals, uploads and commit). The majority elects a new leader, A's lease expires, writer B commits two revisions.
+    /// renewals and commit; A's staged chunks were uploaded before the cut, so its stale receipts travel inside the captured
+    /// commit). The majority elects a new leader, A's lease expires, writer B commits two revisions.
     /// The captured traffic is then delivered in adversarial order and replayed again as delayed duplicates. Old votes,
     /// leases, receipts and outcomes never overwrite the new state: election safety and commit-index monotonicity hold
     /// throughout, A's commit is rejected, B's revision and generation stay authoritative on every replica.
@@ -2182,7 +2183,6 @@ public sealed class ChaSimulationTests
         {
             const string path = "/cha013/f";
             byte[] r1 = TestData.Bytes(13_001, MultiExtentLength);
-            byte[] aStaged = TestData.Bytes(13_002, MultiExtentLength + 30_000);
             byte[] r2 = TestData.Bytes(13_003, MultiExtentLength - 7_000);
             byte[] r3 = TestData.Bytes(13_004, MultiExtentLength - 9_000);
 
@@ -2192,6 +2192,12 @@ public sealed class ChaSimulationTests
             var bOptions = new TestClientOptions { Name = "wb", SeedNodes = Names(rest) };
             DfsClient a = await cluster.ConnectAsync(aOptions, ct);
             DfsVolume av = a.GetVolume(Vol);
+
+            // Whole logical update units: a stream uploads complete chunks early (ARCHITECTURE §9.3) and keeps a partial tail
+            // buffered until its publication, so only whole chunks make "uploaded, unpublished" true and leave the commit
+            // itself as the stale message the cut captures (a buffered tail would have to be uploaded through the cut first,
+            // and that upload, not the commit, would fail).
+            byte[] aStaged = TestData.Bytes(13_002, 4 * a.Capabilities.ChunkSize);
             await av.Directories.CreateDirectoryAsync("/cha013", ct);
             DfsStream writerA = await av.Files.OpenAsync(path, new DfsOpenOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write, Share = FileShare.Read }, ct);
             ulong generationA = writerA.WriterGeneration;
@@ -2249,6 +2255,7 @@ public sealed class ChaSimulationTests
             Log($"captured: fromOld={fromOld.Count} toOld={toOld.Count} fromA={fromA.Count}; new leader {newLeader.Name}");
 
             CapturedMessage[] captured = [.. fromA.Captured, .. fromOld.Captured, .. toOld.Captured];
+            Assert.Contains(captured, m => m.From == aOptions.NetworkName && m.Type == MessageType.CommitFile);   // the stale commit itself is delayed
             if (reverseOrder)
             {
                 fromA.ReleaseAll(reverseOrder: true);

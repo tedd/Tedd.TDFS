@@ -24,6 +24,8 @@ public static partial class MessageCodec
         Register<JoinClusterResultMessage>();
         Register<RegisterIncarnationMessage>();
         Register<RegisterIncarnationResultMessage>();
+        Register<AuditEventMessage>();
+        Register<AuditEventResultMessage>();
         Register<OpenSessionMessage>();
         Register<OpenSessionResultMessage>();
         Register<KeepAliveMessage>();

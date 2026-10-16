@@ -181,7 +181,7 @@ peer                                         server (live node or backup node)
 | Messages | Served by | Peer roles allowed |
 |---|---|---|
 | `Hello*`, `GetClusterMap`, `GetVolumeRoute` (without `RequireLeader`) | any live node; backup nodes serve their own map | all |
-| `JoinCluster`, `RegisterIncarnation` | control leader | Node |
+| `JoinCluster`, `RegisterIncarnation`, `AuditEvent` | control leader | Node |
 | `AdminRequest` | control leader (cluster/node/principal/feature ops) or volume leader (volume-scoped ops), §8.8 | Client (ClusterAdmin / VolumeAdmin) |
 | volume requests (those with a `RequestHeader`) | volume leader; backup nodes for read-only snapshot traffic and their own sessions/pins | Client |
 | `PutObject`, `GetObject`, `LocateObject` | any storage node (live node), backup node for its own objects | Client, Node |
@@ -296,6 +296,7 @@ carry an operation id; **opt** = may carry one (then retries are deduplicated); 
 | `GetClusterMap`, `GetVolumeRoute` | — | — | Read. |
 | `JoinCluster` | `AddMember` (control) | — | Idempotent per (node id, name). |
 | `RegisterIncarnation` | control registration | — | Idempotent per (node, incarnation). |
+| `AuditEvent` | `AppendAudit` (control) | — | Not deduplicated (an audit record; a retry may record the event twice). |
 | `OpenSession` | `OpenSession` | — | Same `Nonce` → same session while retained; otherwise a spare session that simply expires. |
 | `KeepAlive` | `KeepAlive` | — | Naturally idempotent. |
 | `QueryOperation` | `FenceOperation` when `Resolve` | — | Idempotent; resolved answers are definite. |
@@ -802,6 +803,32 @@ Reply to `RegisterIncarnationMessage` (sent after the registration is committed 
 | 4 | `ConfigIndex` | `varuint` | Control config index containing the registration. |
 | 5 | `PlacementEpoch` | `varuint` | Current placement epoch. |
 | 6 | — | `extensions` | Terminal extension block. |
+
+#### `AuditEvent` = 22 (`AuditEventMessage`)
+
+A security or administrative event (denied request, failed authentication, snapshot deletion) observed by a node that does
+not lead the control group, forwarded to the control leader, which records it as an `AppendAudit` control entry (node →
+control leader; members only; SEC-016). Every node bounds what it reports and forwards with the same token bucket as the
+leader's own audit records (bursts of 20, 10 per second); floods are dropped, and a forwarding failure drops the node's
+backlog (best effort). The leader cuts each field to 512 characters. Records never carry payload bytes or secrets.
+Errors: NotLeader (with a hint), AccessDenied (not a member).
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Operation` | `string` | Operation refused or performed (for example `volume:stage uploads`, `authenticate`, `volume:delete snapshot`). |
+| 2 | `Outcome` | `string` | Outcome (for example `denied`, `ok`, `failed:<code>`). |
+| 3 | `Scope` | `string` | Scope (volume, peer, snapshot, required permission). |
+| 4 | `Principal` | `string` | Principal concerned (`-` when unknown). |
+| 5 | — | `extensions` | Terminal extension block. |
+
+#### `AuditEventResult` = 23 (`AuditEventResultMessage`)
+
+Reply to `AuditEventMessage`, sent once the record is applied (or dropped).
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Accepted` | `bool` | True when the record was committed to the audit log (false: dropped by the flood bound or not committed in time). |
+| 2 | — | `extensions` | Terminal extension block. |
 
 ### 9.3 Sessions and outcomes
 

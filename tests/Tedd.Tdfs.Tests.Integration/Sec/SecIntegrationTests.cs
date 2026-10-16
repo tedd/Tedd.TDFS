@@ -180,7 +180,10 @@ public sealed class SecIntegrationTests
                 await victim.RestartAsync(o => identity == PeerIdentityCase.KnownNodeWrongSecret
                     ? o with { ClusterSecret = originalSecret }
                     : o with { CertificatePath = originalCertificate });
-                await cluster.WaitUntilAsync(async () => (await cluster.Admin.ListNodesAsync(Ct)).Single(n => n.Name == victim.Name).IsReachable,
+                // Trusted again means its new incarnation is registered (RCV-02: a node issues no receipts before that), not
+                // merely that its replication traffic is flowing again.
+                await cluster.WaitUntilAsync(async () => (await cluster.Admin.ListNodesAsync(Ct)).Single(n => n.Name == victim.Name) is { IsReachable: true } node
+                        && node.Incarnation > incarnationBefore,
                     TimeSpan.FromSeconds(30), "the node is trusted again with its correct identity");
                 await vol.Files.WriteAllBytesAsync("/after-fix-all3.bin", TestData.Bytes(104, 3 * chunk), new DfsMutationOptions { StoragePolicy = SecHelpers.AllThreePolicy }, Ct);
             }
