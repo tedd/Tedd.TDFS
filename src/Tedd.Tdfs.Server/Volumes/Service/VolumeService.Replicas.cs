@@ -28,6 +28,9 @@ internal sealed partial class VolumeService
 
     private ReplicaPlans? _plans;
 
+    /// <summary>Default-policy migration target whose completion the holders confirmed by probe, and when.</summary>
+    private (DfsStoragePolicy Target, long At)? _migrationConfirmed;
+
     /// <summary>One known copy.</summary>
     /// <param name="Incarnation">Holder incarnation the copy was reported (or receipted) under.</param>
     /// <param name="Staging">Staging session the copy is bound to.</param>
@@ -48,8 +51,15 @@ internal sealed partial class VolumeService
         /// <summary>Incarnation the knowledge below belongs to.</summary>
         public ulong Incarnation { get; set; }
 
-        /// <summary>Last proof of life under <see cref="Incarnation"/>: a complete inventory or a receipt.</summary>
+        /// <summary>Last proof of life under <see cref="Incarnation"/>: a complete inventory, a receipt or a probe answer.</summary>
         public long LastReportAt { get; set; }
+
+        /// <summary>
+        /// Leader timestamp of the last direct probe the node did not answer (0: none). A node that missed a probe after its
+        /// last proof of life is not counted as up until it proves life again: a safety answer (policy effectiveness, replica
+        /// health) never rests on a holder that just stopped answering (CHA-002).
+        /// </summary>
+        public long ProbeFailedAt { get; set; }
     }
 
     /// <summary>What a referenced object must meet.</summary>
@@ -79,6 +89,7 @@ internal sealed partial class VolumeService
         _inventoryNodes.Clear();
         _seeded.Clear();
         _plans = null;
+        _migrationConfirmed = null;
         ClearRepairState();
         ClearGcPushState();
     }
@@ -195,7 +206,8 @@ internal sealed partial class VolumeService
             return false;
         if (!_inventoryNodes.TryGetValue(node, out NodeInventory? state))
             return !ReplicaKnowledgeReady;
-        return state.Incarnation == member.Incarnation && _s.Time.GetElapsedTime(state.LastReportAt, now) <= LivenessWindow;
+        return state.Incarnation == member.Incarnation && _s.Time.GetElapsedTime(state.LastReportAt, now) <= LivenessWindow
+            && state.ProbeFailedAt <= state.LastReportAt;
     }
 
     /// <summary>
@@ -422,25 +434,46 @@ internal sealed partial class VolumeService
     /// <summary>Most objects one health query probes.</summary>
     private const int MaxProbedObjects = 4096;
 
+    /// <summary>Most of its known copies one holder is asked to confirm per health query.</summary>
+    private const int MaxConfirmedPerHolder = 64;
+
     /// <summary>
-    /// Brings the replica knowledge of under-replicated objects up to date before a health answer: asks the pool members
-    /// that are not known to hold them (<c>LocateObject</c>, one call per node) and records the copies they confirm, so an
-    /// answer never lags behind copies that already exist (a late upload, a copy made since the last inventory).
+    /// Brings the replica knowledge up to date before a health answer or a migration-completion claim: asks the pool members
+    /// that are not known to hold under-replicated objects (<c>LocateObject</c>, one call per node) and records the copies they
+    /// confirm, so an answer never lags behind copies that already exist (a late upload, a copy made since the last
+    /// inventory); and asks every holder counted as up to confirm (a sample of) its copies, so an answer never counts a holder
+    /// that stopped answering since its last inventory (CHA-002: a zone lost a moment ago is not reported as full durability).
+    /// A holder that does not answer is not counted as up until it proves life again; a copy it no longer lists is forgotten.
     /// </summary>
     private async Task ProbeDeficitsAsync(CancellationToken ct)
     {
         ControlState control = _s.Control.State;
         long now = _s.Time.GetTimestamp();
         var perNode = new Dictionary<NodeId, List<ObjectId>>();
+        var confirming = new Dictionary<NodeId, HashSet<ObjectId>>();
         var members = new Dictionary<string, IReadOnlyList<MemberRecord>>(StringComparer.Ordinal);
         int probed = 0;
         foreach (ObjectPlan plan in Plans().Objects.Values)
         {
-            if (probed >= MaxProbedObjects)
-                break;
             if (!members.TryGetValue(plan.Pool, out IReadOnlyList<MemberRecord>? poolMembers))
                 members[plan.Pool] = poolMembers = control.PoolMembers(plan.Pool);
             List<NodeId> up = UpHolders(plan.Object, control, now, includeDeleting: true);
+            foreach (NodeId holder in up)
+            {
+                if (holder == _s.NodeId)
+                    continue;
+                if (!confirming.TryGetValue(holder, out HashSet<ObjectId>? sample))
+                    confirming[holder] = sample = [];
+                if (sample.Count < MaxConfirmedPerHolder && sample.Add(plan.Object))
+                {
+                    if (!perNode.TryGetValue(holder, out List<ObjectId>? list))
+                        perNode[holder] = list = [];
+                    list.Add(plan.Object);
+                }
+            }
+
+            if (probed >= MaxProbedObjects)
+                continue;
             (int copies, int zones) = DomainsOf(control, up.Where(n => !IsDeleting(plan.Object, n) && poolMembers.Any(m => m.Id == n)));
             if (copies >= plan.Policy.TargetCopies && zones >= plan.Policy.TargetDistinctZones)
                 continue;
@@ -461,16 +494,34 @@ internal sealed partial class VolumeService
         Task<(NodeId Node, IReadOnlyList<ObjectLocation>? Locations)>[] calls = [.. perNode.Select(p => LocateOnAsync(p.Key, p.Value, ct))];
         foreach ((NodeId node, IReadOnlyList<ObjectLocation>? locations) in await Task.WhenAll(calls))
         {
-            if (locations is null || !IsLeader || Group.Term != term || control.FindMember(node) is not { IsLive: true } member)
+            if (!IsLeader || Group.Term != term || control.FindMember(node) is not { IsLive: true } member)
                 continue;
+            _inventoryNodes.TryGetValue(node, out NodeInventory? state);
+            bool current = state is not null && state.Incarnation == member.Incarnation;
+            if (locations is null)
+            {
+                // A holder counted as up did not answer: not up until its next proof of life.
+                if (current && confirming.ContainsKey(node))
+                    state!.ProbeFailedAt = Math.Max(state.ProbeFailedAt, _s.Time.GetTimestamp());
+                continue;
+            }
+
+            long answeredAt = _s.Time.GetTimestamp();
+            if (current)
+                state!.LastReportAt = Math.Max(state.LastReportAt, answeredAt);
             foreach (ObjectLocation location in locations)
             {
                 // A reply may have been computed before a deletion this leader saw confirmed meanwhile.
                 if (location.Present && !_deleted.Contains((location.Object, node)))
                 {
-                    AddHolding(location.Object, node, new Holding(member.Incarnation, location.Staging, location.Length, location.Checksum, _s.Time.GetTimestamp()));
-                    if (_inventoryNodes.TryGetValue(node, out NodeInventory? state) && state.Incarnation == member.Incarnation)
-                        state.LastReportAt = Math.Max(state.LastReportAt, _s.Time.GetTimestamp());
+                    AddHolding(location.Object, node, new Holding(member.Incarnation, location.Staging, location.Length, location.Checksum, answeredAt));
+                }
+                else if (!location.Present && confirming.TryGetValue(node, out HashSet<ObjectId>? asked) && asked.Contains(location.Object)
+                    && _holdings.TryGetValue(location.Object, out Dictionary<NodeId, Holding>? holders) && holders.TryGetValue(node, out Holding h)
+                    && h.ObservedAt < now)
+                {
+                    // The holder no longer has a copy it was credited with before this probe started.
+                    RemoveHolding(location.Object, node);
                 }
             }
         }
@@ -529,6 +580,23 @@ internal sealed partial class VolumeService
         }
 
         return pending;
+    }
+
+    /// <summary>
+    /// Before a usage report: when the default-policy migration looks complete, asks every counted holder to confirm its
+    /// copies (<see cref="ProbeDeficitsAsync"/>); only a completion confirmed this way is reported to the control leader, so
+    /// the policy is never declared effective on copies of a holder that stopped answering since its last inventory
+    /// (FSD §10.2, CHA-002).
+    /// </summary>
+    public async Task ConfirmMigrationAsync(CancellationToken ct)
+    {
+        _migrationConfirmed = null;
+        if (!IsLeader || _readyTerm != Group.Term || !ReplicaKnowledgeReady || Record.MigrationTarget is not { } target || PendingMigrationObjects(target) != 0)
+            return;
+        ulong term = Group.Term;
+        await ProbeDeficitsAsync(ct);
+        if (IsLeader && Group.Term == term && Record.MigrationTarget == target && PendingMigrationObjects(target) == 0)
+            _migrationConfirmed = (target, _s.Time.GetTimestamp());
     }
 
     /// <summary>
@@ -605,7 +673,9 @@ internal sealed partial class VolumeService
             nodes.Add(new NodeHoldingReport(node, IsUp(node, control, now), objects, bytes, neededForAck));
         }
 
-        DfsStoragePolicy? completed = record.MigrationTarget is { } target && PendingMigrationObjects(target) == 0 ? target : null;
+        // A completion is claimed only right after the holders confirmed it (ConfirmMigrationAsync).
+        DfsStoragePolicy? completed = record.MigrationTarget is { } target && _migrationConfirmed is { } confirmed && confirmed.Target == target
+            && _s.Time.GetElapsedTime(confirmed.At, now) <= _s.Timings.InventoryInterval && PendingMigrationObjects(target) == 0 ? target : null;
         return new VolumeUsageReport(record.Id, record.Epoch, Group.Term, control.PlacementEpoch, completed, pools, nodes);
     }
 

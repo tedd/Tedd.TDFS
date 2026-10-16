@@ -34,6 +34,23 @@ internal sealed class UsageReporter
         _running = true;
         try
         {
+            // Migration completions are claimed only on holder-confirmed knowledge (CHA-002).
+            foreach (VolumeHost host in _s.Volumes.Hosts)
+            {
+                if (host.Service is { IsLeader: true } leading && !host.Group.IsClosed)
+                {
+                    using CancellationTokenSource confirmDeadline = _s.CreateDeadline();
+                    try
+                    {
+                        await leading.ConfirmMigrationAsync(confirmDeadline.Token);
+                    }
+                    catch (Exception ex) when (ex is DfsException or IOException or TimeoutException or OperationCanceledException)
+                    {
+                        _s.Debug("usage", NodeServices.Inv($"Migration confirmation of {host.Name} failed: {ex.GetType().Name}: {ex.Message}"));
+                    }
+                }
+            }
+
             (ReportUsageMessage report, List<(VolumeService Service, ulong Term)> reported) = Build();
             ReportUsageResultMessage? reply = null;
             if (_s.Control.IsLeader)
