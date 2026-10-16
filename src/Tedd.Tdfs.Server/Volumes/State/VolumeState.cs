@@ -151,11 +151,13 @@ internal sealed record VolumeState
 
     /// <summary>
     /// True when the operation ids of <paramref name="session"/> (no longer a live session here) are expired: a session this
-    /// volume issued and retired since, or, in a volume restored from another authority's history, a session numbered below
-    /// this authority's first session (issued by an earlier authority, whose outcomes are not retained here). Any other
-    /// session number was never issued to anyone this volume continues from.
+    /// volume issued and retired since, or, in a volume restored from another authority's history, any session this
+    /// authority did not issue (earlier authorities numbered theirs from their own bases, above or below this one's; their
+    /// outcomes are not retained here, and an operation of theirs may be part of the restored history, so it is never
+    /// reported as unknown to this volume — RST-008). In a volume that continues no other history, any other session number
+    /// was never issued to anyone this volume continues from.
     /// </summary>
-    public bool ExpiredSession(ulong session) => session < NextSessionId && (session >= FirstSessionId || Restore is not null);
+    public bool ExpiredSession(ulong session) => (session < NextSessionId && session >= FirstSessionId) || Restore is not null;
 
     /// <summary>
     /// The first session id of a volume authority (volume id and epoch): sessions, and therefore operation and transaction ids,
