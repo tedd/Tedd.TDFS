@@ -38,6 +38,17 @@ internal sealed class ConnectionPool
         }
     }
 
+    /// <summary>
+    /// True when a pooled connection to <paramref name="endpoint"/> was lost (closed by the transport or the peer, not
+    /// invalidated by this client) after <paramref name="since"/> (a client clock timestamp): the node at the endpoint may
+    /// have restarted, so what was learned from it before (such as which node leads a group) may be stale.
+    /// </summary>
+    public bool LostSince(string endpoint, long since)
+    {
+        lock (_sync)
+            return _slots.TryGetValue(endpoint, out Slot? slot) && slot.LostAt != 0 && slot.LostAt >= since;
+    }
+
     /// <summary>Returns a pooled usable connection to <paramref name="endpoint"/> without connecting, if one exists.</summary>
     public bool TryGetOpen(string endpoint, out ClientConnection connection)
     {
@@ -304,7 +315,10 @@ internal sealed class ConnectionPool
             lock (_sync)
             {
                 if (ReferenceEquals(slot.Connection, opened))
+                {
                     Forget(slot, opened);
+                    slot.LostAt = _runtime.Time.GetTimestamp();
+                }
             }
         };
         return opened;
@@ -317,5 +331,6 @@ internal sealed class ConnectionPool
         public CancellationTokenSource? PendingAbandon;
         public long PendingStarted;
         public TimeSpan LastRoundTrip; // of the endpoint's previous connection (zero when none was ever open)
+        public long LostAt;            // when a pooled connection was last lost (0: never)
     }
 }
