@@ -268,13 +268,14 @@ internal sealed class BackupDispatcher : IRpcHandler
             return new ErrorReplyMessage(DfsErrorCode.ClusterMismatch, $"This backup node holds backups of cluster {clusterId}, not {hello.ExpectedClusterId}.");
         }
 
-        int low = Math.Max((int)hello.ProtocolMin, ProtocolInfo.MinSupportedVersion);
-        int high = Math.Min((int)hello.ProtocolMax, ProtocolInfo.CurrentVersion);
+        Runtime.NodeRelease release = _s.Release;
+        int low = Math.Max((int)hello.ProtocolMin, release.ProtocolMin);
+        int high = Math.Min((int)hello.ProtocolMax, release.ProtocolMax);
         if (low > high)
         {
             Reject(state);
             return new ErrorReplyMessage(DfsErrorCode.Unsupported,
-                $"No common protocol version: peer {hello.ProtocolMin}..{hello.ProtocolMax}, server {ProtocolInfo.MinSupportedVersion}..{ProtocolInfo.CurrentVersion}.");
+                $"No common protocol version: peer {hello.ProtocolMin}..{hello.ProtocolMax}, server {release.ProtocolMin}..{release.ProtocolMax}.");
         }
 
         if (hello.Role is not (PeerRole.Client or PeerRole.Backup))

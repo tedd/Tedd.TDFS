@@ -430,6 +430,7 @@ public sealed partial class TestCluster
             Faults = Faults.Injector,
             Log = log,
             LoopFactory = Runtime.CreateLoopFactory(log),
+            Release = ReleaseOf(node.SoftwareVersion),
         };
     }
 

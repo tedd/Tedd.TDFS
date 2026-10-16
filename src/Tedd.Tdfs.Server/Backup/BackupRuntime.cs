@@ -52,6 +52,15 @@ internal sealed class BackupRuntime
     {
         BackupServices s = Services;
         BackupNodeOptions options = s.Options;
+
+        // A release that cannot read the formats this build stores (object segments, catalog) refuses before anything is
+        // written: its durable image stays byte-for-byte unchanged (FMT-010).
+        if (s.Release.MaxReadableFormat < ObjectStore.FormatVersion)
+        {
+            throw new DfsException(DfsErrorCode.Unsupported,
+                BackupServices.Inv($"Backup node {options.Name}: release {s.Release.Name} reads formats up to {s.Release.MaxReadableFormat}; the backup store uses format {ObjectStore.FormatVersion}."));
+        }
+
         await s.Medium.CreateDirectoryDurableAsync(options.DataDirectory, ct);
         s.Keys = await BackupKeys.LoadOrCreateAsync(s.Medium, options.DataDirectory, options.BackupSecret, s.Random, ct);
         s.Disposables.Add(s.Keys);

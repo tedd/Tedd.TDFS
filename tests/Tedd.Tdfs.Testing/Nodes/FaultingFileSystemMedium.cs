@@ -130,11 +130,16 @@ internal sealed class FaultingFileSystemMedium : IStorageMedium
         }
     }
 
-    /// <summary>The bytes of a file as they are on disk now.</summary>
+    /// <summary>The bytes of a file as they are on disk now (also while the node holds it open for writing).</summary>
     public byte[] ReadRaw(string path)
     {
         lock (_gate)
-            return File.ReadAllBytes(Full(StoragePath.Normalize(path)));
+        {
+            using var stream = new FileStream(Full(StoragePath.Normalize(path)), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var copy = new MemoryStream();
+            stream.CopyTo(copy);
+            return copy.ToArray();
+        }
     }
 
     /// <summary>XORs one stored byte of a file (media corruption).</summary>
