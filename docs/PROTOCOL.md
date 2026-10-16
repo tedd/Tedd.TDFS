@@ -270,8 +270,10 @@ Every volume-scoped request (39 types, all implementing `IVolumeRequest`) starts
   (`OperationExpired`, `LeaseLost` or `EpochMismatch`, for SDK and application ids alike) does not settle the outcome,
   because an earlier transmission may have committed before its outcome was retired, its session expired or its volume
   was re-created: the SDK resolves it through the operation id (`QueryOperation` with `Resolve`) while time allows.
-  A committed outcome is the result; an id the query fenced (it never executed and never will) reports the rejection;
-  anything else is an unknown outcome (`DfsCommitOutcomeUnknownException`). An unexpected (non-error) reply type to a transmitted
+  A committed outcome is the result; an id the query fenced (it never executed and never will) reports the rejection; an
+  id the query reports `Expired` (outside the retained outcome window: its outcome can no longer be learned, and it is
+  never replayed) reports the explicit expired-outcome error `OperationExpired` (FSD §13; neither an abort nor a commit
+  claim); anything else is an unknown outcome (`DfsCommitOutcomeUnknownException`). An unexpected (non-error) reply type to a transmitted
   mutation is likewise an unknown outcome.
 * **Volume binding of retries.** Every transmission of one operation id carries the same `ExpectedVolumeId` /
   `ExpectedVolumeEpoch`: those of the session the id belongs to (an application id: those of its first transmission).
