@@ -43,6 +43,7 @@ internal sealed class DatagramRelay : IAsyncDisposable
     private readonly Task _forward;
     private readonly Task _backward;
     private EndPoint? _client;
+    private int _disposed;
 
     private sealed record Armed(RelayDirection Direction, MessageRule Rule, string Description, long ArmedAt);
 
@@ -84,7 +85,7 @@ internal sealed class DatagramRelay : IAsyncDisposable
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
-        if (_stop.IsCancellationRequested)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
         await _stop.CancelAsync().ConfigureAwait(false);
         _front.Dispose();

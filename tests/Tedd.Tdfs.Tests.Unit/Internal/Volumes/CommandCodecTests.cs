@@ -66,6 +66,7 @@ public sealed class CommandCodecTests
             VolumeCommandKind.AcquirePin => new AcquirePinCommand(PinKind.Enumeration, 3, null, 1, "bind", null),
             VolumeCommandKind.ReleasePin => new ReleasePinCommand(4),
             VolumeCommandKind.ExpirePins => new ExpirePinsCommand([4, 5]),
+            VolumeCommandKind.ExpireSnapshots => new ExpireSnapshotsCommand(["a", "snap"]),
             VolumeCommandKind.PruneDerefLog => new PruneDerefLogCommand(99),
             VolumeCommandKind.RestoreChunk => new RestoreChunkCommand("src", 3, [SampleInode]),
             VolumeCommandKind.RestoreComplete => new RestoreCompleteCommand("src", 1),
@@ -88,6 +89,17 @@ public sealed class CommandCodecTests
             _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "no sample"),
         };
         return command with { LeaderTime = Epoch0.AddTicks(12345), Op = Op("p", 3, 9, DfsOperationKind.Copy, new UInt128(7, 8), groups: "g") };
+    }
+
+    [Fact]
+    public void FencingFallbackRoundTripsAsAnOptionalExtension()
+    {
+        VolumeCommand command = Sample(VolumeCommandKind.CommitFile) with { FencingFallback = new StreamKey(42, "s") };
+        byte[] encoded = CommandCodec.Encode(command);
+        VolumeCommand decoded = CommandCodec.Decode(encoded);
+        Assert.Equal(new StreamKey(42, "s"), decoded.FencingFallback);
+        Assert.Equal(encoded, CommandCodec.Encode(decoded));
+        Assert.Null(CommandCodec.Decode(CommandCodec.Encode(Sample(VolumeCommandKind.CommitFile))).FencingFallback);
     }
 
     [Theory]

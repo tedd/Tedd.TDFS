@@ -2186,8 +2186,9 @@ public sealed class BAKSimulationTests
             // Tokens of other volumes or epochs are not ordered against this volume's checkpoints.
             CommitToken foreign = await live.GetVolume("other").Files.WriteAllBytesAsync("/f.bin", TestData.Bytes(222, 1000), Ct);
             Assert.False(foreign.IsComparableWith(t));
+            // CrossVolume/ClusterMismatch are the typed rejections of another volume's or cluster's token (SNP-010).
             static bool IsTokenRejection(Exception ex) =>
-                ex is ArgumentException || ex is DfsException { ErrorCode: DfsErrorCode.InvalidArgument or DfsErrorCode.EpochMismatch };
+                ex is ArgumentException || ex is DfsException { ErrorCode: DfsErrorCode.InvalidArgument or DfsErrorCode.EpochMismatch or DfsErrorCode.CrossVolume or DfsErrorCode.ClusterMismatch };
             await AssertRefusedAsync(() => vol.Backups.AwaitBackupAsync(b0.TargetName, foreign, ShortAwait, Ct), IsTokenRejection,
                 "a token of another volume must be rejected, not compared");
             CommitToken otherEpoch = t with { VolumeEpoch = t.VolumeEpoch + 1 };
