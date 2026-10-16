@@ -158,6 +158,21 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// The session's retained outcomes retire as well (outcome retention elapsed): queries of its ids answer
+    /// <c>Expired</c> and nothing can be fenced any more.
+    /// </summary>
+    public void RetireSessionOutcomes(ulong session)
+    {
+        lock (_sync)
+        {
+            if (!_sessions.TryGetValue(session, out SessionState? state))
+                return;
+            state.Retired = true;
+            state.Outcomes.Clear();
+        }
+    }
+
     /// <summary>Opens a live read handle on <paramref name="path"/> owned by <paramref name="session"/> (as if that session had opened it).</summary>
     public ulong OpenHandleDirect(string path, ulong session)
     {
@@ -475,6 +490,8 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
             return QueryTransaction(query);
         if (!_sessions.TryGetValue(target.Session, out SessionState? session))
             return new QueryOperationResultMessage(target, WireOutcomeStatus.NotFound, CommitToken.None, DfsErrorCode.None, null, DfsOperationKind.Unknown, default);
+        if (session.Retired)
+            return new QueryOperationResultMessage(target, WireOutcomeStatus.Expired, CommitToken.None, DfsErrorCode.None, null, DfsOperationKind.Unknown, default);
         if (session.Outcomes.TryGetValue(target.Sequence, out Outcome? outcome))
         {
             if (outcome.Success)
@@ -928,6 +945,8 @@ internal sealed class FakeCluster : IRpcHandler, IAsyncDisposable
         public ulong Highest { get; set; }
 
         public bool Expired { get; set; }
+
+        public bool Retired { get; set; }
 
         public ulong MaxWatermark { get; set; }
 

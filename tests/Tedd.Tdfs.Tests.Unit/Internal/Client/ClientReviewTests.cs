@@ -190,6 +190,7 @@ public sealed class ClientReviewTests
                 {
                     expired = true;
                     cluster.ExpireSession(id.Session);
+                    cluster.RetireSessionOutcomes(id.Session);
                 }
             };
             policy.Drop(MessageType.WriteAllResult, LinkDirection.Reply);
