@@ -81,8 +81,10 @@ Dispatcher rules (handlers only see authenticated, authorized requests):
 
 * Requests are refused with retryable `Unavailable` until `IsServing` and while stopping; unknown types → `Unsupported`.
 * `Client`: the principal must still exist. `Node`: a live member with its registered incarnation and boot id (removed
-  → `AccessDenied`, older incarnation/other boot → `StaleIncarnation`). `JoiningNode`: also nodes that proved the cluster
-  secret but are not (yet) in this node's applied view (seed join, Raft traffic only). `Backup`: backup principals.
+  → `AccessDenied`, older incarnation/other boot → `StaleIncarnation`), on connections it opened and on connections this
+  node opened to it alike (the server's boot id travels in a `HelloChallenge` extension; a server without it is checked by
+  incarnation only). `JoiningNode`: also nodes that proved the
+  cluster secret but are not (yet) in this node's applied view (seed join, Raft traffic only). `Backup`: backup principals.
 * The dispatcher hits `F04 rpc.request.accepted` before and `F13 rpc.reply.send` after the handler (not for Raft traffic).
   An injector may throw `FaultReplyDroppedException` (Core, `Tedd.Tdfs.Faults`) at F13: the request was executed and no
   reply is sent. Handlers that send replies themselves must honour the same exception.

@@ -250,7 +250,8 @@ internal sealed class PeerConnections
             connection = await transport.ConnectAsync(endpoint, ct);
             HandshakeOutcome outcome = await HandshakeClient.AuthenticateNodeAsync(connection, _s.CreateNodeCredentials(), expectedPeer, _s.Random,
                 DefaultCallTimeout, ct);
-            _s.Rpc.RegisterOutbound(connection, outcome.ServerIdentity);
+            RefuseStaleServer(outcome);
+            _s.Rpc.RegisterOutbound(connection, outcome.ServerIdentity, outcome.Challenge.ServerBootId);
             IRpcConnection opened = connection;
             connection.Closed += (c, _) => _s.Loop.Post(() =>
             {
@@ -290,6 +291,26 @@ internal sealed class PeerConnections
             if (ex is DfsException or UnauthorizedAccessException)
                 throw;
             throw new DfsUnavailableException(DfsErrorCode.NodeUnavailable, $"Connecting to {endpoint} failed: {ex.Message}", ex);
+        }
+    }
+
+    /// <summary>
+    /// The answering process is an older incarnation of its member, or the registered incarnation started from a cloned disk
+    /// (another boot id): it is fenced exactly as the answering side fences such a peer (RSY-021), so nothing is sent to it
+    /// (it would otherwise receive the log and its answers would count) and the connect backs off. A server that presents no
+    /// boot id (a version that predates the challenge extension) is checked by its incarnation only.
+    /// </summary>
+    private void RefuseStaleServer(HandshakeOutcome outcome)
+    {
+        if (outcome.ServerIdentity.NodeId is not { } id || _s.Control?.State.FindMember(id) is not { } member)
+            return;
+        ulong incarnation = outcome.ServerIdentity.Incarnation;
+        if (incarnation < member.Incarnation
+            || (incarnation == member.Incarnation && member.BootId != UInt128.Zero && outcome.Challenge.ServerBootId != UInt128.Zero
+                && outcome.Challenge.ServerBootId != member.BootId))
+        {
+            throw new DfsException(DfsErrorCode.StaleIncarnation,
+                NodeServices.Inv($"Incarnation {incarnation} of {member.Name} is stale (registered {member.Incarnation}) or runs from a cloned disk."));
         }
     }
 

@@ -72,6 +72,11 @@ internal sealed partial class RpcDispatcher
         IReadOnlySet<string> features = control.Features.Where(hello.Features.Contains).ToHashSet(StringComparer.Ordinal);
         var challenge = new HelloChallengeMessage(_s.ClusterId, control.ClusterName, (ushort)high, features, _s.NodeName, PeerRole.Node, _s.NodeId,
             _s.Incarnation, _s.Random.NextBytes(ProtocolInfo.NonceSize), salt, iterations);
+
+        // A node peer learns this process's boot id, so that it fences a process started from a cloned disk on connections it
+        // opened too (RSY-021).
+        if (hello.Role == PeerRole.Node)
+            challenge = challenge.WithServerBootId(_s.BootId);
         byte[] challengeFrame = MessageCodec.Encode(challenge);
         state.Hello = hello;
         state.HelloFrame = frame;

@@ -119,6 +119,48 @@ public sealed class ConModelsTests
         }
     }
 
+    /// <summary>
+    /// The reduction may discard a message only if it can never have an effect again. A candidate can still win the term it
+    /// campaigns in, and the stale-leader answer a node sends with its newer term reaches a former leader that campaigns in
+    /// exactly that term: the answer must stay in flight while the recipient is that candidate and take effect once it
+    /// leads (it marks the follower recently active). Schedule: n0 leads term 1, its append to n2 is delayed; n1 moves n0
+    /// to term 2; n0 campaigns in term 3 and n2 joins term 3 by granting its vote; the delayed append reaches n2.
+    /// </summary>
+    [Fact, Catalog("CON-001", "M", "INV-03", "INV-18")]
+    public void CON_001_ElectionSafety_ReductionKeepsAnswersACandidateCanStillUse()
+    {
+        var bounds = new RaftModelBounds(3, PreVote: false, CheckQuorum: false, Timeouts: 3, Heartbeats: 0, Proposals: 0, Drops: 0, Duplicates: 0,
+            Crashes: 0);
+        var cluster = new RaftModelCluster(bounds, SeededRandom.DeriveSeed(0xC0_0001, "reduction-candidate-answer"));
+
+        cluster.Apply("timeout n0");
+        Deliver("VoteReq n0->n1 t1");
+        Deliver("VoteResp n1->n0 t1");
+        Assert.Equal(RaftRole.Leader, cluster.RoleOf(0));
+        cluster.Apply("timeout n1");
+        Deliver("VoteReq n1->n0 t2");          // n0 follows term 2 (n1's log is behind: no vote)
+        cluster.Apply("timeout n0");           // n0 campaigns in term 3
+        Assert.Equal(RaftRole.Candidate, cluster.RoleOf(0));
+        Deliver("VoteReq n0->n2 t3");          // n2 joins term 3 and grants its vote
+        Deliver("Append n0->n2 t1");           // the delayed append of term 1: n2 answers with term 3
+        Assert.Null(cluster.Violation);
+
+        const string answer = "AppendResp n2->n0 t3";
+        Assert.True(Find(answer) is not null, $"the answer of term 3 to the candidate of term 3 was discarded; in flight: {string.Join(" | ", cluster.EnabledActions())}");
+        Deliver("VoteResp n2->n0 t3");
+        Assert.Equal(RaftRole.Leader, cluster.RoleOf(0));
+        string before = cluster.DescribeCore(0);
+        Deliver(answer);
+        Assert.Null(cluster.Violation);
+        Assert.NotEqual(before, cluster.DescribeCore(0));   // the answer had an effect: it was not dead
+
+        string? Find(string prefix) =>
+            cluster.EnabledActions().FirstOrDefault(a => a.StartsWith("deliver " + prefix + " ", StringComparison.Ordinal));
+
+        void Deliver(string prefix) =>
+            cluster.Apply(Find(prefix) ?? throw new InvalidOperationException($"no '{prefix}' in flight: {string.Join(" | ", cluster.EnabledActions())}"));
+    }
+
     public static TheoryData<int, ulong> RandomizedSeeds()
     {
         var data = new TheoryData<int, ulong>();

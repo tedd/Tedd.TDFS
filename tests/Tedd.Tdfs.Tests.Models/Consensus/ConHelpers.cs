@@ -108,7 +108,13 @@ internal sealed class RaftModelState(RaftModelCluster cluster, SubsumptionKey ke
 /// that only apply once a budget is spent, on the consumed budgets, so the state with no more consumed budget discards
 /// no more), and the invariants depend on the core alone; so a state simulated by one already visited has no behaviour
 /// of its own to explore. In particular message loss, explicit or as a message that is never delivered, is covered by the
-/// state that still holds the message.</para>
+/// state that still holds the message. Proposed commands are numbered by the consumed proposal budget, so the simulating
+/// state proposes the same commands under lower numbers; none of the numbers it then uses occurs in the simulated state
+/// (every command there also occurs in the simulating state, in its core or in a message it holds, and so was numbered
+/// below its count), so the two futures correspond under an injective renaming of commands, which every checked property
+/// is invariant under. Interchangeable term notifications (see <see cref="PruneDeadMessages"/>) are related the same
+/// way: the simulating state may keep another member of the same class, with the same effect whenever it is
+/// delivered.</para>
 /// </remarks>
 internal sealed class RaftModelCluster
 {
@@ -229,6 +235,12 @@ internal sealed class RaftModelCluster
     /// <summary>True when some running core currently believes it is the leader.</summary>
     public bool AnyLeader => _nodes.Any(n => n is not null && n.Role == RaftRole.Leader);
 
+    /// <summary>The role of node <paramref name="i"/> (null while it is crashed).</summary>
+    public RaftRole? RoleOf(int i) => _nodes[i]?.Role;
+
+    /// <summary>The canonical description of node <paramref name="i"/>'s core (reduction tests).</summary>
+    public string DescribeCore(int i) => _nodes[i]?.DescribeCanonicalState(abstractElectionTimer: true, Name) ?? "crashed";
+
     /// <summary>First invariant violation observed, or null.</summary>
     public string? Violation => _violation;
 
@@ -330,7 +342,10 @@ internal sealed class RaftModelCluster
     /// <item>a (non-pre-vote) <see cref="VoteResponse"/> of the recipient's current term counts only while the recipient is the
     /// candidate of that term (it can never become one again in that term);</item>
     /// <item>an append, heartbeat or snapshot response of the recipient's current term counts only while the recipient leads
-    /// that term (a node never leads a term again after it stopped leading it).</item>
+    /// that term or is its candidate (a node never leads a term again after it stopped leading it, and only the candidate of
+    /// a term can still come to lead it). A candidate does receive such answers: a node that led an earlier term gets the
+    /// stale-leader answer <c>RaftNode.Step</c> sends with the answering node's newer term, which can be the term it
+    /// campaigns in, and that answer still reaches it after it won (it then marks the follower recently active).</item>
     /// </list>
     /// A pre-vote response stays relevant while its future term is above the recipient's term: a pre-candidate may start
     /// another pre-vote round in the same term.
@@ -402,7 +417,8 @@ internal sealed class RaftModelCluster
             VoteResponse { PreVote: true, Reject: false } when r.TermsFixed => true,
             VoteResponse { PreVote: true } => m.Term < term || (r.TermsFixed && m.Term <= term),
             VoteResponse => m.Term < term || (m.Term == term && role != RaftRole.Candidate),
-            AppendResponse or HeartbeatResponse or InstallSnapshotResponse => m.Term < term || (m.Term == term && role != RaftRole.Leader)
+            AppendResponse or HeartbeatResponse or InstallSnapshotResponse => m.Term < term
+                || (m.Term == term && role is not (RaftRole.Leader or RaftRole.Candidate))
                 || (node is not null && node.IsSpentLeaderAnswer(m, r.LogsFixed, r.TicksOver)),
             TimeoutNow => m.Term < term,
             VoteRequest { PreVote: true } => r.TermsFixed && TermOf(_indexOf[m.From]) == r.MaxTerm,
@@ -435,14 +451,25 @@ internal sealed class RaftModelCluster
         RaftNode copy = node.Clone(_logs[to], CreateRandom(to));
         copy.Step(entry.Message);
         IReadOnlyList<RaftMessage> answers = [];
-        if (copy.HasReady())
+        string after;
+        RaftReady? ready = copy.HasReady() ? copy.GetReady() : null;
+        if (ready is { HardState: not null } or { EntriesToPersist.Count: > 0 } or { CommittedEntries.Count: > 0 } or { SnapshotToInstall: not null }
+            or { ReadStates.Count: > 0 })
         {
-            RaftReady ready = copy.GetReady();
-            answers = ready.Messages;
-            copy.Advance(ready);
+            // Durable or applied work: the copy is not advanced past it (nothing was persisted for it); it changed.
+            after = "<ready with durable or applied work>";
+        }
+        else
+        {
+            if (ready is not null)
+            {
+                answers = ready.Messages;
+                copy.Advance(ready);
+            }
+
+            after = copy.DescribeCanonicalState(abstractElectionTimer: true, Name);
         }
 
-        string after = copy.DescribeCanonicalState(abstractElectionTimer: true, Name);
         if (!string.Equals(before, after, StringComparison.Ordinal))
         {
             _violation = $"model reduction: '{entry.Key}' was discarded as a message that can never have an effect, but delivering it to n{to} "

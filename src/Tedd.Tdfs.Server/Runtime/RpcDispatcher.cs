@@ -151,11 +151,16 @@ internal sealed partial class RpcDispatcher : IRpcHandler
     /// <summary>True when a handler for <paramref name="type"/> is registered.</summary>
     public bool IsRegistered(MessageType type) => _handlers.ContainsKey(type);
 
-    /// <summary>Records an outbound connection authenticated by this node as a trusted channel for inbound messages.</summary>
-    public void RegisterOutbound(IRpcConnection connection, RpcPeerIdentity identity)
+    /// <summary>
+    /// Records an outbound connection authenticated by this node as a trusted channel for inbound messages;
+    /// <paramref name="bootId"/> is the boot id the server presented in its (authenticated) challenge, checked like an
+    /// inbound peer's (RSY-021).
+    /// </summary>
+    public void RegisterOutbound(IRpcConnection connection, RpcPeerIdentity identity, UInt128 bootId)
     {
         ConnectionState state = GetState(connection, outbound: true);
         state.Identity = identity;
+        state.BootId = bootId;
         state.Phase = HandshakePhase.Authenticated;
     }
 
@@ -404,8 +409,12 @@ internal sealed partial class RpcDispatcher : IRpcHandler
                 return new ErrorReplyMessage(DfsErrorCode.AccessDenied, $"Node {member.Name} was removed from the cluster.");
             }
 
+            // The boot id is known in both directions (the opener's Hello, the server's challenge extension): a process started
+            // from a cloned disk is fenced whichever side opened the connection (RSY-021). A server that presented no boot id
+            // (a version that predates the extension) is checked by its incarnation only.
+            bool bootIdKnown = !state.Outbound || state.BootId != UInt128.Zero;
             if (identity.Incarnation < member.Incarnation
-                || (!state.Outbound && identity.Incarnation == member.Incarnation && member.BootId != UInt128.Zero && state.BootId != member.BootId))
+                || (bootIdKnown && identity.Incarnation == member.Incarnation && member.BootId != UInt128.Zero && state.BootId != member.BootId))
             {
                 Reject(state);
                 return new ErrorReplyMessage(DfsErrorCode.StaleIncarnation,
