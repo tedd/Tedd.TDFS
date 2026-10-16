@@ -4,7 +4,10 @@ namespace Tedd.Tdfs.Storage;
 /// <param name="SegmentSize">Target size of a packed segment file before a new one is started.</param>
 /// <param name="ReservedBytes">Space kept free for journals, checkpoints, compaction and repair; uploads fail with capacity errors before touching it.</param>
 /// <param name="MaxObjectSize">Largest accepted object (plaintext bytes).</param>
-/// <param name="Cipher">Record cipher for encryption at rest; null stores plaintext.</param>
+/// <param name="Cipher">
+/// Node-wide record cipher for encryption at rest; null stores plaintext unless <see cref="VolumeKeys"/> is set. With
+/// <see cref="VolumeKeys"/> it only decrypts records sealed before per-volume keys were used (<see cref="ObjectEncoding.SealedUnits"/>).
+/// </param>
 public sealed record ObjectStoreOptions(long SegmentSize = 64 << 20, long ReservedBytes = 16 << 20, int MaxObjectSize = 4 << 20, IRecordCipher? Cipher = null)
 {
     /// <summary>
@@ -13,6 +16,13 @@ public sealed record ObjectStoreOptions(long SegmentSize = 64 << 20, long Reserv
     /// stored plaintext bytes without verifying unit checksums).
     /// </summary>
     public SafetyMutations Mutations { get; init; } = SafetyMutations.None;
+
+    /// <summary>
+    /// Per-volume data-encryption keys (ARCHITECTURE §11). When set, new records are sealed with a key version of their
+    /// owning volume (<see cref="ObjectEncoding.SealedVolumeUnits"/>, the version recorded in the record header) instead of
+    /// <see cref="Cipher"/>.
+    /// </summary>
+    public IVolumeKeyProvider? VolumeKeys { get; init; }
 
     /// <summary>Node name reported in fault-injection contexts.</summary>
     public string NodeName { get; init; } = "local";

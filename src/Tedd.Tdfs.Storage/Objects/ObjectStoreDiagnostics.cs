@@ -8,6 +8,12 @@ public static class ObjectEncoding
 
     /// <summary>Payload sealed per 64 KiB unit with the store's <see cref="IRecordCipher"/> (nonce + ciphertext + tag per unit).</summary>
     public const byte SealedUnits = 1;
+
+    /// <summary>
+    /// Payload sealed per 64 KiB unit with a data-encryption key of the owning volume (<see cref="IVolumeKeyProvider"/>);
+    /// <see cref="ObjectRecordInfo.KeyVersion"/> is the volume's key version. Same unit layout as <see cref="SealedUnits"/>.
+    /// </summary>
+    public const byte SealedVolumeUnits = 2;
 }
 
 /// <summary>Physical placement of an object record (diagnostics and corruption tests).</summary>

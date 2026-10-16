@@ -35,12 +35,30 @@ internal sealed class Capabilities
     /// </summary>
     private DateTimeOffset Now => _wallAnchor + _time.GetElapsedTime(_monotonicAnchor);
 
-    /// <summary>A signed staging capability for one open staging session.</summary>
-    public byte[] IssueStaging(VolumeRecord volume, string principal, StagingId staging, TimeSpan lifetime, out DateTimeOffset expires)
+    /// <summary>
+    /// A signed staging capability for one open staging session. It requires storage nodes to seal the session's objects
+    /// with at least the volume's current data-key version (<see cref="DataCapability.MinimumKeyVersion"/>).
+    /// </summary>
+    /// <param name="volume">The volume.</param>
+    /// <param name="principal">Principal the capability is issued to.</param>
+    /// <param name="staging">The open staging session.</param>
+    /// <param name="lifetime">Validity.</param>
+    /// <param name="expires">Expiry on this node's capability clock.</param>
+    /// <param name="minimumKeyVersion">Required data-key version (null = the record's current version).</param>
+    public byte[] IssueStaging(VolumeRecord volume, string principal, StagingId staging, TimeSpan lifetime, out DateTimeOffset expires,
+        uint? minimumKeyVersion = null)
     {
         ArgumentNullException.ThrowIfNull(volume);
         expires = Now + lifetime;
-        return DataCapability.ForStaging(_clusterId(), volume.Id, volume.Epoch, principal, staging, expires).Sign(_keys.CapabilityKey).Encode();
+        return DataCapability.ForStaging(_clusterId(), volume.Id, volume.Epoch, principal, staging, expires)
+            .WithMinimumKeyVersion(minimumKeyVersion ?? volume.CurrentKeyVersion).Sign(_keys.CapabilityKey).Encode();
+    }
+
+    /// <summary>The data-key version a verified staging capability requires (0 for none).</summary>
+    public static uint MinimumKeyVersion(DataCapability capability)
+    {
+        ArgumentNullException.ThrowIfNull(capability);
+        return capability.Kind == DataCapabilityKind.Staging ? capability.MinimumKeyVersion : 0;
     }
 
     /// <summary>A signed read capability for exactly <paramref name="objects"/>.</summary>

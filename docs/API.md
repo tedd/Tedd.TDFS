@@ -790,7 +790,12 @@ public sealed class ObjectStore : IAsyncDisposable   // used by NodeHost; tests 
     public ValueTask CompactAsync(CancellationToken ct = default);
     public long LiveBytes { get; } public long TotalBytes { get; }
 }
-public sealed record ObjectStoreOptions(long SegmentSize = 64 << 20, long ReservedBytes = 16 << 20, int MaxObjectSize = 4 << 20, IRecordCipher? Cipher = null);
+public sealed record ObjectStoreOptions(long SegmentSize = 64 << 20, long ReservedBytes = 16 << 20, int MaxObjectSize = 4 << 20, IRecordCipher? Cipher = null)
+{
+    public IVolumeKeyProvider? VolumeKeys { get; init; }   // per-volume DEKs: new records sealed with the volume's key (ObjectEncoding.SealedVolumeUnits = 2)
+}
+public interface IVolumeKeyProvider { IRecordCipher? GetCipher(VolumeId volume); }   // null = no key material for the volume
+// ObjectStore.PutAsync(id, volume, staging, plaintext, operation, admission, uint keyVersion, ct, volumeName): explicit key version (0 = current)
 public sealed record ScrubResult(int Checked, IReadOnlyList<ObjectId> Corrupt);
 public interface IRecordCipher { int Overhead { get; } void Encrypt(ReadOnlySpan<byte> aad, ReadOnlySpan<byte> plain, Span<byte> output, uint keyVersion); bool TryDecrypt(ReadOnlySpan<byte> aad, ReadOnlySpan<byte> sealedData, Span<byte> plain, uint keyVersion); }
 public sealed class Journal : IAsyncDisposable   // append-only CRC'd records (used by RaftLogStore, backups)
