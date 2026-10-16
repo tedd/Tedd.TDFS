@@ -991,12 +991,6 @@ internal sealed class VolumeContext : IRpcRouter
             case WireOutcomeStatus.Aborted:
                 throw new ResolvedFailureException(DfsErrors.ToException(result.Error, result.Detail ?? $"{request.Name} failed.", request.Path, target));
 
-            case WireOutcomeStatus.Expired:
-                // The id lies outside the retained outcome window: its outcome can no longer be learned, and it is never
-                // replayed. That is the explicit expired-outcome error (FSD §13), not an abort and not "still unknown".
-                throw new ResolvedFailureException(new DfsOperationExpiredException(
-                    $"{request.Name} ({target}): the operation id is outside the retained outcome window; its outcome is no longer known and it is never replayed. {result.Detail}"));
-
             default:
                 return null;
         }
