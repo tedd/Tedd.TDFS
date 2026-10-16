@@ -31,7 +31,8 @@ internal sealed partial class VolumeService
         RequireGrant(principal, DfsPermissions.Write, "publish");
         IWireMessage reply = await MutateAsync(context, request, DfsOperationKind.CommitFile, async (op, ct) =>
         {
-            HandleRecord h = VolumeStateMachine.RequireWriterHandle(State, new ApplyContext(0, 0, new CloseHandleCommand(0, 0) { Op = op }),
+            StreamKey? fallback = FencingFallbackFor(request.Handle.Value);
+            HandleRecord h = VolumeStateMachine.RequireWriterHandle(State, new ApplyContext(0, 0, new CloseHandleCommand(0, 0) { Op = op, FencingFallback = fallback }),
                 request.Handle.Value, request.Generation);
             IDisposable hold = await LockStreamAsync(h.Key, ct);
             try
@@ -54,7 +55,8 @@ internal sealed partial class VolumeService
                 {
                     Policy = inode.PolicyName,
                 };
-                return new Prepared(Stamp(new CommitFileCommand(h.Id, request.Generation, request.BaseRevision, spec, request.SnapshotName), op), hold);
+                return new Prepared(Stamp(new CommitFileCommand(h.Id, request.Generation, request.BaseRevision, spec, request.SnapshotName), op)
+                    with { FencingFallback = fallback }, hold);
             }
             catch
             {
@@ -65,6 +67,30 @@ internal sealed partial class VolumeService
         CountStaleWrite(reply);
         return reply;
     }
+
+    /// <summary>Ended writable handles' streams, remembered only while <see cref="SafetyMutations.SkipFencingCheck"/> is on (MUT-001).</summary>
+    private readonly Dictionary<ulong, StreamKey> _endedWriters = [];
+
+    /// <summary>Negative control MUT-001: remembers the streams of writable handles about to end (no-op without the mutation).</summary>
+    private void RememberEndedWriters(VolumeState s, IEnumerable<ulong> handles)
+    {
+        if (!_s.Mutations.SkipFencingCheck)
+            return;
+        if (_endedWriters.Count > 4096)
+            _endedWriters.Clear();
+        foreach (ulong id in handles)
+        {
+            if (s.Handles.TryGetValue(id, out HandleRecord? h) && h.IsWriter)
+                _endedWriters[id] = h.Key;
+        }
+    }
+
+    /// <summary>
+    /// Negative control MUT-001: the remembered stream of an ended writable handle, which lets the mutant skip handle
+    /// validity together with the generation check (null without the mutation or for a live handle).
+    /// </summary>
+    private StreamKey? FencingFallbackFor(ulong handle)
+        => _s.Mutations.SkipFencingCheck && !State.Handles.ContainsKey(handle) && _endedWriters.TryGetValue(handle, out StreamKey key) ? key : null;
 
     /// <summary><c>WriteAll</c> (FSD §5.4): atomic replacement by path preserving the inode (one entry; receipts validated first).</summary>
     public async Task<IWireMessage> WriteAllAsync(RpcContext context, WriteAllMessage request)

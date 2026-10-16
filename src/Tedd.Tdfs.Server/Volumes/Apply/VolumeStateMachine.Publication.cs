@@ -11,8 +11,17 @@ internal sealed partial class VolumeStateMachine
     internal static HandleRecord RequireWriterHandle(VolumeState s, ApplyContext ctx, ulong handleId, ulong generation)
     {
         string principal = ctx.Op?.Principal ?? string.Empty;
+        bool skipFencing = ctx.Op is { } op && (op.Flags & CommandFlags.SkipFencing) != 0;
         if (!s.Handles.TryGetValue(handleId, out HandleRecord? h))
         {
+            // Negative control (MUT-001): the mutant skips the whole writer-fencing check, handle validity included, and
+            // publishes through the ended handle's stream the leader remembered for it.
+            if (skipFencing && s.IssuedHandle(handleId) && ctx.Command.FencingFallback is { } fallback)
+            {
+                return new HandleRecord(handleId, fallback.Inode, fallback.Stream, 0, principal, FileMode.Open, FileAccess.Write, FileShare.Read, true, generation,
+                    HandleView.Live, null, 0, 0, DfsFileSystemRights.WriteData, false);
+            }
+
             throw !s.IssuedHandle(handleId)
                 ? Fail(DfsErrorCode.InvalidHandle, $"Handle {handleId} was never issued by this volume.")
                 : Fail(DfsErrorCode.LeaseLost, $"Handle {handleId} is no longer active (closed or its lease expired).");
@@ -22,7 +31,6 @@ internal sealed partial class VolumeStateMachine
             throw Fail(DfsErrorCode.InvalidHandle, $"Handle {handleId} belongs to another principal.");
         if (!h.IsWriter)
             throw Fail(DfsErrorCode.AccessDenied, $"Handle {handleId} was not opened for writing.");
-        bool skipFencing = ctx.Op is { } op && (op.Flags & CommandFlags.SkipFencing) != 0;
         if (!skipFencing && (generation != h.WriterGeneration || s.WriterGenerationOf(h.Key) != h.WriterGeneration))
             throw Fail(DfsErrorCode.LeaseLost, $"Writer generation {generation} of handle {handleId} is stale (current {s.WriterGenerationOf(h.Key)}).");
         return h;

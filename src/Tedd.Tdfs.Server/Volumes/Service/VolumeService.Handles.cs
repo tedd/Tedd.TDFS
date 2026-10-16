@@ -135,6 +135,7 @@ internal sealed partial class VolumeService
             .Select(h => h.Id)];
         if (handles.Length > 0)
         {
+            RememberEndedWriters(s, handles);
             await ProposeHousekeepingAsync(new ExpireHandlesCommand(handles));
             foreach (ulong id in handles)
                 _handleRenewals.Remove(id);
