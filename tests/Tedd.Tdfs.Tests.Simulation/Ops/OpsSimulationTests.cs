@@ -303,6 +303,7 @@ public sealed class OpsSimulationTests
             TestBackupNode b0 = cluster.BackupNodes[0];
             await b0.RegisterAsync(Vol);
             DfsSnapshotInfo s1 = await vol.Snapshots.CreateAsync("ops003-s1", null, Ct);
+            await vol.Backups.RequestSyncAsync(b0.TargetName, "ops003-s1", Ct);   // registered without an automatic schedule
             DfsBackupCheckpoint cp1 = await vol.Backups.AwaitBackupSnapshotAsync(b0.TargetName, "ops003-s1", TimeSpan.FromSeconds(60), Ct);
             Assert.Equal(s1.Boundary, cp1.CoveredCommit);
             Assert.True(cp1.IsExactSnapshot);
@@ -603,6 +604,7 @@ public sealed class OpsSimulationTests
             await b0.RegisterAsync(Vol);
             await OpsHelpers.SeedFilesAsync(vol, "/ops006/a", 4, 64 * 1024, 600);
             DfsSnapshotInfo s1 = await vol.Snapshots.CreateAsync("ops006-s1", null, Ct);
+            await vol.Backups.RequestSyncAsync(b0.TargetName, "ops006-s1", Ct);   // registered without an automatic schedule
             DfsBackupCheckpoint cp1 = await vol.Backups.AwaitBackupSnapshotAsync(b0.TargetName, "ops006-s1", TimeSpan.FromSeconds(60), Ct);
 
             await cluster.DelayAsync(TimeSpan.FromSeconds(30), Ct);

@@ -3170,7 +3170,7 @@ Replica health of a volume (mirrors the SDK's `DfsReplicaHealth`).
 | 6 | `RepairBacklogBytes` | `varint` | Bytes waiting for repair. |
 | 7 | `PendingGcObjects` | `varint` | Objects waiting for garbage collection. |
 | 8 | `StagedBytes` | `varint` | Bytes in open staging sessions. |
-| 9 | `PinnedBytes` | `varint` | Bytes protected only by pins. |
+| 9 | `PinnedBytes` | `varint` | Bytes the current namespace no longer references that snapshots or pins (reader, transfer, version-pinned handles) retain. |
 | 10 | — | `extensions` | Terminal extension block. |
 
 #### `RequestHeader`

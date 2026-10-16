@@ -68,7 +68,7 @@ public sealed record GroupStatusData(
 /// <param name="RepairBacklogBytes">Bytes waiting for repair.</param>
 /// <param name="PendingGcObjects">Objects waiting for garbage collection.</param>
 /// <param name="StagedBytes">Bytes in open staging sessions.</param>
-/// <param name="PinnedBytes">Bytes protected only by pins.</param>
+/// <param name="PinnedBytes">Bytes the current namespace no longer references that snapshots or pins retain.</param>
 public sealed record ReplicaHealthData(
     long Objects,
     long UnderReplicatedObjects,

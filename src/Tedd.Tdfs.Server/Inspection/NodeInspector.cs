@@ -78,7 +78,7 @@ public sealed partial class NodeInspector
     public Task<long> GetStagedBytesAsync() => _loop.InvokeAsync(() =>
         S.Volumes.Hosts.Select(h => h.StateMachine).OfType<IVolumeStateInspection>().Sum(i => i.StagedBytes));
 
-    /// <summary>Bytes retained only by pins.</summary>
+    /// <summary>Bytes the current namespaces no longer reference that snapshots or pins retain.</summary>
     public Task<long> GetPinnedBytesAsync() => _loop.InvokeAsync(() =>
         S.Volumes.Hosts.Select(h => h.StateMachine).OfType<IVolumeStateInspection>().Sum(i => i.PinnedBytes));
 

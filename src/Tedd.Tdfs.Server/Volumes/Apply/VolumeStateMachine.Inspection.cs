@@ -108,17 +108,16 @@ internal sealed partial class VolumeStateMachine
     private static IReadOnlyList<ExtentInspection> Extents(StreamRecord stream)
         => stream.IsInline ? [] : stream.Extents.Select(e => new ExtentInspection(e.Offset, e.Length, e.Object, e.ObjectOffset, e.ObjectLength)).ToArray();
 
-    /// <summary>Bytes of objects referenced only through pins (pinned roots and version-pinned handles).</summary>
+    /// <summary>
+    /// Bytes of objects the current namespace no longer references that are retained only for history: snapshot retention
+    /// references, pinned roots (reader, enumeration and transfer pins) and version-pinned handles (GC-015, OPS-005: the
+    /// space a volume holds beyond its visible files).
+    /// </summary>
     internal static long ComputePinnedBytes(VolumeState s)
     {
         var live = new HashSet<ObjectId>();
         foreach (InodeRecord n in s.Inodes.Values)
             live.UnionWith(n.Objects());
-        foreach (SnapshotRecord snap in s.Snapshots.Values)
-        {
-            foreach (InodeRecord n in snap.Root.Values)
-                live.UnionWith(n.Objects());
-        }
 
         var pinned = new Dictionary<ObjectId, long>();
         void Add(InodeRecord n)
@@ -133,6 +132,12 @@ internal sealed partial class VolumeStateMachine
                         pinned[e.Object] = e.ObjectLength;
                 }
             }
+        }
+
+        foreach (SnapshotRecord snap in s.Snapshots.Values)
+        {
+            foreach (InodeRecord n in snap.Root.Values)
+                Add(n);
         }
 
         foreach (PinRecord p in s.Pins.Values)

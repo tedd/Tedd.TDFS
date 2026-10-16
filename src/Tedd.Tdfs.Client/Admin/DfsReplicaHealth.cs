@@ -9,7 +9,7 @@ namespace Tedd.Tdfs;
 /// <param name="RepairBacklogBytes">Bytes awaiting repair.</param>
 /// <param name="PendingGcObjects">Objects eligible for collection but not yet deleted.</param>
 /// <param name="StagedBytes">Staged (unpublished) bytes.</param>
-/// <param name="PinnedBytes">Bytes retained by pins.</param>
+/// <param name="PinnedBytes">Bytes the current namespace no longer references that snapshots or pins retain.</param>
 public sealed record DfsReplicaHealth(
     long Objects,
     long UnderReplicatedObjects,

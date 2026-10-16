@@ -14,7 +14,10 @@ namespace Tedd.Tdfs.Server.Data;
 /// report tells the leader the node is up and holds nothing). The decision is the leader's (unreachable from every root,
 /// unprotected at the GC watermark, staging session closed); this node only deletes a reported copy whose record still
 /// matches the decision's (object, staging) pair, and ignores decisions of a superseded volume epoch. Every completed
-/// report is one GC sweep on this node (fault site <c>gc.sweep</c>, hit before anything is deleted). Runs on the node loop.
+/// report is one GC sweep on this node (fault site <c>gc.sweep</c>, hit before anything is deleted). The sweep runs beside
+/// the reporting: a slow or stalled sweep never holds up the next inventories, which keep replica health, staged-bytes
+/// accounting and holder liveness current (OPS-005); while a sweep of a volume runs, later reports of that volume skip theirs
+/// (their decisions are taken again by the next report). Runs on the node loop.
 /// </summary>
 internal sealed class InventoryReporter
 {
@@ -25,6 +28,9 @@ internal sealed class InventoryReporter
     private ulong _reports;
     private bool _running;
     private bool _again;
+
+    /// <summary>Volumes whose GC sweep is running.</summary>
+    private readonly HashSet<VolumeId> _sweeping = [];
 
     public InventoryReporter(NodeServices services)
     {
@@ -134,12 +140,30 @@ internal sealed class InventoryReporter
             last = await SendAsync(volume, message);
         }
 
-        if (last is null)
+        if (last is null || !_sweeping.Add(volume.Id))
             return;
+        InventoryReportResultMessage decision = last;
+        _s.Jobs.Run("gc-sweep", async () =>
+        {
+            try
+            {
+                await SweepAsync(volume, decision);
+            }
+            finally
+            {
+                _sweeping.Remove(volume.Id);
+            }
+        });
+    }
 
-        // One GC sweep per completed report, whether or not it deletes anything (fault site F20 on the sweeping node).
+    /// <summary>
+    /// One GC sweep per completed report, whether or not it deletes anything (fault site F20 on the sweeping node): deletes
+    /// the copies the leader's decision lists whose stored record still matches it.
+    /// </summary>
+    private async Task SweepAsync(VolumeRecord volume, InventoryReportResultMessage last)
+    {
         await _s.HitAsync(FaultStage.F20, FaultSites.GcSweep, volume.Name, DfsOperationKind.Gc, detail: _s.NodeName);
-        if (last.Delete.Count == 0 || _s.Control.State.FindVolume(volume.Id) is not { } current || last.VolumeEpoch < current.Epoch)
+        if (_s.IsStopping || last.Delete.Count == 0 || _s.Control.State.FindVolume(volume.Id) is not { } current || last.VolumeEpoch < current.Epoch)
             return;
 
         int deleted = 0;
