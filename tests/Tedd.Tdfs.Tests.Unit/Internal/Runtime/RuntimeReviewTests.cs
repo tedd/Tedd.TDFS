@@ -115,13 +115,16 @@ public sealed class RuntimeReviewTests
         await cluster.WaitForRegistrationAsync();
         VolumeEntry volume = await cluster.CreateVolumeAsync("vol");
         RuntimeNode volumeLeader = await cluster.WaitForLeaderAsync("vol");
-        RuntimeNode controlLeader = await cluster.WaitForLeaderAsync("control");
         RuntimeNode outsider = cluster.Nodes.Single(n => !volume.Voters.Contains(n.Id));
+
+        // The replacement is cut off from the start (see below); the admin requests go to a control leader that stays
+        // reachable (the outsider may have led the control group).
+        cluster.Links.Isolate(outsider.Name);
+        RuntimeNode controlLeader = await cluster.WaitForLeaderAsync("control", cluster.Nodes.Where(n => n != outsider));
         RuntimeNode drained = cluster.Nodes.First(n => volume.Voters.Contains(n.Id) && n != volumeLeader && n != controlLeader);
 
         // The replacement is unreachable: it is added as a learner but has acknowledged nothing. A fresh learner's
         // progress starts "recently active" with match 0, which a lag check against a small commit index accepts.
-        cluster.Links.Isolate(outsider.Name);
         RawClient admin = await cluster.ConnectAsync(controlLeader);
         await admin.AdminAsync<AdminNodeNameBody, AdminEmptyBody>(AdminOp.DrainNode, new AdminNodeNameBody(drained.Name));
         await RuntimeCluster.WaitUntilAsync(async () =>
@@ -151,15 +154,18 @@ public sealed class RuntimeReviewTests
         await cluster.WaitForRegistrationAsync();
         VolumeEntry volume = await cluster.CreateVolumeAsync("vol");
         RuntimeNode volumeLeader = await cluster.WaitForLeaderAsync("vol");
-        RuntimeNode controlLeader = await cluster.WaitForLeaderAsync("control");
         RuntimeNode outsider = cluster.Nodes.Single(n => !volume.Voters.Contains(n.Id));
+
+        // The replacement is cut off from the start (see below); the admin requests go to a control leader that stays
+        // reachable (the outsider may have led the control group).
+        cluster.Links.Isolate(outsider.Name);
+        RuntimeNode controlLeader = await cluster.WaitForLeaderAsync("control", cluster.Nodes.Where(n => n != outsider));
         RuntimeNode drained = cluster.Nodes.First(n => volume.Voters.Contains(n.Id) && n != volumeLeader && n != controlLeader);
         string groupDirectory = "node/groups/vol-" + volume.Id.Value.ToString("N");
         Assert.True(await drained.Medium.ExistsAsync(groupDirectory, Ct));
 
         // The replacement voter is cut off, so the volume leader can add it as a learner but never promote it, and the
         // drained voter keeps its seat in the group's configuration.
-        cluster.Links.Isolate(outsider.Name);
         RawClient admin = await cluster.ConnectAsync(controlLeader);
         await admin.AdminAsync<AdminNodeNameBody, AdminEmptyBody>(AdminOp.DrainNode, new AdminNodeNameBody(drained.Name));
         await RuntimeCluster.WaitUntilAsync(async () => await drained.Host!.InvokeAsync(s =>
