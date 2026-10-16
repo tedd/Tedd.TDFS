@@ -89,8 +89,16 @@ public sealed class RuntimeVolumeTests
 
         var names = await client.AdminAsync<AdminEmptyBody, AdminNameListBody>(AdminOp.ListVolumes, new AdminEmptyBody());
         Assert.Equal(["vol"], names.Names);
-        var missing = Assert.IsType<ErrorReplyMessage>(await client.CallAsync(new GetVolumeRouteMessage("nope")));
+
+        // "Does not exist" is definite, so only the control leader answers it (after a ReadIndex round); any other node
+        // redirects to it (PROTOCOL.md GetVolumeRoute: linearizable volume-not-found).
+        RuntimeNode controlLeader = await cluster.WaitForLeaderAsync("control");
+        RawClient controlClient = controlLeader == leader ? client : await cluster.ConnectAsync(controlLeader);
+        var missing = Assert.IsType<ErrorReplyMessage>(await controlClient.CallAsync(new GetVolumeRouteMessage("nope")));
         Assert.Equal(DfsErrorCode.VolumeNotFound, missing.Code);
+        RawClient otherClient = await cluster.ConnectAsync(cluster.Nodes.First(n => n != controlLeader));
+        var redirected = Assert.IsType<ErrorReplyMessage>(await otherClient.CallAsync(new GetVolumeRouteMessage("nope")));
+        Assert.Equal(DfsErrorCode.NotLeader, redirected.Code);
     }
 
     [Fact]
