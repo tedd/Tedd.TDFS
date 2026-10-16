@@ -429,17 +429,20 @@ public sealed class MeshSimulationTests
 
             // Acknowledgements the victims sent before crashing are legitimate evidence and may still be delivered, and
             // followers learn an earlier commit index from heartbeats: let that settle, then nothing new may commit.
+            // A survivor that does not host the group (on a partial mesh a voter without a link to the control leader may never
+            // learn that it hosts the volume) has committed nothing.
             string[] survivors = s.VolumeVoters.Except(victims).ToArray();
             await cluster.DelayAsync(s.ElectionWindow * 2, Ct);
             ulong settled = 0;
             foreach (string survivor in survivors)
-                settled = Math.Max(settled, (await cluster.Node(survivor).Inspect.GetGroupAsync(Vol))!.CommitIndex);
+                settled = Math.Max(settled, (await cluster.Node(survivor).Inspect.GetGroupAsync(Vol))?.CommitIndex ?? 0);
 
             await s.ProbeAsync("beyond-tolerance");
             await s.AssertSafetyAsync("beyond-tolerance");
             foreach (string survivor in survivors)
             {
-                GroupInspection g = (await cluster.Node(survivor).Inspect.GetGroupAsync(Vol))!;
+                if (await cluster.Node(survivor).Inspect.GetGroupAsync(Vol) is not { } g)
+                    continue;
                 Assert.True(g.CommitIndex <= settled,
                     $"surviving voter {survivor} reached commit index {g.CommitIndex} > {settled} (the highest index committed before the majority was lost) " +
                     $"with only [{string.Join(",", survivors)}] of the configured voters [{string.Join(",", s.VolumeVoters)}] alive (CON-007, MUT-004)");
