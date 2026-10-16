@@ -87,6 +87,11 @@ internal sealed class RaftTransport
                 Pending[] batch = box.Queue.GetRange(0, take).ToArray();
                 box.Queue.RemoveRange(0, take);
                 var message = new RaftBatchMessage(_s.NodeId, _s.Incarnation, batch.Select(p => p.Envelope).ToArray());
+
+                // Every batch carries this node's data-capability clock so group peers converge on one capability time
+                // (Capabilities.ObservePeerClock, PROTOCOL.md §7.3).
+                if (_s.Objects is { } objects)
+                    message = message.WithCapabilityClock(objects.Capabilities.Clock);
                 bool sent = await _s.Peers.TrySendAsync(peer, message);
                 if (!sent)
                 {

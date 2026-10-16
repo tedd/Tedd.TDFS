@@ -17,8 +17,46 @@ public sealed record RaftBatchMessage(
     ulong Incarnation,
     IReadOnlyList<RaftEnvelope> Messages) : IWireMessage<RaftBatchMessage>
 {
-    /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
+    /// <summary>
+    /// Extension field id of <see cref="CapabilityClock"/> (optional; value: the sender's data-capability clock as UTC ticks,
+    /// 8 bytes little-endian). An extension because the message shipped without it (PROTOCOL.md §2.5): a receiver that does
+    /// not know it ignores it (FMT-003), and a batch without it simply carries no clock sample.
+    /// </summary>
+    public const uint CapabilityClockExtension = 1;
+
+    /// <summary>Optional extensions preserved from the wire (re-emitted on encode), including <see cref="CapabilityClockExtension"/>.</summary>
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
+
+    /// <summary>
+    /// The sender's data-capability clock when it sent the batch (PROTOCOL.md §7.3), from <see cref="CapabilityClockExtension"/>;
+    /// null when absent or malformed.
+    /// </summary>
+    public DateTimeOffset? CapabilityClock
+    {
+        get
+        {
+            foreach (WireExtension extension in Extensions)
+            {
+                if (extension.FieldId != CapabilityClockExtension || extension.Value.Length != sizeof(long))
+                    continue;
+                long ticks = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(extension.Value.Span);
+                return ticks >= DateTimeOffset.MinValue.UtcTicks && ticks <= DateTimeOffset.MaxValue.UtcTicks
+                    ? new DateTimeOffset(ticks, TimeSpan.Zero)
+                    : null;
+            }
+
+            return null;
+        }
+    }
+
+    /// <summary>A copy that carries <paramref name="clock"/> as its <see cref="CapabilityClockExtension"/>.</summary>
+    public RaftBatchMessage WithCapabilityClock(DateTimeOffset clock)
+    {
+        byte[] value = new byte[sizeof(long)];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(value, clock.UtcTicks);
+        WireExtension[] others = [.. Extensions.Where(e => e.FieldId != CapabilityClockExtension)];
+        return this with { Extensions = [new WireExtension(CapabilityClockExtension, Required: false, value), .. others] };
+    }
 
     /// <inheritdoc />
     public MessageType Type => WireType;

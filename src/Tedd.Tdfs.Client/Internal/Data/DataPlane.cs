@@ -390,6 +390,7 @@ internal sealed class DataPlane
         var tried = new HashSet<NodeId>();
         var failures = new List<Exception>();
         int integrityFailures = 0;
+        DataCapabilityRejectedException? denied = null;
         var candidates = new List<NodeId>();
         foreach (NodeId location in locations)
             AddCandidate(location);
@@ -404,6 +405,7 @@ internal sealed class DataPlane
 
         bool located = false;
         var reconnected = new HashSet<NodeId>();
+        var unresolved = new List<NodeId>();
         for (int i = 0; ; i++)
         {
             if (i >= candidates.Count)
@@ -411,7 +413,31 @@ internal sealed class DataPlane
                 if (located || scope.Token.IsCancellationRequested)
                     break;
                 located = true;
-                foreach (NodeId holder in await LocateAsync(scope, volume, obj, tried).ConfigureAwait(false))
+
+                // Holders may be nodes this client's cluster map does not list yet: nodes that joined after the map was
+                // fetched, to which repair then moved the copies (and removed the excess ones the map knows). When a holder
+                // was not in the map, or every node asked answered without a verifiable copy, refresh the map before asking
+                // every storage node, so "no verifiable copy" is never concluded for want of asking the nodes that hold it.
+                // (With unreachable nodes the read fails as unavailable anyway; no refresh round trips are spent then.)
+                bool mayBeStale = unresolved.Count > 0 || failures.Count == integrityFailures;
+                if (mayBeStale && await _runtime.RefreshMapAsync(scope).ConfigureAwait(false))
+                {
+                    foreach (NodeId node in unresolved)
+                    {
+                        if (_runtime.Map.EndpointOf(node) is not null)
+                        {
+                            tried.Remove(node);
+                            candidates.Add(node);
+                        }
+                    }
+
+                    unresolved.Clear();
+                    PlacementNode[] refreshed = _runtime.Map.StorageNodes().Select(n => new PlacementNode(n.Id, n.Name, n.Labels, true, 1)).ToArray();
+                    foreach (PlacementNode node in Placement.FallbackOrder(obj, placementEpoch, refreshed))
+                        AddCandidate(node.Id);
+                }
+
+                foreach (NodeId holder in await LocateAsync(scope, volume, obj, [.. tried, .. candidates.Skip(i)]).ConfigureAwait(false))
                     AddCandidate(holder);
                 if (i >= candidates.Count)
                     break;
@@ -421,7 +447,10 @@ internal sealed class DataPlane
             tried.Add(candidate);
             string? endpoint = _runtime.Map.EndpointOf(candidate);
             if (endpoint is null)
+            {
+                unresolved.Add(candidate);
                 continue;
+            }
             try
             {
                 await ReadFromAsync(scope, volume, endpoint, capability, obj, objectLength, checksum, objectOffset, destination).ConfigureAwait(false);
@@ -437,9 +466,16 @@ internal sealed class DataPlane
             {
                 throw scope.NotTransmittedFailure(failures.LastOrDefault());
             }
-            catch (DataCapabilityRejectedException)
+            catch (DataCapabilityRejectedException ex)
             {
-                throw;
+                // One storage node refusing the capability (its control replica lags behind a volume change, or its clock
+                // disagrees) says nothing about the other replicas: try them, and report the refusal only when no replica
+                // served the range, keeping the longest verified prefix (objects are immutable, so every replica's verified
+                // bytes are the same bytes).
+                if (denied is null || ex.Filled > denied.Filled)
+                    denied = ex;
+                _runtime.Emit("read.replica-denied", $"Replica of {obj} on {endpoint} refused the read capability; trying another.", volume: volume.Name,
+                    exception: ex);
             }
             catch (Exception ex) when (RpcInvoker.IsTransient(ex) || ex is DfsProtocolException or DfsClusterIdentityException or OperationCanceledException
                                            or DfsException)
@@ -454,6 +490,8 @@ internal sealed class DataPlane
         }
 
         scope.ThrowIfCancelled();
+        if (denied is not null)
+            throw denied;
         Exception? inner = failures.Count switch { 0 => null, 1 => failures[0], _ => new AggregateException(failures) };
         int unreachable = failures.Count - integrityFailures;
         if (integrityFailures > 0 && unreachable == 0)

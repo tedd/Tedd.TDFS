@@ -172,6 +172,7 @@ public sealed class MeshScenario
         s.Note($"start {config.Nodes} nodes {config.Format()} seed {cluster.Seed}");
         s.VerifyLayout();
         await s.ReadRolesAsync();
+        await s.NoteUnregisteredAtFormationAsync();
         string[] seeds = await s.LeaderFirstSeedsAsync();
         foreach (string name in s.Options.ProbeClients)
             s._clients[name] = await s.ConnectClientAsync(name, seeds);
@@ -311,6 +312,30 @@ public sealed class MeshScenario
         if (side is null || !MeshOracle.IsClique(Net, side))
             return false;
         return ControlVoters.Where(side.Contains).All(v => v == node || Net.Linked(node, v));
+    }
+
+    /// <summary>
+    /// On a partial link mesh, the nodes without a direct link to the control leader that formed the cluster never received
+    /// its log (groups replicate without relaying, ARCHITECTURE §2.4): they could not register their incarnation (RCV-02) nor
+    /// learn which volume groups they host (the harness's own stability check exempts them for that reason). Whether they
+    /// count for volume quorums, receipts and reads therefore depends on which node leads the control group later, which the
+    /// specification does not fix: like nodes restarted without a reachable control quorum they are kept in
+    /// <see cref="PendingRegistration"/> (expectations bounded, section 2 of the mesh test notes) until the control group can
+    /// certainly register them (a healed, fully linked mesh).
+    /// </summary>
+    private async Task NoteUnregisteredAtFormationAsync()
+    {
+        if (Net.IsFullyConnected)
+            return;
+        string controlLeader = await ControlLeaderAsync();
+        lock (_lock)
+        {
+            foreach (string node in Net.NodeNames.Where(n => n != controlLeader && !Net.Linked(n, controlLeader)))
+            {
+                _pendingRegistration.Add(node);
+                _trace.Add($"[{Cluster.Time.GetUtcNow():HH:mm:ss.fff}] {node} has no link to control leader {controlLeader} on the {Net.Mesh} mesh: it cannot register or learn its volume groups (no relaying); maybe-down until it can");
+            }
+        }
     }
 
     private void RefreshRegistrations()

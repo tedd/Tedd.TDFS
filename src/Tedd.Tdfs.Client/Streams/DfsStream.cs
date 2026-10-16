@@ -1226,7 +1226,6 @@ public sealed class DfsStream : Stream, ILeaseHolder
 
         // Consecutive dirty ranges smaller than a chunk are packed into one object of at most a chunk (each range maps to its
         // own object offset): a fragmented overlay costs one upload per chunk of data, not one per range (LAY-017).
-        int ordinal = 0;
         for (int first = 0; first < pieces.Count;)
         {
             int last = first + 1;
@@ -1252,9 +1251,13 @@ public sealed class DfsStream : Stream, ILeaseHolder
                 bytes = packed;
             }
 
+            // The chunk's ordinal is its logical update unit in the file (offset / chunk size), not a per-call counter: a
+            // stream uploads its chunks over several calls (spills while writing, the rest at publication), and each payload
+            // chunk keeps one ordinal however the uploads are split (fault sites address chunks by it, NET-004).
+            int chunkIndex = (int)Math.Min(int.MaxValue, pieces[first].Offset / chunk);
             (ObjectId id, UInt128 checksum) = _runtime.Data.Describe(bytes.Span);
             IReadOnlyList<ObjectReceipt> receipts = await _runtime.Data.UploadAsync(scope, _volume, staging, id, bytes, checksum, policy, pool,
-                scope.OperationId, ordinal++).ConfigureAwait(false);
+                scope.OperationId, chunkIndex).ConfigureAwait(false);
             var uploaded = new UploadedObject(id, checksum, bytes.Length, receipts);
             long objectOffset = 0;
             for (int i = first; i < last; i++)

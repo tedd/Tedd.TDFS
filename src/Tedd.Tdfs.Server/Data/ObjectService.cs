@@ -105,7 +105,7 @@ internal sealed class ObjectService
         if (!context.IsNode || !message.Capability.IsEmpty)
         {
             if (found is null)
-                throw new UnauthorizedAccessException("Access denied: the capability does not authorize this volume.");
+                throw UnknownVolume(message.Capability.Span, message.Volume, context.Principal ?? string.Empty);
             Capabilities.Verify(message.Capability.Span, DataCapabilityKind.Staging, found, context.Principal ?? string.Empty, staging: message.Staging);
         }
 
@@ -123,7 +123,7 @@ internal sealed class ObjectService
         if (!context.IsNode || !message.Capability.IsEmpty)
         {
             if (volume is null)
-                throw new UnauthorizedAccessException("Access denied: the capability does not authorize this volume.");
+                throw UnknownVolume(message.Capability.Span, message.Volume, context.Principal ?? string.Empty);
 
             // A staging capability also lets its holder read back what it stored under that staging session (a writer's own
             // staged, unpublished data — PROTOCOL.md §7.3); every other read needs a read capability naming the object.
@@ -173,6 +173,18 @@ internal sealed class ObjectService
         _s.Metrics.ObjectRead(requested);
         return new GetObjectResultMessage(objectLength, info.Checksum, ObjectEncodings.Plain, start, data, unit, checksums);
     }
+
+    /// <summary>
+    /// The refusal of a data request for a volume this node's control replica does not know. An authentic capability for it
+    /// was issued by a member that knows the volume, so this node lags (a seed-joined or restarted node still catching up, or
+    /// one without a direct link to the control leader on a partial mesh — no relaying): a retryable unavailability that lets
+    /// the client use another replica or target. Anything else is refused as unauthorized (SEC-004).
+    /// </summary>
+    private Exception UnknownVolume(ReadOnlySpan<byte> capability, VolumeId volume, string principal) =>
+        Capabilities.IsAuthentic(capability, volume, principal)
+            ? new DfsUnavailableException(DfsErrorCode.NodeUnavailable,
+                $"{_s.NodeName} does not know volume {volume} yet (its control replica has not applied it); another node can serve the request.")
+            : new UnauthorizedAccessException("Access denied: the capability does not authorize this volume.");
 
     private ValueTask<IWireMessage> LocateObjectAsync(RpcContext context, IWireMessage request)
     {

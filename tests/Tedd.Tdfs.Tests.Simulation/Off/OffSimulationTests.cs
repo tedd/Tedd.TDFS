@@ -2798,9 +2798,20 @@ public sealed class OffSimulationTests
             OffAttempt<CommitToken> write = await TryAsync(() => v.Files.WriteAllBytesAsync("/o20/needs-quorum", V2, Ct));
             if (write.Succeeded)
             {
-                // Only acceptable if the replacement had been fully admitted and caught up before; it must then hold everything.
+                // Only acceptable if the replacement had been fully admitted and caught up before; it must then hold every
+                // committed metadata record: each file still resolves to its exact committed content. Its data objects may be
+                // held, at this moment, only by the voters just crashed (the copies lost with the replaced disk may still be
+                // under repair — nothing above waited for it), so a read may fail as typed unavailability, never as absence or
+                // other bytes; durability of every object is asserted below once the crashed voters are back.
                 foreach ((string path, byte[] bytes) in files)
-                    await ExpectContentAsync(bytes, v.Files.ReadAllBytesAsync(path, Ct), "no committed state lost");
+                {
+                    OffAttempt<byte[]> read = await TryAsync(() => v.Files.ReadAllBytesAsync(path, Ct));
+                    if (read.Succeeded)
+                        AssertEx.BytesEqual(bytes, read.Value!, "no committed state lost");
+                    else
+                        Assert.True(read.Error is DfsUnavailableException and not DfsQuorumUnavailableException,
+                            $"{path}: with a quorum serving, a read may only fail because its data holders are down, got {read}");
+                }
             }
 
             foreach (TestNode node in crashed)

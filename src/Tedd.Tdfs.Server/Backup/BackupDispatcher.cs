@@ -140,10 +140,20 @@ internal sealed class BackupDispatcher : IRpcHandler
             return expectsReply ? Error(new ErrorReplyMessage(DfsErrorCode.AuthenticationFailed, "Authenticate before sending requests.")) : null;
         }
 
+        // The request-path stages of the RPC boundary (test plan §8.2 F04/F13), reported like a live node's dispatcher does:
+        // the export pipeline (BackupTransfer, BackupPublish) and the read-only service are request/response exchanges whose
+        // acceptance and reply transmission are real fault boundaries (NET-020).
+        DfsOperationKind operation = MessageTypes.OperationOf(type);
+        string? volume = (message as IVolumeRequest)?.Header.Volume;
         IWireMessage result;
         try
         {
+            await _s.HitAsync(FaultStage.F04, FaultSites.RpcRequestAccepted, volume, operation, ct: ct);
             result = await HandleRequestAsync(state.Principal, message, ct);
+        }
+        catch (FaultReplyDroppedException)
+        {
+            return null;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -157,7 +167,22 @@ internal sealed class BackupDispatcher : IRpcHandler
             result = ErrorReplyMessage.FromException(mapped, (message as IVolumeRequest)?.Header.Operation is { IsEmpty: false } own ? own : null);
         }
 
-        return expectsReply ? MessageCodec.Encode(result) : null;
+        if (!expectsReply)
+            return null;
+        try
+        {
+            await _s.HitAsync(FaultStage.F13, FaultSites.RpcReplySend, volume, operation, ct: ct);
+        }
+        catch (FaultReplyDroppedException)
+        {
+            return null;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            return null;
+        }
+
+        return MessageCodec.Encode(result);
     }
 
     private static Exception Map(Exception ex) => ex switch

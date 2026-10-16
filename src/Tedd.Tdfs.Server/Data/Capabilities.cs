@@ -15,6 +15,7 @@ internal sealed class Capabilities
     private readonly TimeProvider _time;
     private readonly DateTimeOffset _wallAnchor;
     private readonly long _monotonicAnchor;
+    private TimeSpan _peerAdvance;
 
     public Capabilities(KeyHierarchy keys, Func<Guid> clusterId, TimeProvider time)
     {
@@ -29,11 +30,30 @@ internal sealed class Capabilities
     }
 
     /// <summary>
-    /// Capability time: this node's wall clock when it started, advanced by its monotonic clock. Expiries are issued and
-    /// verified on it, so a later wall-clock step on the issuing leader or on a verifying storage node neither expires valid
-    /// capabilities early nor revives expired ones (SEC-017, HAR-003); the nodes' wall clocks only need to agree at start.
+    /// Capability time: this node's wall clock when it started, advanced by its monotonic clock, and moved forward (never
+    /// back) to the capability clock of any group peer found ahead of it (<see cref="ObservePeerClock"/>). Expiries are
+    /// issued and verified on it, so a later wall-clock step on the issuing leader or on a verifying storage node neither
+    /// expires valid capabilities early nor revives expired ones (SEC-017, HAR-003). Peers adopting the most advanced clock
+    /// they hear of keeps issuers and verifiers on one capability time although monotonic clocks drift apart (oscillator
+    /// drift accumulates for as long as a node runs; a node whose clock ran slow or fast for a while would otherwise keep
+    /// rejecting, or have rejected, capabilities long after its clock rate is correct again — MESH-036).
     /// </summary>
-    private DateTimeOffset Now => _wallAnchor + _time.GetElapsedTime(_monotonicAnchor);
+    private DateTimeOffset Now => _wallAnchor + _time.GetElapsedTime(_monotonicAnchor) + _peerAdvance;
+
+    /// <summary>This node's current capability time (sent to group peers with every Raft batch).</summary>
+    public DateTimeOffset Clock => Now;
+
+    /// <summary>
+    /// Adopts a group peer's capability clock <paramref name="peer"/> (sampled when the peer sent it) when it is ahead of
+    /// this node's. The clock only ever moves forward, so a sample never revives an expired capability; a peer far ahead
+    /// makes outstanding capabilities expire early everywhere, which costs one re-issue, never authority.
+    /// </summary>
+    public void ObservePeerClock(DateTimeOffset peer)
+    {
+        DateTimeOffset now = Now;
+        if (peer > now)
+            _peerAdvance += peer - now;
+    }
 
     /// <summary>A signed staging capability for one open staging session.</summary>
     public byte[] IssueStaging(VolumeRecord volume, string principal, StagingId staging, TimeSpan lifetime, out DateTimeOffset expires)
@@ -81,6 +101,20 @@ internal sealed class Capabilities
         if (obj is { } o && !capability.AllowsRead(o))
             throw Denied("the capability does not cover the object");
         return capability;
+    }
+
+    /// <summary>
+    /// True when <paramref name="token"/> is an authentic capability of this cluster for <paramref name="volume"/> presented by
+    /// the principal it was issued to (MAC in constant time, cluster, volume id, principal) — used when this node does not
+    /// know the volume yet: an authentic capability proves a member that knew the volume issued it, so the request meets a
+    /// node whose control replica lags (a retryable unavailability), not a request this node may refuse as unauthorized.
+    /// </summary>
+    public bool IsAuthentic(ReadOnlySpan<byte> token, VolumeId volume, string principal)
+    {
+        if (token.IsEmpty || !DataCapability.TryDecode(token, out DataCapability? capability) || capability is null)
+            return false;
+        return capability.VerifyMac(_keys.CapabilityKey) && capability.ClusterId == _clusterId() && capability.Volume == volume
+            && string.Equals(capability.Principal, principal, StringComparison.Ordinal);
     }
 
     private static UnauthorizedAccessException Denied(string reason) => new("Access denied: " + reason + ".");

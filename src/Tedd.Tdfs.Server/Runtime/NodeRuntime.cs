@@ -197,7 +197,13 @@ internal sealed partial class NodeRuntime
         var batch = (RaftBatchMessage)request;
         if (context.PeerNode != batch.From || context.Identity.Incarnation != batch.Incarnation)
             throw new UnauthorizedAccessException("The Raft batch does not come from the authenticated node incarnation.");
-        return new ValueTask<IWireMessage>(Services.Raft.HandleBatch(batch, batch.From));
+        RaftBatchResultMessage result = Services.Raft.HandleBatch(batch, batch.From);
+
+        // A batch a hosted group accepted comes from a fellow member: adopt its capability clock when it is ahead, so data
+        // capabilities issued by any member verify on every other one although node clocks drift (PROTOCOL.md §7.3).
+        if (result.Accepted > 0 && batch.CapabilityClock is { } clock && Services.Objects is { } objects)
+            objects.Capabilities.ObservePeerClock(clock);
+        return new ValueTask<IWireMessage>(result);
     }
 
     private async ValueTask<IWireMessage> HandleSnapshotChunkAsync(RpcContext context, IWireMessage request)
@@ -221,6 +227,8 @@ internal sealed partial class NodeRuntime
             return Task.CompletedTask;
         });
         s.Jobs.StartPeriodic("rejoin", tick * 40, RejoinIfNeededAsync, tick * 20);
+        var balancer = new LeaderBalancer(s);
+        s.Jobs.StartPeriodic("leader-balance", tick * 20, balancer.RunOnceAsync, tick * 20);
         StartFeatureJobs();
     }
 

@@ -486,11 +486,15 @@ internal sealed partial class RpcDispatcher : IRpcHandler
             : MessageTypes.OperationOf(type);
 
     /// <summary>
-    /// Consensus traffic is not reported at request-path fault sites (it is not an operation, INTERNALS.md). The handshake
-    /// reports its own request-path stages (operation <see cref="DfsOperationKind.Authenticate"/>) before this check.
+    /// Raft replication batches are not reported at request-path fault sites: they are one-way messages (no reply, so no
+    /// F13 boundary) carrying every heartbeat and append of every group, i.e. continuous background traffic rather than an
+    /// operation's request (INTERNALS.md); their delivery faults are injected per message by the network (drop, delay,
+    /// duplicate, hold, partitions) and their durable boundaries at the <c>raft.*</c> and <c>recovery.*</c> sites. Snapshot
+    /// chunks are request/response exchanges of the <see cref="DfsOperationKind.RaftSnapshot"/> catch-up and are reported
+    /// like any request (F04 accepted, F13 reply). The handshake reports its own request-path stages (operation
+    /// <see cref="DfsOperationKind.Authenticate"/>) before this check.
     /// </summary>
-    private static bool IsObservedForFaults(MessageType type)
-        => type is not (MessageType.RaftBatch or MessageType.RaftSnapshotChunk);
+    private static bool IsObservedForFaults(MessageType type) => type is not MessageType.RaftBatch;
 
     private readonly record struct Registration(RpcHandler Handler, RpcAccess Access);
 }

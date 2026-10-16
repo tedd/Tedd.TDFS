@@ -93,6 +93,10 @@ Independent of the implementation; checked by MESH-034.
   them; every volume/data expectation is then bounded by `MeshOracle.Bound`: `Must` only if it holds with those nodes
   down, `Never` only if it holds with them up, otherwise `Either`. Control-group expectations are unaffected
   (registration is itself a control operation).
+* **Partial meshes at formation.** On a Ring/Line/Star link mesh, nodes without a direct link to the control leader
+  that formed the cluster never received its log, so they could neither register nor learn which volume groups they host;
+  they start in `MeshScenario.PendingRegistration` (bounded expectations as above) until a healed, fully linked mesh lets
+  the control group register them.
 
 ## 3. Catalog
 
@@ -161,6 +165,10 @@ Data policy for a configuration: ack copies = `ack`; target = max(ack, min(3, n)
 ack zones = min(ack, target zones). Volume voters: explicit central voters on partial meshes (Star: hub and first
 leaves; Ring/Line: a centred contiguous block, control and volume blocks concentric), else one-per-zone when there are
 enough zones, else any. Control voters on partial meshes are forced through the static bootstrap description.
+On Ring/Line link meshes the second zone of `2+1` (the same ⌊n/3⌋ nodes) is the centred block of the line rather than its
+end: groups replicate without relaying, so only nodes linked to the control leader register (RCV-02) and can acknowledge
+data, and with centred voter blocks a second zone at the far end would make the acknowledged zones unreachable by
+construction (the probe files of section 1 could never be written).
 
 Excluded (invalid) configurations, each with its reason (`MeshConfig.Invalid`): volume voters or ack copies above the
 node count (impossible); seed join on Ring/Line link meshes (a joiner cannot reach the control leader n0); seed join on a

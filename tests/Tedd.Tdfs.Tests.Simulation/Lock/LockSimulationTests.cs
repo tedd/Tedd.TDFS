@@ -2149,8 +2149,14 @@ public sealed class LockSimulationTests
                 await AssertBackupHoldsNothingAsync("while a live FileShare.None writer coexists with a backup snapshot reader");
             }
 
+            // A already published everything it staged (tA above), so a bare commit would publish nothing and prove nothing
+            // about its authority: A attempts a real publication, which only an extended lease could have let through.
             pausedA.Resume();
-            LockHelpers.AssertLeaseLost(await LockHelpers.WithinAsync(cluster, LockHelpers.CatchAsync(() => a.CommitAsync(ct)), lease * 10, "A after resuming", ct),
+            LockHelpers.AssertLeaseLost(await LockHelpers.WithinAsync(cluster, LockHelpers.CatchAsync(async () =>
+                {
+                    await a.WriteAsync(dataA.AsMemory(0, 100), ct);
+                    await a.CommitAsync(ct);
+                }), lease * 10, "A after resuming", ct),
                 "A's lease was not extended by the backup's renewal attempts");
             LockHelpers.BytesEqual(dataC, await LockHelpers.ReadCommittedAsync(vc, path, ct), "live contents are the live writer's");
             await LockHelpers.CatchAsync(() => a.DisposeAsync().AsTask());

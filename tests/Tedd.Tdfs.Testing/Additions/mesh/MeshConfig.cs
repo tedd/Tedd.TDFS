@@ -88,8 +88,24 @@ public sealed record MeshConfig
         _ => SeedGraph.Full,
     };
 
-    /// <summary>The node layout (n0..n{N-1}) per <see cref="Topology"/>.</summary>
-    public IReadOnlyList<TestNodeSpec> NodeSpecs() => new TestClusterOptions { NodeCount = Nodes, Topology = Topology }.GetNodeSpecs();
+    /// <summary>
+    /// The node layout (n0..n{N-1}) per <see cref="Topology"/>. On a <see cref="LinkMesh.Ring"/>/<see cref="LinkMesh.Line"/>
+    /// link mesh the second zone of <see cref="TestTopology.TwoPlusOne"/> (the same ⌊n/3⌋ nodes as elsewhere) sits in the
+    /// middle of the line instead of at its end: groups replicate without relaying (ARCHITECTURE §2.4), so only nodes linked
+    /// to the control leader receive the cluster map and can register their incarnation (RCV-02) — the only nodes that can
+    /// acknowledge data. The voter blocks are centred (<see cref="CentralVoters"/>), so a second zone at the far end of the
+    /// line would leave every electable leader without a neighbour in it and make the acknowledged zone count unreachable by
+    /// construction, whereas a centred second zone is linked to every node that can win an election.
+    /// </summary>
+    public IReadOnlyList<TestNodeSpec> NodeSpecs()
+    {
+        IReadOnlyList<TestNodeSpec> specs = new TestClusterOptions { NodeCount = Nodes, Topology = Topology }.GetNodeSpecs();
+        if (Topology != TestTopology.TwoPlusOne || Mesh is not (LinkMesh.Ring or LinkMesh.Line))
+            return specs;
+        int second = specs.Count(s => s.Zone == "z2");
+        int start = (Nodes - second) / 2;
+        return specs.Select((s, i) => s with { Zone = i >= start && i < start + second ? "z2" : "z1" }).ToArray();
+    }
 
     /// <summary>Distinct zones of the layout.</summary>
     public int Zones => NodeSpecs().Select(s => s.Region + "\0" + s.Zone).Distinct(StringComparer.Ordinal).Count();
@@ -176,6 +192,7 @@ public sealed record MeshConfig
         {
             NodeCount = Nodes,
             Topology = Topology,
+            Nodes = Topology == TestTopology.TwoPlusOne && Mesh is (LinkMesh.Ring or LinkMesh.Line) ? NodeSpecs() : null,
             ControlVoters = ControlVoters,
             Volumes = [new TestVolumeSpec(VolumeName) { Metadata = VolumeMetadata(), DefaultPolicy = policy }],
             DefaultPolicy = policy,

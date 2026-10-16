@@ -97,7 +97,7 @@ count × ( varuint32 fieldId, u8 flags, bytes value )      flags: bit 0 = Requir
 ```
 
 * Field ids are unique within one block (duplicates are malformed). Version 1 defined **no** extension fields; fields added since are listed with their message (`RestoreSnapshot` field 1 `StoragePool`, `HelloChallenge` field 1 `ServerBootId`,
-  `RegisterIncarnation` field 1 `Release`).
+  `RegisterIncarnation` field 1 `Release`, `RaftBatch` field 1 `CapabilityClock`).
 * An **unknown optional** extension is preserved on the decoded record (`Extensions`) and re-emitted when the record is
   re-encoded (for example when a node forwards a request), and is otherwise ignored (FMT-003).
 * An **unknown required** extension makes the whole message fail with `Unsupported` (FMT-002): a receiver never
@@ -430,13 +430,21 @@ objects (strictly ascending), `timestamp` expiry, `bytes[0|32]` MAC, extension b
 `CapabilityKey = HKDF(clusterSecret, "tdfs/v1/capability")`; unlike other records, extensions **are** MAC-covered, so a
 future issuer can add restrictions as required extensions that old verifiers reject rather than ignore. A verifier
 checks: MAC (constant time); cluster; volume and epoch (older epoch → rejected, SEC-007); principal equals the
-connection principal; not expired on the verifier's clock; kind matches the request; for `PutObject` the staging id
+connection principal; not expired on the verifier's capability clock (below); kind matches the request; for `PutObject` the staging id
 matches the request; for `GetObject` the object is listed (`AllowsRead`, binary search). Failures → `AccessDenied`.
 A staging capability is also accepted by `GetObject` for objects stored under **its own** staging session (a writer reading
 back its staged, unpublished data that it uploaded early to bound memory); any other object → `AccessDenied`. Only the
 client's own uploads are stored under a client's staging session: objects the leader materializes go under a staging
 session of the leader's (§8.1), so a staging capability never reads bytes its holder did not upload.
 Node peers may omit capabilities on `GetObject` (repair pulls) — clients never may (SEC-004/005).
+Expiries are issued and verified on each node's **capability clock**: its wall clock at start advanced by its monotonic
+clock (so later wall-clock steps neither expire valid capabilities early nor revive expired ones, SEC-017), moved forward —
+never back — to the capability clock carried by any `RaftBatch` a hosted group accepted from a peer (`RaftBatch` extension
+field 1 `CapabilityClock`). Group peers thereby converge on the most advanced clock among them, so issuers and verifiers
+agree although monotonic clocks drift for as long as nodes run (MESH-036). A storage node that does not know the volume
+of an **authentic** capability (MAC, cluster, volume, principal) — its control replica has not applied the volume yet — answers
+`NodeUnavailable` (retryable; another replica or target serves) instead of `AccessDenied`. A client that is refused a
+capability by one replica tries the other replicas before re-acquiring the capability.
 
 ### 7.4 Reads
 
@@ -2001,7 +2009,13 @@ Raft messages from one node to another, batched per destination (node → node).
 | 1 | `From` | `NodeId` | Sending node (must equal the authenticated connection identity). |
 | 2 | `Incarnation` | `varuint` | Sending node incarnation. |
 | 3 | `Messages` | `list<RaftEnvelope>` | Messages in send order. |
-| 4 | — | `extensions` | Terminal extension block. |
+| 4 | — | `extensions` | Terminal extension block (field 1, see below). |
+
+Extension fields (added after v1 shipped, §2.5):
+
+| Field | Name | Flags | Value |
+|---|---|---|---|
+| 1 | `CapabilityClock` | optional | The sender's data-capability clock when it sent the batch: UTC ticks, 8 bytes little-endian (§7.3). |
 
 #### `RaftBatchResult` = 131 (`RaftBatchResultMessage`)
 

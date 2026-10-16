@@ -176,6 +176,12 @@ internal static class NetFaultMatrix
     {
         FaultStage.F03 or FaultStage.F04 or FaultStage.F13 or FaultStage.F14 when CarriedBy.TryGetValue(operation, out string? carrier) =>
             $"{operation} has no message of its own (it travels as a {carrier} request, see MessageTypes.OperationOf); its wire and server stages are the {carrier} cases",
+        FaultStage.F04 or FaultStage.F13 when operation == DfsOperationKind.RaftAppend =>
+            "Raft replication travels as one-way RaftBatch messages (PROTOCOL.md §8.7): there is no reply to send (F13), and the batches are " +
+            "continuous background traffic of every group, not an operation's request, so the dispatcher does not report them at the " +
+            "request-path stages (RpcDispatcher.IsObservedForFaults); their delivery faults are injected per message by the network " +
+            "(drop/delay/duplicate/hold, partitions and one-way cuts: NET-011, NET-012, MESH-009/010/014, the CON suite) and their durable " +
+            "boundaries are the raft.* and recovery.* sites (the follower restart of this driver)",
         FaultStage.F00 or FaultStage.F01 => $"{operation} is not started by a public SDK call (internal protocol or background work), so client op.start/validated stages do not exist for it",
         FaultStage.F02 => $"{operation} runs over an established pooled connection; connection establishment is the Connect operation's stage (stale pooled reuse is NET-016)",
         FaultStage.F03 when site == FaultSites.ClientUploadChunk => $"{operation} uploads no object payload chunks (payload chunks are PutObject requests)",
@@ -927,7 +933,7 @@ internal static class NetFaultMatrix
     private static OperationDriver RaftAppendDriver() => new(
         DfsOperationKind.RaftAppend,
         "replication traffic plus a follower restart (journal replay)",
-        Sites(ServerWire, [FaultSites.RecoveryJournalReplay]),
+        Sites([FaultSites.RecoveryJournalReplay]),
         DefaultOptions,
         async context =>
         {
