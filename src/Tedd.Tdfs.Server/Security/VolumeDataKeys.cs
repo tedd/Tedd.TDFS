@@ -58,6 +58,7 @@ internal sealed class VolumeDataKeys : IVolumeKeyProvider, IDisposable
     /// through <paramref name="warn"/> and skipped: the control state supplies every key of an existing volume again, and a
     /// record whose key stays unavailable fails with <see cref="DfsRecoveryKeyMissingException"/> where it is needed.
     /// </summary>
+    /// <exception cref="DfsAuthenticationException">The file holds keys and none unwraps with <paramref name="kek"/> (wrong cluster secret).</exception>
     public static async Task<VolumeDataKeys> OpenAsync(IStorageMedium medium, string path, byte[] kek, IRandomSource random,
         Func<VolumeId, VolumeRecord?> lookup, Action<string> warn, CancellationToken ct)
     {
@@ -241,6 +242,8 @@ internal sealed class VolumeDataKeys : IVolumeKeyProvider, IDisposable
 
     private void Load(byte[] content)
     {
+        int attempted = 0;
+        int unwrapped = 0;
         try
         {
             var reader = new SpanReader(content);
@@ -262,7 +265,11 @@ internal sealed class VolumeDataKeys : IVolumeKeyProvider, IDisposable
                         int length = reader.U16();
                         if (length > MaxWrappedKeyLength)
                             throw new DfsIntegrityException("implausible wrapped key length");
+                        long before = _generation;
+                        attempted++;
                         AddLocked(volume, keyVersion, reader.Bytes(length), "the key file");
+                        if (_generation != before)
+                            unwrapped++;
                     }
                 }
 
@@ -273,6 +280,14 @@ internal sealed class VolumeDataKeys : IVolumeKeyProvider, IDisposable
         catch (Exception ex) when (ex is DfsIntegrityException or ArgumentException or IndexOutOfRangeException)
         {
             _warn($"The volume key file '{_path}' is damaged ({ex.Message}); keys are taken from the control state.");
+        }
+
+        // Not one of this node's own data keys unwraps: the configured cluster secret is not the one the node ran with.
+        // Refuse to start before the object store could misjudge its records as damaged (SEC-001).
+        if (attempted > 0 && unwrapped == 0)
+        {
+            throw new DfsAuthenticationException(
+                $"None of the {attempted} data key(s) in '{_path}' can be unwrapped: the configured cluster secret is not this node's.");
         }
     }
 

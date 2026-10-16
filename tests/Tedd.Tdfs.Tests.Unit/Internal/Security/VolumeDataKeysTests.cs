@@ -67,15 +67,12 @@ public sealed class VolumeDataKeysTests
         using (VolumeDataKeys keys = await OpenAsync(host.Medium, () => control))
             await keys.PrepareWriteAsync(control, 0, null, default);
 
-        var warnings = new List<string>();
-        using (VolumeDataKeys foreign = await VolumeDataKeys.OpenAsync(host.Medium, Path, TestData.Bytes(81, 32), new SeededRandom(1), _ => null, warnings.Add, default))
-        {
-            Assert.Null(foreign.GetCipher(Volume));
-            Assert.NotEmpty(warnings);
-        }
+        // A wrong cluster secret unwraps none of the node's own keys: refuse to start rather than misjudge records as damaged.
+        await Assert.ThrowsAsync<DfsAuthenticationException>(() =>
+            VolumeDataKeys.OpenAsync(host.Medium, Path, TestData.Bytes(81, 32), new SeededRandom(1), _ => null, _ => { }, default));
 
         host.Simulated.CorruptByte(Path, 30);
-        warnings.Clear();
+        var warnings = new List<string>();
         using VolumeDataKeys damaged = await VolumeDataKeys.OpenAsync(host.Medium, Path, Kek, new SeededRandom(1), _ => null, warnings.Add, default);
         Assert.Null(damaged.GetCipher(Volume));
         Assert.NotEmpty(warnings);
