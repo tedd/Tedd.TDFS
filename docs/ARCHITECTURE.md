@@ -338,7 +338,8 @@ snapshot root as id→revision lists.
 
 * **Object store** (`Storage.ObjectStore`): packed append-only segment files. Record =
   `{magic, version, ObjectId, VolumeId, StagingId, plaintextLength, storedLength, encoding, keyVersion,
-  checksum(xxHash128 of plaintext), headerCrc32C}` + payload (+ GCM tags per 64 KiB unit when encrypted). Index is
+  checksum(xxHash128 of plaintext), headerCrc32C}` + payload (+ GCM tags per 64 KiB unit when encrypted; `keyVersion` is
+  the owning volume's data-key version, §11). Index is
   in memory and rebuilt by scanning segments at startup (self-contained, DSK-018). Deletes write tombstones.
   Compaction copies live records to a new segment, flushes, then deletes the old segment (crash-safe either way).
 * Object size: ≤ `MaxObjectSize` (default 4 MiB). The client chunks writes into logical update units of
@@ -514,7 +515,29 @@ implements partitions, asymmetric cuts, black holes, reply drops, duplication an
 * **At rest**: object payloads encrypted with AES-256-GCM using per-volume data keys (DEK versions); Raft journals,
   checkpoints and backup manifests encrypted with node/backup storage keys derived from the KEK. DEKs are stored in
   control state wrapped by the cluster KEK. Key rotation adds a DEK version; old versions are retained while any
-  object uses them. **Recovery key**: `DfsAdminClient.ExportRecoveryKeyAsync` returns the KEK escrow wrapped under an
+  object uses them. Details:
+  * `CreateVolume` (and every restore, which creates a new volume) commits DEK v1; `RotateDataKey` commits
+    `current + 1` (`AddDataKey` control entry, wrapped DEK generated and wrapped by the control leader). Versions are
+    never removed (a version may still be referenced by an object record, a retained snapshot or a backup export
+    source), so every recorded version stays decodable.
+  * Each object record is sealed per 64 KiB unit with record key `HKDF(DEK_v, "storage/object", v)` of its volume
+    (`ObjectEncoding.SealedVolumeUnits`) and records `v` in its header (`ObjectRecordInfo.KeyVersion`). Reads, scrub,
+    compaction and open-time verification decrypt with the recorded version; records sealed with the older node-wide
+    object key (`SealedUnits`) stay readable.
+  * New writes: the storage node seals with the newest version it knows, at least the staging capability's
+    `MinimumKeyVersion` (PROTOCOL.md §7.3). The volume leader's proposals run a control barrier, so a staging session
+    created after `RotateDataKey` returned requires the new version; a node that has not learned it runs a control
+    barrier and otherwise refuses retryably. Node-internal copies (repair, `CopyObjects`, snapshot and backup restore)
+    re-encrypt under the receiving node's current version of the target volume; payload travels as verified plaintext
+    over TLS, so versions never have to match between holders. The volume leader records the versions in the volume log
+    (`RotateDataKey` volume entry, `VolumeState.KeyVersions`).
+  * `Server.Security.VolumeDataKeys` unwraps a volume's DEKs into one cipher per volume and keeps every wrapped DEK it
+    ever sealed a record with in the node-local `volume-keys` file (wrapped only; written durably before the first
+    record uses a version), so the object store can verify its newest segment at start before the control state is
+    loaded, and records of a deleted volume's control record stay readable until GC removes them.
+  * Backups never carry source DEKs: the exporter reads verified plaintext, the backup node stores objects and manifests
+    under its own key hierarchy (its data key wrapped by the backup secret), and a restore re-encrypts under the new
+    volume's DEK — a restore works with the source absent and with the source's key versions irrelevant. **Recovery key**: `DfsAdminClient.ExportRecoveryKeyAsync` returns the KEK escrow wrapped under an
   admin-supplied passphrase; backup nodes hold their own KEK (config) and escrow. Missing key material →
   `DfsRecoveryKeyMissingException`, never a "verified" backup (RST-005).
 * Diagnostics/audit never contain payload bytes or secrets (SDK-016, SEC-016).

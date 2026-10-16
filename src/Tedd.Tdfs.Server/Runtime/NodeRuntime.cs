@@ -151,17 +151,26 @@ internal sealed partial class NodeRuntime
         s.ClusterId = superblock.ClusterId;
         s.Incarnation = superblock.Incarnation;
 
+        // Object payloads are sealed with per-volume data keys (ARCHITECTURE §11); the node-wide object cipher only opens
+        // records sealed before per-volume keys existed. The node-local key file is loaded before the store verifies its
+        // newest segment, since the control state that holds the wrapped keys is opened after the store.
         IRecordCipher? objectCipher = null;
+        VolumeDataKeys? volumeKeys = null;
         if (options.EncryptAtRest)
         {
             RecordCipher cipher = s.Keys.CreateObjectCipher(s.Random.Fork("cipher/objects"));
             s.Disposables.Add(cipher);
             objectCipher = cipher;
+            volumeKeys = await VolumeDataKeys.OpenAsync(medium, s.DataPath(VolumeDataKeys.FileName), s.Keys.StorageKek, s.Random.Fork("cipher/volumes"),
+                id => s.Control.State.FindVolume(id), message => s.Warn("keys", message), ct);
+            s.Disposables.Add(volumeKeys);
         }
 
+        s.VolumeKeys = volumeKeys;
         s.ObjectStore = await ObjectStore.OpenAsync(medium, s.DataPath(NodeServices.ObjectsDirectory),
             new ObjectStoreOptions(SegmentSizeFor(options), options.ReservedBytes, options.Timings.MaxObjectSize, objectCipher)
             {
+                VolumeKeys = volumeKeys,
                 Mutations = options.Mutations,
                 NodeName = options.Name,
                 CapacityLimitBytes = options.CapacityBytes,

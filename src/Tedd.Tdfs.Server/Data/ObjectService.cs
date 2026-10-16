@@ -3,6 +3,7 @@ using Tedd.Tdfs.Protocol;
 using Tedd.Tdfs.Protocol.Messages;
 using Tedd.Tdfs.Server.Control;
 using Tedd.Tdfs.Server.Runtime;
+using Tedd.Tdfs.Server.Volumes.Service;
 using Tedd.Tdfs.Storage;
 
 namespace Tedd.Tdfs.Server.Data;
@@ -15,6 +16,7 @@ namespace Tedd.Tdfs.Server.Data;
 internal sealed class ObjectService
 {
     private readonly NodeServices _s;
+    private readonly ControlBarrier _barrier;
 
     public ObjectService(NodeServices services, Capabilities capabilities)
     {
@@ -22,6 +24,7 @@ internal sealed class ObjectService
         ArgumentNullException.ThrowIfNull(capabilities);
         _s = services;
         Capabilities = capabilities;
+        _barrier = new ControlBarrier(services);
     }
 
     /// <summary>Capability issuing and verification.</summary>
@@ -48,8 +51,16 @@ internal sealed class ObjectService
     /// Stores an object durably and returns a receipt. <paramref name="admission"/> selects how much of the reserve the
     /// copy may use: repair copies (<see cref="ObjectAdmission.Repair"/>) may fill the repair reserve, client payload never.
     /// </summary>
+    /// <remarks>
+    /// With encryption at rest the copy is sealed with the newest data-key version of the volume this node knows, which is
+    /// at least <paramref name="minimumKeyVersion"/> (the version a staging capability requires, so writes staged after a
+    /// committed <c>RotateDataKey</c> use the new key; 0 for node-internal copies such as repair and restore, which
+    /// re-encrypt under the current version). The version is recorded in the object record and durable in the node's key
+    /// file before the record is written.
+    /// </remarks>
     public async Task<(ObjectReceipt Receipt, bool AlreadyPresent)> StoreAsync(ObjectId obj, VolumeRecord volume, StagingId staging, UInt128 checksum,
-        long length, byte encoding, ulong placementEpoch, ReadOnlyMemory<byte> data, DfsOperationKind operation, ObjectAdmission admission, CancellationToken ct)
+        long length, byte encoding, ulong placementEpoch, ReadOnlyMemory<byte> data, DfsOperationKind operation, ObjectAdmission admission, CancellationToken ct,
+        uint minimumKeyVersion = 0)
     {
         if (!_s.Control.IsSelfRegistered)
         {
@@ -73,7 +84,10 @@ internal sealed class ObjectService
 
         bool alreadyPresent = Store.TryGetInfo(obj) is { } existing && existing.Volume == volume.Id && existing.Staging == staging
             && existing.Checksum == checksum && existing.Length == length;
-        await Store.PutAsync(obj, volume.Id, staging, data, operation, admission, ct, volume.Name);
+        uint keyVersion = 0;
+        if (_s.VolumeKeys is { } keys)
+            keyVersion = await keys.PrepareWriteAsync(volume, minimumKeyVersion, _barrier.WaitAsync, ct);
+        await Store.PutAsync(obj, volume.Id, staging, data, operation, admission, keyVersion, ct, volume.Name);
         await _s.HitAsync(FaultStage.F08, FaultSites.ObjectAfterFlushBeforeReceipt, volume.Name, operation, obj: obj, ct: ct);
         _s.Metrics.ObjectPut(data.Length);
         _s.Metrics.SetStored(Store.ObjectCount, Store.LiveBytes);
@@ -102,16 +116,19 @@ internal sealed class ObjectService
     {
         var message = (PutObjectMessage)request;
         VolumeRecord? found = _s.Control.State.FindVolume(message.Volume);
+        uint minimumKeyVersion = 0;
         if (!context.IsNode || !message.Capability.IsEmpty)
         {
             if (found is null)
                 throw UnknownVolume(message.Capability.Span, message.Volume, context.Principal ?? string.Empty);
-            Capabilities.Verify(message.Capability.Span, DataCapabilityKind.Staging, found, context.Principal ?? string.Empty, staging: message.Staging);
+            DataCapability capability = Capabilities.Verify(message.Capability.Span, DataCapabilityKind.Staging, found, context.Principal ?? string.Empty,
+                staging: message.Staging);
+            minimumKeyVersion = Capabilities.MinimumKeyVersion(capability);
         }
 
         VolumeRecord volume = found ?? throw new DfsException(DfsErrorCode.VolumeNotFound, $"Volume {message.Volume} does not exist.");
         (ObjectReceipt receipt, bool alreadyPresent) = await StoreAsync(message.Object, volume, message.Staging, message.Checksum, message.Length,
-            message.Encoding, message.PlacementEpoch, message.Data, DfsOperationKind.PutObject, context.Cancellation);
+            message.Encoding, message.PlacementEpoch, message.Data, DfsOperationKind.PutObject, ObjectAdmission.Normal, context.Cancellation, minimumKeyVersion);
         return new PutObjectResultMessage(receipt, alreadyPresent);
     }
 

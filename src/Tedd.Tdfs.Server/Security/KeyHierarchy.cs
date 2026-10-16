@@ -55,7 +55,10 @@ internal sealed class KeyHierarchy
     /// <summary>Record cipher for state-machine checkpoints at rest.</summary>
     public RecordCipher CreateCheckpointCipher(IRandomSource random) => new RecordCipher(KeyRing.Derive(StorageKek, StorageKeys.CheckpointPurpose), random);
 
-    /// <summary>Record cipher for object payloads at rest (node level; per-volume DEKs are tracked in the control state).</summary>
+    /// <summary>
+    /// Node-level record cipher of object payloads: opens records sealed before per-volume data keys were used
+    /// (<c>ObjectEncoding.SealedUnits</c>); new records are sealed with the volume DEKs (<see cref="VolumeDataKeys"/>).
+    /// </summary>
     public RecordCipher CreateObjectCipher(IRandomSource random) => new RecordCipher(KeyRing.Derive(StorageKek, StorageKeys.ObjectPurpose), random);
 
     /// <summary>

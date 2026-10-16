@@ -125,12 +125,21 @@ public sealed partial class ObjectStore
     internal const int UnitAadSize = 44;
 
     /// <summary>Builds a complete object record (header + payload).</summary>
-    private byte[] BuildObjectRecord(ObjectId id, VolumeId volume, StagingId staging, ReadOnlySpan<byte> plain, UInt128 checksum, out RecordHeader header)
+    private byte[] BuildObjectRecord(ObjectId id, VolumeId volume, StagingId staging, ReadOnlySpan<byte> plain, UInt128 checksum, uint requestedKeyVersion,
+        out RecordHeader header)
     {
         int unitCount = UnitCountFor(plain.Length);
-        bool encrypt = _cipher is not null;
-        int overhead = encrypt ? _cipherOverhead : 0;
-        uint keyVersion = encrypt ? CipherSupport.CurrentVersion(_cipher!) : 0;
+        (IRecordCipher? cipher, byte encoding) = SealingCipher(volume);
+        bool encrypt = cipher is not null;
+        int overhead = encrypt ? (ReferenceEquals(cipher, _cipher) ? _cipherOverhead : CipherSupport.ValidateOverhead(cipher!)) : 0;
+        uint keyVersion = 0;
+        if (encrypt)
+        {
+            keyVersion = requestedKeyVersion != 0 ? requestedKeyVersion : CipherSupport.CurrentVersion(cipher!);
+            if (!cipher!.CanDecrypt(keyVersion))
+                throw new DfsRecoveryKeyMissingException($"Object {id}: key version {keyVersion} of volume {volume} is not available on this node.");
+        }
+
         long stored = (long)plain.Length + ((long)unitCount * overhead);
         int headerLength = FixedHeaderSize + (8 * unitCount) + 4;
         var record = new byte[checked(headerLength + stored)];
@@ -146,7 +155,7 @@ public sealed partial class ObjectStore
             if (encrypt)
             {
                 WriteUnitAad(aad, id, volume, u, plain.Length);
-                _cipher!.Encrypt(aad, unit, record.AsSpan((int)storedOffset, length + overhead), keyVersion);
+                cipher!.Encrypt(aad, unit, record.AsSpan((int)storedOffset, length + overhead), keyVersion);
                 storedOffset += length + overhead;
             }
             else
@@ -156,10 +165,27 @@ public sealed partial class ObjectStore
             }
         }
 
-        header = new RecordHeader(KindObject, encrypt ? ObjectEncoding.SealedUnits : ObjectEncoding.Plain, id, volume, staging,
+        header = new RecordHeader(KindObject, encoding, id, volume, staging,
             plain.Length, stored, keyVersion, UnitSize, checksum, hashes, default, 0, headerLength);
         WriteHeader(record, header);
         return record;
+    }
+
+    /// <summary>
+    /// The cipher new records of <paramref name="volume"/> are sealed with and the resulting encoding: the volume's data keys
+    /// when per-volume keys are configured (missing key material throws <see cref="DfsRecoveryKeyMissingException"/>),
+    /// otherwise the node-wide cipher, otherwise none (plaintext).
+    /// </summary>
+    private (IRecordCipher? Cipher, byte Encoding) SealingCipher(VolumeId volume)
+    {
+        if (_options.VolumeKeys is { } keys)
+        {
+            IRecordCipher cipher = keys.GetCipher(volume)
+                ?? throw new DfsRecoveryKeyMissingException($"No data-encryption key of volume {volume} is available on this node.");
+            return (cipher, ObjectEncoding.SealedVolumeUnits);
+        }
+
+        return _cipher is null ? (null, ObjectEncoding.Plain) : (_cipher, ObjectEncoding.SealedUnits);
     }
 
     /// <summary>Builds a tombstone (delete) or quarantine record (header only).</summary>
@@ -264,7 +290,7 @@ public sealed partial class ObjectStore
                     if (stored != plainLength || keyVersion != 0)
                         return false;
                 }
-                else if (encoding == ObjectEncoding.SealedUnits)
+                else if (encoding is ObjectEncoding.SealedUnits or ObjectEncoding.SealedVolumeUnits)
                 {
                     if (keyVersion == 0 || stored < plainLength)
                         return false;

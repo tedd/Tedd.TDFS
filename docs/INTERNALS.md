@@ -34,7 +34,8 @@ Volumes/
 Data/           ObjectService (PutObject/GetObject/Locate/Replicate/Delete/Copy handlers), Receipts (MAC),
                 Capabilities (staging + per-object read capabilities), InventoryReporter, Scrubber, RepairWorker
 Backup/         BackupExporter (leader side, per target), BackupNodeHost runtime, BackupReceiver, BackupCatalog
-Security/       KeyHierarchy (HKDF from cluster secret: NodeAuth, Receipt, Capability, StorageKek), PrincipalStore
+Security/       KeyHierarchy (HKDF from cluster secret: NodeAuth, Receipt, Capability, StorageKek), DataKeys (DEK wrap,
+                recovery escrow), VolumeDataKeys (per-volume DEK ciphers of the object store + node-local key file), PrincipalStore
                 helpers (PBKDF2 verifiers), Authorization (permission checks), AuditLog
 Admin/          AdminService (AdminRequest dispatch) + partials per admin area
 Inspection/     NodeInspector, BackupInspector, inspection record builders
