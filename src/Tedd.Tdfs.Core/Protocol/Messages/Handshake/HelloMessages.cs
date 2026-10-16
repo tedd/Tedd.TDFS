@@ -32,8 +32,62 @@ public sealed record HelloMessage(
     ReadOnlyMemory<byte> Nonce,
     UInt128 BootId = default) : IWireMessage<HelloMessage>
 {
-    /// <summary>Unknown optional extensions preserved from the wire (re-emitted on encode).</summary>
+    /// <summary>
+    /// Extension field id of <see cref="TransportCertificate"/> (optional; value: the length-prefixed 32-byte SPKI SHA-256 of the
+    /// certificate the node's listener presents, then its validity as two timestamps). An extension because the message
+    /// shipped without it (INTERNALS.md §4).
+    /// </summary>
+    public const uint TransportCertificateExtension = 1;
+
+    /// <summary>Optional extensions preserved from the wire (re-emitted on encode), including <see cref="TransportCertificateExtension"/>.</summary>
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
+
+    /// <summary>
+    /// The transport certificate a node peer declares (its listener's SPKI pin and validity), from
+    /// <see cref="TransportCertificateExtension"/>; null when absent or malformed. Bound into the handshake transcript like
+    /// every other byte of the hello, so the node proof covers it: a node with a pinned transport refuses a node peer whose
+    /// declared certificate is unknown to it or outside its validity (SEC-001), also on connections that peer opened (where
+    /// TLS authenticates only the listening side).
+    /// </summary>
+    public (byte[] SpkiSha256, DateTimeOffset NotBefore, DateTimeOffset NotAfter)? TransportCertificate
+    {
+        get
+        {
+            foreach (WireExtension extension in Extensions)
+            {
+                if (extension.FieldId != TransportCertificateExtension)
+                    continue;
+                try
+                {
+                    var reader = new WireReader(extension.Value.Span, WireLimits.Default);
+                    byte[] pin = reader.ReadFixedBytes(32, "SpkiSha256").ToArray();
+                    DateTimeOffset notBefore = reader.ReadDateTimeOffset();
+                    DateTimeOffset notAfter = reader.ReadDateTimeOffset();
+                    return (pin, notBefore, notAfter);
+                }
+                catch (DfsProtocolException)
+                {
+                    return null;
+                }
+            }
+
+            return null;
+        }
+    }
+
+    /// <summary>A copy declaring a node's transport certificate (sets <see cref="TransportCertificateExtension"/>).</summary>
+    public HelloMessage WithTransportCertificate(ReadOnlySpan<byte> spkiSha256, DateTimeOffset notBefore, DateTimeOffset notAfter)
+    {
+        if (spkiSha256.Length != 32)
+            throw new ArgumentException("An SPKI pin is 32 bytes.", nameof(spkiSha256));
+        var buffer = new System.Buffers.ArrayBufferWriter<byte>(64);
+        var writer = new WireWriter(buffer);
+        writer.WriteBytes(spkiSha256);
+        writer.WriteDateTimeOffset(notBefore);
+        writer.WriteDateTimeOffset(notAfter);
+        WireExtension[] others = [.. Extensions.Where(e => e.FieldId != TransportCertificateExtension)];
+        return this with { Extensions = [new WireExtension(TransportCertificateExtension, Required: false, buffer.WrittenMemory.ToArray()), .. others] };
+    }
 
     /// <inheritdoc />
     public MessageType Type => WireType;

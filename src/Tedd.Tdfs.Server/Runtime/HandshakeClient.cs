@@ -21,7 +21,14 @@ internal sealed record HandshakeOutcome(HelloChallengeMessage Challenge, HelloRe
 /// <param name="ProtocolMin">Lowest protocol version this node's release negotiates.</param>
 /// <param name="ProtocolMax">Highest protocol version this node's release negotiates.</param>
 internal sealed record NodeCredentials(Guid ExpectedClusterId, string Name, NodeId NodeId, ulong Incarnation, UInt128 BootId,
-    byte[] NodeAuthKey, IReadOnlySet<string> Features, int ProtocolMin = ProtocolInfo.MinSupportedVersion, int ProtocolMax = ProtocolInfo.CurrentVersion);
+    byte[] NodeAuthKey, IReadOnlySet<string> Features, int ProtocolMin = ProtocolInfo.MinSupportedVersion, int ProtocolMax = ProtocolInfo.CurrentVersion)
+{
+    /// <summary>
+    /// The certificate this node's transport listener presents (QUIC), declared in the hello so that a pinning peer can
+    /// refuse a node with an unknown or expired certificate also on connections that node opens (SEC-001); null without one.
+    /// </summary>
+    public RpcCertificateInfo? TransportCertificate { get; init; }
+}
 
 /// <summary>
 /// Peer side of the connection handshake (PROTOCOL.md §3): <c>Hello → HelloChallenge → HelloProof → HelloResult</c>,
@@ -47,6 +54,8 @@ internal static class HandshakeClient
         ArgumentNullException.ThrowIfNull(credentials);
         var hello = new HelloMessage(credentials.ExpectedClusterId, (ushort)credentials.ProtocolMin, (ushort)credentials.ProtocolMax, credentials.Features,
             PeerRole.Node, credentials.Name, credentials.NodeId, credentials.Incarnation, null, random.NextBytes(ProtocolInfo.NonceSize), credentials.BootId);
+        if (credentials.TransportCertificate is { } certificate)
+            hello = hello.WithTransportCertificate(certificate.SpkiSha256, certificate.NotBefore, certificate.NotAfter);
         byte[] helloFrame = MessageCodec.Encode(hello);
         (HelloChallengeMessage challenge, byte[] challengeFrame) = await ExchangeHelloAsync(connection, helloFrame, credentials.ExpectedClusterId, timeout, ct);
         if (challenge.ServerRole != PeerRole.Node)

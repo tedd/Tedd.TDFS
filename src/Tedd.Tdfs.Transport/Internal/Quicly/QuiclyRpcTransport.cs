@@ -21,7 +21,7 @@ namespace Tedd.Tdfs.Transport.Internal;
 /// Quicly "game thread" rule). Other threads enqueue frames and actions and wake the pump; MsQuic callbacks wake it
 /// through wrapped transport sinks, and an idle pump waits at most 1 ms.
 /// </summary>
-internal sealed class QuiclyRpcTransport : IRpcTransport, IRpcTransportControl, IPumpSignal
+internal sealed class QuiclyRpcTransport : IRpcTransport, IRpcTransportControl, IRpcTransportIdentity, IPumpSignal
 {
     private const int StateCreated = 0;
     private const int StateDisposing = 1;
@@ -94,6 +94,34 @@ internal sealed class QuiclyRpcTransport : IRpcTransport, IRpcTransportControl, 
 
     /// <summary>The options the transport was created with.</summary>
     public QuiclyTransportOptions Options { get; }
+
+    /// <inheritdoc />
+    public RpcCertificateInfo? LocalCertificate
+    {
+        get
+        {
+            X509Certificate2? certificate = Options.Certificate;
+            if (certificate is null)
+                return null;
+            return new RpcCertificateInfo(QuiclyTransportFactory.ComputeSpkiPin(certificate), new DateTimeOffset(certificate.NotBefore.ToUniversalTime()),
+                new DateTimeOffset(certificate.NotAfter.ToUniversalTime()));
+        }
+    }
+
+    /// <inheritdoc />
+    public bool PinsPeers => Options.TrustedSpkiPins.Count > 0;
+
+    /// <inheritdoc />
+    public bool TrustsPin(ReadOnlySpan<byte> spkiSha256)
+    {
+        foreach (byte[] pin in Options.TrustedSpkiPins)
+        {
+            if (spkiSha256.SequenceEqual(pin))
+                return true;
+        }
+
+        return false;
+    }
 
     /// <inheritdoc />
     public string LocalName { get; }

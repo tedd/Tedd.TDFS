@@ -134,6 +134,7 @@ internal sealed partial class NodeRuntime
 
         // Listen before joining (the leader must be able to reach a joining node); every request is refused until serving.
         _transport = s.Env.TransportFactory.Create(options.Name, options.ListenEndpoint);
+        s.TransportIdentity = _transport as IRpcTransportIdentity;
         s.Peers.Attach(_transport);
         await _transport.StartAsync(s.Rpc, ct);
         s.Endpoint = _transport.LocalEndpoint;
@@ -240,7 +241,7 @@ internal sealed partial class NodeRuntime
         NodeServices s = Services;
         s.NodeId = NodeId.New(s.Random);
         var credentials = new NodeCredentials(Guid.Empty, s.NodeName, s.NodeId, 0, s.BootId, s.Keys.NodeAuthKey, s.Release.Features,
-            s.Release.ProtocolMin, s.Release.ProtocolMax);
+            s.Release.ProtocolMin, s.Release.ProtocolMax) { TransportCertificate = s.TransportIdentity?.LocalCertificate };
         Exception? last = null;
         foreach (string seed in s.Options.JoinSeeds)
         {

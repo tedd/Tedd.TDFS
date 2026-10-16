@@ -6,6 +6,7 @@ using Tedd.Tdfs.Server.Raft;
 using Tedd.Tdfs.Server.Security;
 using Tedd.Tdfs.Server.Volumes;
 using Tedd.Tdfs.Storage;
+using Tedd.Tdfs.Transport;
 
 namespace Tedd.Tdfs.Server.Runtime;
 
@@ -125,9 +126,19 @@ internal sealed class NodeServices
     /// <summary>True once a graceful stop began (new requests are refused).</summary>
     public bool IsStopping { get; set; }
 
+    /// <summary>
+    /// The certificate identity of this node's transport (QUIC): the certificate its listener presents, declared in node
+    /// handshakes, and the pins node peers' declared certificates are checked against. Null for transports without
+    /// certificates (in-memory, simulated).
+    /// </summary>
+    public IRpcTransportIdentity? TransportIdentity { get; set; }
+
     /// <summary>The identity this node presents in node handshakes.</summary>
     public NodeCredentials CreateNodeCredentials()
-        => new(ClusterId, NodeName, NodeId, Incarnation, BootId, Keys.NodeAuthKey, Release.Features, Release.ProtocolMin, Release.ProtocolMax);
+        => new(ClusterId, NodeName, NodeId, Incarnation, BootId, Keys.NodeAuthKey, Release.Features, Release.ProtocolMin, Release.ProtocolMax)
+        {
+            TransportCertificate = TransportIdentity?.LocalCertificate,
+        };
 
     /// <summary>Path of <paramref name="relative"/> inside the node data directory.</summary>
     public string DataPath(string relative) => StoragePath.Combine(Options.DataDirectory, relative);

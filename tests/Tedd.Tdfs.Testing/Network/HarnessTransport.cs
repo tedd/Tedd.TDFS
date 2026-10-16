@@ -51,7 +51,7 @@ internal sealed class HarnessTransportFactory : IRpcTransportFactory
 }
 
 /// <summary>A fabric transport: the inner transport (simulated, in-memory or QUIC) behind the harness interposition layer.</summary>
-internal sealed class HarnessTransport : IRpcTransport, IRpcTransportControl
+internal sealed class HarnessTransport : IRpcTransport, IRpcTransportControl, IRpcTransportIdentity
 {
     public HarnessTransport(HarnessTransportFactory factory, IRpcTransport inner, string localName)
     {
@@ -76,6 +76,15 @@ internal sealed class HarnessTransport : IRpcTransport, IRpcTransportControl
 
     /// <summary>The inner transport's control interface (null for the simulated network).</summary>
     public IRpcTransportControl? InnerControl => Inner as IRpcTransportControl;
+
+    /// <inheritdoc />
+    public RpcCertificateInfo? LocalCertificate => (Inner as IRpcTransportIdentity)?.LocalCertificate;
+
+    /// <inheritdoc />
+    public bool PinsPeers => Inner is IRpcTransportIdentity { PinsPeers: true };
+
+    /// <inheritdoc />
+    public bool TrustsPin(ReadOnlySpan<byte> spkiSha256) => Inner is IRpcTransportIdentity identity && identity.TrustsPin(spkiSha256);
 
     /// <inheritdoc />
     public int OpenConnectionCount => InnerControl?.OpenConnectionCount ?? Fabric.CountOpenConnections(LocalName);
