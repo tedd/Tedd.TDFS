@@ -189,7 +189,7 @@ internal sealed partial class VolumeService
         if (keyVersion > (s.KeyVersions.IsEmpty ? 0 : s.KeyVersions.Max))
             await ProposeHousekeepingAsync(new RotateDataKeyCommand(keyVersion));
 
-        await MaintainTransactionsAsync(wall);
+        await MaintainTransactionsAsync();
 
         if (IsLeader && _readyTerm == Group.Term)
             ResumeRestores();

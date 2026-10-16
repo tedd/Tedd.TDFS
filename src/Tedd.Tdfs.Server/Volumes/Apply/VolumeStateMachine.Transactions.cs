@@ -120,8 +120,9 @@ internal sealed partial class VolumeStateMachine
                 throw Fail(DfsErrorCode.TransactionAborted, $"Transaction {c.Transaction} was aborted.");
         }
 
-        if (ctx.Now > tx.DeadlineUtc)
-            return Abandon(s, tx, ctx, DfsErrorCode.TransactionAborted, $"Transaction {tx.Id} passed its deadline {tx.DeadlineUtc:O} before it committed.");
+        // The duration limit is enforced by the leader that began the transaction, on its monotonic clock (only that leader
+        // holds the working view a commit is built from; it refuses and aborts an overdue transaction): a wall-clock step of
+        // the leader never aborts a transaction by itself (GC-004/GC-005).
         if (c.Descriptor.Length > s.Config.Limits.MaxTransactionDescriptorBytes)
         {
             return Abandon(s, tx, ctx, DfsErrorCode.LimitExceeded,

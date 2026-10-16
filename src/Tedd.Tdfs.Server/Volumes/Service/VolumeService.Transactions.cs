@@ -103,7 +103,7 @@ internal sealed partial class VolumeService
                 if (!_transactions.ContainsKey(id) && _sm.State.Transactions.TryGetValue(id, out TxRecord? record) && record.State == TxState.Active)
                 {
                     VolumeState root = _sm.TransactionRoot(id) ?? _sm.State;
-                    _transactions[id] = new TxWork(id, record.Principal, root);
+                    _transactions[id] = new TxWork(id, record.Principal, root) { StartedAt = _s.Time.GetTimestamp(), Duration = duration };
                 }
 
                 byte[] capability = _s.Objects.Capabilities.IssueStaging(Record, principal, begun.Staging, StagingCapabilityLifetime, out DateTimeOffset expiry,
@@ -139,6 +139,12 @@ internal sealed partial class VolumeService
             {
                 if (!string.Equals(tx.Principal, principal, StringComparison.Ordinal))
                     throw new UnauthorizedAccessException($"Transaction {id} belongs to another principal.");
+                if (IsPastDuration(tx))
+                {
+                    throw new DfsTransactionAbortedException(new DfsTransactionId(id),
+                        $"Transaction {id} ran longer than its {tx.Duration} limit before it committed; it is aborted and must be retried.");
+                }
+
                 descriptor = tx.Describe().Encode();
 
                 // F09 of the commit (test plan §8.2: a publication path has its own stage instrumentation): the receipts of
@@ -201,10 +207,10 @@ internal sealed partial class VolumeService
     }
 
     /// <summary>
-    /// Leader maintenance of transactions: aborts transactions past their deadline and those begun under an earlier leader
-    /// (their private views were lost), and forgets views of transactions that ended.
+    /// Leader maintenance of transactions: aborts transactions past their duration limit and those begun under an earlier
+    /// leader (their private views were lost), and forgets views of transactions that ended.
     /// </summary>
-    private async Task MaintainTransactionsAsync(DateTimeOffset wall)
+    private async Task MaintainTransactionsAsync()
     {
         VolumeState s = _sm.State;
         foreach (DfsOperationId id in _transactions.Keys.ToArray())
@@ -215,8 +221,10 @@ internal sealed partial class VolumeService
 
         foreach (TxRecord tx in s.Transactions.Values.Where(t => t.State == TxState.Active).ToArray())
         {
-            bool expired = tx.DeadlineUtc <= wall;
-            bool orphaned = !_transactions.ContainsKey(tx.Id) && tx.ReadIndex <= _transactionsSince;
+            // The duration limit runs on this leader's monotonic clock (the transaction exists only on the leader that began
+            // it): a wall-clock step never ends a transaction (GC-004/GC-005: time alone never decides an outcome).
+            bool expired = _transactions.TryGetValue(tx.Id, out TxWork? work) && IsPastDuration(work);
+            bool orphaned = work is null && tx.ReadIndex <= _transactionsSince;
             if (!expired && !orphaned)
                 continue;
             DropTransaction(tx.Id);
@@ -500,6 +508,9 @@ internal sealed partial class VolumeService
             tx.Reads.TryAdd(inode, baseInode.Revision);
     }
 
+    /// <summary>True when <paramref name="tx"/> ran longer than its duration limit (leader monotonic clock).</summary>
+    private bool IsPastDuration(TxWork tx) => _s.Time.GetElapsedTime(tx.StartedAt) > tx.Duration;
+
     /// <summary>The leader-private state of one active transaction.</summary>
     private sealed class TxWork
     {
@@ -517,6 +528,12 @@ internal sealed partial class VolumeService
         public DfsOperationId Id { get; }
 
         public string Principal { get; }
+
+        /// <summary>Leader timestamp of the begin (the duration limit runs from here on the monotonic clock).</summary>
+        public long StartedAt { get; init; }
+
+        /// <summary>Longest the transaction may stay active.</summary>
+        public TimeSpan Duration { get; init; } = TimeSpan.MaxValue;
 
         /// <summary>The namespace at the read version (read-set baseline).</summary>
         public ImmutableSortedDictionary<ulong, InodeRecord> BaseInodes { get; }
