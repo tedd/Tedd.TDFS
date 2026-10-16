@@ -243,6 +243,11 @@ topologies and policies (`MeshHelpers.Base` in the integration project). Smaller
 | 7 | 2+1 | 5 | 3 | 2 |
 | 10 | one per zone | 3 | 5 | 2 |
 
+Out-of-process rows (MESH-033, MESH-038) have no in-process inspector: the harness reads the same ground truth from each
+`Tedd.Tdfs.Host` process over its launcher control channel (`inspect` queries for group state, file layouts, verified
+local copies and state digests — `HostInspection`), and replica-health waits use the product's admin report there (the
+holder assertions that follow them stay ground truth).
+
 ## 6. Assumptions on harness behaviour
 
 The suite relies on documented-but-stubbed harness behaviour (no signature changes); the precise list is in

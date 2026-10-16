@@ -18,6 +18,8 @@ internal sealed class HostProcess : IAsyncDisposable
     private readonly TaskCompletionSource<HostReadyMessage> _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _exited = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly Action<string> _trace;
+    private readonly Dictionary<long, TaskCompletionSource<string>> _inspections = [];
+    private long _nextInspection;
 
     private HostProcess(Process process, string name, Action<string> trace)
     {
@@ -155,6 +157,42 @@ internal sealed class HostProcess : IAsyncDisposable
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Asks the host an inspection query (<c>Tedd.Tdfs.Host.HostInspection</c>: applied group state, file layout, verified
+    /// copies, state digests) and returns its JSON answer: the ground truth an out-of-process cluster offers in place of the
+    /// in-process inspectors.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">The process is gone (or exits before answering), or the query failed in the host.</exception>
+    /// <exception cref="TimeoutException">No answer within <paramref name="timeout"/>.</exception>
+    public async Task<string> InspectAsync(string query, string argument, TimeSpan timeout)
+    {
+        if (!IsRunning)
+            throw new InvalidOperationException($"The host process for {Name} is not running.");
+        var answer = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        long id;
+        lock (_inspections)
+        {
+            id = ++_nextInspection;
+            _inspections[id] = answer;
+        }
+
+        try
+        {
+            Send($"inspect {id.ToString(System.Globalization.CultureInfo.InvariantCulture)} {query} {Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(argument))}");
+            Task first = await Task.WhenAny(answer.Task, _exited.Task, Task.Delay(timeout));
+            if (first == answer.Task)
+                return await answer.Task;
+            if (first == _exited.Task)
+                throw new InvalidOperationException($"The host process for {Name} exited before answering the {query} inspection.");
+            throw new TimeoutException($"The host process for {Name} did not answer the {query} inspection within {timeout}.");
+        }
+        finally
+        {
+            lock (_inspections)
+                _inspections.Remove(id);
+        }
+    }
+
     /// <summary>Kills the process tree immediately (crash).</summary>
     public void Kill()
     {
@@ -214,6 +252,12 @@ internal sealed class HostProcess : IAsyncDisposable
 
         if (isError)
             return;
+        if (line.StartsWith(HostInspection.ReplyPrefix, StringComparison.Ordinal) || line.StartsWith(HostInspection.ErrorPrefix, StringComparison.Ordinal))
+        {
+            OnInspection(line);
+            return;
+        }
+
         if (line.StartsWith(HostConfigurationJson.ReadyPrefix, StringComparison.Ordinal))
         {
             try
@@ -242,6 +286,25 @@ internal sealed class HostProcess : IAsyncDisposable
             DfsErrorCode code = failed is not null && Enum.TryParse(failed.Code, out DfsErrorCode parsed) ? parsed : DfsErrorCode.Internal;
             _ready.TrySetException(DfsErrors.ToException(code, $"Host {Name} failed to start: {failed?.Type}: {failed?.Message}"));
         }
+    }
+
+    private void OnInspection(string line)
+    {
+        bool failed = line.StartsWith(HostInspection.ErrorPrefix, StringComparison.Ordinal);
+        string rest = line[(failed ? HostInspection.ErrorPrefix : HostInspection.ReplyPrefix).Length..];
+        int space = rest.IndexOf(' ', StringComparison.Ordinal);
+        if (space < 0 || !long.TryParse(rest.AsSpan(0, space), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out long id))
+            return;
+        TaskCompletionSource<string>? answer;
+        lock (_inspections)
+            _inspections.TryGetValue(id, out answer);
+        if (answer is null)
+            return;
+        string payload = rest[(space + 1)..];
+        if (failed)
+            answer.TrySetException(new InvalidOperationException($"Host {Name} failed an inspection: {payload}"));
+        else
+            answer.TrySetResult(System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(payload)));
     }
 
     private void OnExited()

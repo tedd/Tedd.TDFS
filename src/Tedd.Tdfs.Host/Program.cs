@@ -99,7 +99,7 @@ internal static class Program
         }
 
         Ready(new HostReadyMessage(host.Name, host.Endpoint, host.Id.ToString(), host.Incarnation, DevelopmentCertificates.PersistedKeyName(certificate)));
-        await control.RunAsync(host.Pause, host.Resume);
+        await control.RunAsync(host.Pause, host.Resume, (query, argument) => HostInspection.InvokeAsync(host.Inspect, query, argument));
         await host.StopAsync();
         return ExitOk;
     }

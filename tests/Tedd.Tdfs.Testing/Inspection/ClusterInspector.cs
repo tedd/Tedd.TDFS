@@ -13,7 +13,9 @@ namespace Tedd.Tdfs.Testing;
 /// running nodes holding a copy that re-reads and verifies, replica health is computed by the harness from the leader's
 /// reachable object set and those holders, and convergence compares the replicated state digests of replicas at the same
 /// applied index. Nodes that are not <see cref="TestNodeState.Running"/> are not consulted. Out-of-process clusters have no
-/// in-process inspectors: every member throws <see cref="NotSupportedException"/> there.
+/// in-process inspectors: their nodes answer the same queries over the host's control channel (groups, file layouts,
+/// verified copies, state digests — <c>Tedd.Tdfs.Host.HostInspection</c>), replica health is the product's own report
+/// there, and the members that need more of a node's state throw <see cref="NotSupportedException"/>.
 /// </remarks>
 public sealed partial class ClusterInspector
 {
@@ -27,9 +29,8 @@ public sealed partial class ClusterInspector
     /// <summary>The control group as seen by its leader.</summary>
     public async Task<GroupInspection> GetControlGroupAsync()
     {
-        RequireInProcess();
         TestNode leader = await _cluster.GetControlLeaderAsync();
-        return await leader.Inspect.GetGroupAsync(ProtocolInfo.ControlGroup)
+        return await leader.InspectGroupAsync(ProtocolInfo.ControlGroup)
             ?? throw new InvalidOperationException($"The control leader {leader.Name} stopped hosting the control group.");
     }
 
@@ -37,9 +38,8 @@ public sealed partial class ClusterInspector
     public async Task<GroupInspection> GetVolumeGroupAsync(string volume)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(volume);
-        RequireInProcess();
         TestNode leader = await _cluster.GetLeaderAsync(volume);
-        return await leader.Inspect.GetGroupAsync(volume)
+        return await leader.InspectGroupAsync(volume)
             ?? throw new InvalidOperationException($"The leader {leader.Name} of volume {volume} stopped hosting it.");
     }
 
@@ -58,6 +58,12 @@ public sealed partial class ClusterInspector
     public async Task<FileInspection?> GetFileAsync(string volume, string path)
     {
         ArgumentNullException.ThrowIfNull(path);
+        if (_cluster.Options.OutOfProcess)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(volume);
+            return await (await _cluster.GetLeaderAsync(volume)).InspectFileAsync(volume, path);
+        }
+
         VolumeStateInspection state = await GetVolumeStateAsync(volume);
         return state.GetFile(path);
     }
@@ -65,7 +71,6 @@ public sealed partial class ClusterInspector
     /// <summary>Running nodes durably holding a verified copy of an object (node order).</summary>
     public async Task<IReadOnlyList<string>> GetObjectHoldersAsync(ObjectId id)
     {
-        RequireInProcess();
         IReadOnlyDictionary<ObjectId, List<TestNode>> holders = await VerifiedHoldersAsync([id]);
         return holders.TryGetValue(id, out List<TestNode>? nodes) ? nodes.Select(n => n.Name).ToArray() : [];
     }
@@ -73,7 +78,6 @@ public sealed partial class ClusterInspector
     /// <summary>Distinct hosts and zones durably holding an object (verified copies on running nodes).</summary>
     public async Task<(int Copies, int Zones)> CountDurableDomainsAsync(ObjectId id)
     {
-        RequireInProcess();
         IReadOnlyDictionary<ObjectId, List<TestNode>> holders = await VerifiedHoldersAsync([id]);
         return holders.TryGetValue(id, out List<TestNode>? nodes) ? Domains(nodes, await CurrentLabelsAsync()) : (0, 0);
     }
@@ -85,6 +89,8 @@ public sealed partial class ClusterInspector
     private async Task<IReadOnlyDictionary<string, DfsTopologyLabels>> CurrentLabelsAsync()
     {
         HarnessControlSummary? best = null;
+        if (_cluster.Options.OutOfProcess)
+            return new Dictionary<string, DfsTopologyLabels>(StringComparer.Ordinal); // the specification labels (no run-time relabelling there)
         foreach (TestNode node in _cluster.RunningNodes())
         {
             try
@@ -134,7 +140,11 @@ public sealed partial class ClusterInspector
     public async Task<DfsReplicaHealth> GetReplicaHealthAsync(string volume)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(volume);
-        RequireInProcess();
+
+        // Out of process the harness cannot enumerate a leader's reachable objects; the product's own report stands in
+        // (waits on it are followed by ground-truth holder checks of the objects the test cares about).
+        if (_cluster.Options.OutOfProcess)
+            return await _cluster.Admin.GetReplicaHealthAsync(volume);
         TestNode leader = await _cluster.GetLeaderAsync(volume);
         NodeInspector leaderInspector = leader.Inspect;
         VolumeStateInspection state = await leaderInspector.GetVolumeStateAsync(volume)
@@ -278,7 +288,6 @@ public sealed partial class ClusterInspector
     public async Task AssertReplicasConvergedAsync(string volume)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(volume);
-        RequireInProcess();
         IReadOnlyList<string> divergence = await FindDivergenceAsync(volume);
         if (divergence.Count > 0)
             throw new Xunit.Sdk.XunitException($"Replicas of {volume} diverged: " + string.Join("; ", divergence));
@@ -295,7 +304,7 @@ public sealed partial class ClusterInspector
             string? line;
             try
             {
-                line = await node.Inspect.ComputeGroupDigestAsync(group);
+                line = await node.InspectGroupDigestAsync(group);
             }
             catch (Exception ex) when (TestCluster.IsNodeGone(ex))
             {
@@ -360,7 +369,7 @@ public sealed partial class ClusterInspector
             IReadOnlySet<ObjectId> verified;
             try
             {
-                verified = await node.Inspect.VerifyObjectsAsync(ids);
+                verified = await node.VerifyObjectsAsync(ids);
             }
             catch (Exception ex) when (TestCluster.IsNodeGone(ex))
             {

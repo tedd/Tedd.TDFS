@@ -563,7 +563,7 @@ public sealed partial class TestCluster
     {
         try
         {
-            return node.State == TestNodeState.Running ? await node.Inspect.GetGroupAsync(group) : null;
+            return node.State == TestNodeState.Running ? await node.InspectGroupAsync(group) : null;
         }
         catch (Exception ex) when (IsNodeGone(ex))
         {
@@ -577,6 +577,22 @@ public sealed partial class TestCluster
         var views = new List<NodeView>();
         foreach (TestNode node in RunningNodes())
         {
+            if (Options.OutOfProcess)
+            {
+                // Out of process only the groups are inspectable (over the host's control channel); stability is judged
+                // through the admin API there (EvaluateStabilityRemoteAsync).
+                try
+                {
+                    views.Add(new NodeView(node, EmptyStatus, await node.InspectGroupsAsync(), EmptyControl));
+                }
+                catch (Exception ex) when (IsNodeGone(ex) || ex is TimeoutException)
+                {
+                    // Gone, or not answering: not part of this snapshot.
+                }
+
+                continue;
+            }
+
             try
             {
                 NodeInspector inspector = node.Inspect;

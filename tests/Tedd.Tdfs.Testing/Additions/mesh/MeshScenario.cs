@@ -858,7 +858,7 @@ public sealed class MeshScenario
             GroupInspection control = await Cluster.Inspect.GetControlGroupAsync();
             foreach (string name in Net.AliveNodes.Where(n => !_removed.Contains(n)))
             {
-                GroupInspection? g = await Cluster.Node(name).Inspect.GetGroupAsync("control");
+                GroupInspection? g = await Cluster.Node(name).InspectGroupAsync("control");
                 if (g is null || g.AppliedIndex < control.CommitIndex)
                     return false;
             }
