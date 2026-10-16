@@ -10,8 +10,8 @@ internal sealed record UploadedObject(ObjectId Id, UInt128 Checksum, long Length
 /// <summary>
 /// One dirty range of the staged view: <c>[Offset, Offset + Length)</c> of the file maps to buffered bytes
 /// (<see cref="Buffer"/> from <see cref="BufferOffset"/>), to bytes of an uploaded object (<see cref="Object"/> from
-/// <see cref="ObjectOffset"/>), or to both: a readable writer keeps the bytes it uploaded early (staging capabilities never
-/// authorize reading them back), so its reads are served from memory while the publication references the object.
+/// <see cref="ObjectOffset"/>), or to both (a caller may keep bytes it uploaded; the stream does not: a readable writer
+/// reads uploaded ranges back with its staging capability, so its memory stays bounded by the buffer).
 /// Immutable (a snapshot of the overlay can share segments).
 /// </summary>
 internal sealed record StagedSegment(long Offset, long Length, byte[]? Buffer, int BufferOffset, bool OwnsTail, UploadedObject? Object, long ObjectOffset)
