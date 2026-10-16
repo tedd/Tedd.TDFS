@@ -775,6 +775,11 @@ public sealed class SecIntegrationTests
             }
 
             await vol.Backups.RemoveTargetAsync(backup.TargetName, Ct);
+            // The source's own retention protects S1 (hold) and S2 (expiry) on the source too (DeleteSnapshot answers
+            // RetentionProtected while held or unexpired): the source administrator, who holds RetentionAdmin there, lifts it
+            // first. Neither the release nor the deletion may reach the destination's independently enforced retention.
+            await vol.Snapshots.SetRetentionAsync("S1", new DfsRetention(), Ct);
+            await vol.Snapshots.SetRetentionAsync("S2", new DfsRetention(), Ct);
             await vol.Snapshots.DeleteAsync("S1", Ct);
             await vol.Snapshots.DeleteAsync("S2", Ct);
 
