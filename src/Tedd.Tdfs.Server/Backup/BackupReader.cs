@@ -299,6 +299,10 @@ internal sealed class BackupReader
         _s.Catalog.RequireLoaded("changing retention");
         BackupVolume volume = _s.Catalog.Find(m.Header.Volume) ?? throw SnapshotNotFound(m.Name, m.Header.Volume);
         using IDisposable held = await _s.Catalog.Locks.AcquireAsync(volume.Name, ct);
+
+        // A retry that waited for the volume lock while the original still ran is answered by the original's outcome.
+        if (TryReplay(session, m.Header, out replay))
+            return replay;
         BackupSnapshot snapshot = volume.FindVisible(m.Name) ?? throw SnapshotNotFound(m.Name, volume.Name);
         if (!admin && !BackupReceiver.IsExtension(snapshot.Retention, m.Retention))
         {
@@ -324,6 +328,11 @@ internal sealed class BackupReader
         _s.Catalog.RequireLoaded("deleting a snapshot");
         BackupVolume volume = _s.Catalog.Find(m.Header.Volume) ?? throw SnapshotNotFound(m.Name, m.Header.Volume);
         using IDisposable held = await _s.Catalog.Locks.AcquireAsync(volume.Name, ct);
+
+        // A retry that waited for the volume lock while the original still ran (condemning and collecting can take long) is
+        // answered by the original's outcome instead of finding the snapshot gone.
+        if (TryReplay(session, m.Header, out replay))
+            return replay;
         BackupSnapshot snapshot = volume.FindVisible(m.Name) ?? throw SnapshotNotFound(m.Name, volume.Name);
         if (snapshot.IsProtected(_s.Time.GetUtcNow()))
         {

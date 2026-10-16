@@ -817,7 +817,9 @@ internal sealed class VolumeContext : IRpcRouter
     /// Error replies to a mutation that need more than the generic handling (PROTOCOL.md §5.1). <c>EpochMismatch</c>,
     /// <c>OperationExpired</c> and <c>LeaseLost</c> reject a transmission without executing it — but after more than one
     /// transmission an earlier one may have committed before the rejection became possible (the outcome was retired, the
-    /// session expired, the volume was re-created), so the outcome is then unknown. After a single transmission an
+    /// session expired, the volume was re-created), so the outcome is then resolved through the operation id (the invoker
+    /// reports the rejection only for an id the resolution fenced, else the result or an unknown outcome;
+    /// <see cref="UncertainRejectionException"/>). After a single transmission an
     /// SDK-allocated id moves to a fresh id (a new session, or the re-created volume for requests that refer to nothing
     /// session-owned); otherwise the rejection is the definite answer.
     /// </summary>
@@ -827,7 +829,7 @@ internal sealed class VolumeContext : IRpcRouter
         if (error.Code is not (DfsErrorCode.EpochMismatch or DfsErrorCode.OperationExpired or DfsErrorCode.LeaseLost))
             return false;
         if (transmissions > 1)
-            throw Runtime.Rpc.CreateUnknown(request, error.ToException(request.Path));
+            throw new UncertainRejectionException(error.ToException(request.Path));
         if (!sdkAllocated)
             return false;
         switch (error.Code)
@@ -972,7 +974,10 @@ internal sealed class VolumeContext : IRpcRouter
 
             case WireOutcomeStatus.Aborted when result.Error is DfsErrorCode.Cancelled or DfsErrorCode.None:
                 throw new ResolvedFailureException(new DfsUnavailableException(DfsErrorCode.Unavailable,
-                    $"{request.Name} ({target}) did not take effect: it was not applied before its deadline and has been fenced. {result.Detail}"));
+                    $"{request.Name} ({target}) did not take effect: it was not applied before its deadline and has been fenced. {result.Detail}"))
+                {
+                    NeverExecuted = true,
+                };
 
             case WireOutcomeStatus.Aborted:
                 throw new ResolvedFailureException(DfsErrors.ToException(result.Error, result.Detail ?? $"{request.Name} failed.", request.Path, target));

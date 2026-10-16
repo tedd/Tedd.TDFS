@@ -271,7 +271,21 @@ internal sealed class RpcInvoker
 
             request.Router.OnAnswered(endpoint);
             DfsOperationId? before = request.Operation;
-            if (request.OnError is not null && await request.OnError(error, scope, transmissions).ConfigureAwait(false))
+            bool retry;
+            try
+            {
+                retry = request.OnError is not null && await request.OnError(error, scope, transmissions).ConfigureAwait(false);
+            }
+            catch (UncertainRejectionException uncertain)
+            {
+                // A rejection that proves nothing about earlier transmissions of the id (one may have been executed before
+                // the rejected copy arrived): the outcome is resolved through the operation id (QueryOperation with resolve).
+                // A fenced, never executed id reports the rejection itself; otherwise the outcome stays unknown.
+                return await FinishWithoutReplyAsync(request, scope, possiblyTransmittedMutation: true, uncertain.Rejection, uncertain.Rejection)
+                    .ConfigureAwait(false);
+            }
+
+            if (retry)
             {
                 last = ErrorOf(error, request);
                 failures++;
@@ -433,7 +447,8 @@ internal sealed class RpcInvoker
         return reply;
     }
 
-    private async Task<IWireMessage> FinishWithoutReplyAsync(RpcRequest request, OperationScope scope, bool possiblyTransmittedMutation, Exception? last)
+    private async Task<IWireMessage> FinishWithoutReplyAsync(RpcRequest request, OperationScope scope, bool possiblyTransmittedMutation, Exception? last,
+        Exception? failureIfNeverExecuted = null)
     {
         last = AtDeadline(last);
         if (!possiblyTransmittedMutation)
@@ -470,7 +485,7 @@ internal sealed class RpcInvoker
             catch (ResolvedFailureException definite)
             {
                 request.OnDefinite?.Invoke();
-                throw definite.Failure;
+                throw definite.NeverExecuted && failureIfNeverExecuted is not null ? failureIfNeverExecuted : definite.Failure;
             }
             catch (Exception ex) when (ex is not ResolvedFailureException)
             {
@@ -593,4 +608,40 @@ internal sealed class ResolvedFailureException : Exception
 
     /// <summary>The definite failure to report.</summary>
     public Exception Failure { get; }
+
+    /// <summary>The resolution fenced the id: it never executed and never will (no outcome was recorded for it).</summary>
+    public bool NeverExecuted { get; init; }
+}
+
+/// <summary>
+/// Thrown by <see cref="RpcRequest.OnError"/> for a definite rejection of a mutation's latest transmission that does not settle
+/// its earlier ones (<c>OperationExpired</c>, <c>LeaseLost</c>, <c>EpochMismatch</c> after more than one transmission): the
+/// invoker resolves the outcome through the operation id and reports <see cref="Rejection"/> only when the id never executed.
+/// </summary>
+internal sealed class UncertainRejectionException : Exception
+{
+    public UncertainRejectionException(Exception rejection)
+        : base(rejection.Message, rejection)
+    {
+        Rejection = rejection;
+    }
+
+    public UncertainRejectionException()
+        : this(new InvalidOperationException("Unspecified rejection."))
+    {
+    }
+
+    public UncertainRejectionException(string message)
+        : this(new InvalidOperationException(message))
+    {
+    }
+
+    public UncertainRejectionException(string message, Exception inner)
+        : base(message, inner)
+    {
+        Rejection = inner;
+    }
+
+    /// <summary>The rejection of the latest transmission.</summary>
+    public Exception Rejection { get; }
 }

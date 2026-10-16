@@ -543,14 +543,21 @@ internal sealed partial class VolumeService
         return new PublishPlan(result.ToImmutable(), truncateTo, false, fromBase ? baseStream!.Revision : 0, leaderStaging);
     }
 
-    /// <summary>Proposes a staging session owned by the caller for leader-materialized objects (closed by the publication).</summary>
+    /// <summary>
+    /// Proposes a staging session owned by the caller for leader-materialized objects (closed by the publication). It belongs
+    /// to the request's client session when there is one, so a publication that never happens (the leader crashed or lost
+    /// its term before proposing) does not leave it open past that session's expiry; its capability is never handed out.
+    /// </summary>
     private async Task<ulong> CreateLeaderStagingAsync(OperationHeader op, CancellationToken ct)
     {
         OperationHeader header = op with { Id = default, PayloadHash = UInt128.Zero, Operation = DfsOperationKind.CreateStaging };
 
         // Always a real entry, also for a transaction-bound publication: the objects stored under it must be protected by a
         // committed staging session (the transaction closes it when it ends without committing).
-        VolumeApplyResult result = await ProposeAsync(Stamp(new CreateStagingCommand(0, 0, default), header), ct, bypassTransaction: true);
+        ulong session = op.RequestSession != 0 && State.Sessions.TryGetValue(op.RequestSession, out SessionRecord? owner) && owner.State == SessionState.Active
+            ? op.RequestSession
+            : 0;
+        VolumeApplyResult result = await ProposeAsync(Stamp(new CreateStagingCommand(session, 0, default), header), ct, bypassTransaction: true);
         if (!result.IsSuccess || result.Value is not StagingRecord staging)
             throw DfsErrors.ToException(result.Code, result.Message);
         CurrentTransaction?.LeaderStagings.Add(staging.Id);

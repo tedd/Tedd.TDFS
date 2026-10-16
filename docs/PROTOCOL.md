@@ -267,9 +267,11 @@ Every volume-scoped request (39 types, all implementing `IVolumeRequest`) starts
   the new volume) and continues under a fresh id. After more than one transmission (every transmission counts, one
   answered `NotLeader` included: the network may deliver a request twice, and an earlier copy may have been proposed
   while that node still led, its reply lost) such a rejection
-  (`OperationExpired`, `LeaseLost` or `EpochMismatch`, for SDK and application ids alike) makes the outcome unknown
-  (`DfsCommitOutcomeUnknownException`), because an earlier transmission may have committed before its outcome was
-  retired, its session expired or its volume was re-created. An unexpected (non-error) reply type to a transmitted
+  (`OperationExpired`, `LeaseLost` or `EpochMismatch`, for SDK and application ids alike) does not settle the outcome,
+  because an earlier transmission may have committed before its outcome was retired, its session expired or its volume
+  was re-created: the SDK resolves it through the operation id (`QueryOperation` with `Resolve`) while time allows.
+  A committed outcome is the result; an id the query fenced (it never executed and never will) reports the rejection;
+  anything else is an unknown outcome (`DfsCommitOutcomeUnknownException`). An unexpected (non-error) reply type to a transmitted
   mutation is likewise an unknown outcome.
 * **Volume binding of retries.** Every transmission of one operation id carries the same `ExpectedVolumeId` /
   `ExpectedVolumeEpoch`: those of the session the id belongs to (an application id: those of its first transmission).
@@ -490,7 +492,8 @@ zeroes; missing objects never do (STR, DSK-016).
 * **Inline → extents**: when a publication turns an inline file into an extent-based one, bytes of the new content not
   covered by the change set are taken from the old inline bytes; the leader materializes them (and any `Inline` changes
   of the request) as objects with receipts meeting the file's policy, before proposing, under a staging session it
-  creates for them and the publication closes — never under the request's staging session, whose capability can read
+  creates for them and the publication closes (owned by the request's client session when it has one, so it also closes
+  when that session expires if the publication never happens; its capability is never handed out) — never under the request's staging session, whose capability can read
   back what is stored under it (§7.3) while these bytes may be ones the caller may write but not read (ACL-015). (The
   client never has to read-modify-write to append to a small file.)
 * **Extents → inline**: when the result of a publication fits inline (and LAY-002 allows it), the leader reads the kept

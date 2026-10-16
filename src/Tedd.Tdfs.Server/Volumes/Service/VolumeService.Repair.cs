@@ -59,6 +59,18 @@ internal sealed partial class VolumeService
     private bool _repairRequested;
     private bool _repairBacklog;
     private ulong _repairTerm;
+    private ulong _usageReportedTerm;
+
+    /// <summary>
+    /// This leader's replica summary of <paramref name="term"/> reached the control leader (its <c>ReportUsage</c> was answered).
+    /// Excess copies are trimmed only from then on, so the control plane's view of where copies are (draining holders,
+    /// removal checks, migration progress) covers a holder before its copies start to disappear.
+    /// </summary>
+    public void NoteUsageReported(ulong term)
+    {
+        if (IsLeader && term == Group.Term)
+            _usageReportedTerm = term;
+    }
 
     /// <summary>How long a node that refused a repair copy for capacity is not used as a destination.</summary>
     private TimeSpan RefusalBackoff => _s.Timings.InventoryInterval * 8;
@@ -262,6 +274,8 @@ internal sealed partial class VolumeService
             (int copies, int zones) = DomainsOf(control, targets.Select(t => t.Id));
             if (copies < plan.Policy.TargetCopies || zones < plan.Policy.TargetDistinctZones)
                 continue;
+            if (_usageReportedTerm != Group.Term)
+                continue; // the control leader does not know this term's holders yet (see NoteUsageReported)
             rate.Charge(plan.Length * targets.Count);
             StartExcessDeletion(plan, [.. targets.Select(t => t.Id)], excess, epoch);
         }
