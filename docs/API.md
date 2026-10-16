@@ -1127,6 +1127,7 @@ public sealed record TestClusterOptions
     public long ReservedBytes { get; init; } = 8L << 20;
     public TimeSpan ScenarioTimeout { get; init; } = TimeSpan.FromSeconds(120);   // realtime wall clock / deterministic virtual time
     public bool OutOfProcess { get; init; } = false;                 // real Tedd.Tdfs.Host processes (Quic + Disk only)
+    public bool QuicDatagramInterposer { get; init; } = false;       // Quic: per-connection UDP relay; TamperNext alters encrypted datagrams (SEC-011)
     public string? DataRoot { get; init; }                            // default: $TDFS_TEST_ROOT or %TEMP%/tdfs-tests, per test subfolder
     public Action<string, NodeOptions>? ConfigureNode { get; init; }  // last-chance per-node override (name, options) -> use `with` via ConfigureNodeOptions
     public Func<string, NodeOptions, NodeOptions>? ConfigureNodeOptions { get; init; }
