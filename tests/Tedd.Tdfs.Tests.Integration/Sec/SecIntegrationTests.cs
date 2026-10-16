@@ -998,7 +998,7 @@ public sealed class SecIntegrationTests
     [InlineData(TamperTarget.ReadRangeReply, TransportTamper.Scramble)]
     [Catalog("SEC-011", "I", "INV-08", "INV-12", "INV-13", "INV-14")]
     public Task SEC_011_TransportTamperingDetected(TamperTarget target, TransportTamper mode) =>
-        ClusterTest.RunAsync(SecHelpers.Options(), async cluster =>
+        ClusterTest.RunAsync(SecHelpers.Options() with { QuicDatagramInterposer = true }, async cluster =>
         {
             const string client = "client:t0";
             await using DfsClient admin = await cluster.ConnectAsync(new TestClientOptions { Name = "admin-c" }, Ct);

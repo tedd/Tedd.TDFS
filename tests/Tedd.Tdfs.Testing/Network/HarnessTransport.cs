@@ -104,9 +104,29 @@ internal sealed class HarnessTransport : IRpcTransport, IRpcTransportControl
         string? target = Fabric.NameOfEndpoint(endpoint);
         if (!Identity.IsHarness)
             Fabric.CountAttempt(target ?? NetworkFabric.NormalizeEndpoint(endpoint));
-        IRpcConnection inner = await Inner.ConnectAsync(endpoint, ct).ConfigureAwait(false);
+        DatagramRelay? relay = null;
+        IRpcConnection inner;
+        if (Fabric.UsesDatagramRelays && RpcAddress.TryParse(endpoint, out RpcAddress address) && address.IsQuic)
+        {
+            // The connection's encrypted datagrams travel through its own relay (TamperNext alters them there).
+            relay = await Fabric.CreateRelayAsync(endpoint, ct).ConfigureAwait(false);
+            try
+            {
+                inner = await Inner.ConnectAsync(relay.FrontEndpoint, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                Fabric.ReleaseRelay(relay);
+                throw;
+            }
+        }
+        else
+        {
+            inner = await Inner.ConnectAsync(endpoint, ct).ConfigureAwait(false);
+        }
+
         string remote = NetworkFabric.RemoteNameOf(inner) ?? target ?? inner.Remote.ToString();
-        var connection = new HarnessConnection(this, inner, remote, isClientSide: true, endpoint);
+        var connection = new HarnessConnection(this, inner, remote, isClientSide: true, endpoint) { Relay = relay };
         Fabric.AddConnection(connection);
         connection.AttachClosed();
         return connection;
@@ -176,6 +196,9 @@ internal sealed class HarnessConnection : IRpcConnection
 
     /// <summary>The endpoint a client-side connection was opened to.</summary>
     public string? Endpoint { get; }
+
+    /// <summary>The UDP relay a relayed client-side QUIC connection runs through (<see cref="NetworkFabric.UsesDatagramRelays"/>).</summary>
+    public DatagramRelay? Relay { get; init; }
 
     /// <summary>Role declared by the first <c>Hello</c> sent on this (client-side) connection.</summary>
     public PeerRole? HelloRole { get; private set; }
@@ -256,7 +279,9 @@ internal sealed class HarnessConnection : IRpcConnection
 
         if (Fabric.Policy.TryTakeRule(MessageRuleKind.Truncate, LocalName, RemoteName, LinkDirection.Request, request.Span) is { } truncate)
             return TruncatedCall(request, truncate, timeout, ct);
-        if (Fabric.Policy.TryTakeRule(MessageRuleKind.Tamper, LocalName, RemoteName, LinkDirection.Request, request.Span) is { } tamper)
+        if (Fabric.UsesDatagramRelays)
+            ArmRelayedTamper(LinkDirection.Request, request.Span);
+        else if (Fabric.Policy.TryTakeRule(MessageRuleKind.Tamper, LocalName, RemoteName, LinkDirection.Request, request.Span) is { } tamper)
             return TamperedCall(request, tamper, timeout, ct);
 
         Task<ReadOnlyMemory<byte>> call = Inner.CallAsync(request, timeout, ct);
@@ -290,7 +315,11 @@ internal sealed class HarnessConnection : IRpcConnection
             return ValueTask.CompletedTask;
         }
 
-        if (Fabric.Policy.TryTakeRule(MessageRuleKind.Tamper, LocalName, RemoteName, LinkDirection.OneWay, message.Span) is { } tamper)
+        if (Fabric.UsesDatagramRelays)
+        {
+            ArmRelayedTamper(LinkDirection.OneWay, message.Span);
+        }
+        else if (Fabric.Policy.TryTakeRule(MessageRuleKind.Tamper, LocalName, RemoteName, LinkDirection.OneWay, message.Span) is { } tamper)
         {
             Fabric.Trace($"tampered one-way {TypeOf(message.Span)} {LocalName}->{RemoteName} below integrity protection ({tamper.Tamper}): {TamperOutcome(tamper.Tamper)}");
             if (tamper.Tamper == TransportTamper.Replay)
@@ -300,6 +329,21 @@ internal sealed class HarnessConnection : IRpcConnection
         }
 
         return Inner.SendAsync(message, ct);
+    }
+
+    /// <summary>
+    /// Relayed QUIC: arms the relay carrying this side's transmissions to alter the encrypted datagram of a transmission that
+    /// matches an active tamper rule (<see cref="NetworkFabric.ArmRelay"/>); the rule is consumed only when a datagram is
+    /// altered. The frame itself is sent unchanged: QUIC's packet protection must reject the altered packet and its loss
+    /// recovery resend the data.
+    /// </summary>
+    internal void ArmRelayedTamper(LinkDirection direction, ReadOnlySpan<byte> frame)
+    {
+        if (Fabric.Policy.FindActiveRule(MessageRuleKind.Tamper, LocalName, RemoteName, direction, frame) is not { } rule)
+            return;
+        string description = $"{direction} {TypeOf(frame)} {LocalName}->{RemoteName}";
+        if (!Fabric.ArmRelay(this, rule, description))
+            Fabric.Trace($"tamper of {description} not applied: the connection does not run through a datagram relay");
     }
 
     /// <summary>What the receiver's transport does with a transmission tampered below its integrity protection.</summary>
@@ -433,6 +477,8 @@ internal sealed class HarnessConnection : IRpcConnection
         }
 
         Fabric.RemoveConnection(this);
+        if (Relay is { } relay)
+            Fabric.ReleaseRelay(relay);
         if (handlers is null)
             return;
         foreach (Delegate handler in handlers.GetInvocationList())
@@ -577,6 +623,10 @@ internal sealed class HarnessHandler : IRpcHandler
             Fabric.Trace($"truncated reply {HarnessConnection.TypeOf(reply.Span)} {_transport.LocalName}->{connection.RemoteName} to {keep.ToString(CultureInfo.InvariantCulture)} of {reply.Length.ToString(CultureInfo.InvariantCulture)} byte(s), then closed");
             deliver = keep >= reply.Length;
             close = true;
+        }
+        else if (Fabric.UsesDatagramRelays)
+        {
+            connection.ArmRelayedTamper(LinkDirection.Reply, reply.Span);
         }
         else if (Fabric.Policy.TryTakeRule(MessageRuleKind.Tamper, _transport.LocalName, connection.RemoteName, LinkDirection.Reply, reply.Span) is { } tamper)
         {

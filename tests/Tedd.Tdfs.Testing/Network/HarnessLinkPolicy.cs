@@ -212,6 +212,21 @@ internal sealed class HarnessLinkPolicy : ILinkPolicy
         return false;
     }
 
+    /// <summary>The first active rule of <paramref name="kind"/> matching the message, without consuming it (or null).</summary>
+    public MessageRule? FindActiveRule(MessageRuleKind kind, string from, string to, LinkDirection direction, ReadOnlySpan<byte> frame)
+    {
+        lock (_gate)
+        {
+            foreach (MessageRule rule in _rules)
+            {
+                if (rule.Kind == kind && rule.IsActive && rule.Filter.Matches(from, to, direction, frame))
+                    return rule;
+            }
+        }
+
+        return null;
+    }
+
     /// <summary>
     /// Consumes one application of the first active rule of <paramref name="kind"/> matching the message (rules applied by
     /// the interposition layer rather than by transport decisions: reply drops, truncation, tampering).

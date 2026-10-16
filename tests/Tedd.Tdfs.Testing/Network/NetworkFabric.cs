@@ -1,3 +1,4 @@
+using System.Net;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography.X509Certificates;
 using Tedd.Tdfs.Protocol;
@@ -56,6 +57,8 @@ internal sealed class NetworkFabric
     private readonly List<Func<VolumeId, string?>> _volumeNames = [];
     private readonly ConditionalWeakTable<CapturedMessage, HarnessConnection> _origins = [];
     private readonly Dictionary<(string Node, string Volume), IReadOnlySet<ObjectId>> _inventoryClaims = [];
+    private readonly Dictionary<int, DatagramRelay> _relays = [];
+    private int _relaySeed;
     private int _activeHolds;
     private int _activeReadLimits;
     private int _activeClaims;
@@ -102,6 +105,84 @@ internal sealed class NetworkFabric
 
     /// <summary>The fabric-wide message log.</summary>
     public MessageLog Log { get; }
+
+    /// <summary>
+    /// True when every QUIC connection of the fabric runs through its own <see cref="DatagramRelay"/>
+    /// (<see cref="TestClusterOptions.QuicDatagramInterposer"/>), so tampering happens on encrypted datagrams (SEC-011).
+    /// </summary>
+    public bool UsesDatagramRelays { get; set; }
+
+    // -------------------------------------------------------------------------------------------- datagram relays
+
+    /// <summary>A relay in front of <paramref name="endpoint"/> for one new connection (registered by its back port).</summary>
+    internal async Task<DatagramRelay> CreateRelayAsync(string endpoint, CancellationToken ct)
+    {
+        RpcAddress address = RpcAddress.Parse(endpoint);
+        IPAddress ip = IPAddress.TryParse(address.Host, out IPAddress? literal)
+            ? literal
+            : (await Dns.GetHostAddressesAsync(address.Host, ct).ConfigureAwait(false)).First();
+        var relay = new DatagramRelay(new IPEndPoint(ip, address.Port), Trace, Interlocked.Increment(ref _relaySeed));
+        lock (_gate)
+            _relays[relay.BackPort] = relay;
+        return relay;
+    }
+
+    /// <summary>The relay whose back socket is <paramref name="remote"/> (the peer address a relayed connection's target sees).</summary>
+    internal DatagramRelay? RelayOfPeer(RpcAddress remote)
+    {
+        if (!UsesDatagramRelays || !remote.IsQuic)
+            return null;
+        lock (_gate)
+            return _relays.TryGetValue(remote.Port, out DatagramRelay? relay) ? relay : null;
+    }
+
+    /// <summary>Stops and forgets a relay (its connection closed).</summary>
+    internal void ReleaseRelay(DatagramRelay relay)
+    {
+        lock (_gate)
+        {
+            if (_relays.TryGetValue(relay.BackPort, out DatagramRelay? known) && ReferenceEquals(known, relay))
+                _relays.Remove(relay.BackPort);
+        }
+
+        _ = relay.DisposeAsync().AsTask();
+    }
+
+    /// <summary>Stops every relay (fabric disposal).</summary>
+    internal async Task DisposeRelaysAsync()
+    {
+        DatagramRelay[] relays;
+        lock (_gate)
+        {
+            relays = [.. _relays.Values];
+            _relays.Clear();
+        }
+
+        foreach (DatagramRelay relay in relays)
+            await relay.DisposeAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Arms the relay carrying a transmission of <paramref name="connection"/>'s local side for <paramref name="rule"/>: the
+    /// connection's own relay (datagrams towards its target) for a connection this side opened, else the relay of the peer
+    /// that opened it (datagrams back towards that peer). False when the connection is not relayed.
+    /// </summary>
+    internal bool ArmRelay(HarnessConnection connection, MessageRule rule, string description)
+    {
+        if (connection.Relay is { } own)
+        {
+            own.Arm(RelayDirection.Forward, rule, description);
+            return true;
+        }
+
+        if (!connection.IsClientSide && RelayOfPeer(connection.Inner.Remote) is { } peer)
+        {
+            peer.Arm(RelayDirection.Backward, rule, description);
+            return true;
+        }
+
+        return false;
+    }
 
     /// <summary>True while a hold, a reply drop, a reply truncation/tamper or a read limit is active (reply interposition needed).</summary>
     public bool NeedsReplyInterposition =>
