@@ -551,7 +551,10 @@ internal sealed class BackupRestoreCoordinator
             }
         }
 
-        throw new DfsUnavailableException(DfsErrorCode.NodeUnavailable, $"No backup host endpoint could be reached: {last?.Message}", last);
+        // Every endpoint was tried within the call timeout: retrying the request repeats the same attempt, and the control
+        // leader answering it shows the cluster is fine — the backup host is what is unavailable (RST-013), so the failure is
+        // reported as it is, not retried into a quorum-loss diagnosis.
+        throw new DfsUnavailableException(DfsErrorCode.NodeUnavailable, $"No backup host endpoint could be reached: {last?.Message}", last) { IsRetryable = false };
     }
 
     private static async Task DisposeQuietlyAsync(IRpcConnection connection)
