@@ -128,8 +128,9 @@ public sealed partial class ClusterInspector
     /// <see cref="DfsStoragePolicy.TargetCopies"/> hold a verified copy, zone deficit when those copies span fewer zones than
     /// <see cref="DfsStoragePolicy.TargetDistinctZones"/>, missing when no verified copy exists, a placement violation when a
     /// copy lies on a node outside the volume's storage pool. The backlog is the plaintext bytes of under-replicated objects
-    /// with at least one copy; pending GC counts stored records of the volume that are no longer reachable; staged and
-    /// pinned bytes are the leader's.
+    /// with at least one copy; pending GC counts stored records of the volume that are no longer reachable; staged bytes are
+    /// the distinct plaintext bytes of stored records that are not reachable and belong to a staging session open in the
+    /// leader's applied state; pinned bytes are the leader's.
     /// </remarks>
     public async Task<DfsReplicaHealth> GetReplicaHealthAsync(string volume)
     {
@@ -148,6 +149,8 @@ public sealed partial class ClusterInspector
 
         var lengths = new Dictionary<ObjectId, long>();
         var stored = new HashSet<ObjectId>();
+        var openStaging = new HashSet<StagingId>(state.Staging.Where(s => s.Open).Select(s => s.Id));
+        var stagedLengths = new Dictionary<ObjectId, long>();
         foreach (TestNode node in _cluster.RunningNodes())
         {
             IReadOnlyList<ObjectRecordInfo> records;
@@ -164,6 +167,8 @@ public sealed partial class ClusterInspector
             {
                 stored.Add(record.Id);
                 lengths.TryAdd(record.Id, record.Length);
+                if (!reachable.Contains(record.Id) && openStaging.Contains(record.Staging))
+                    stagedLengths.TryAdd(record.Id, record.Length);
             }
         }
 
@@ -192,7 +197,7 @@ public sealed partial class ClusterInspector
         }
 
         long pendingGc = stored.Count(id => !reachable.Contains(id));
-        long staged = await leaderInspector.GetStagedBytesAsync();
+        long staged = stagedLengths.Values.Sum();
         long pinned = await leaderInspector.GetPinnedBytesAsync();
         return new DfsReplicaHealth(reachable.Count, under, zoneDeficit, missing, violations, backlog, pendingGc, staged, pinned);
     }

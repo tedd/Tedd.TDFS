@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using Tedd.Tdfs.Server.Volumes.State;
+using Tedd.Tdfs.Storage;
 
 namespace Tedd.Tdfs.Server.Volumes.Apply;
 
@@ -9,8 +10,33 @@ internal sealed partial class VolumeStateMachine
     public VolumeStateInspection Inspect() => InspectState(_state);
 
     /// <inheritdoc />
-    /// <remarks>The replicated state records no upload sizes (they live on storage nodes until published): always 0.</remarks>
+    /// <remarks>
+    /// The replicated state records no upload sizes (they live on storage nodes until published): always 0. A node's stored
+    /// staged bytes are <see cref="LocalStagedBytes"/>.
+    /// </remarks>
     public long StagedBytes => 0;
+
+    /// <summary>
+    /// Bytes of the given stored copies of this volume that are unpublished uploads at the applied state: not referenced by
+    /// any root and bound to an open staging session (GC-015: a node's space held by uncommitted uploads).
+    /// </summary>
+    public long LocalStagedBytes(IEnumerable<ObjectRecordInfo> records)
+    {
+        ArgumentNullException.ThrowIfNull(records);
+        VolumeState s = _state;
+        HashSet<ObjectId>? reachable = null;
+        long total = 0;
+        foreach (ObjectRecordInfo record in records)
+        {
+            if (record.Volume != s.Config.Id || !s.Staging.TryGetValue(record.Staging.Value, out StagingRecord? staging) || !staging.IsOpen)
+                continue;
+            reachable ??= Reachable(s);
+            if (!reachable.Contains(record.Id))
+                total += record.Length;
+        }
+
+        return total;
+    }
 
     /// <inheritdoc />
     public long PinnedBytes => ComputePinnedBytes(_state);
