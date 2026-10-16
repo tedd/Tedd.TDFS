@@ -73,6 +73,14 @@ public sealed class RuntimeOperationsTests
         await admin.AdminAsync<AdminSetNodeLabelsBody, AdminEmptyBody>(AdminOp.SetNodeLabels,
             new AdminSetNodeLabelsBody("n2", new DfsTopologyLabels("r1", "z9", "rk1", "h2", "d1")));
         await admin.AdminAsync<AdminNodeNameBody, AdminEmptyBody>(AdminOp.DrainNode, new AdminNodeNameBody("n2"));
+        if (leader.Name == "n2")
+        {
+            // A draining control voter leaves the control voters once enough active ones remain: when it led the group, the
+            // remaining requests go to its successor.
+            leader = await cluster.WaitForLeaderAsync("control", cluster.Nodes.Where(n => n.Name != "n2"));
+            admin = await cluster.ConnectAsync(leader);
+        }
+
         var nodes = await admin.AdminAsync<AdminEmptyBody, AdminNodeListBody>(AdminOp.ListNodes, new AdminEmptyBody());
         NodeEntry n2 = nodes.Nodes.Single(n => n.Name == "n2");
         Assert.Equal(WireNodeStatus.Draining, n2.Status);
