@@ -27,10 +27,18 @@ internal static class SdkHelpers
     public static long ForegroundRequests(TestCluster cluster, string clientNetworkName)
     {
         MessageLog log = cluster.Network.Log;
-        long total = log.CountMessages(new MessageFilter(From: clientNetworkName, Direction: LinkDirection.Request));
-        foreach (DfsOperationKind kind in BackgroundKinds)
-            total -= log.CountMessages(new MessageFilter(From: clientNetworkName, Direction: LinkDirection.Request, Operation: kind));
-        return total;
+        var all = new MessageFilter(From: clientNetworkName, Direction: LinkDirection.Request);
+        while (true)
+        {
+            // Each count is its own snapshot of the log: background traffic logged between the snapshots would make the
+            // difference off by one, so recount until no request was logged meanwhile.
+            long total = log.CountMessages(all);
+            long foreground = total;
+            foreach (DfsOperationKind kind in BackgroundKinds)
+                foreground -= log.CountMessages(new MessageFilter(From: clientNetworkName, Direction: LinkDirection.Request, Operation: kind));
+            if (log.CountMessages(all) == total)
+                return foreground;
+        }
     }
 
     /// <summary>Requests of one operation kind sent by a client.</summary>

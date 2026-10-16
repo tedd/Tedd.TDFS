@@ -138,6 +138,36 @@ public sealed class OutSimulationTests
             await AssertSingleCommittedEffectAsync(scenario, v1, id, retry.Token, Ct);
         }, Ct);
 
+    /// <summary>
+    /// OUT-002 at the inline threshold: an append whose result just fits inline commits, and the same id with the same bytes
+    /// is retried afterwards — by the same client and by another one — when the grown file could no longer take the suffix
+    /// inline. The retries return the stored outcome, never <see cref="DfsOperationIdMismatchException"/>: the
+    /// representation of an application-id append must not depend on a length that changes between attempts.
+    /// </summary>
+    [Fact]
+    [Catalog("OUT-002", "S", "INV-06", "INV-02")]
+    public Task OUT_002_SameIdSamePayloadSameOutcome_AcrossTheInlineThreshold() =>
+        ClusterTest.RunAsync(Sim(), async cluster =>
+        {
+            (DfsClient c0, DfsVolume v0) = await ConnectAsync(cluster, "c0", Ct);
+            (DfsClient c1, DfsVolume v1) = await ConnectAsync(cluster, "c1", Ct);
+            await using var own0 = c0;
+            await using var own1 = c1;
+            const string path = "/edge";
+            byte[] prefix = TestData.Bytes(0x0002_1001, 1000);
+            byte[] suffix = TestData.Bytes(0x0002_1002, 3000);
+            await v0.Files.WriteAllBytesAsync(path, prefix, Ct);
+            Assert.True((await cluster.Inspect.GetFileAsync(Volume, path))!.IsInline, "test precondition: the file starts inline");
+            DfsOperationId id = await v0.NewOperationIdAsync(Ct);
+            var withId = new DfsMutationOptions { OperationId = id };
+
+            CommitToken original = await v0.Files.AppendAllBytesAsync(path, suffix, withId, Ct);
+            Assert.Equal(original, await v0.Files.AppendAllBytesAsync(path, suffix, withId, Ct));
+            Assert.Equal(original, await v1.Files.AppendAllBytesAsync(path, suffix, withId, Ct));
+            await ExpectContentAsync(Concat(prefix, suffix), v1.Files.ReadAllBytesAsync(path, Ct), "the suffix was appended exactly once");
+            Assert.Equal(DfsOutcomeStatus.Committed, (await v1.QueryOperationAsync(id, resolve: false, Ct)).Status);
+        }, Ct);
+
     // ================================================================================================================
     // OUT-003 SameIdDifferentPayloadRejected
     // ================================================================================================================

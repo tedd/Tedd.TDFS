@@ -477,7 +477,11 @@ public sealed class PropSimulationTests
             ? [DfsErrorCode.AlreadyExists, DfsErrorCode.IsADirectory]
             : kind == NsKind.CreateDirectory ? [DfsErrorCode.AlreadyExists, DfsErrorCode.NotADirectory] : [DfsErrorCode.AlreadyExists],
         nameof(DfsErrorCode.DirectoryNotFound) => [DfsErrorCode.DirectoryNotFound],
-        nameof(DfsErrorCode.NotADirectory) => [DfsErrorCode.NotADirectory, DfsErrorCode.DirectoryNotFound],
+        // A recursive create through a file may be reported as the file that already exists where a directory is needed
+        // (ReferenceNamespaceModel.CreateDirectory: NotADirectory/AlreadyExists; NS-001 accepts both).
+        nameof(DfsErrorCode.NotADirectory) => kind == NsKind.CreateDirectory
+            ? [DfsErrorCode.NotADirectory, DfsErrorCode.DirectoryNotFound, DfsErrorCode.AlreadyExists]
+            : [DfsErrorCode.NotADirectory, DfsErrorCode.DirectoryNotFound],
         nameof(DfsErrorCode.FileNotFound) => kind is NsKind.MoveDirectory or NsKind.DeleteDirectory ? [DfsErrorCode.DirectoryNotFound] : [DfsErrorCode.FileNotFound],
         nameof(DfsErrorCode.IsADirectory) => [DfsErrorCode.IsADirectory, DfsErrorCode.AlreadyExists],
         nameof(DfsErrorCode.DirectoryNotEmpty) => [DfsErrorCode.DirectoryNotEmpty],
@@ -919,10 +923,14 @@ public sealed class PropSimulationTests
                 // Client c3's mutation replies are lost for a window: the server executes, the client times out (Unknown).
                 MessageRule dropWrites = cluster.Network.DropReplies(new MessageFilter(From: "client:c3", Operation: DfsOperationKind.WriteAll), count: 1_000);
                 MessageRule dropDeletes = cluster.Network.DropReplies(new MessageFilter(From: "client:c3", Operation: DfsOperationKind.Delete), count: 1_000);
+
+                // Within the window c3 also loses the replies to the outcome queries its SDK sends to resolve those mutations
+                // (PROTOCOL.md §5.1); otherwise every lost reply is resolved and no genuinely uncertain operation remains.
+                MessageRule dropQueries = cluster.Network.DropReplies(new MessageFilter(From: "client:c3", Type: MessageType.QueryOperation), count: 1_000);
                 var tasks = new List<Task>();
                 for (int p = 0; p < clients.Count; p++)
                     tasks.Add(ProcessAsync(p, clients[p].GetVolume(Vol), new SeededRandom(Derive(seed, "proc" + p.ToString(CultureInfo.InvariantCulture)))));
-                tasks.Add(FaultsAsync(dropWrites, dropDeletes));
+                tasks.Add(FaultsAsync(dropWrites, dropDeletes, dropQueries));
                 await Task.WhenAll(tasks);
 
                 Assert.True(dropWrites.Matched + dropDeletes.Matched > 0, "the reply-loss window was never reached (fault not exercised)");
@@ -1010,7 +1018,7 @@ public sealed class PropSimulationTests
                 }
             }
 
-            async Task FaultsAsync(MessageRule dropWrites, MessageRule dropDeletes)
+            async Task FaultsAsync(MessageRule dropWrites, MessageRule dropDeletes, MessageRule dropQueries)
             {
                 await cluster.DelayAsync(TimeSpan.FromMilliseconds(400), Ct);
                 if (crashLeader)
@@ -1022,9 +1030,12 @@ public sealed class PropSimulationTests
                     await leader.RestartAsync();
                 }
 
-                await cluster.DelayAsync(TimeSpan.FromSeconds(3), Ct);
+                // Long enough for two of c3's mutations (2 s deadline each) to end unresolved inside the window: half of the
+                // unknown operations are resolved below and at least one must stay unknown.
+                await cluster.DelayAsync(TimeSpan.FromSeconds(5), Ct);
                 dropWrites.Cancel();
                 dropDeletes.Cancel();
+                dropQueries.Cancel();
                 trace.Step("reply-loss window closed");
             }
         }));
@@ -1816,7 +1827,9 @@ public sealed class PropSimulationTests
             catch (Exception ex) when (ex is not NotImplementedException)
             {
                 string directory = SaveCrossProductFailure(cluster, workloadSeed, faultSeed, schedule, workload, start, trace, ex);
-                throw new Xunit.Sdk.XunitException($"PROP-007 failure for workload seed {workloadSeed} x fault seed {faultSeed}; starting image, seeds and traces saved to {directory}", ex);
+                // XunitException.ToString() omits inner exceptions: the cause is part of the message so the report names it.
+                throw new Xunit.Sdk.XunitException(
+                    $"PROP-007 failure for workload seed {workloadSeed} x fault seed {faultSeed}; starting image, seeds and traces saved to {directory}: {ex.GetType().Name}: {ex.Message}", ex);
             }
             finally
             {

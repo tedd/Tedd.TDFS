@@ -237,6 +237,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
                 return ValueTask.FromResult(0);
             }
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // A token cancelled before anything started is reported through the returned task (Stream convention).
+            gate.Dispose();
+            return ValueTask.FromCanceled<int>(cancellationToken);
+        }
         catch
         {
             gate.Dispose();
@@ -325,8 +331,33 @@ public sealed class DfsStream : Stream, ILeaseHolder
                 }
 
                 case StagedSource.Uploaded:
-                    // Only write-only streams upload staged data early (staging capabilities never authorize reads).
-                    throw new InvalidOperationException("A readable stream never uploads its staged data before publishing it.");
+                {
+                    // Staged data uploaded early (bounded memory) is read back from its holders with the staging capability,
+                    // which authorizes reading the objects stored under its own staging session (PROTOCOL.md §7.3).
+                    StagedSegment segment = piece.Segment!;
+                    UploadedObject uploaded = segment.Object!;
+                    StagingLease staging = _staging ?? throw new InvalidOperationException("Staged data was uploaded without a staging session.");
+                    long objectOffset = segment.ObjectOffset + (piece.Offset - segment.Offset);
+                    NodeId[] holders = [.. uploaded.Receipts.Select(r => r.Node).Distinct()];
+                    for (int attempt = 0; ; attempt++)
+                    {
+                        if (staging.NeedsRenewal(_runtime.Time.GetUtcNow()))
+                            await _volume.RenewStagingAsync(staging, scope).ConfigureAwait(false);
+                        try
+                        {
+                            await _runtime.Data.ReadObjectAsync(scope, _volume, staging.Capability, uploaded.Id, uploaded.Length, uploaded.Checksum,
+                                ObjectEncodings.Plain, staging.PlacementEpoch, holders, objectOffset, target).ConfigureAwait(false);
+                            break;
+                        }
+                        catch (DataCapabilityRejectedException) when (attempt == 0)
+                        {
+                            // The capability expired on the node's clock: renew it once and read again.
+                            await _volume.RenewStagingAsync(staging, scope).ConfigureAwait(false);
+                        }
+                    }
+
+                    break;
+                }
 
                 case StagedSource.Base:
                 {
@@ -500,6 +531,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
             if (offset > maximum - owned.Length)
                 throw new DfsLimitExceededException(nameof(DfsVolumeLimits.MaxFileLength), maximum, offset + owned.Length);
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // A token cancelled before anything started is reported through the returned task (Stream convention).
+            gate.Dispose();
+            return Task.FromCanceled(ct);
+        }
         catch
         {
             gate.Dispose();
@@ -616,6 +653,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
             ThrowIfFaulted();
             ct.ThrowIfCancellationRequested();
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // A token cancelled before anything started is reported through the returned task (Stream convention).
+            gate.Dispose();
+            return Task.FromCanceled(ct);
+        }
         catch
         {
             gate.Dispose();
@@ -669,6 +712,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
                 return ValueTask.FromResult(length);
             }
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // A token cancelled before anything started is reported through the returned task (Stream convention).
+            gate.Dispose();
+            return ValueTask.FromCanceled<long>(ct);
+        }
         catch
         {
             gate.Dispose();
@@ -705,6 +754,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
         {
             ThrowIfFaulted();
             ct.ThrowIfCancellationRequested();
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // A token cancelled before anything started is reported through the returned task (Stream convention).
+            gate.Dispose();
+            return ValueTask.FromCanceled<DfsFileInfo>(ct);
         }
         catch
         {
@@ -781,6 +836,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
                 return Task.CompletedTask;
             }
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // A token cancelled before anything started is reported through the returned task (Stream convention).
+            gate.Dispose();
+            return Task.FromCanceled(cancellationToken);
+        }
         catch
         {
             gate.Dispose();
@@ -811,6 +872,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
             Validation.MutationOptions(options, nameof(options));
             ThrowIfFaulted();
             ct.ThrowIfCancellationRequested();
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // A token cancelled before anything started is reported through the returned task (Stream convention).
+            gate.Dispose();
+            return Task.FromCanceled<CommitToken>(ct);
         }
         catch
         {
@@ -928,7 +995,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
         DfsStoragePolicy policy = ContentLayout.ResolvePolicy(entry, _policyName) ?? entry.DefaultPolicy;
         long newLength = overlay.Length;
         int threshold = ContentLayout.InlineThreshold(entry, _runtime.Capabilities);
-        // Objects uploaded early (write-only streams) stay objects: the leader materializes them if the result is inline.
+        // Objects uploaded early stay objects: the leader materializes them if the result is inline.
         bool inline = newLength <= threshold && overlay.Segments.All(s => s.IsBuffered)
             && ContentLayout.InlinePermitted(entry, policy, id => _runtime.Map.Node(id)?.Labels);
 
@@ -937,8 +1004,8 @@ public sealed class DfsStream : Stream, ILeaseHolder
         var seenObjects = new HashSet<ObjectId>();
         StagingLease? staging = null;
 
-        // Uploading replaces buffered ranges with staged objects, which a readable writer cannot read back (staging
-        // capabilities never authorize GetObject): if the publication fails, its staged view returns to buffered bytes.
+        // Uploading replaces buffered ranges with staged objects; if the publication fails, a readable writer's staged view
+        // returns to the buffered bytes it still holds (they stay readable without a round trip to storage).
         StagedOverlay.Snapshot? readable = _canRead ? overlay.Capture() : null;
         CommitFileResultMessage result;
         try
@@ -1004,27 +1071,27 @@ public sealed class DfsStream : Stream, ILeaseHolder
     }
 
     /// <summary>
-    /// True when buffered staged data should be uploaded before the publication (complete chunks once the buffer bound is
-    /// exceeded, ARCHITECTURE §9.3). A readable writer uploads too but keeps the uploaded bytes to serve its own reads
-    /// (staging capabilities never authorize reading staged objects back), so only write-only streams bound their memory.
+    /// True when buffered staged data should be uploaded before the publication (bounded memory, FSD §15, PUB-002). A
+    /// readable writer reads uploaded ranges back with its staging capability.
     /// </summary>
     private bool NeedsSpill()
     {
         StagedOverlay overlay = _overlay!;
-        long bound = Math.Max(_bufferSize, ContentLayout.ChunkSize(_runtime.Capabilities));
         int inline = ContentLayout.InlineThreshold(_volume.Entry, _runtime.Capabilities);
-        return overlay.Length > inline && overlay.BufferedBytes > bound;
+        return overlay.Length > inline && overlay.BufferedBytes > _bufferSize;
     }
 
-    /// <summary>Uploads buffered staged data early (bounded memory, FSD §6.2): whole chunks first, the rest when far over the bound.</summary>
+    /// <summary>
+    /// Uploads buffered staged data early so the stream's memory stays bounded by its buffer (FSD §15, PUB-002): whole
+    /// chunks (logical update units) first, then the remaining buffered ranges when they alone still exceed the buffer.
+    /// </summary>
     private async Task SpillAsync(OperationScope scope)
     {
         VolumeEntry entry = await EnsureEntryAsync(scope).ConfigureAwait(false);
         DfsStoragePolicy policy = ContentLayout.ResolvePolicy(entry, _policyName) ?? entry.DefaultPolicy;
         StagingLease staging = await EnsureStagingAsync(scope).ConfigureAwait(false);
         await UploadBufferedAsync(scope, staging, entry, policy, all: false).ConfigureAwait(false);
-        long bound = Math.Max(_bufferSize, ContentLayout.ChunkSize(_runtime.Capabilities));
-        if (_overlay!.BufferedBytes > 2 * bound)
+        if (_overlay!.BufferedBytes > _bufferSize)
             await UploadBufferedAsync(scope, staging, entry, policy, all: true).ConfigureAwait(false);
     }
 
@@ -1111,6 +1178,12 @@ public sealed class DfsStream : Stream, ILeaseHolder
                 throw new NotSupportedException("The destination stream is not writable.");
             ThrowIfFaulted();
             cancellationToken.ThrowIfCancellationRequested();
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // A token cancelled before anything started is reported through the returned task (Stream convention).
+            gate.Dispose();
+            return Task.FromCanceled(cancellationToken);
         }
         catch
         {

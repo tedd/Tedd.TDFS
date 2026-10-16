@@ -49,7 +49,7 @@ public sealed partial class DfsFileClient
     /// <summary>Lists the named streams of a file or directory (ordinal by name; the default stream is not listed).</summary>
     public async Task<IReadOnlyList<DfsStreamInfo>> ListStreamsAsync(string path, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.GetInfo, ct);
+        using OperationScope scope = Begin(DfsOperationKind.GetInfo, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.Path(path);
         if (DfsStreamPath.HasStream(p))

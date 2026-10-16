@@ -183,7 +183,7 @@ public sealed class VolumeStateMachineSessionTests
     }
 
     [Fact]
-    public void ReserveOperationIds_BlocksAreDisjointAndProtectedFromCountRetirement()
+    public void ReserveOperationIds_BlocksAreDisjointAndRetireWithTheOutcomeWindow()
     {
         var d = new SmDriver();
         ulong session = d.OpenSession(maxOutcomes: 2);
@@ -192,8 +192,18 @@ public sealed class VolumeStateMachineSessionTests
         Assert.Equal(1UL, first.FirstSequence);
         Assert.Equal(5UL, second.FirstSequence);
 
-        // Many later operations: the reserved, unused sequence 2 must stay usable (never retired before use).
-        for (ulong seq = 10; seq < 16; seq++)
+        // A reserved sequence is usable while the window has not passed it.
+        d.Ok<CreateDirectoryResultMessage>(new CreateDirectoryCommand("/early", false, null)
+        {
+            Op = Op(session: session, sequence: 3, kind: DfsOperationKind.CreateDirectory, payload: Hash("early")),
+        });
+        Assert.True(d.Exists("/early"));
+
+        // Many later operations: the window (2 outcomes) retires the oldest sequences, and with them the reserved, never used
+        // sequence 2 (OUT-012: an id below the retired watermark is expired and never executes as a new request).
+        var third = d.Ok<ReserveOperationIdsResultMessage>(new ReserveOperationIdsCommand(session, 10) { Op = Op(session: session) });
+        Assert.Equal(7UL, third.FirstSequence);
+        for (ulong seq = third.FirstSequence; seq < third.FirstSequence + 6; seq++)
         {
             d.Ok<CreateDirectoryResultMessage>(new CreateDirectoryCommand("/r" + seq, false, null)
             {
@@ -201,12 +211,63 @@ public sealed class VolumeStateMachineSessionTests
             });
         }
 
-        Assert.True(d.State.Sessions[session].RetiredWatermark < 1);
-        d.Ok<CreateDirectoryResultMessage>(new CreateDirectoryCommand("/reserved", false, null)
+        Assert.True(d.State.Sessions[session].RetiredWatermark >= 10);
+        Assert.Equal(2, d.State.Sessions[session].Outcomes.Count);
+        d.Fails(DfsErrorCode.OperationExpired, new CreateDirectoryCommand("/reserved", false, null)
         {
             Op = Op(session: session, sequence: 2, kind: DfsOperationKind.CreateDirectory, payload: Hash("reserved")),
         });
-        Assert.True(d.Exists("/reserved"));
+        Assert.False(d.Exists("/reserved"));
+    }
+
+    [Fact]
+    public void OutcomeWindow_RetiresTheOldestOutcomesWhateverTheirSequences()
+    {
+        // A client may use its reservations out of order: an application id reserved after an internal block is used before
+        // the rest of the block. The window is the session's most recent outcomes, so that id still ages out first.
+        var d = new SmDriver();
+        ulong session = d.OpenSession(maxOutcomes: 3);
+        var block = d.Ok<ReserveOperationIdsResultMessage>(new ReserveOperationIdsCommand(session, 8) { Op = Op(session: session) });
+        var single = d.Ok<ReserveOperationIdsResultMessage>(new ReserveOperationIdsCommand(session, 1) { Op = Op(session: session) });
+        ulong app = single.FirstSequence;
+        Assert.True(app > block.FirstSequence + 7);
+
+        d.Ok<CreateDirectoryResultMessage>(new CreateDirectoryCommand("/app", false, null)
+        {
+            Op = Op(session: session, sequence: app, kind: DfsOperationKind.CreateDirectory, payload: Hash("app")),
+        });
+        for (ulong seq = block.FirstSequence; seq < block.FirstSequence + 3; seq++)
+        {
+            d.Ok<CreateDirectoryResultMessage>(new CreateDirectoryCommand("/i" + seq, false, null)
+            {
+                Op = Op(session: session, sequence: seq, kind: DfsOperationKind.CreateDirectory, payload: Hash("i" + seq)),
+            });
+        }
+
+        // The application id was decided first: it is the one retired, although its sequence is the highest.
+        SessionRecord record = d.State.Sessions[session];
+        Assert.Equal(3, record.Outcomes.Count);
+        Assert.False(record.Outcomes.ContainsKey(app));
+        Assert.Equal(app, record.RetiredWatermark);
+        d.Fails(DfsErrorCode.OperationExpired, new CreateDirectoryCommand("/app", false, null)
+        {
+            Op = Op(session: session, sequence: app, kind: DfsOperationKind.CreateDirectory, payload: Hash("app")),
+        });
+
+        // The newer outcomes below the watermark are still answered from the record (never re-executed, never expired) ...
+        d.Ok<CreateDirectoryResultMessage>(new CreateDirectoryCommand("/i" + block.FirstSequence, false, null)
+        {
+            Op = Op(session: session, sequence: block.FirstSequence, kind: DfsOperationKind.CreateDirectory, payload: Hash("i" + block.FirstSequence)),
+        });
+        Assert.Equal(3, d.State.Sessions[session].Outcomes.Count);
+
+        // ... while the block's unused sequences, reserved before the retired id, are expired and never execute as new.
+        ulong unused = block.FirstSequence + 5;
+        d.Fails(DfsErrorCode.OperationExpired, new CreateDirectoryCommand("/late", false, null)
+        {
+            Op = Op(session: session, sequence: unused, kind: DfsOperationKind.CreateDirectory, payload: Hash("late")),
+        });
+        Assert.False(d.Exists("/late"));
     }
 
     [Fact]

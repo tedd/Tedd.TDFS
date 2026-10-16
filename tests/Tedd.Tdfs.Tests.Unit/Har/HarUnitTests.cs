@@ -721,7 +721,11 @@ public sealed class HarUnitTests
         {
             CancellationToken ct = Ct;
             TestNode leader = await cluster.GetLeaderAsync(Vol, ct);
-            TestNode[] others = cluster.Nodes.Where(n => n.Name != leader.Name).ToArray();
+
+            // Directional traffic is only guaranteed inside one Raft group (heartbeats and their replies): with five nodes the
+            // volume group has three voters, and a node outside it may exchange nothing with the volume leader for seconds.
+            GroupInspection group = await cluster.Inspect.GetVolumeGroupAsync(Vol);
+            TestNode[] others = cluster.Nodes.Where(n => n.Name != leader.Name && group.Voters.Contains(n.Name)).ToArray();
             TestNode follower = others[0];
             TestNode bystander = others[1];
             string from = cutLeaderToFollower ? leader.Name : follower.Name;
@@ -1260,6 +1264,13 @@ public sealed class HarUnitTests
                 ? cluster.Network.DropReplies(writes, count: 1000)
                 : cluster.Network.DropNext(writes, count: 1000);
 
+            // The outcome queries the SDK sends to resolve the write itself (PROTOCOL.md §5.1) are lost the same way: otherwise
+            // the client does learn the outcome, and the ambiguity this case records never reaches the application.
+            var queries = new MessageFilter(From: "client:c0", Type: MessageType.QueryOperation, Direction: LinkDirection.Request);
+            MessageRule queryRule = loss == MessageLoss.DropReplies
+                ? cluster.Network.DropReplies(queries, count: 1000)
+                : cluster.Network.DropNext(queries, count: 1000);
+
             long hid = history.Invoke("c0", "write", path, payload, id);
             Exception? failure = await Record.ExceptionAsync(() => vol.Files.WriteAllBytesAsync(path, payload, new DfsMutationOptions { OperationId = id }, ct));
             Assert.NotNull(failure);
@@ -1268,6 +1279,7 @@ public sealed class HarUnitTests
             Assert.Equal(OpOutcome.Unknown, observedOutcome); // the client cannot know whether the request executed
             Assert.True(rule.Matched >= 1);
             rule.Cancel();
+            queryRule.Cancel();
 
             HistoryOp recorded = history.Get(hid);
             Assert.Equal(OpOutcome.Unknown, recorded.Outcome);
@@ -1806,6 +1818,9 @@ public sealed class HarUnitTests
                 : requestSite
                     ? new FaultMatch(site, Volume: Vol, Operation: DfsOperationKind.WriteAll, Occurrence: occurrence)
                     : new FaultMatch(site, Node: leader.Name, Volume: Vol, Occurrence: occurrence);
+            // Occurrences count from the moment the fault is armed: hits of the site recorded earlier (cluster bootstrap, the
+            // session and directory created above) are not candidates.
+            int recordedBeforeArming = cluster.Faults.Coverage.Hits.Count;
             FaultArm arm = cluster.Faults.Arm(match, FaultAction.Delay(TimeSpan.Zero));
 
             byte[] data = TestData.Bytes(1300, (4 * cluster.Options.Timings.ChunkSize) + 1); // five upload chunks
@@ -1820,7 +1835,7 @@ public sealed class HarUnitTests
             Assert.Equal(stage, hit.Stage);
 
             // Event identity + hit count: the action ran on exactly the occurrence-th recorded event matching the identity.
-            FaultContext[] matching = cluster.Faults.Coverage.Hits.Where(h => match.Matches(h)).ToArray();
+            FaultContext[] matching = cluster.Faults.Coverage.Hits.Skip(recordedBeforeArming).Where(h => match.Matches(h)).ToArray();
             Assert.True(matching.Length >= occurrence, $"{site}: only {matching.Length} matching events recorded for occurrence {occurrence}");
             Assert.Equal(matching[occurrence - 1], hit);
             if (clientSite)

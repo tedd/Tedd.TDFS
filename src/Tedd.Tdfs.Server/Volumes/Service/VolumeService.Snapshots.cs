@@ -12,7 +12,7 @@ internal sealed partial class VolumeService
 {
     /// <summary>
     /// <c>CreateSnapshot</c> (FSD §11): with <c>MinimumCommit</c> the leader first waits until it applied that commit (same
-    /// cluster/volume/epoch, else EpochMismatch). F17 is hit while the capture's pin is established.
+    /// cluster/volume/epoch, else ClusterMismatch, CrossVolume or EpochMismatch). F17 is hit while the capture's pin is established.
     /// </summary>
     public async Task<IWireMessage> CreateSnapshotAsync(RpcContext context, CreateSnapshotMessage request)
     {
@@ -22,8 +22,14 @@ internal sealed partial class VolumeService
             throw new ArgumentException(nameError);
         if (request.MinimumCommit is { IsNone: false } minimum)
         {
+            // A token of another cluster, another volume (a restored volume is a new volume) or another authority epoch can
+            // never be ordered against this volume's boundaries (SNP-010, SNP-018): the typed identity error, not a wait.
             CommitToken current = Token(0);
-            if (minimum.ClusterId != current.ClusterId || minimum.VolumeId != current.VolumeId || minimum.VolumeEpoch != current.VolumeEpoch)
+            if (minimum.ClusterId != current.ClusterId)
+                throw new DfsClusterIdentityException($"Commit {minimum} was issued by another cluster; it cannot bound a snapshot of volume '{Name}'.");
+            if (minimum.VolumeId != current.VolumeId)
+                throw new DfsCrossVolumeException($"Commit {minimum} belongs to another volume; a snapshot of volume '{Name}' covers only its own commits.");
+            if (minimum.VolumeEpoch != current.VolumeEpoch)
                 throw new DfsEpochMismatchException($"Commit {minimum} does not belong to volume '{Name}' epoch {Record.Epoch}.");
         }
 

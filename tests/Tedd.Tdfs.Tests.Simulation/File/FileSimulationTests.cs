@@ -281,11 +281,17 @@ public sealed class FileSimulationTests
                 case AppendLoss.AllRepliesDroppedThenNewClient:
                 {
                     FaultArm arm = cluster.Faults.Arm(new FaultMatch(FaultSites.RpcReplySend, Operation: DfsOperationKind.Append, Count: Always), FaultAction.DropReply());
+
+                    // Every reply to the first client is lost, including those of the outcome queries the SDK sends to resolve
+                    // the append itself (PROTOCOL.md §5.1): otherwise it learns the committed outcome and the uncertainty this
+                    // case is about never reaches the application.
+                    MessageRule lostQueries = cluster.Network.DropReplies(new MessageFilter(From: "client:c1", Type: MessageType.QueryOperation), count: 10_000);
                     DfsCommitOutcomeUnknownException unknown = await AssertEx.ThrowsDfsAsync<DfsCommitOutcomeUnknownException>(
                         () => v1.Files.AppendAllBytesAsync(path, suffix, withK, Ct), DfsErrorCode.OutcomeUnknown);
                     Assert.Equal(k, unknown.OperationId);
                     cluster.Faults.AssertReached(arm);
                     cluster.KillClient(first);
+                    lostQueries.Cancel();
                     cluster.Faults.DisarmAll();
                     second = await cluster.ConnectAsync(Named("c2"), Ct);
                     resolver = second.GetVolume(Vol);

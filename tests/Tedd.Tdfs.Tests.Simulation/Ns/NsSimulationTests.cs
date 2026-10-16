@@ -1,3 +1,4 @@
+using Tedd.Tdfs.Protocol;
 using Tedd.Tdfs.Server;
 using Tedd.Tdfs.Testing;
 using static Tedd.Tdfs.Tests.Simulation.Ns.NsHelpers;
@@ -1457,6 +1458,12 @@ public sealed class NsSimulationTests
             FaultArm arm = cluster.Faults.Arm(
                 new FaultMatch(FaultSites.RpcReplySend, Operation: kind, Count: dropEveryReply ? Always : 1), FaultAction.DropReply());
 
+            // "Every reply lost" includes the replies to the outcome queries the SDK sends to resolve the mutation itself
+            // (PROTOCOL.md §5.1); otherwise it learns the committed outcome and correctly reports success.
+            MessageRule? lostQueries = dropEveryReply
+                ? cluster.Network.DropReplies(new MessageFilter(From: "client:c1", Type: MessageType.QueryOperation), count: 10_000)
+                : null;
+
             Task Mutate() => operation switch
             {
                 "mkdir" => v.Directories.CreateDirectoryAsync("/m", withK, Ct),
@@ -1468,6 +1475,7 @@ public sealed class NsSimulationTests
             Exception? first = await Record.ExceptionAsync(Mutate);
             cluster.Faults.AssertReached(arm);
             cluster.Faults.DisarmAll();
+            lostQueries?.Cancel();
             if (dropEveryReply)
             {
                 Assert.True(first is DfsCommitOutcomeUnknownException, $"with every reply lost the outcome is unknown, got {first?.ToString() ?? "success"}");

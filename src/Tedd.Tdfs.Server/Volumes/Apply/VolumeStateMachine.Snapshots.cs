@@ -66,7 +66,7 @@ internal sealed partial class VolumeStateMachine
         if (c.PinKind != PinKind.Transfer)
         {
             session = RequireSession(s, ctx, c.Session).Id;
-            int held = s.Pins.Values.Count(p => p.Session == session && p.Kind != PinKind.Handle);
+            int held = ReadPinsOf(s, session);
             if (held >= s.Config.Limits.MaxPinsPerSession)
             {
                 throw Fail(DfsErrorCode.LimitExceeded, $"The session already holds {held} pins.",

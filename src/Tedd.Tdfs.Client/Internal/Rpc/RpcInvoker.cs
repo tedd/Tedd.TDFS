@@ -42,6 +42,11 @@ internal sealed class RpcInvoker
         bool mutation = request.Kind == CallKind.Mutation;
         bool transmitted = false;
         int transmissions = 0;
+
+        // Transmissions that may have taken effect: every transmission except those answered NotLeader (a node that is not
+        // the leader proposes nothing, and a proposal that lost its log index to another term never commits — PROTOCOL.md
+        // §11.1). Only these can hide an earlier commit behind a later rejection (OperationExpired, LeaseLost, EpochMismatch).
+        int effective = 0;
         int failures = 0;
         int redirects = 0;
         Exception? last = null;
@@ -165,6 +170,7 @@ internal sealed class RpcInvoker
             if (!refused)
             {
                 transmissions++;
+                effective++;
                 request.Transmissions = transmissions;
                 transmitted |= mutation;
             }
@@ -245,15 +251,16 @@ internal sealed class RpcInvoker
 
             request.Router.OnAnswered(endpoint);
             DfsOperationId? before = request.Operation;
-            if (request.OnError is not null && await request.OnError(error, scope, transmissions).ConfigureAwait(false))
+            if (request.OnError is not null && await request.OnError(error, scope, effective).ConfigureAwait(false))
             {
-                last = error.ToException(request.Path);
+                last = ErrorOf(error, request);
                 failures++;
                 if (request.Operation != before)
                 {
                     // The hook replaced an id that was definitively rejected without effect: the new id starts afresh.
                     transmitted = false;
                     transmissions = 0;
+                    effective = 0;
                     request.Transmissions = 0;
                     scope.OperationId = request.Operation;
                 }
@@ -264,8 +271,10 @@ internal sealed class RpcInvoker
             switch (error.Code)
             {
                 case DfsErrorCode.NotLeader:
-                    last = error.ToException(request.Path);
+                    last = ErrorOf(error, request);
                     request.Router.OnNotLeader(endpoint, error.LeaderHint);
+                    effective--;
+                    transmitted = mutation && effective > 0;
                     if (error.LeaderHint is { Length: > 0 } hint && !string.Equals(hint, endpoint, StringComparison.Ordinal) && redirects < MaxRedirects)
                     {
                         redirects++;
@@ -281,14 +290,14 @@ internal sealed class RpcInvoker
                 case DfsErrorCode.NodeUnavailable:
                 case DfsErrorCode.QuorumUnavailable:
                 case DfsErrorCode.Timeout:
-                    last = error.ToException(request.Path);
+                    last = ErrorOf(error, request);
                     failures++;
                     if (!await BackoffAsync(failures, scope).ConfigureAwait(false))
                         goto Exhausted;
                     continue;
 
                 case DfsErrorCode.OutcomeUnknown when mutation:
-                    last = error.ToException(request.Path);
+                    last = ErrorOf(error, request);
                     failures++;
                     if (!await BackoffAsync(failures, scope).ConfigureAwait(false))
                         goto Exhausted;
@@ -296,7 +305,7 @@ internal sealed class RpcInvoker
 
                 default:
                     request.OnDefinite?.Invoke();
-                    throw error.ToException(request.Path);
+                    throw ErrorOf(error, request);
             }
         }
 
@@ -343,6 +352,7 @@ internal sealed class RpcInvoker
 
     private async Task<IWireMessage> FinishWithoutReplyAsync(RpcRequest request, OperationScope scope, bool possiblyTransmittedMutation, Exception? last)
     {
+        last = AtDeadline(last);
         if (!possiblyTransmittedMutation)
         {
             request.OnDefinite?.Invoke();
@@ -391,6 +401,17 @@ internal sealed class RpcInvoker
         throw Unknown(request, operation, last ?? new TimeoutException($"{request.Name} did not complete within its {scope.Timeout} deadline."));
     }
 
+    /// <summary>
+    /// The failure that ended a request without a usable answer. A <c>NotLeader</c> without a leader hint means the node asked
+    /// knew no leader of the group: when that is still the case as the request gives up, no majority of the group's voters
+    /// elected one within the deadline — a typed quorum unavailability (FSD §13 error surfaces), not a generic availability
+    /// error.
+    /// </summary>
+    private static Exception? AtDeadline(Exception? last) =>
+        last is DfsUnavailableException { ErrorCode: DfsErrorCode.NotLeader, LeaderHint: null } noLeader
+            ? new DfsQuorumUnavailableException($"No leader of the group could be reached before the deadline: {noLeader.Message}", noLeader)
+            : last;
+
     /// <summary>The unknown-outcome failure of <paramref name="request"/> (its operation and transaction id, the cause as inner exception).</summary>
     public DfsCommitOutcomeUnknownException CreateUnknown(RpcRequest request, Exception cause) =>
         Unknown(request, request.Operation.GetValueOrDefault(), cause);
@@ -428,6 +449,22 @@ internal sealed class RpcInvoker
     /// The operation kind of a request at the client wire sites: transaction-bound requests (other than the transaction's
     /// own begin/commit/abort and outcome queries) are <see cref="DfsOperationKind.TxOp"/> operations.
     /// </summary>
+    /// <summary>
+    /// The exception an error reply to <paramref name="request"/> stands for. A transaction failure of a transaction-bound
+    /// request always names the request's transaction (PROTOCOL.md §11): when the reply does not transport the id, the
+    /// request's own transaction id is used instead of the failed request's operation id.
+    /// </summary>
+    private static Exception ErrorOf(ErrorReplyMessage error, RpcRequest request)
+    {
+        if (error.TransactionId is null && request.Transaction is { } tx
+            && error.Code is DfsErrorCode.TransactionConflict or DfsErrorCode.TransactionAborted)
+        {
+            error = error with { TransactionId = tx };
+        }
+
+        return error.ToException(request.Path);
+    }
+
     private static DfsOperationKind WireKindOf(IWireMessage message, RpcRequest request) =>
         request.Transaction is not null
         && message.Type is not (MessageType.TxBegin or MessageType.TxCommit or MessageType.TxAbort or MessageType.QueryOperation)

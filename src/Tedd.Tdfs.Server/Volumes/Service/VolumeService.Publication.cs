@@ -49,7 +49,7 @@ internal sealed partial class VolumeService
                     throw new ArgumentException(appendError);
                 }
 
-                PublishPlan plan = await PlanAsync(stream, request.TruncateTo, changes, request.NewLength, policy, pool, request.Staging, op, ct);
+                PublishPlan plan = await PlanAsync(stream, request.TruncateTo, changes, request.NewLength, policy, pool, op, ct);
                 var spec = new PublishSpec(plan.TruncateTo, request.NewLength, plan.Changes, plan.FinalInline, plan.Derived, request.Staging.Value, plan.LeaderStaging)
                 {
                     Policy = inode.PolicyName,
@@ -95,7 +95,7 @@ internal sealed partial class VolumeService
                 (DfsStoragePolicy policy, string pool) = PolicyOf(policyName);
                 ImmutableArray<StreamChange> changes = await ValidateChangesAsync(request.Changes, request.Length, request.Receipts, request.Staging, policy, pool,
                     DfsOperationKind.WriteAll, op.Id, path, ct);
-                PublishPlan plan = await PlanAsync(null, 0, changes, request.Length, policy, pool, request.Staging, op, ct);
+                PublishPlan plan = await PlanAsync(null, 0, changes, request.Length, policy, pool, op, ct);
                 var spec = new PublishSpec(0, request.Length, plan.Changes, plan.FinalInline, 0, request.Staging.Value, plan.LeaderStaging) { Policy = policyName };
                 return new Prepared(Stamp(new WriteAllCommand(path, spec, request.StoragePolicy, request.SnapshotName, request.CreateParents,
                     request.ExpectedRevision), op), hold);
@@ -151,7 +151,7 @@ internal sealed partial class VolumeService
                 if (oldLength > long.MaxValue - request.AppendLength)
                     throw new ArgumentException("The append overflows the maximum file length.");
                 ImmutableArray<StreamChange> absolute = [.. relative.Select(c => c with { Offset = c.Offset + oldLength })];
-                PublishPlan plan = await PlanAsync(stream, -1, absolute, oldLength + request.AppendLength, policy, pool, request.Staging, op, ct);
+                PublishPlan plan = await PlanAsync(stream, -1, absolute, oldLength + request.AppendLength, policy, pool, op, ct);
                 bool changed = plan.LeaderStaging != 0 || plan.Derived != 0 || !plan.Changes.SequenceEqual(absolute);
                 PublishSpec spec;
                 bool isAbsolute;
@@ -473,7 +473,7 @@ internal sealed partial class VolumeService
     /// content (extents → inline), inline bytes are stored as objects meeting the policy (inline → extents, PROTOCOL.md §8.1).
     /// </summary>
     private async Task<PublishPlan> PlanAsync(StreamRecord? baseStream, long truncateTo, ImmutableArray<StreamChange> changes, long newLength,
-        DfsStoragePolicy policy, string pool, StagingId requestStaging, OperationHeader op, CancellationToken ct)
+        DfsStoragePolicy policy, string pool, OperationHeader op, CancellationToken ct)
     {
         bool inline = newLength <= State.Config.InlineThreshold && InlineAllowed(policy);
         if (ContentAlgebra.Plan(baseStream, truncateTo, changes, newLength, out List<IContentSegment>? small, out ImmutableList<ExtentRef>.Builder? large,
@@ -512,15 +512,12 @@ internal sealed partial class VolumeService
         if (!hasInline)
             return new PublishPlan(changes, truncateTo, false, 0, 0);
 
-        // Inline bytes must become objects meeting the policy, under an open staging session of the caller.
-        ulong leaderStaging = 0;
-        StagingId staging = requestStaging;
-        if (staging.IsEmpty || !State.Staging.TryGetValue(staging.Value, out StagingRecord? record) || !record.IsOpen
-            || !string.Equals(record.Principal, op.Principal, StringComparison.Ordinal))
-        {
-            leaderStaging = await CreateLeaderStagingAsync(op, ct);
-            staging = new StagingId(leaderStaging);
-        }
+        // Inline bytes must become objects meeting the policy, under a staging session the leader creates for them (closed by
+        // the publication) — never under the request's own staging session: its staging capability lets the caller read back
+        // what is stored under it (PROTOCOL.md §7.3), and these objects may hold base bytes of the stream that the caller
+        // may write but not read (an append-only or write-only principal, ACL-015, SEC-004).
+        ulong leaderStaging = await CreateLeaderStagingAsync(op, ct);
+        var staging = new StagingId(leaderStaging);
 
         ImmutableArray<StreamChange>.Builder result = changes.ToBuilder();
         foreach (InlineSegment seg in segments.OfType<InlineSegment>())

@@ -103,6 +103,10 @@ internal sealed partial class VolumeStateMachine
             return (same, VolumeApplyResult.Ok(new MoveResultMessage(new InodeId(node.Id), node.ReportedRevision, s.TokenAt(ctx.Index), sameSnap)));
         }
 
+        // Moving a directory into its own subtree is invalid whatever exists below it (checked before the destination
+        // parent, which may not exist precisely because it would lie inside the moved subtree).
+        if (node.IsDirectory && DfsPath.IsAncestorOrSelf(source, destination))
+            throw Fail(DfsErrorCode.InvalidArgument, $"'{source}' cannot be moved into its own subtree.");
         if (!dst.ParentExists)
             throw Fail(DfsErrorCode.DirectoryNotFound, $"The destination parent of '{destination}' does not exist.");
         InodeRecord dstParent = dst.Parent!;

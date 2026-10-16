@@ -46,6 +46,7 @@ public sealed class AppUnitTests
             await using DfsClient client = await cluster.ConnectAsync(null, ct);
             DfsVolume vol = client.GetVolume(Volume);
             byte[] content = TestData.Bytes(0xA_001_001, 5000);
+            await vol.Directories.CreateDirectoryAsync("/app", ct);
             CommitToken before = await vol.Files.WriteAllBytesAsync("/app/state", content, ct);
             const string name = "fs-default";
 

@@ -598,13 +598,23 @@ internal sealed class VolumeContext : IRpcRouter
     /// The id becomes visible to the application (a transaction id): it is never acknowledged, so its outcome stays
     /// queryable (PROTOCOL.md §5.1).
     /// </param>
+    /// <param name="grantsLease">
+    /// The request grants a lease (a handle): every attempt waits at most one renewal interval of the session's lease, so
+    /// a lost reply is retried — and the granted handle learned and renewed — before the lease can lapse unrenewed. The
+    /// handle belongs to the session the request is sent in, so such a request always opens this client's session first.
+    /// </param>
+    /// <param name="ownedBySession">
+    /// The request creates something the session it is sent in owns (a transaction): it always opens this client's session
+    /// first, also with an application-supplied id.
+    /// </param>
     public async Task<TReply> MutateAsync<TReply>(OperationScope scope, string name, DfsOperationId? applicationId,
         Func<RequestHeader, IWireMessage> build, string? path = null, DfsTransactionId? transaction = null, bool rebindable = true,
-        DfsOperationId? queryTarget = null, bool queryAsTransaction = false, VolumeBinding? binding = null, bool keepProtected = false)
+        DfsOperationId? queryTarget = null, bool queryAsTransaction = false, VolumeBinding? binding = null, bool keepProtected = false,
+        bool grantsLease = false, bool ownedBySession = false)
         where TReply : IWireMessage<TReply>
     {
         Bound<TReply> bound = await MutateBoundAsync<TReply>(scope, name, applicationId, build, path, transaction, rebindable, queryTarget, queryAsTransaction,
-            binding, keepProtected).ConfigureAwait(false);
+            binding, keepProtected, grantsLease, ownedBySession).ConfigureAwait(false);
         return bound.Reply;
     }
 
@@ -614,10 +624,18 @@ internal sealed class VolumeContext : IRpcRouter
     /// </summary>
     public async Task<Bound<TReply>> MutateBoundAsync<TReply>(OperationScope scope, string name, DfsOperationId? applicationId,
         Func<RequestHeader, IWireMessage> build, string? path = null, DfsTransactionId? transaction = null, bool rebindable = true,
-        DfsOperationId? queryTarget = null, bool queryAsTransaction = false, VolumeBinding? binding = null, bool keepProtected = false)
+        DfsOperationId? queryTarget = null, bool queryAsTransaction = false, VolumeBinding? binding = null, bool keepProtected = false,
+        bool grantsLease = false, bool ownedBySession = false)
         where TReply : IWireMessage<TReply>
     {
-        VolumeSession session = await EnsureSessionAsync(scope).ConfigureAwait(false);
+        // An application-supplied id of a request that neither refers to nor creates anything a session owns needs no session
+        // of this client: the id carries its own session, and another process may retry an id it persisted (FSD §13,
+        // OUT-002). Such a request is sent without opening a session first, so a retry is never held up behind an OpenSession
+        // entry that must commit. A request that creates a handle or a transaction is owned by the session it is sent in
+        // (RequestHeader.Session): it is always sent in this client's session, or the server would have no session to bind
+        // the handle's lease or the transaction to.
+        bool sessionFree = applicationId is not null && rebindable && transaction is null && binding is null && !grantsLease && !ownedBySession;
+        VolumeSession? session = sessionFree ? CurrentSession : await EnsureSessionAsync(scope).ConfigureAwait(false);
         bool sdkAllocated = applicationId is null;
         DfsOperationId operation;
 
@@ -627,7 +645,7 @@ internal sealed class VolumeContext : IRpcRouter
         if (applicationId is { } supplied)
         {
             operation = supplied;
-            session.Protect(supplied);
+            session?.Protect(supplied);
         }
         else
         {
@@ -648,10 +666,11 @@ internal sealed class VolumeContext : IRpcRouter
             Path = path,
             Transaction = transaction,
             Operation = operation,
+            AttemptTimeout = grantsLease ? LeaseRenewalInterval(session) : null,
             Build = async s =>
             {
-                VolumeSession current = await EnsureSessionAsync(s).ConfigureAwait(false);
-                pinned ??= current.Binding;
+                VolumeSession? current = sessionFree ? CurrentSession : await EnsureSessionAsync(s).ConfigureAwait(false);
+                pinned ??= current?.Binding ?? CurrentBinding;
                 sent = current;
                 return build(Header(current, request.Operation.GetValueOrDefault(), transaction, pinned));
             },
@@ -688,6 +707,20 @@ internal sealed class VolumeContext : IRpcRouter
             Finish(request, sdkAllocated, keepProtected);
             throw;
         }
+    }
+
+    /// <summary>
+    /// The longest a lease-granting request may wait for one reply: a third of the lease (the keep-alive interval), but never
+    /// shorter than the default attempt floor.
+    /// </summary>
+    private TimeSpan? LeaseRenewalInterval(VolumeSession? session)
+    {
+        TimeSpan lease = session is { LeaseDuration: var d } && d > TimeSpan.Zero ? d : Runtime.Capabilities.LeaseDuration;
+        if (lease <= TimeSpan.Zero)
+            return null;
+        TimeSpan third = lease / 3;
+        TimeSpan floor = TimeSpan.FromMilliseconds(100);
+        return third > floor ? third : floor;
     }
 
     /// <summary>The request ended definitely: its id is acknowledged (or reused when it was never transmitted).</summary>
@@ -743,8 +776,17 @@ internal sealed class VolumeContext : IRpcRouter
                 // The referenced handle, staging session or transaction is gone: definite.
                 return false;
 
+            case DfsErrorCode.OperationExpired:
+                // The sequence was retired by the session's outcome window (or the session expired) before it was ever used:
+                // allocation moves past the current block. The fresh reservation also detects an expired session, which
+                // then expires here and is replaced (AllocateWithSessionAsync).
+                if (CurrentSession is { } current && request.Operation is { } retired && retired.Session == current.Id)
+                    current.AbandonBlock();
+                await replace(scope).ConfigureAwait(false);
+                return true;
+
             default:
-                // OperationExpired, or LeaseLost of the session itself: continue under a new session.
+                // LeaseLost of the session itself: continue under a new session.
                 if (CurrentSession is { } session && request.Operation is { } old && old.Session == session.Id)
                     ExpireSession(session, error.Message);
                 await replace(scope).ConfigureAwait(false);
@@ -1008,10 +1050,21 @@ internal sealed class VolumeContext : IRpcRouter
     /// an availability failure. A session it may still have created holds nothing and closes with its client session.
     /// </summary>
     private static Exception StagingNotCreated(OperationScope scope, DfsCommitOutcomeUnknownException unknown)
-        => scope.IsAbortedByCaller
-            ? scope.NotTransmittedFailure(unknown.InnerException ?? unknown)
-            : new DfsUnavailableException(DfsErrorCode.Unavailable, "A staging session could not be created: the request was not answered.",
-                unknown.InnerException ?? unknown);
+    {
+        Exception cause = unknown.InnerException ?? unknown;
+        if (scope.IsAbortedByCaller)
+            return scope.NotTransmittedFailure(cause);
+
+        // A typed reason is the publication's own failure: the volume's quorum is unavailable, or the deadline passed
+        // without an answer (an availability failure with the Timeout code — never a bare transport timeout).
+        return cause switch
+        {
+            DfsQuorumUnavailableException => cause,
+            TimeoutException => new DfsUnavailableException(DfsErrorCode.Timeout,
+                "A staging session could not be created before the deadline: the request was not answered.", cause),
+            _ => new DfsUnavailableException(DfsErrorCode.Unavailable, "A staging session could not be created: the request was not answered.", cause),
+        };
+    }
 
     /// <summary>Renews the capability of <paramref name="lease"/> (<c>CreateStaging</c> with <c>Renew</c>; no log entry).</summary>
     public async Task RenewStagingAsync(StagingLease lease, OperationScope scope)

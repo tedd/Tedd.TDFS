@@ -78,7 +78,9 @@ internal sealed class RpcRequest
 
     /// <summary>
     /// Called for error replies before the generic handling; returns true when the request should be retried (for example
-    /// after re-binding to a re-created volume or replacing a never-used expired operation id).
+    /// after re-binding to a re-created volume or replacing a never-used expired operation id). The count passed is the
+    /// number of transmissions that may have taken effect, the answered one included (transmissions answered
+    /// <c>NotLeader</c> proposed nothing that can commit and are not counted).
     /// </summary>
     public Func<ErrorReplyMessage, OperationScope, int, ValueTask<bool>>? OnError { get; init; }
 

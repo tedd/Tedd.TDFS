@@ -48,7 +48,7 @@ internal sealed class ConnectionPool
 
     /// <summary>
     /// Returns an authenticated connection to <paramref name="endpoint"/>, connecting when none is pooled. A new connection
-    /// hits the <c>client.connect</c> fault site (F02) of the operation that triggers it. Waiting ends after
+    /// and the reuse of a pooled one hit the <c>client.connect</c> fault site (F02) of the operation that triggers it. Waiting ends after
     /// <paramref name="waitTimeout"/> (<see cref="TimeoutException"/>) or when the operation is cancelled; the shared
     /// connect itself is bounded by <see cref="DfsClientOptions.ConnectTimeout"/>.
     /// </summary>
@@ -56,25 +56,37 @@ internal sealed class ConnectionPool
     {
         ArgumentNullException.ThrowIfNull(endpoint);
         Task<ClientConnection>? pending = null;
+        ClientConnection? pooled = null;
         bool mustStart = false;
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_closed, typeof(DfsClient));
             Slot slot = SlotOf(endpoint);
             if (slot.Connection is { IsUsable: true } open)
-                return open;
-            if (slot.Connection is not null)
+                pooled = open;
+            else if (slot.Connection is not null)
             {
                 slot.Connection.Poison();
                 slot.Connection = null;
             }
 
-            if (slot.Pending is { IsCompleted: true })
-                slot.Pending = null; // a finished connect either pooled its connection (now unusable) or failed: start afresh
-            if (slot.Pending is null)
-                mustStart = true;
-            else
-                pending = slot.Pending;
+            if (pooled is null)
+            {
+                if (slot.Pending is { IsCompleted: true })
+                    slot.Pending = null; // a finished connect either pooled its connection (now unusable) or failed: start afresh
+                if (slot.Pending is null)
+                    mustStart = true;
+                else
+                    pending = slot.Pending;
+            }
+        }
+
+        if (pooled is not null)
+        {
+            // F02 also covers reusing a pooled connection (test plan §8.2): the operation can still stop here untransmitted.
+            await scope.HitAsync(FaultStage.F02, FaultSites.ClientConnect, detail: endpoint).ConfigureAwait(false);
+            scope.ThrowIfCancelled();
+            return pooled;
         }
 
         if (mustStart)

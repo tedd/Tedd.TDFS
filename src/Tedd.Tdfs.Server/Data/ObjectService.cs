@@ -73,7 +73,7 @@ internal sealed class ObjectService
 
         bool alreadyPresent = Store.TryGetInfo(obj) is { } existing && existing.Volume == volume.Id && existing.Staging == staging
             && existing.Checksum == checksum && existing.Length == length;
-        await Store.PutAsync(obj, volume.Id, staging, data, operation, admission, ct);
+        await Store.PutAsync(obj, volume.Id, staging, data, operation, admission, ct, volume.Name);
         await _s.HitAsync(FaultStage.F08, FaultSites.ObjectAfterFlushBeforeReceipt, volume.Name, operation, obj: obj, ct: ct);
         _s.Metrics.ObjectPut(data.Length);
         _s.Metrics.SetStored(Store.ObjectCount, Store.LiveBytes);
@@ -119,11 +119,18 @@ internal sealed class ObjectService
     {
         var message = (GetObjectMessage)request;
         VolumeRecord? volume = _s.Control.State.FindVolume(message.Volume);
+        StagingId? stagedBy = null;
         if (!context.IsNode || !message.Capability.IsEmpty)
         {
             if (volume is null)
                 throw new UnauthorizedAccessException("Access denied: the capability does not authorize this volume.");
-            Capabilities.Verify(message.Capability.Span, DataCapabilityKind.Read, volume, context.Principal ?? string.Empty, obj: message.Object);
+
+            // A staging capability also lets its holder read back what it stored under that staging session (a writer's own
+            // staged, unpublished data — PROTOCOL.md §7.3); every other read needs a read capability naming the object.
+            if (DataCapability.TryDecode(message.Capability.Span, out DataCapability? presented) && presented?.Kind == DataCapabilityKind.Staging)
+                stagedBy = Capabilities.Verify(message.Capability.Span, DataCapabilityKind.Staging, volume, context.Principal ?? string.Empty).Staging;
+            else
+                Capabilities.Verify(message.Capability.Span, DataCapabilityKind.Read, volume, context.Principal ?? string.Empty, obj: message.Object);
         }
 
         if (message.Offset < 0 || message.Length < 0)
@@ -131,6 +138,8 @@ internal sealed class ObjectService
         ObjectRecordInfo info = Store.TryGetInfo(message.Object) is { } found && found.Volume == message.Volume
             ? found
             : throw new DfsObjectMissingException(message.Object);
+        if (stagedBy is { } staging && info.Staging != staging)
+            throw new UnauthorizedAccessException("Access denied: the staging capability does not cover the object.");
 
         long objectLength = info.Length;
         if (message.Offset >= objectLength)

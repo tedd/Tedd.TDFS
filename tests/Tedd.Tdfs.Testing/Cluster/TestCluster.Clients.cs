@@ -178,7 +178,7 @@ public sealed partial class TestCluster
             OperationTimeout = options.OperationTimeout ?? TimeSpan.FromSeconds(10),
             Security = new DfsTransportSecurity { PinnedSpkiSha256 = _trustedPins },
             TimeProvider = clock,
-            Diagnostics = options.Diagnostics,
+            Diagnostics = options.Diagnostics ?? (TraceClientEvents ? new TraceDiagnostics(this, options.NetworkName) : null),
         };
         if (options.ConnectTimeout is { } connect)
             result = result with { ConnectTimeout = connect };
@@ -287,4 +287,22 @@ public sealed partial class TestCluster
 
     /// <summary>What the harness knows about a client it connected.</summary>
     private sealed record ClientRecord(string NetworkName, bool IsHarness);
+
+    /// <summary>
+    /// True when the environment variable <c>TDFS_TRACE_CLIENT_EVENTS</c> is set to <c>1</c>: clients without their own
+    /// diagnostics sink then record every SDK diagnostic event in the cluster trace (debugging aid; off by default).
+    /// </summary>
+    private static bool TraceClientEvents { get; } =
+        string.Equals(Environment.GetEnvironmentVariable("TDFS_TRACE_CLIENT_EVENTS"), "1", StringComparison.Ordinal);
+
+    /// <summary>Records SDK diagnostic events of one client in the cluster trace.</summary>
+    private sealed class TraceDiagnostics(TestCluster cluster, string client) : IDfsDiagnostics
+    {
+        public void OnEvent(DfsDiagnosticEvent e)
+        {
+            string op = e.OperationId is { } id ? " " + id : string.Empty;
+            string error = e.Exception is { } ex ? $" [{ex.GetType().Name}: {ex.Message}]" : string.Empty;
+            cluster.Record($"{client} {e.Name}{op}: {e.Message}{error}");
+        }
+    }
 }

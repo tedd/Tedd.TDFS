@@ -58,8 +58,8 @@ internal sealed partial class VolumeService
         if (!_transactions.TryGetValue(id, out TxWork? tx))
         {
             if (_sm.State.Transactions.TryGetValue(id, out TxRecord? record) && record.State == TxState.Committed)
-                throw new DfsException(DfsErrorCode.TransactionAborted, $"Transaction {id} has committed; it accepts no further operations.");
-            throw new DfsException(DfsErrorCode.TransactionAborted,
+                throw new DfsTransactionAbortedException(new DfsTransactionId(id), $"Transaction {id} has committed; it accepts no further operations.") { IsRetryable = false };
+            throw new DfsTransactionAbortedException(new DfsTransactionId(id),
                 $"Transaction {id} is not active on this leader (it ended, or a leader change discarded its private view); begin a new transaction.");
         }
 
@@ -68,7 +68,7 @@ internal sealed partial class VolumeService
         if (!_sm.State.Transactions.TryGetValue(id, out TxRecord? live) || live.State != TxState.Active)
         {
             _transactions.Remove(id);
-            throw new DfsException(DfsErrorCode.TransactionAborted, $"Transaction {id} was aborted (expiry, deadline or a resolving outcome query).");
+            throw new DfsTransactionAbortedException(new DfsTransactionId(id), $"Transaction {id} was aborted (expiry, deadline or a resolving outcome query).");
         }
 
         return tx;
@@ -134,7 +134,7 @@ internal sealed partial class VolumeService
             else if (_sm.State.Transactions.TryGetValue(id, out TxRecord? record) && record.State == TxState.Active)
             {
                 // The working view is gone (leader change): the transaction cannot commit what it did.
-                throw new DfsException(DfsErrorCode.TransactionAborted,
+                throw new DfsTransactionAbortedException(new DfsTransactionId(id),
                     $"Transaction {id} lost its private view in a leader change; it is aborted and must be retried.");
             }
 
@@ -142,6 +142,13 @@ internal sealed partial class VolumeService
         }, bindTransaction: false);
         if (!(_sm.State.Transactions.TryGetValue(id, out TxRecord? after) && after.State == TxState.Active))
             DropTransaction(id);
+
+        // A refused commit is a transaction failure: the reply carries the transaction id (PROTOCOL.md §11), not only the
+        // commit request's operation id.
+        if (reply is ErrorReplyMessage { TransactionId: null } refused)
+            reply = refused with { TransactionId = new DfsTransactionId(id) };
+        if (reply is ErrorReplyMessage { Code: DfsErrorCode.TransactionConflict })
+            _s.Metrics.TransactionConflict();
         return reply;
     }
 

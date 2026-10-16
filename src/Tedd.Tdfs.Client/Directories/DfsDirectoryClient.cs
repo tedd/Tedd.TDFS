@@ -62,7 +62,7 @@ public sealed partial class DfsDirectoryClient
     /// <summary>Creates a directory (recursively) with options.</summary>
     public async Task<DfsDirectoryInfo> CreateDirectoryAsync(string path, DfsMutationOptions options, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.CreateDirectory, ct);
+        using OperationScope scope = Begin(DfsOperationKind.CreateDirectory, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.DirectoryPath(path);
         Validation.MutationOptions(options);
@@ -82,7 +82,7 @@ public sealed partial class DfsDirectoryClient
     /// <summary>True when a directory exists at <paramref name="path"/> (false only for genuine absence).</summary>
     public async Task<bool> ExistsAsync(string path, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Exists, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Exists, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         // Stream syntax in a directory operation is an invalid path (Addendum ADS-06).
         string p = Validation.DirectoryPath(path);
@@ -100,7 +100,7 @@ public sealed partial class DfsDirectoryClient
     /// <summary>Metadata of a directory (<see cref="DirectoryNotFoundException"/> when absent).</summary>
     public async Task<DfsDirectoryInfo> GetInfoAsync(string path, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.GetInfo, ct);
+        using OperationScope scope = Begin(DfsOperationKind.GetInfo, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.DirectoryPath(path);
         using DfsTransaction.TransactionOperation? txOperation = EnterTransaction();
@@ -129,7 +129,7 @@ public sealed partial class DfsDirectoryClient
     /// <summary>Renames a directory atomically with options.</summary>
     public async Task<CommitToken> MoveAsync(string sourcePath, string destinationPath, DfsMutationOptions options, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Move, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Move, sourcePath, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string source = Validation.DirectoryPath(sourcePath, nameof(sourcePath));
         string destination = Validation.DirectoryPath(destinationPath, nameof(destinationPath));
@@ -159,7 +159,7 @@ public sealed partial class DfsDirectoryClient
     /// <summary>Deletes a directory with options.</summary>
     public async Task<CommitToken> DeleteAsync(string path, bool recursive, DfsMutationOptions options, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Delete, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Delete, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.DirectoryPath(path);
         Validation.MutationOptions(options);
@@ -201,7 +201,7 @@ public sealed partial class DfsDirectoryClient
     public async Task<DfsDirectoryPage> ListPageAsync(string path, DfsEnumerationOptions? options = null, string? continuationToken = null,
         CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Enumerate, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Enumerate, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.DirectoryPath(path);
         DfsEnumerationOptions validated = Validation.EnumerationOptions(options);
@@ -313,6 +313,10 @@ public sealed partial class DfsDirectoryClient
     /// <summary>Starts an operation; transaction-bound operations are <see cref="DfsOperationKind.TxOp"/> operations.</summary>
     private OperationScope Begin(DfsOperationKind kind, CancellationToken ct) =>
         Runtime.BeginOperation(Transaction is not null ? DfsOperationKind.TxOp : kind, Volume.Name, null, ct);
+
+    /// <summary>Begins an operation addressing <paramref name="path"/> (the raw argument: fault sites hit before validation carry it too).</summary>
+    private OperationScope Begin(DfsOperationKind kind, string? path, CancellationToken ct) =>
+        Runtime.BeginOperation(Transaction is not null ? DfsOperationKind.TxOp : kind, Volume.Name, path, ct);
 
     private void EnsureWritable()
     {

@@ -1875,6 +1875,7 @@ public sealed class NetSimulationTests
             byte[] data = TestData.Bytes(0x1902, 6 * 64 * 1024);
             DfsStream stream = await volume.Files.OpenAsync("/batch", new DfsOpenOptions { Mode = FileMode.Open, Access = FileAccess.ReadWrite, Share = FileShare.Read }, Ct);
             Exception? flushError;
+            bool written = false;
 
             if (variant == "client-cut-after-receipts")
             {
@@ -1890,6 +1891,7 @@ public sealed class NetSimulationTests
                 flushError = await CaptureAsync(async () =>
                 {
                     await stream.WriteAsync(data, Ct);
+                    written = true;
                     await stream.SetLengthAsync(data.Length, Ct);
                     await stream.FlushAsync(Ct);
                 });
@@ -1904,6 +1906,7 @@ public sealed class NetSimulationTests
                 // or crashes; the coordinator must only count receipts that are still valid and durable.
                 MessageHold commitHold = cluster.Network.Hold(new MessageFilter(From: ClientNet("c0"), Type: MessageType.CommitFile));
                 await stream.WriteAsync(data, Ct);
+                written = true;
                 await stream.SetLengthAsync(data.Length, Ct);
                 Task<Exception?> flush = CaptureAsync(() => stream.FlushAsync(Ct));
                 await commitHold.WaitForAsync(1, ElectionBound);
@@ -1926,9 +1929,22 @@ public sealed class NetSimulationTests
                     await issuer.RestartAsync();
             }
 
-            // Retry the publication through the same handle if the stream is not faulted; it publishes all or nothing.
+            // Retry the publication through the same handle if the stream is not faulted; it publishes all or nothing. A write
+            // call that failed was rolled back privately (PUB-022): its bytes are not staged, so the retry repeats the call.
             if (flushError is not null && !stream.IsFaulted)
-                flushError = await CaptureAsync(() => stream.FlushAsync(Ct));
+            {
+                flushError = await CaptureAsync(async () =>
+                {
+                    if (!written)
+                    {
+                        stream.Position = 0;
+                        await stream.WriteAsync(data, Ct);
+                    }
+
+                    await stream.SetLengthAsync(data.Length, Ct);
+                    await stream.FlushAsync(Ct);
+                });
+            }
             await CaptureAsync(async () => await stream.DisposeAsync());
 
             await using DfsClient observer = await cluster.ConnectAsync(new TestClientOptions { Name = "observer", OperationTimeout = ElectionBound }, Ct);

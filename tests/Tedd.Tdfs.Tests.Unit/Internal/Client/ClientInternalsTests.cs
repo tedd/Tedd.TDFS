@@ -240,6 +240,19 @@ public sealed class ClientInternalsTests
         Assert.Equal(3UL, session.Watermark);
         Assert.True(session.TryAllocate(out DfsOperationId c));
         Assert.Equal(3UL, c.Sequence);
+
+        // The leader retired sequences of the block (OperationExpired on an id's only transmission, PROTOCOL.md §5.1): the
+        // rest of the block is abandoned and allocation continues in a new block; the watermark still never passes the
+        // in-flight id or the application id.
+        session.AbandonBlock();
+        Assert.False(session.TryAllocate(out _), "an abandoned block is not used any further");
+        session.AddBlock(11, 4);
+        Assert.True(session.TryAllocate(out DfsOperationId d));
+        Assert.Equal(11UL, d.Sequence);
+        Assert.Equal(3UL, session.Watermark);
+        session.Complete(c);
+        session.Complete(d);
+        Assert.Equal(10UL, session.Watermark);
     }
 
     // ------------------------------------------------------------------------------------------------ validation

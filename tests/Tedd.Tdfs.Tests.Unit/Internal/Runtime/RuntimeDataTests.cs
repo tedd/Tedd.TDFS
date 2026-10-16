@@ -90,19 +90,26 @@ public sealed class RuntimeDataTests
         Assert.Equal([storage.Id], evaluation.Holders);
         Assert.NotNull(state);
 
-        // Reads need a read capability listing the object, issued to the caller.
+        // Reads need a read capability listing the object, issued to the caller, or the staging capability of the staging
+        // session the object was stored under (a writer reading back its own staged data, PROTOCOL.md §7.3).
         foreach ((string name, RawClient client, byte[] capability) in new (string, RawClient, byte[])[]
         {
             ("missing", admin, []),
             ("other object", admin, Read(RuntimeCluster.AdminPrincipal, [ObjectId.New(random)], expires)),
             ("other principal", reader, Read(RuntimeCluster.AdminPrincipal, [obj], expires)),
             ("expired", admin, Read(RuntimeCluster.AdminPrincipal, [obj], DateTimeOffset.UtcNow.AddSeconds(-1))),
-            ("staging kind", admin, Staging(RuntimeCluster.AdminPrincipal, staging, expires)),
+            ("other staging session", admin, Staging(RuntimeCluster.AdminPrincipal, new StagingId(8), expires)),
+            ("staging, other principal", reader, Staging(RuntimeCluster.AdminPrincipal, staging, expires)),
+            ("staging, expired", admin, Staging(RuntimeCluster.AdminPrincipal, staging, DateTimeOffset.UtcNow.AddSeconds(-1))),
         })
         {
             var error = Assert.IsType<ErrorReplyMessage>(await client.CallAsync(new GetObjectMessage(capability, volume.Id, obj, 0, data.Length)));
             Assert.True(error.Code == DfsErrorCode.AccessDenied, $"{name}: expected AccessDenied, got {error.Code}");
         }
+
+        var readBack = await admin.CallOrThrowAsync<GetObjectResultMessage>(
+            new GetObjectMessage(Staging(RuntimeCluster.AdminPrincipal, staging, expires), volume.Id, obj, 0, data.Length));
+        Assert.Equal(data, readBack.Data.ToArray());
 
         byte[] readCapability = Read(RuntimeCluster.AdminPrincipal, [obj], expires);
         var whole = await admin.CallOrThrowAsync<GetObjectResultMessage>(new GetObjectMessage(readCapability, volume.Id, obj, 0, data.Length));

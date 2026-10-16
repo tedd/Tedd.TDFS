@@ -229,8 +229,9 @@ ClientAckWatermark }` and is applied through `OperationGate`:
 2. Outcome retained for `(session, seq)`: if principal/opKind/payloadHash differ → `OperationIdMismatch`;
    else → return the **stored outcome** (no second effect).
 3. Otherwise execute, then store the outcome record `{opKind, payloadHash, principal, status, result, index}`.
-4. Retire outcomes `< ClientAckWatermark`, and retire the oldest beyond `MaxOutcomesPerSession` (advancing
-   `RetiredWatermark`, which is durable state — OUT-012/019).
+4. Retire outcomes `< ClientAckWatermark`, and retire the oldest (by deciding log index, whatever their sequences)
+   beyond `MaxOutcomesPerSession` (advancing `RetiredWatermark` to the highest retired sequence, which is durable state
+   — OUT-012/019; unused sequences below it, reserved ones included, are expired from then on).
 
 `FenceOperation(id)` records a definite **Aborted(fenced)** outcome for an id with no outcome yet, so a delayed copy
 can never commit later (OUT-013, used by `QueryOperationAsync(resolve: true)`).
@@ -418,8 +419,9 @@ transaction bodies are never re-executed.
 ### 9.3 DfsStream
 * Overlay = sorted set of staged ranges (each either buffered bytes or an already-uploaded staged object range) +
   staged length + truncation watermark. Reads on a writable handle merge overlay with the base revision.
-* Memory bound: when buffered bytes exceed `BufferSize` (and always for chunks reaching `ChunkSize`), complete chunks
-  are uploaded under the staging session (still unpublished — PUB-002).
+* Memory bound: when buffered bytes exceed `BufferSize`, complete chunks are uploaded under the staging session (still
+  unpublished — PUB-002), and the remaining buffered ranges too when they alone still exceed `BufferSize` (FSD §15:
+  memory bounded by the configured buffer). Readable writers read uploaded ranges back with their staging capability.
 * `Flush`/`FlushAsync` publish all pending changes as one revision (`CommitFile`). `WriteThrough` publishes per call.
 * Overlap detection: each public operation enters an `OperationGate`; overlapping calls throw
   `InvalidOperationException` (STR-019).

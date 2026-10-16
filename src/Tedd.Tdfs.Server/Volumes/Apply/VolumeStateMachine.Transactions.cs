@@ -32,6 +32,15 @@ internal sealed partial class VolumeStateMachine
         SessionRecord session = RequireSession(s, ctx, c.Session);
         if (s.Transactions.ContainsKey(id))
             throw Fail(DfsErrorCode.AlreadyExists, $"Transaction {id} already exists.");
+
+        // An active transaction pins its read root: it counts against the session's read pins (TX-022).
+        int held = ReadPinsOf(s, session.Id);
+        if (held >= s.Config.Limits.MaxPinsPerSession)
+        {
+            throw Fail(DfsErrorCode.LimitExceeded, $"The session already holds {held} read pins (snapshot readers, enumerations, transactions).",
+                LimitDetail(nameof(DfsVolumeLimits.MaxPinsPerSession), s.Config.Limits.MaxPinsPerSession, held + 1));
+        }
+
         var staging = new StagingRecord(s.NextStagingId, session.Id, 0, id, op.Principal, StagingState.Open, ctx.Index, 0, ctx.Now);
         var tx = new TxRecord(id, session.Id, op.Principal, TxState.Active, ctx.Index, staging.Id, 0, c.DeadlineUtc, ImmutableSortedSet.Create<StreamKey>(StreamKeyComparer.Instance),
             0);
@@ -116,7 +125,8 @@ internal sealed partial class VolumeStateMachine
         if (c.Descriptor.Length > s.Config.Limits.MaxTransactionDescriptorBytes)
         {
             return Abandon(s, tx, ctx, DfsErrorCode.LimitExceeded,
-                $"Transaction {tx.Id} needs a {c.Descriptor.Length}-byte descriptor; the limit is {s.Config.Limits.MaxTransactionDescriptorBytes}.");
+                $"Transaction {tx.Id} needs a {c.Descriptor.Length}-byte descriptor; the limit is {s.Config.Limits.MaxTransactionDescriptorBytes}.",
+                LimitDetail(nameof(DfsVolumeLimits.MaxTransactionDescriptorBytes), s.Config.Limits.MaxTransactionDescriptorBytes, c.Descriptor.Length));
         }
 
         TxDescriptor descriptor;
@@ -197,8 +207,14 @@ internal sealed partial class VolumeStateMachine
     }
 
     /// <summary>Ends <paramref name="tx"/> without effect (conflict, deadline, limits) and fails the commit with <paramref name="code"/>.</summary>
-    private static (VolumeState, VolumeApplyResult) Abandon(VolumeState s, TxRecord tx, ApplyContext ctx, DfsErrorCode code, string message)
-        => (EndTransaction(s, tx, TxState.Aborted, ctx.Index), VolumeApplyResult.Fail(code, message));
+    private static (VolumeState, VolumeApplyResult) Abandon(VolumeState s, TxRecord tx, ApplyContext ctx, DfsErrorCode code, string message,
+        ErrorDetailData? detail = null)
+        => (EndTransaction(s, tx, TxState.Aborted, ctx.Index), VolumeApplyResult.Fail(code, message, detail));
+
+    /// <summary>Read pins held by <paramref name="session"/>: snapshot readers, enumerations and its active transactions.</summary>
+    internal static int ReadPinsOf(VolumeState s, ulong session) =>
+        s.Pins.Values.Count(p => p.Session == session && p.Kind != PinKind.Handle)
+        + s.Transactions.Values.Count(t => t.Session == session && t.State == TxState.Active);
 
     /// <summary>The handle and generation of a working-view handle replaced by the handle its replayed open created.</summary>
     private static VolumeCommand RemapTransactionHandles(VolumeCommand command, Dictionary<ulong, HandleRecord> handles) => command switch

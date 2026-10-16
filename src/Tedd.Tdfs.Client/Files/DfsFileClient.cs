@@ -57,7 +57,7 @@ public sealed partial class DfsFileClient
     /// <summary>Opens a stream with FileStream-like semantics (FSD §6.1).</summary>
     public async Task<DfsStream> OpenAsync(string path, DfsOpenOptions options, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Open, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Open, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.FilePath(path);
         ArgumentNullException.ThrowIfNull(options);
@@ -121,7 +121,7 @@ public sealed partial class DfsFileClient
             bound = await Context.MutateBoundAsync<OpenHandleResultMessage>(scope, "OpenHandle", options.OperationId,
                 header => new OpenHandleMessage(header, path, options.Mode, options.Access, options.Share, options.Options, pinned, writeThrough,
                     WirePolicy(options.StoragePolicy)),
-                path, TxId, binding: Bound).ConfigureAwait(false);
+                path, TxId, binding: Bound, grantsLease: true).ConfigureAwait(false);
         }
         catch (DfsCommitOutcomeUnknownException unknown) when (options.Mode == FileMode.Open && (options.Access & FileAccess.Write) == 0)
         {
@@ -159,7 +159,7 @@ public sealed partial class DfsFileClient
     /// <summary>Reads a whole file from one pinned revision (bounded by <see cref="DfsClientOptions.MaxMaterializeBytes"/>).</summary>
     public async Task<byte[]> ReadAllBytesAsync(string path, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Read, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Read, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.FilePath(path);
         using DfsTransaction.TransactionOperation? txOperation = EnterTransaction();
@@ -338,7 +338,7 @@ public sealed partial class DfsFileClient
     /// <summary>Atomically replaces the contents of a file with options (operation id, storage policy, commit-and-snapshot).</summary>
     public async Task<CommitToken> WriteAllBytesAsync(string path, ReadOnlyMemory<byte> bytes, DfsMutationOptions options, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.WriteAll, ct);
+        using OperationScope scope = Begin(DfsOperationKind.WriteAll, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.FilePath(path);
         Validation.MutationOptions(options);
@@ -389,7 +389,7 @@ public sealed partial class DfsFileClient
     /// <summary>Atomically appends bytes with options.</summary>
     public async Task<CommitToken> AppendAllBytesAsync(string path, ReadOnlyMemory<byte> bytes, DfsMutationOptions options, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Append, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Append, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.FilePath(path);
         Validation.MutationOptions(options);
@@ -410,7 +410,7 @@ public sealed partial class DfsFileClient
     public async Task<CommitToken> AppendAllTextAsync(string path, string contents, Encoding? encoding = null, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(contents);
-        using OperationScope scope = Begin(DfsOperationKind.Append, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Append, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.FilePath(path);
         EnsureWritable();
@@ -442,9 +442,24 @@ public sealed partial class DfsFileClient
     private async Task<CommitToken> WriteAllCoreAsync(string path, ReadOnlyMemory<byte> bytes, DfsMutationOptions options, OperationScope scope)
     {
         VolumeEntry entry = await EntryAsync(scope).ConfigureAwait(false);
-        DfsStoragePolicy policy = await PolicyForAsync(path, options.StoragePolicy, entry, null, scope).ConfigureAwait(false);
         int threshold = ContentLayout.InlineThreshold(entry, Runtime.Capabilities);
-        bool inline = bytes.Length <= threshold && ContentLayout.InlinePermitted(entry, policy, LabelsOf);
+
+        // Content that every policy the file could have stores inline needs no lookup of the file's own policy (a
+        // linearizable read): the request is sent straight away, so a retry of a persisted id reaches the leader even
+        // while its log is stalled (OUT-002). The leader applies the file's own policy either way.
+        bool inline;
+        DfsStoragePolicy policy;
+        if (bytes.Length <= threshold && options.StoragePolicy is null && EveryPolicyPermitsInline(entry))
+        {
+            policy = entry.DefaultPolicy;
+            inline = true;
+        }
+        else
+        {
+            policy = await PolicyForAsync(path, options.StoragePolicy, entry, null, scope).ConfigureAwait(false);
+            inline = bytes.Length <= threshold && ContentLayout.InlinePermitted(entry, policy, LabelsOf);
+        }
+
         long length = bytes.Length;
         for (int attempt = 0; ; attempt++)
         {
@@ -481,28 +496,54 @@ public sealed partial class DfsFileClient
         int threshold = ContentLayout.InlineThreshold(entry, Runtime.Capabilities);
         bool inlineRejected = false;
         bool stagingReplaced = false;
+
+        // An application-supplied id may be retried — by another process — after the original committed (the file has grown
+        // since) or while it is still in flight (the volume's log may be stalled, so no linearizable read completes). Such a
+        // retry cannot know the length the first attempt saw, and the representation is part of the payload identity
+        // (PROTOCOL.md §5.2): a length-based choice could turn a legitimate retry into OperationIdMismatch. The representation
+        // of an application-id append therefore depends on the appended bytes alone: inline when they fit the inline
+        // threshold — the leader stores them as objects meeting the file's policy when the result is extent-based or the
+        // policy requires it (§8.1, LAY-002) — and objects otherwise. Only the byte helper accepts an id, and its content does
+        // not depend on the length. (Transaction-bound appends keep the length-based choice: the transaction answers their
+        // ids from its own results.)
+        bool lengthIndependent = options.OperationId is not null && Transaction is null;
         while (true)
         {
-            // The current length decides the representation (and whether a text preamble is due). A principal may hold
-            // AppendData without ReadAttributes (ACL-015): it then appends blind — as objects (the leader stores the result
-            // inline when it fits) and without a preamble.
-            GetInfoResultMessage? info;
-            try
+            // Otherwise the current length decides the representation (and whether a text preamble is due). A principal may
+            // hold AppendData without ReadAttributes (ACL-015): it then appends blind — as objects (the leader stores the
+            // result inline when it fits) and without a preamble.
+            GetInfoResultMessage? info = null;
+            if (!lengthIndependent)
             {
-                info = await InfoAsync(path, scope).ConfigureAwait(false);
-            }
-            catch (UnauthorizedAccessException)
-            {
-                info = null;
+                try
+                {
+                    info = await InfoAsync(path, scope).ConfigureAwait(false);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    info = null;
+                }
             }
 
             bool known = info is not null;
             long current = info is { Exists: true, Info: { } file } && (file.Kind == WireEntryKind.File || file.IsStream) ? file.Length : 0;
             ReadOnlyMemory<byte> bytes = content(known ? current : 1);
-            DfsStoragePolicy policy = known
-                ? await PolicyForAsync(path, options.StoragePolicy, entry, info, scope).ConfigureAwait(false)
-                : ContentLayout.ResolvePolicy(entry, options.StoragePolicy) ?? entry.DefaultPolicy;
-            bool inline = known && !inlineRejected && current + bytes.Length <= threshold && ContentLayout.InlinePermitted(entry, policy, LabelsOf);
+            bool inline;
+            DfsStoragePolicy policy;
+            if (lengthIndependent)
+            {
+                inline = bytes.Length <= threshold;
+                policy = inline ? ContentLayout.ResolvePolicy(entry, options.StoragePolicy) ?? entry.DefaultPolicy
+                    : await AppendPolicyAsync(path, options.StoragePolicy, entry, scope).ConfigureAwait(false);
+            }
+            else
+            {
+                policy = known
+                    ? await PolicyForAsync(path, options.StoragePolicy, entry, info, scope).ConfigureAwait(false)
+                    : ContentLayout.ResolvePolicy(entry, options.StoragePolicy) ?? entry.DefaultPolicy;
+                inline = known && !inlineRejected && current + bytes.Length <= threshold && ContentLayout.InlinePermitted(entry, policy, LabelsOf);
+            }
+
             Payload payload = inline
                 ? Payload.Inline(bytes)
                 : await UploadAsync(bytes, 0, entry, policy, scope).ConfigureAwait(false);
@@ -541,6 +582,22 @@ public sealed partial class DfsFileClient
     /// </summary>
     private bool IsClosedHelperStaging(DfsException ex, Payload payload, DfsMutationOptions options) =>
         ex.ErrorCode == DfsErrorCode.LeaseLost && payload.Lease is not null && Transaction is null && options.OperationId is null;
+
+    /// <summary>
+    /// The policy an application-id append uploads its objects for: the file's own policy where the caller may read it, else
+    /// the requested or default one (a blind append, ACL-015; the leader validates the receipts against the file's policy).
+    /// </summary>
+    private async Task<DfsStoragePolicy> AppendPolicyAsync(string path, string? requested, VolumeEntry entry, OperationScope scope)
+    {
+        try
+        {
+            return await PolicyForAsync(path, requested, entry, null, scope).ConfigureAwait(false);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return ContentLayout.ResolvePolicy(entry, requested) ?? entry.DefaultPolicy;
+        }
+    }
 
     /// <summary>The changes, receipts and staging session (with its lease, when uploaded) of a publication's content.</summary>
     private sealed record Payload(IReadOnlyList<RangeChange> Changes, IReadOnlyList<ObjectReceipt> Receipts, StagingId Staging, StagingLease? Lease = null)
@@ -629,6 +686,11 @@ public sealed partial class DfsFileClient
 
     private DfsTopologyLabels? LabelsOf(NodeId node) => Runtime.Map.Node(node)?.Labels;
 
+    /// <summary>True when the volume's metadata group satisfies the default and every named policy for inline storage.</summary>
+    private bool EveryPolicyPermitsInline(VolumeEntry entry) =>
+        ContentLayout.InlinePermitted(entry, entry.DefaultPolicy, LabelsOf)
+        && entry.NamedPolicies.Values.All(policy => ContentLayout.InlinePermitted(entry, policy, LabelsOf));
+
     // ---- Namespace operations ---------------------------------------------------------------------------------
 
     /// <summary>Copies a file atomically (FSD §5.4).</summary>
@@ -642,7 +704,7 @@ public sealed partial class DfsFileClient
     /// <summary>Copies a file atomically with options.</summary>
     public async Task<CommitToken> CopyAsync(string sourcePath, string destinationPath, bool overwrite, DfsMutationOptions options, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Copy, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Copy, sourcePath, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string source = Validation.FilePath(sourcePath, nameof(sourcePath));
         string destination = Validation.FilePath(destinationPath, nameof(destinationPath));
@@ -672,7 +734,7 @@ public sealed partial class DfsFileClient
     /// <summary>Renames a file atomically with options.</summary>
     public async Task<CommitToken> MoveAsync(string sourcePath, string destinationPath, bool overwrite, DfsMutationOptions options, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Move, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Move, sourcePath, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string source = Validation.FilePath(sourcePath, nameof(sourcePath));
         string destination = Validation.FilePath(destinationPath, nameof(destinationPath));
@@ -702,7 +764,7 @@ public sealed partial class DfsFileClient
     /// <summary>Deletes a file with options.</summary>
     public async Task<CommitToken> DeleteAsync(string path, DfsMutationOptions options, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Delete, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Delete, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.FilePath(path);
         Validation.MutationOptions(options);
@@ -722,7 +784,7 @@ public sealed partial class DfsFileClient
     /// <summary>True when a file exists at <paramref name="path"/> (false only for genuine absence).</summary>
     public async Task<bool> ExistsAsync(string path, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Exists, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Exists, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.Path(path);
         using DfsTransaction.TransactionOperation? txOperation = EnterTransaction();
@@ -741,7 +803,7 @@ public sealed partial class DfsFileClient
     /// <summary>Metadata of a file (<see cref="FileNotFoundException"/> when absent).</summary>
     public async Task<DfsFileInfo> GetInfoAsync(string path, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.GetInfo, ct);
+        using OperationScope scope = Begin(DfsOperationKind.GetInfo, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.FilePath(path);
         using DfsTransaction.TransactionOperation? txOperation = EnterTransaction();
@@ -758,7 +820,7 @@ public sealed partial class DfsFileClient
     /// <summary>Changes the storage policy of a file (existing data migrates in the background).</summary>
     public async Task<CommitToken> SetStoragePolicyAsync(string path, string policyName, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.PolicyChange, ct);
+        using OperationScope scope = Begin(DfsOperationKind.PolicyChange, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.Path(path);
         Validation.Name(policyName, nameof(policyName));
@@ -778,7 +840,7 @@ public sealed partial class DfsFileClient
     /// <summary>Changes the owner-only / read-only-for-others access flags of a file.</summary>
     public async Task<CommitToken> SetAccessAsync(string path, DfsInodeAccess access, CancellationToken ct = default)
     {
-        using OperationScope scope = Begin(DfsOperationKind.Admin, ct);
+        using OperationScope scope = Begin(DfsOperationKind.Admin, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
         string p = Validation.Path(path);
         ArgumentNullException.ThrowIfNull(access);
@@ -800,6 +862,10 @@ public sealed partial class DfsFileClient
     /// <summary>Starts an operation; transaction-bound operations are <see cref="DfsOperationKind.TxOp"/> operations.</summary>
     private OperationScope Begin(DfsOperationKind kind, CancellationToken ct) =>
         Runtime.BeginOperation(Transaction is not null ? DfsOperationKind.TxOp : kind, Volume.Name, null, ct);
+
+    /// <summary>Begins an operation addressing <paramref name="path"/> (the raw argument: fault sites hit before validation carry it too).</summary>
+    private OperationScope Begin(DfsOperationKind kind, string? path, CancellationToken ct) =>
+        Runtime.BeginOperation(Transaction is not null ? DfsOperationKind.TxOp : kind, Volume.Name, path, ct);
 
     private void EnsureWritable()
     {

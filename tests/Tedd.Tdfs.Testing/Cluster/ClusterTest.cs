@@ -305,6 +305,13 @@ public static class ClusterTest
             sb.Append(CultureInfo.InvariantCulture, $", cluster {cluster.ClusterId}, data root {cluster.DataRoot}");
         sb.AppendLine();
         sb.Append(CultureInfo.InvariantCulture, $"Failure: {failure.GetType().FullName}: {failure.Message}").AppendLine();
+        if (failure is UncontrolledDependencyException uncontrolled)
+        {
+            // The evidence (posting thread and stack) is what locates the escape; print the distinct ones.
+            foreach (UncontrolledDependency dependency in uncontrolled.Dependencies.DistinctBy(d => d.Detail, StringComparer.Ordinal).Take(4))
+                sb.Append(CultureInfo.InvariantCulture, $"Uncontrolled dependency ({dependency.Kind} in {dependency.Component}): {dependency.Detail}").AppendLine();
+        }
+
         if (scheduler is not null)
             sb.Append(CultureInfo.InvariantCulture, $"Simulation: t={SimScheduler.FormatTime(scheduler.Now)}, steps {scheduler.StepCount}").AppendLine();
         if (cluster is not null)

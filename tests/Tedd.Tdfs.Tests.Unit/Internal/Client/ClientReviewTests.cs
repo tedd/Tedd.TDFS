@@ -390,6 +390,56 @@ public sealed class ClientReviewTests
         }
     }
 
+    // ------------------------------------------------------------------------------------------------ persisted ids
+
+    [Fact]
+    public async Task PersistedId_OpenFromAFreshClientCreatesAHandleOfThatClientsSession()
+    {
+        (FakeCluster cluster, DfsClient issuer) = await StartAsync();
+        await using (cluster)
+        await using (issuer)
+        {
+            // The id was issued to another process (persisted and handed over); the opening client has no session yet.
+            DfsOperationId id = await issuer.GetVolume(Vol).NewOperationIdAsync();
+            await using DfsClient opener = await cluster.ConnectAsync();
+            DfsFileClient files = opener.GetVolume(Vol).Files;
+            int sessionsBefore = Count(cluster, MessageType.OpenSession);
+
+            // The handle belongs to the session the open is sent in: it must be the opener's (renewed by its keep-alives).
+            DfsStream stream = await files.OpenAsync("/persisted",
+                new DfsOpenOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write, Share = FileShare.Read, OperationId = id });
+            Assert.Equal(sessionsBefore + 1, Count(cluster, MessageType.OpenSession));
+            byte[] data = Bytes(21, 100);
+            await stream.WriteAsync(data);
+            await stream.FlushAsync();
+            await stream.DisposeAsync();
+            Assert.Equal(data, cluster.Content("/persisted"));
+            Assert.Equal(0, cluster.OpenHandles);
+        }
+    }
+
+    [Fact]
+    public async Task PersistedId_TransactionBegunFromAFreshClientBelongsToThatClientsSession()
+    {
+        (FakeCluster cluster, DfsClient issuer) = await StartAsync();
+        await using (cluster)
+        await using (issuer)
+        {
+            DfsOperationId id = await issuer.GetVolume(Vol).NewOperationIdAsync();
+            await using DfsClient beginner = await cluster.ConnectAsync();
+            DfsVolume volume = beginner.GetVolume(Vol);
+            int sessionsBefore = Count(cluster, MessageType.OpenSession);
+
+            DfsTransaction tx = await volume.Transactions.BeginAsync(new DfsTransactionOptions { OperationId = id });
+            Assert.Equal(sessionsBefore + 1, Count(cluster, MessageType.OpenSession));
+            byte[] data = Bytes(22, 100);
+            await tx.Files.WriteAllBytesAsync("/tx-persisted", data);
+            await tx.CommitAsync();
+            Assert.Equal(DfsTransactionState.Committed, tx.State);
+            Assert.Equal(data, cluster.Content("/tx-persisted"));
+        }
+    }
+
     // ------------------------------------------------------------------------------------------------ publication
 
     [Fact]
@@ -400,7 +450,10 @@ public sealed class ClientReviewTests
         await using (client)
         {
             DfsFileClient files = client.GetVolume(Vol).Files;
-            DfsStream stream = await files.OpenAsync("/rw", new DfsOpenOptions { Mode = FileMode.CreateNew, Access = FileAccess.ReadWrite, Share = FileShare.Read });
+            // The buffer holds all written bytes, so nothing is uploaded before the flush (a writer uploads early once its
+            // buffered bytes exceed BufferSize, PUB-002).
+            DfsStream stream = await files.OpenAsync("/rw",
+                new DfsOpenOptions { Mode = FileMode.CreateNew, Access = FileAccess.ReadWrite, Share = FileShare.Read, BufferSize = 1 << 20 });
             byte[] data = Bytes(10, 200_000);
             await stream.WriteAsync(data);
 

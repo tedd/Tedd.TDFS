@@ -125,6 +125,10 @@ internal sealed class VolumeSession
 
     /// <summary>
     /// Registers a sequence the leader reserved for the application: protected for the session's lifetime (never acknowledged).
+    /// The current internal block stays in use: abandoning it here would leave a reservation with unused sequences on the
+    /// leader for every application id until the outcome window passes it, and enough application ids would then exhaust
+    /// the session's reserved-block limit. Internal sequences that the window retires meanwhile (it retires the lowest
+    /// sequences first) are skipped once the leader rejects one of them (<see cref="AbandonBlock"/>, PROTOCOL.md §5.1).
     /// </summary>
     public void AddApplicationVisible(ulong sequence)
     {
@@ -134,6 +138,25 @@ internal sealed class VolumeSession
             _protected.Add(sequence);
             _highWater = Math.Max(_highWater, sequence + 1);
         }
+    }
+
+    /// <summary>
+    /// Abandons the unallocated rest of the current internal block and the released sequences: the next internal allocation
+    /// reserves a new block (above everything handed out so far). Used after the leader retired sequences of the block (an
+    /// internal id rejected with <c>OperationExpired</c> on its only transmission).
+    /// </summary>
+    public void AbandonBlock()
+    {
+        lock (_sync)
+            AbandonBlockLocked();
+    }
+
+    private void AbandonBlockLocked()
+    {
+        _next = _end;
+        foreach (ulong released in _free)
+            _protected.Remove(released);
+        _free.Clear();
     }
 
     /// <summary>
