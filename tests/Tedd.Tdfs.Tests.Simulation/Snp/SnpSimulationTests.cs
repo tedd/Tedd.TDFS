@@ -1815,6 +1815,7 @@ public sealed class SnpSimulationTests
             DfsVolume vol = client.GetVolume(Volume);
             byte[] f1 = TestData.Bytes(0x5014_0001, (4 * Chunk) + 21);
             byte[] g = TestData.Bytes(0x5014_0002, 200);
+            await vol.Directories.CreateDirectoryAsync("/m", ct);   // writes never create missing parents (FSD §5)
             await vol.Files.WriteAllBytesAsync("/m/f", f1, ct);
             await vol.Files.WriteAllBytesAsync("/m/g", g, ct);
             FileInspection? file = await cluster.Inspect.GetFileAsync(Volume, "/m/f");
