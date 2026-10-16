@@ -32,6 +32,9 @@ internal sealed class InventoryReporter
     /// <summary>Volumes whose GC sweep is running.</summary>
     private readonly HashSet<VolumeId> _sweeping = [];
 
+    /// <summary>The node that accepted the last inventory page of each volume (its leader then).</summary>
+    private readonly Dictionary<VolumeId, NodeId> _accepted = [];
+
     public InventoryReporter(NodeServices services)
     {
         ArgumentNullException.ThrowIfNull(services);
@@ -184,7 +187,12 @@ internal sealed class InventoryReporter
         }
     }
 
-    /// <summary>Sends one page to the volume leader: the local service when this node leads, else the leader or a voter.</summary>
+    /// <summary>
+    /// Sends one page to the volume leader: the local service when this node leads, else the leader this node knows of (it
+    /// may host no replica of the group), the node that accepted this volume's last page, then the voters. A candidate that
+    /// cannot be reached (crashed, partitioned) is skipped like one answering <c>NotLeader</c>: a non-member always trying a
+    /// dead voter first would never report again, and its copies would stop counting (PERF-010).
+    /// </summary>
     private async Task<InventoryReportResultMessage> SendAsync(VolumeRecord volume, InventoryReportMessage message)
     {
         using CancellationTokenSource deadline = _s.CreateDeadline();
@@ -194,6 +202,8 @@ internal sealed class InventoryReporter
         var candidates = new List<NodeId>();
         if (_s.Raft.LeaderOf(volume.GroupName) is { } known)
             candidates.Add(known);
+        if (_accepted.TryGetValue(volume.Id, out NodeId previous))
+            candidates.Add(previous);
         candidates.AddRange(volume.Voters);
         var tried = new HashSet<NodeId>();
         Exception? lastFailure = null;
@@ -204,13 +214,22 @@ internal sealed class InventoryReporter
                 continue;
             try
             {
-                return (InventoryReportResultMessage)await _s.Peers.CallAsync(node, message, ct: deadline.Token);
+                var result = (InventoryReportResultMessage)await _s.Peers.CallAsync(node, message, ct: deadline.Token);
+                _accepted[volume.Id] = node;
+                return result;
             }
             catch (DfsUnavailableException ex) when (ex.ErrorCode == DfsErrorCode.NotLeader)
             {
                 lastFailure = ex;
                 if (ex.LeaderHint is { } hint && MemberAt(hint) is { } hinted && !tried.Contains(hinted))
                     candidates.Insert(i + 1, hinted);
+            }
+            catch (Exception ex) when ((ex is DfsUnavailableException or IOException or TimeoutException) && !deadline.IsCancellationRequested)
+            {
+                // Unreachable or unavailable: ask the next candidate.
+                lastFailure = ex;
+                if (_accepted.TryGetValue(volume.Id, out NodeId stale) && stale == node)
+                    _accepted.Remove(volume.Id);
             }
         }
 
