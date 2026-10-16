@@ -41,6 +41,23 @@ internal sealed partial class VolumeStateMachine
         return (s, VolumeApplyResult.Ok(new DeleteSnapshotResultMessage(true, s.TokenAt(ctx.Index))));
     }
 
+    private static (VolumeState, VolumeApplyResult) ApplyExpireSnapshots(VolumeState s, ApplyContext ctx, ExpireSnapshotsCommand c)
+    {
+        var expired = new List<string>();
+        foreach (string name in OrEmpty(c.Names).Order(StringComparer.Ordinal))
+        {
+            // Only a snapshot whose retention expired by the leader time of the entry, and that is not held (the retention may
+            // have been extended or a hold placed since the leader decided).
+            if (s.Snapshots.TryGetValue(name, out SnapshotRecord? snapshot) && !snapshot.Hold && snapshot.ExpiresUtc is { } expires && expires <= ctx.Now)
+            {
+                s = s with { Snapshots = s.Snapshots.Remove(name) };
+                expired.Add(name);
+            }
+        }
+
+        return (s, VolumeApplyResult.Ok(null, expired));
+    }
+
     private static (VolumeState, VolumeApplyResult) ApplySetRetention(VolumeState s, ApplyContext ctx, SetSnapshotRetentionCommand c)
     {
         RequireGrant(ctx, DfsPermissions.Snapshot, "set retention");

@@ -676,6 +676,34 @@ internal sealed record ExpirePinsCommand(ImmutableArray<ulong> Pins) : VolumeCom
     internal static ExpirePinsCommand ReadBody(ref WireReader r) => new(CommandCodec.ReadUInt64s(ref r));
 }
 
+/// <summary>
+/// Removes the retention reference of snapshots whose retention expired (no hold, expiry at or before the leader time the
+/// command carries): retention is the snapshot's last obligation; readers and transfers keep their pinned roots.
+/// </summary>
+internal sealed record ExpireSnapshotsCommand(ImmutableArray<string> Names) : VolumeCommand
+{
+    public override VolumeCommandKind Kind => VolumeCommandKind.ExpireSnapshots;
+
+    public override DfsOperationKind OperationKind => DfsOperationKind.Gc;
+
+    internal override void WriteBody(ref WireWriter w)
+    {
+        ImmutableArray<string> names = Names.IsDefault ? [] : Names;
+        w.WriteVarUInt((ulong)names.Length);
+        foreach (string name in names)
+            w.WriteString(name);
+    }
+
+    internal static ExpireSnapshotsCommand ReadBody(ref WireReader r)
+    {
+        int count = r.ReadCount(1);
+        var names = ImmutableArray.CreateBuilder<string>(count);
+        for (int i = 0; i < count; i++)
+            names.Add(r.ReadString());
+        return new ExpireSnapshotsCommand(names.MoveToImmutable());
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // GC and restore (500-599)
 // ---------------------------------------------------------------------------------------------------------------------

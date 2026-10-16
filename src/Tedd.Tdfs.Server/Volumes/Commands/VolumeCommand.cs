@@ -42,6 +42,7 @@ internal enum VolumeCommandKind : ushort
     AcquirePin = 403,
     ReleasePin = 404,
     ExpirePins = 405,
+    ExpireSnapshots = 406,
 
     PruneDerefLog = 500,
     RestoreChunk = 510,

@@ -37,6 +37,7 @@ internal static partial class CommandCodec
         readers.Add(VolumeCommandKind.AcquirePin, AcquirePinCommand.ReadBody);
         readers.Add(VolumeCommandKind.ReleasePin, ReleasePinCommand.ReadBody);
         readers.Add(VolumeCommandKind.ExpirePins, ExpirePinsCommand.ReadBody);
+        readers.Add(VolumeCommandKind.ExpireSnapshots, ExpireSnapshotsCommand.ReadBody);
 
         readers.Add(VolumeCommandKind.PruneDerefLog, PruneDerefLogCommand.ReadBody);
         readers.Add(VolumeCommandKind.RestoreChunk, RestoreChunkCommand.ReadBody);

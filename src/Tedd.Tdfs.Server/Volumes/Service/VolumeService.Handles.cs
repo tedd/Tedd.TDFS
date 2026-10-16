@@ -154,6 +154,13 @@ internal sealed partial class VolumeService
         }
 
         s = State;
+        ImmutableArray<string> expiredSnapshots = [.. s.Snapshots.Values
+            .Where(x => !x.Hold && x.ExpiresUtc is { } expires && expires <= wall)
+            .Select(x => x.Name)];
+        if (expiredSnapshots.Length > 0)
+            await ProposeHousekeepingAsync(new ExpireSnapshotsCommand(expiredSnapshots));
+
+        s = State;
         TimeSpan stale = _s.Timings.SessionTimeout + _s.Timings.SessionTimeout;
         ulong restoreStaging = s.Restore is { Complete: false } restoring ? restoring.Staging : 0;
         ImmutableArray<ulong> leaderStaging = [.. s.Staging.Values
