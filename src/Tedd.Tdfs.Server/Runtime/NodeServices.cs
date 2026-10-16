@@ -92,6 +92,9 @@ internal sealed class NodeServices
 
     public ObjectService Objects { get; set; } = null!;
 
+    /// <summary>Per-volume data-encryption keys of the object store (null when encryption at rest is off).</summary>
+    public VolumeDataKeys? VolumeKeys { get; set; }
+
     /// <summary>Maintenance plane (inventory/GC sweeps, repair, scrubbing, usage reports); null until the data handlers are registered.</summary>
     public MaintenancePlane? Maintenance { get; set; }
 

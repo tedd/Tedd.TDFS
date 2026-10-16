@@ -1727,6 +1727,10 @@ public sealed class ChaSimulationTests
             await vol.Files.WriteAllBytesAsync("/cha010/f1", s2["/cha010/f1"], ct);
             await vol.Files.WriteAllBytesAsync("/cha010/f2", s2["/cha010/f2"], ct);
             await vol.Snapshots.CreateAsync("cha010-s2", ct: ct);
+
+            // The target is registered without an automatic schedule: requesting the sync while it is offline makes the
+            // exporter pin s2 for it, and that pin's age budget is what the offline target exceeds.
+            await vol.Backups.RequestSyncAsync(target, "cha010-s2", ct);
             await cluster.WaitUntilAsync(async () => (await vol.Backups.GetStatusAsync(target, ct)).ReseedRequired,
                 TimeSpan.FromSeconds(60), "the offline target exceeded its pin age budget and needs a reseed", ct);
 

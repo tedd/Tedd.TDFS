@@ -392,6 +392,10 @@ carry an operation id; **opt** = may carry one (then retries are deduplicated); 
 3. A storage node verifies the capability (§7.3), the declared length and XxHash128 against the payload and capacity
    admission (`CapacityExhausted` before touching reserves), writes the record, flushes, and only then returns a signed
    `ObjectReceipt` (never before the flush; `SafetyMutations.AcknowledgeBeforeFlush` is a negative control only).
+   With encryption at rest the record is sealed with the newest data-key version of the volume the node knows, at least
+   the capability's `MinimumKeyVersion` (§7.3); a node whose control replica has not learned that version yet runs a
+   control barrier once and otherwise answers retryable `Unavailable` (the client tries again or another target). The
+   version is recorded in the object record (ARCHITECTURE §11); receipts and the wire payload never depend on it.
 4. The client publishes (`CommitFile`/`WriteAll`/`Append`/transaction requests) with the receipts. The leader validates
    **before proposing**: every receipt MAC; receipt ↔ change binding (`ObjectReceipt.Covers`: object id, checksum,
    object length, encoding; plus volume and staging session); node incarnation equals the registered one; placement
@@ -437,6 +441,13 @@ back its staged, unpublished data that it uploaded early to bound memory); any o
 client's own uploads are stored under a client's staging session: objects the leader materializes go under a staging
 session of the leader's (§8.1), so a staging capability never reads bytes its holder did not upload.
 Node peers may omit capabilities on `GetObject` (repair pulls) — clients never may (SEC-004/005).
+
+Extensions (MAC-covered): field **1** `MinimumKeyVersion` (optional, `u32` little-endian; staging capabilities only) —
+the volume's current data-key version in the issuing leader's control replica when the capability was issued (a
+proposal's control barrier makes that replica reflect every `RotateDataKey` committed before the `CreateStaging` /
+`TxBegin` entry, and renewals re-issue it). Storage nodes seal the session's objects with at least that version, so
+every object staged after a rotation committed uses the new key. It is optional: a verifier that does not understand it
+ignores it and seals with the newest version it knows (still a valid, recorded version).
 
 ### 7.4 Reads
 
@@ -1806,7 +1817,7 @@ Stores one immutable object (client or node → storage node). The node verifies
 | 6 | `Length` | `varint` | Length of `Data`. |
 | 7 | `Encoding` | `u8` | Object encoding (`ObjectEncodings`). |
 | 8 | `PlacementEpoch` | `varuint` | Placement epoch the uploader computed targets under. |
-| 9 | `Data` | `bytes` | Object payload (plaintext; nodes encrypt at rest). |
+| 9 | `Data` | `bytes` | Object payload (plaintext; nodes encrypt at rest with a data-key version of the volume, at least the capability's `MinimumKeyVersion`). |
 | 10 | — | `extensions` | Terminal extension block. |
 
 #### `PutObjectResult` = 111 (`PutObjectResultMessage`)
@@ -2497,7 +2508,10 @@ Request of `AdminOp.Grant` and `AdminOp.Revoke`.
 
 #### `AdminKeyRotationBody`
 
-Result of `AdminOp.RotateDataKey`.
+Result of `AdminOp.RotateDataKey`. The new version is committed in the control group (the DEK wrapped by the cluster
+KEK in the volume's control record) before the reply: objects staged afterwards are sealed with it (§7.3), objects
+sealed with older versions keep their recorded version, and old versions are retained. The volume leader also records
+the version in the volume log (`RotateDataKey` volume entry) during its housekeeping.
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
@@ -2828,7 +2842,7 @@ Short-lived, MAC-protected authorization for data-plane requests (ARCHITECTURE �
 | 7 | `Objects` | `list<ObjectId>` | Readable objects in strictly ascending order (`DataCapabilityKind.Read`); empty for staging capabilities. |
 | 8 | `ExpiresUtc` | `timestamp` | Expiry on the issuer's wall clock; verifiers reject expired capabilities using their own clock. |
 | 9 | `Mac` | `bytes[0|32]` | HMAC-SHA256 with the cluster capability key over `GetMacInput`; empty before `Sign`. |
-| 10 | — | `extensions` | Terminal extension block. |
+| 10 | — | `extensions` | Terminal extension block (MAC-covered; field 1 = optional `MinimumKeyVersion`, `u32`, §7.3). |
 
 #### `DirectoryEntryData`
 

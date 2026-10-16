@@ -35,6 +35,42 @@ public sealed record DataCapability(
     /// <summary>Optional extensions (covered by the MAC, so issuers can add scope restrictions that old verifiers must not ignore).</summary>
     public IReadOnlyList<WireExtension> Extensions { get; init; } = [];
 
+    /// <summary>
+    /// Extension field id of <see cref="MinimumKeyVersion"/> (optional; value: u32 little-endian). Verifiers that do not
+    /// understand it ignore it and seal with the newest key version they know.
+    /// </summary>
+    public const uint MinimumKeyVersionExtension = 1;
+
+    /// <summary>
+    /// Staging capabilities: the lowest volume data-key version a storage node may seal the session's objects with (the
+    /// volume's current version when the capability was issued, so objects staged after a committed key rotation use the
+    /// new key); 0 when absent.
+    /// </summary>
+    public uint MinimumKeyVersion
+    {
+        get
+        {
+            foreach (WireExtension extension in Extensions)
+            {
+                if (extension.FieldId == MinimumKeyVersionExtension && extension.Value.Length == 4)
+                    return System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(extension.Value.Span);
+            }
+
+            return 0;
+        }
+    }
+
+    /// <summary>Returns an unsigned copy carrying <see cref="MinimumKeyVersion"/> = <paramref name="version"/> (0 removes it).</summary>
+    public DataCapability WithMinimumKeyVersion(uint version)
+    {
+        WireExtension[] others = [.. Extensions.Where(e => e.FieldId != MinimumKeyVersionExtension)];
+        if (version == 0)
+            return this with { Extensions = others, Mac = ReadOnlyMemory<byte>.Empty };
+        var value = new byte[4];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(value, version);
+        return this with { Extensions = [.. others, new WireExtension(MinimumKeyVersionExtension, Required: false, value)], Mac = ReadOnlyMemory<byte>.Empty };
+    }
+
     /// <inheritdoc />
     public static int MinEncodedSize => 1 + 16 + 16 + 1 + 1 + 1 + 1 + 1 + 1 + 1;
 

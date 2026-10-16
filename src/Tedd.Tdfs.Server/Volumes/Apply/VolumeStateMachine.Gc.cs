@@ -166,7 +166,18 @@ internal sealed partial class VolumeStateMachine
     {
         if (c.Version == 0)
             throw Fail(DfsErrorCode.InvalidArgument, "Data-key versions start at 1.");
-        s = s with { KeyVersions = s.KeyVersions.Add(c.Version) };
+        // Versions are contiguous (the control group assigns current + 1): recording a newer one records every version up to it.
+        uint first = s.KeyVersions.IsEmpty ? 1 : s.KeyVersions.Max + 1;
+        if (c.Version >= first && c.Version - first > 65_536)
+            throw Fail(DfsErrorCode.InvalidArgument, $"Data-key version {c.Version} is implausibly far beyond the recorded version {first - 1}.");
+        if (c.Version >= first)
+        {
+            ImmutableSortedSet<uint>.Builder versions = s.KeyVersions.ToBuilder();
+            for (uint v = first; v <= c.Version; v++)
+                versions.Add(v);
+            s = s with { KeyVersions = versions.ToImmutable() };
+        }
+
         _ = ctx;
         return (s, VolumeApplyResult.Ok(null, c.Version));
     }

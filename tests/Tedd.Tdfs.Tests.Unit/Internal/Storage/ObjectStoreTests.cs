@@ -36,8 +36,10 @@ public abstract class ObjectStoreContractTests : StorageContractTests
 
     protected virtual IRecordCipher? Cipher => null;
 
+    protected virtual IVolumeKeyProvider? VolumeKeys => null;
+
     protected ObjectStoreOptions Options(long segmentSize = 1 << 20, long reserved = 0)
-        => new(segmentSize, reserved, 4 << 20, Cipher);
+        => new(segmentSize, reserved, 4 << 20, Cipher) { VolumeKeys = VolumeKeys };
 
     protected ValueTask<ObjectStore> OpenAsync(ObjectStoreOptions? options = null, IStorageMedium? medium = null)
         => ObjectStore.OpenAsync(medium ?? Medium, Dir, options ?? Options(), NoFaults.Instance);
@@ -60,8 +62,8 @@ public abstract class ObjectStoreContractTests : StorageContractTests
             Assert.Equal(Tedd.Tdfs.Data.ObjectChecksum.Compute(content), info.Checksum);
             Assert.Equal(ObjectTestData.VolumeA, info.Volume);
             Assert.Equal(ObjectTestData.Staging1, info.Staging);
-            Assert.Equal(Cipher is null ? ObjectEncoding.Plain : ObjectEncoding.SealedUnits, info.Encoding);
-            Assert.Equal(Cipher is null ? 0u : 1u, info.KeyVersion);
+            Assert.Equal(VolumeKeys is not null ? ObjectEncoding.SealedVolumeUnits : Cipher is null ? ObjectEncoding.Plain : ObjectEncoding.SealedUnits, info.Encoding);
+            Assert.Equal(Cipher is null && VolumeKeys is null ? 0u : 1u, info.KeyVersion);
             Assert.Equal(content, await ObjectTestData.ReadAllAsync(store, ObjectTestData.Id(1)));
         }
 
@@ -455,6 +457,109 @@ public sealed class ObjectStoreSimulatedEncryptedTests : ObjectStoreContractTest
         Assert.False(await reopened.ContainsAsync(ObjectTestData.Id(2)));
         await Assert.ThrowsAsync<DfsIntegrityException>(async () => await reopened.ReadAsync(ObjectTestData.Id(1), 0, new byte[10]));
     }
+}
+
+/// <summary>Per-volume data keys for store tests: one ring per volume, derived from a per-volume secret.</summary>
+internal sealed class TestVolumeKeys : IVolumeKeyProvider, IDisposable
+{
+    private readonly Dictionary<VolumeId, (KeyRing Ring, RecordCipher Cipher)> _volumes = [];
+
+    public KeyRing Add(VolumeId volume, uint versions = 1)
+    {
+        KeyRing ring = KeyRing.Derive(Secret(volume), StorageKeys.ObjectPurpose, versions);
+        _volumes[volume] = (ring, new RecordCipher(ring, new SeededRandom((ulong)volume.Value.GetHashCode() & 0xFFFF)));
+        return ring;
+    }
+
+    public void Rotate(VolumeId volume)
+    {
+        KeyRing ring = _volumes[volume].Ring;
+        uint next = ring.CurrentVersion + 1;
+        ring.Add(next, StorageKeys.DeriveKey(Secret(volume), StorageKeys.ObjectPurpose, next));
+    }
+
+    public void Forget(VolumeId volume) => _volumes.Remove(volume);
+
+    public IRecordCipher? GetCipher(VolumeId volume) => _volumes.TryGetValue(volume, out var keys) ? keys.Cipher : null;
+
+    public void Dispose()
+    {
+        foreach ((KeyRing _, RecordCipher cipher) in _volumes.Values)
+            cipher.Dispose();
+    }
+
+    private static byte[] Secret(VolumeId volume) => TestData.Bytes(70UL + (volume == ObjectTestData.VolumeA ? 0UL : 1UL), 32);
+}
+
+/// <summary>The store contract with per-volume data keys (ARCHITECTURE §11), plus key-version specifics.</summary>
+public sealed class ObjectStoreSimulatedVolumeKeyTests : ObjectStoreContractTests, IDisposable
+{
+    private readonly TestVolumeKeys _keys = new();
+
+    public ObjectStoreSimulatedVolumeKeyTests()
+    {
+        _keys.Add(ObjectTestData.VolumeA);
+        _keys.Add(ObjectTestData.VolumeB);
+    }
+
+    protected override MediumHost CreateHost() => new SimulatedHost();
+
+    protected override IVolumeKeyProvider? VolumeKeys => _keys;
+
+    [Fact]
+    public async Task RecordsCarryTheVolumeKeyVersion_AndStayReadableAfterRotation()
+    {
+        await using (ObjectStore store = await OpenAsync())
+        {
+            ObjectRecordInfo first = await store.PutAsync(ObjectTestData.Id(1), ObjectTestData.VolumeA, ObjectTestData.Staging1, ObjectTestData.Content(1, 70_000));
+            Assert.Equal(ObjectEncoding.SealedVolumeUnits, first.Encoding);
+            Assert.Equal(1u, first.KeyVersion);
+            _keys.Rotate(ObjectTestData.VolumeA);
+            Assert.Equal(2u, (await store.PutAsync(ObjectTestData.Id(2), ObjectTestData.VolumeA, ObjectTestData.Staging1, ObjectTestData.Content(2, 70_000))).KeyVersion);
+
+            // An explicit (older, still held) version is honoured; volume B's keys are independent of A's rotation.
+            Assert.Equal(1u, (await store.PutAsync(ObjectTestData.Id(3), ObjectTestData.VolumeA, ObjectTestData.Staging1, ObjectTestData.Content(3, 100),
+                DfsOperationKind.PutObject, ObjectAdmission.Normal, 1)).KeyVersion);
+            Assert.Equal(1u, (await store.PutAsync(ObjectTestData.Id(4), ObjectTestData.VolumeB, ObjectTestData.Staging1, ObjectTestData.Content(4, 100))).KeyVersion);
+        }
+
+        await using ObjectStore reopened = await OpenAsync();
+        for (int n = 1; n <= 4; n++)
+            Assert.Equal(ObjectTestData.Content(n, n <= 2 ? 70_000 : 100), await ObjectTestData.ReadAllAsync(reopened, ObjectTestData.Id(n)));
+        Assert.Equal(2u, reopened.TryGetInfo(ObjectTestData.Id(2))!.KeyVersion);
+    }
+
+    [Fact]
+    public async Task MissingVolumeKey_IsRecoveryKeyMissing_NeverPlaintext()
+    {
+        var unknown = new VolumeId(new Guid("0c0c0c0c-0000-4000-8000-000000000003"));
+        await using ObjectStore store = await OpenAsync(Options(segmentSize: 300));
+        await Assert.ThrowsAsync<DfsRecoveryKeyMissingException>(async () =>
+            await store.PutAsync(ObjectTestData.Id(1), unknown, ObjectTestData.Staging1, ObjectTestData.Content(1, 100)));
+        await Assert.ThrowsAsync<DfsRecoveryKeyMissingException>(async () =>
+            await store.PutAsync(ObjectTestData.Id(1), ObjectTestData.VolumeA, ObjectTestData.Staging1, ObjectTestData.Content(1, 100),
+                DfsOperationKind.PutObject, ObjectAdmission.Normal, 9));
+        Assert.Equal(0, store.ObjectCount);
+
+        await store.PutAsync(ObjectTestData.Id(2), ObjectTestData.VolumeB, ObjectTestData.Staging1, ObjectTestData.Content(2, 100));
+        _keys.Forget(ObjectTestData.VolumeB);
+        await Assert.ThrowsAsync<DfsRecoveryKeyMissingException>(async () => await store.ReadAsync(ObjectTestData.Id(2), 0, new byte[10]));
+    }
+
+    [Fact]
+    public async Task RecordsSealedWithTheNodeCipher_StayReadableWithVolumeKeys()
+    {
+        using RecordCipher legacy = ObjectTestData.NewCipher();
+        await using (ObjectStore store = await ObjectStore.OpenAsync(Medium, ObjectTestData.Dir, new ObjectStoreOptions(1 << 20, 0, Cipher: legacy), NoFaults.Instance))
+            Assert.Equal(ObjectEncoding.SealedUnits, (await store.PutAsync(ObjectTestData.Id(1), ObjectTestData.VolumeA, ObjectTestData.Staging1, ObjectTestData.Content(1, 100))).Encoding);
+
+        await using ObjectStore both = await ObjectStore.OpenAsync(Medium, ObjectTestData.Dir, new ObjectStoreOptions(1 << 20, 0, Cipher: legacy) { VolumeKeys = _keys },
+            NoFaults.Instance);
+        Assert.Equal(ObjectTestData.Content(1, 100), await ObjectTestData.ReadAllAsync(both, ObjectTestData.Id(1)));
+        Assert.Equal(ObjectEncoding.SealedVolumeUnits, (await both.PutAsync(ObjectTestData.Id(2), ObjectTestData.VolumeA, ObjectTestData.Staging1, ObjectTestData.Content(2, 100))).Encoding);
+    }
+
+    public void Dispose() => _keys.Dispose();
 }
 
 public sealed class ObjectStoreFileSystemTests : ObjectStoreContractTests

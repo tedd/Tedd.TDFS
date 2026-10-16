@@ -175,6 +175,13 @@ internal sealed partial class VolumeService
         if (prunable && DerefPruneDue(now))
             await ProposeHousekeepingAsync(new PruneDerefLogCommand(watermark));
 
+        // Key rotation is committed in the control group (the wrapped DEK); the volume log records the versions in use so
+        // its checkpoints and inspection show which data keys the volume's objects may be sealed with.
+        s = State;
+        uint keyVersion = CurrentDataKeyVersion;
+        if (keyVersion > (s.KeyVersions.IsEmpty ? 0 : s.KeyVersions.Max))
+            await ProposeHousekeepingAsync(new RotateDataKeyCommand(keyVersion));
+
         await MaintainTransactionsAsync(wall);
 
         if (IsLeader && _readyTerm == Group.Term)
@@ -421,9 +428,16 @@ internal sealed partial class VolumeService
 
     private CreateStagingResultMessage StagingReply(CreateStagingResultMessage reply, string principal)
     {
-        byte[] capability = _s.Objects.Capabilities.IssueStaging(Record, principal, reply.Staging, StagingCapabilityLifetime, out DateTimeOffset expiry);
+        byte[] capability = _s.Objects.Capabilities.IssueStaging(Record, principal, reply.Staging, StagingCapabilityLifetime, out DateTimeOffset expiry,
+            CurrentDataKeyVersion);
         return reply with { Capability = capability, CapabilityExpiry = expiry, PlacementEpoch = PlacementEpochForUploads() };
     }
+
+    /// <summary>
+    /// The volume's current data-key version in the local control replica (which a proposal's control barrier made reflect
+    /// every rotation committed before it): staging capabilities require storage nodes to seal with at least this version.
+    /// </summary>
+    private uint CurrentDataKeyVersion => Math.Max(Record.CurrentKeyVersion, _s.Control.State.FindVolume(Record.Id)?.CurrentKeyVersion ?? 0);
 
     /// <summary>Lifetime of staging capabilities (renewable with <c>CreateStaging(Renew)</c>).</summary>
     private TimeSpan StagingCapabilityLifetime => _s.Timings.SessionTimeout;

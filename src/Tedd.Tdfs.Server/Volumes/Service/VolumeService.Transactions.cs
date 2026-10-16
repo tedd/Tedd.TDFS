@@ -106,7 +106,8 @@ internal sealed partial class VolumeService
                     _transactions[id] = new TxWork(id, record.Principal, root);
                 }
 
-                byte[] capability = _s.Objects.Capabilities.IssueStaging(Record, principal, begun.Staging, StagingCapabilityLifetime, out DateTimeOffset expiry);
+                byte[] capability = _s.Objects.Capabilities.IssueStaging(Record, principal, begun.Staging, StagingCapabilityLifetime, out DateTimeOffset expiry,
+                    CurrentDataKeyVersion);
                 return begun with { Capability = capability, CapabilityExpiry = expiry, PlacementEpoch = PlacementEpochForUploads() };
             },
             bindTransaction: false);
