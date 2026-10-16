@@ -72,6 +72,8 @@ public sealed partial class RaftNode
         foreach (RaftMessage message in _msgs)
             sb.Append(DescribeMessage(message, namer)).Append(',');
         sb.Append(inv, $";phs={_prevHardState.Term}/{Id(_prevHardState.Vote)}/{_prevHardState.Commit};prole={_prevRole};plead={Id(_prevLeader)};out={_outstanding is not null}");
+        if (_rebuilding || _rebuildTarget != 0 || _rebuildLeader is not null || _rebuildTerm != 0 || _rebuildContact != 0)
+            sb.Append(inv, $";rb={_rebuilding}/{_rebuildTarget}/{Id(_rebuildLeader)}/{_rebuildTerm}/{_rebuildContact}");
         sb.Append(inv, $";log={_log.Committed}/{_log.Applied}/{_log.UnstableOffset}:");
         foreach (RaftEntry entry in _log.UnstableEntries())
             sb.Append(DescribeEntry(entry, namer)).Append(',');
@@ -113,7 +115,7 @@ public sealed partial class RaftNode
     /// <remarks>
     /// <para>This follows from the leader's handling of answers (<c>HandleAppendResponse</c>, <c>HandleHeartbeatResponse</c>):
     /// such an answer only sets <c>RecentActive</c> (already set) and finds nothing to update, so it changes nothing and sends
-    /// nothing. It stays so because, while the core leads the term, a follower's <c>Match</c> never decreases,
+    /// nothing. It stays so because, while the core leads the term, a follower's <c>Match</c> decreases only when a rejection that <see cref="WouldLowerMatch"/> is delivered (the host keeps such answers, and acknowledgements of that follower while one is in flight),
     /// <c>Next &gt; Match</c> always holds, <c>RecentActive</c> is cleared only by a CheckQuorum interval elapsing, and a fully
     /// replicated follower of a log that cannot grow never leaves replicate state, never has a probe or append in flight and
     /// is never sent entries again.</para>
@@ -124,6 +126,8 @@ public sealed partial class RaftNode
     /// </remarks>
     internal bool IsSpentLeaderAnswer(RaftMessage message, bool logFixed, bool leaderTicksOver)
     {
+        // (Match decreases only through a rejection with a hint below it, see WouldLowerMatch: a host that applies these
+        // rules must keep acknowledgements while such a rejection of the same follower may still be delivered.)
         ArgumentNullException.ThrowIfNull(message);
         if (_state != NodeState.Leader || message.Term != _term || message.To != _self || (_cfg.CheckQuorum && !leaderTicksOver) || _reachableQuorum)
             return false;
@@ -133,10 +137,33 @@ public sealed partial class RaftNode
         return message switch
         {
             AppendResponse { Reject: false } ack => ack.ReadContext == 0 && ack.MatchIndex <= pr.Match,
-            AppendResponse { Reject: true } reject => reject.ReadContext == 0 && (reject.MatchIndex < pr.Match || (replicated && reject.MatchIndex <= pr.Match)),
+            AppendResponse { Reject: true } reject => reject.ReadContext == 0 && !WouldLowerMatch(reject)
+                && (reject.MatchIndex < pr.Match || (replicated && reject.MatchIndex <= pr.Match)),
             HeartbeatResponse answer => answer.ReadContext == 0 && replicated && !pr.ProbeSent && !pr.InflightsFull,
             _ => false,
         };
+    }
+
+    /// <summary>
+    /// True when this core leads the term of <paramref name="message"/>, a rejection by one of its followers, and delivering
+    /// it would lower that follower's <c>Match</c> (lost-state probing in <c>HandleAppendResponse</c>: the resolved hint lies
+    /// below the match and no snapshot is being sent). This is the only way a follower's match decreases while the core
+    /// leads a term. A follower that acknowledged <c>Match</c> in this term holds those entries durably and answers every
+    /// later append with a hint at or above it, so only rejections sent before that acknowledgement (or by a follower that
+    /// lost its durable state) can lower it. A bounded model checker keeps acknowledgements of a follower while such a
+    /// rejection is in flight (CON-001).
+    /// </summary>
+    internal bool WouldLowerMatch(RaftMessage message)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        if (message is not AppendResponse { Reject: true } reject || _state != NodeState.Leader || reject.Term != _term || reject.To != _self)
+            return false;
+        if (!_progress.TryGetValue(reject.From, out RaftProgress? pr) || pr.State == RaftProgressState.Snapshot)
+            return false;
+        ulong hint = reject.RejectHint;
+        if (reject.RejectHintTerm > 0)
+            hint = _log.FindConflictByTerm(reject.RejectHint, reject.RejectHintTerm).Index;
+        return hint < pr.Match;
     }
 
     /// <summary>
@@ -267,6 +294,11 @@ public sealed partial class RaftNode
         _prevHardState = source._prevHardState;
         _prevRole = source._prevRole;
         _prevLeader = source._prevLeader;
+        _rebuilding = source._rebuilding;
+        _rebuildTarget = source._rebuildTarget;
+        _rebuildLeader = source._rebuildLeader;
+        _rebuildTerm = source._rebuildTerm;
+        _rebuildContact = source._rebuildContact;
     }
 
     /// <summary>

@@ -419,7 +419,7 @@ internal sealed class RaftModelCluster
             VoteResponse => m.Term < term || (m.Term == term && role != RaftRole.Candidate),
             AppendResponse or HeartbeatResponse or InstallSnapshotResponse => m.Term < term
                 || (m.Term == term && role is not (RaftRole.Leader or RaftRole.Candidate))
-                || (node is not null && node.IsSpentLeaderAnswer(m, r.LogsFixed, r.TicksOver)),
+                || (node is not null && node.IsSpentLeaderAnswer(m, r.LogsFixed, r.TicksOver) && !LoweringInFlight(node, m.From)),
             TimeoutNow => m.Term < term,
             VoteRequest { PreVote: true } => r.TermsFixed && TermOf(_indexOf[m.From]) == r.MaxTerm,
             VoteRequest { PreVote: false } when r.TermsFixed && _crashes >= _bounds.Crashes && node is not null && m.Term == r.MaxTerm
@@ -427,7 +427,7 @@ internal sealed class RaftModelCluster
                 (_nodes[_indexOf[m.From]]?.Role ?? RaftRole.Follower) != RaftRole.Candidate,
             AppendEntries or Heartbeat when r.TermsFixed && r.LogsFixed && _crashes >= _bounds.Crashes && m.Term == r.MaxTerm && node is not null
                 && node.IsRedundantLeaderMessage(m) =>
-                _nodes[_indexOf[m.From]] is { } leader && leader.IsFullyReplicatedTo(m.To, r.MaxTerm, r.LogsFixed, r.TicksOver),
+                _nodes[_indexOf[m.From]] is { } leader && leader.IsFullyReplicatedTo(m.To, r.MaxTerm, r.LogsFixed, r.TicksOver) && !LoweringInFlight(leader, m.To),
             AppendEntries or Heartbeat or InstallSnapshot or VoteRequest { PreVote: false } =>
                 r.TermsFixed && node is not null && node.IsStale(m) && StaleAnswerIsDead(m, r.MaxTerm, r.LogsFixed, r.TicksOver),
             _ => false,
@@ -509,6 +509,23 @@ internal sealed class RaftModelCluster
         }
     }
 
+    /// <summary>
+    /// True when a rejection by <paramref name="follower"/> that would lower its match at <paramref name="leader"/>
+    /// (<c>RaftNode.WouldLowerMatch</c>, lost-state probing) is still in flight. The spent-answer rules assume the follower's
+    /// match never decreases; it decreases only when such a rejection is delivered, and a follower that acknowledged its
+    /// match never sends a new one (its later hints are at or above it), so the rules hold once none is in flight.
+    /// </summary>
+    private bool LoweringInFlight(RaftNode leader, NodeId follower)
+    {
+        foreach (Inflight entry in _inflight)
+        {
+            if (entry.Message is AppendResponse { Reject: true } reject && reject.From == follower && leader.WouldLowerMatch(reject))
+                return true;
+        }
+
+        return false;
+    }
+
     /// <summary>The term of node <paramref name="i"/>: its running core's, else (crashed) its persisted one.</summary>
     private ulong TermOf(int i) => Math.Max(_hard[i].Term, _nodes[i]?.Term ?? 0);
 
@@ -565,8 +582,8 @@ internal sealed class RaftModelCluster
         {
             RaftRole.Follower or RaftRole.Learner => true,
             RaftRole.Leader => m is VoteRequest
-                || sender!.IsSpentLeaderAnswer(new AppendResponse(m.To, m.From, maxTerm, Reject: false, MatchIndex: 0, RejectHint: 0), logsFixed,
-                    ticksOver),
+                || (sender!.IsSpentLeaderAnswer(new AppendResponse(m.To, m.From, maxTerm, Reject: false, MatchIndex: 0, RejectHint: 0), logsFixed,
+                    ticksOver) && !LoweringInFlight(sender, m.To)),
             _ => false,
         };
     }

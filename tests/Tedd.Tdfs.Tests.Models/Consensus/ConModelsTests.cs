@@ -100,7 +100,8 @@ public sealed class ConModelsTests
             "_cfg", "_options", "_random", "_log", "_self", "_reachableQuorum", "_term", "_vote", "_lead", "_state", "_electionElapsed",
             "_heartbeatElapsed", "_randomizedElectionTimeout", "_tickCount", "_confBase", "_confBaseIndex", "_confHistory", "_conf", "_progress",
             "_pendingConfIndex", "_leadTransferee", "_votes", "_readQueue", "_deferredReads", "_readSeq", "_readStates", "_lastHeard", "_incoming",
-            "_msgs", "_prevHardState", "_prevRole", "_prevLeader", "_outstanding");
+            "_msgs", "_prevHardState", "_prevRole", "_prevLeader", "_outstanding", "_rebuilding", "_rebuildTarget", "_rebuildLeader", "_rebuildTerm",
+            "_rebuildContact");
         AssertFields(typeof(RaftNode).Assembly.GetType("Tedd.Tdfs.Consensus.RaftLog", throwOnError: true)!,
             "_stable", "_unstable", "_offset", "_pendingSnapshot", "Committed", "Applied");
         AssertFields(typeof(RaftNode).Assembly.GetType("Tedd.Tdfs.Consensus.RaftProgress", throwOnError: true)!,
