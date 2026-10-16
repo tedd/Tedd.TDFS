@@ -495,7 +495,17 @@ internal sealed class DataPlane
                         if (wholeFetched)
                             throw new DfsIntegrityException(obj, $"Object {obj} from {endpoint} could not be verified.");
                         wholeFetched = true;
-                        await ReadWholeAsync(scope, volume, endpoint, capability, obj, objectLength, checksum, offset, destination[filled..]).ConfigureAwait(false);
+                        try
+                        {
+                            await ReadWholeAsync(scope, volume, endpoint, capability, obj, objectLength, checksum, offset, destination[filled..])
+                                .ConfigureAwait(false);
+                        }
+                        catch (DataCapabilityRejectedException denied) when (filled > 0)
+                        {
+                            // The bytes verified before the whole-object fetch stay valid: the caller keeps them.
+                            throw new DataCapabilityRejectedException(denied.Message, denied.InnerException ?? denied) { Filled = filled };
+                        }
+
                         return;
                     }
 

@@ -36,7 +36,9 @@ internal sealed partial class NodeRuntime
     private async Task<(ulong Incarnation, ulong ControlIndex)?> ProbeReplacementAsync(ClusterBootstrap bootstrap, BootstrapMember self, CancellationToken ct)
     {
         NodeServices s = Services;
-        var credentials = new NodeCredentials(Guid.Empty, s.NodeName, NodeId.New(s.Random), 0, s.BootId, s.Keys.NodeAuthKey, ProtocolFeatures.Supported);
+        // Presents the release this node runs (like a seed join), not the build's full feature set and protocol range.
+        var credentials = new NodeCredentials(Guid.Empty, s.NodeName, NodeId.New(s.Random), 0, s.BootId, s.Keys.NodeAuthKey, s.Release.Features,
+            s.Release.ProtocolMin, s.Release.ProtocolMax);
         ulong incarnation = 0;
         ulong controlIndex = 0;
         bool answered = false;

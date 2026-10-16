@@ -7,7 +7,7 @@ namespace Tedd.Tdfs.Client.Internal.Runtime;
 /// connection per endpoint and one in-progress connect; dead pooled connections (closed by either side, or declared dead
 /// after a timeout on a silently dead link) are detected and replaced, and a connect stuck on a lost handshake message is
 /// abandoned once it outlived a patient caller's wait, or a wait of many round trips of the endpoint's previous connection.
-/// Thread-safe.
+/// A caller whose wait outlives a failed connect it joined (started by another caller) makes one fresh attempt. Thread-safe.
 /// </summary>
 internal sealed class ConnectionPool
 {
@@ -63,6 +63,33 @@ internal sealed class ConnectionPool
     public async Task<ClientConnection> GetAsync(string endpoint, OperationScope scope, TimeSpan waitTimeout)
     {
         ArgumentNullException.ThrowIfNull(endpoint);
+        long waitStarted = _runtime.Time.GetTimestamp();
+        var attempt = new JoinedConnect();
+        try
+        {
+            return await GetOnceAsync(endpoint, scope, waitTimeout, waitStarted, attempt).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (attempt.Joined && !scope.Token.IsCancellationRequested && _runtime.Time.GetElapsedTime(waitStarted) < waitTimeout
+                                   && (ex is RpcConnectionException or TimeoutException || (ex is IOException and not DfsException)))
+        {
+            // The shared connect this caller joined was started by another caller earlier, and it failed (it was abandoned as
+            // stuck on a lost handshake message, or it began while the link was cut and the link has healed since). Its
+            // outcome may predate the current state of the link, so within its own wait this caller makes one fresh attempt
+            // instead of failing: a request that may wait long (an upload, PUB-004) must not fail because a short-waiting one
+            // (a keep-alive) gave up on a stuck connect first, or because a connect begun during a partition failed after it.
+        }
+
+        return await GetOnceAsync(endpoint, scope, waitTimeout, waitStarted, new JoinedConnect()).ConfigureAwait(false);
+    }
+
+    /// <summary>Whether a <see cref="GetOnceAsync"/> call waited for a connect another caller had started.</summary>
+    private sealed class JoinedConnect
+    {
+        public bool Joined { get; set; }
+    }
+
+    private async Task<ClientConnection> GetOnceAsync(string endpoint, OperationScope scope, TimeSpan waitTimeout, long waitStarted, JoinedConnect attempt)
+    {
         Task<ClientConnection>? pending = null;
         ClientConnection? pooled = null;
         bool mustStart = false;
@@ -83,9 +110,14 @@ internal sealed class ConnectionPool
                 if (slot.Pending is { IsCompleted: true })
                     slot.Pending = null; // a finished connect either pooled its connection (now unusable) or failed: start afresh
                 if (slot.Pending is null)
+                {
                     mustStart = true;
+                }
                 else
+                {
                     pending = slot.Pending;
+                    attempt.Joined = true;
+                }
             }
         }
 
@@ -116,6 +148,10 @@ internal sealed class ConnectionPool
                     slot.PendingStarted = _runtime.Time.GetTimestamp();
                     slot.Pending = ConnectAsync(endpoint, slot, abandon);
                 }
+                else
+                {
+                    attempt.Joined = true; // another caller started one meanwhile
+                }
 
                 pending = slot.Pending;
             }
@@ -124,7 +160,8 @@ internal sealed class ConnectionPool
         if (pending!.IsCompleted)
             return await pending.ConfigureAwait(false);
 
-        using var wait = new CancellationTokenSource(waitTimeout > TimeSpan.Zero ? waitTimeout : TimeSpan.FromMilliseconds(1), _runtime.Time);
+        TimeSpan left = waitTimeout - _runtime.Time.GetElapsedTime(waitStarted);
+        using var wait = new CancellationTokenSource(left > TimeSpan.Zero ? left : TimeSpan.FromMilliseconds(1), _runtime.Time);
         using CancellationTokenRegistration link = scope.Token.UnsafeRegister(static s => ContextFree.Cancel((CancellationTokenSource)s!), wait);
         try
         {

@@ -566,7 +566,14 @@ internal sealed class VolumeContext : IRpcRouter
             ReplyType = MessageType.ReserveOperationIdsResult,
             Kind = CallKind.Idempotent,
             Router = this,
-            Build = _ => ValueTask.FromResult<IWireMessage>(new ReserveOperationIdsMessage(Header(session), count)),
+            Build = _ =>
+            {
+                // The session can expire while the reservation waits (a keep-alive learned it): a header without a session
+                // would be refused as a malformed request, so the caller is told it lost the session and opens a new one.
+                if (session.IsExpired)
+                    throw new DfsLeaseLostException($"Session {session.Id} on volume '{Name}' expired before its operation ids could be reserved.");
+                return ValueTask.FromResult<IWireMessage>(new ReserveOperationIdsMessage(Header(session), count));
+            },
         };
         return (ReserveOperationIdsResultMessage)await Runtime.Rpc.InvokeAsync(request, scope).ConfigureAwait(false);
     }

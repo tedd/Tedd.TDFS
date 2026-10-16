@@ -544,10 +544,6 @@ internal sealed class RpcInvoker
     }
 
     /// <summary>
-    /// The operation kind of a request at the client wire sites: transaction-bound requests (other than the transaction's
-    /// own begin/commit/abort and outcome queries) are <see cref="DfsOperationKind.TxOp"/> operations.
-    /// </summary>
-    /// <summary>
     /// The exception an error reply to <paramref name="request"/> stands for. A transaction failure of a transaction-bound
     /// request always names the request's transaction (PROTOCOL.md §11): when the reply does not transport the id, the
     /// request's own transaction id is used instead of the failed request's operation id.
@@ -563,6 +559,10 @@ internal sealed class RpcInvoker
         return error.ToException(request.Path);
     }
 
+    /// <summary>
+    /// The operation kind of a request at the client wire sites: transaction-bound requests (other than the transaction's
+    /// own begin/commit/abort and outcome queries) are <see cref="DfsOperationKind.TxOp"/> operations.
+    /// </summary>
     private static DfsOperationKind WireKindOf(IWireMessage message, RpcRequest request) =>
         request.Transaction is not null
         && message.Type is not (MessageType.TxBegin or MessageType.TxCommit or MessageType.TxAbort or MessageType.QueryOperation)

@@ -458,15 +458,14 @@ public sealed class ClientReviewTests
             byte[] data = Bytes(10, 200_000);
             await stream.WriteAsync(data);
 
-            // The complete chunks were uploaded while writing (bounded memory, ARCHITECTURE 9.3); the last object finds the
-            // node full: nothing is published.
+            // The flush's upload finds the node full: nothing is published.
             cluster.PutsBeforeFailure = 0;
             Exception? flush = await Record.ExceptionAsync(() => stream.FlushAsync());
             Assert.IsType<DfsCapacityException>(flush);
             Assert.False(stream.IsFaulted);
             Assert.Empty(cluster.Content("/rw")!);
 
-            // The writer still reads exactly its staged bytes (the early uploads with its staging capability) ...
+            // The writer still reads exactly its staged bytes (still buffered: a failed publication restores its staged view) ...
             stream.Position = 0;
             byte[] back = new byte[data.Length];
             await stream.ReadExactlyAsync(back);
