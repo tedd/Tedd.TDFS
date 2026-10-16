@@ -13,7 +13,9 @@ Runtime/        NodeRuntime (start/join/stop; feature hooks in NodeRuntime.Regis
                 jobs on the node loop), NodeMetrics (NodeCounters), StorageCleanup
 Raft/           RaftGroupHost, GroupRuntime (+ .Ready.cs Ready loop, .Snapshots.cs checkpoints/install),
                 RaftStorageAdapter (Storage.RaftLogStore -> Consensus.IRaftLogView), IReplicatedStateMachine,
-                SnapshotEnvelope, RaftWireMapper, RaftTransport (RaftBatch batching, RaftSnapshotChunk)
+                SnapshotEnvelope, RaftWireMapper, RaftTransport (RaftBatch batching, RaftSnapshotChunk; every batch carries
+                the sender's capability clock), LeaderBalancer (periodic job: a node leading >= 2 more volume groups than
+                another caught-up voter hands one over by TimeoutNow, FSD §3.2)
 Control/        ControlState (deterministic, SortedDictionary-based), ControlCommands, ControlStateMachine,
                 ControlService (cluster map, join, incarnation, admin RPCs), MembershipManager (voter promotion,
                 volume voter placement), ControlStateMachine.<Feature>.cs partials
