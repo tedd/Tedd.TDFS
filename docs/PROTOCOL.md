@@ -2013,9 +2013,9 @@ Raft messages from one node to another, batched per destination (node → node).
 
 Extension fields (added after v1 shipped, §2.5):
 
-| Field | Name | Flags | Value |
+| Field id | Flags | Value | Meaning |
 |---|---|---|---|
-| 1 | `CapabilityClock` | optional | The sender's data-capability clock when it sent the batch: UTC ticks, 8 bytes little-endian (§7.3). |
+| 1 `CapabilityClock` | Optional | `i64` (8 bytes, little-endian UTC ticks) | The sender's data-capability clock when it sent the batch (§7.3): a receiver whose hosted group accepted the batch moves its own capability clock forward to it when it is behind (never back). Absent from a sender that predates the field. |
 
 #### `RaftBatchResult` = 131 (`RaftBatchResultMessage`)
 

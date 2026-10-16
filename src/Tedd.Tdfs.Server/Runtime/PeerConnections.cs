@@ -242,7 +242,7 @@ internal sealed class PeerConnections
         if (slot.Connection is { IsOpen: true } open)
             return open;
         if (slot.Connecting is { } pending)
-            return await pending.WaitAsync(ct); // joining another caller's connect never outlasts this caller's own deadline
+            return await pending;
         long now = _s.Time.GetTimestamp();
         if (slot.RetryAfter > now)
             throw new DfsUnavailableException(DfsErrorCode.NodeUnavailable, $"Connecting to {label} is backing off after {slot.Failures} failure(s).");

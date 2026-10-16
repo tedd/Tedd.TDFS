@@ -461,17 +461,17 @@ internal sealed partial class VolumeService
 
         // Best effort and bounded as a whole: a node that cannot be reached (down, or without a link to this leader on a
         // partial mesh, where even connecting waits for the connect timeout) must not hold up the status request that asked.
-        // One election window: well inside any caller's attempt timeout (which is derived from the same timings).
-        using CancellationTokenSource probeDeadline = _s.CreateDeadline(_s.Timings.Tick * _s.Timings.ElectionTicksMax);
+        // One election window: well inside any caller's attempt timeout (which is derived from the same timings). What
+        // answered by then counts; the rest finishes (and is ignored) later.
+        TimeSpan window = _s.Timings.Tick * _s.Timings.ElectionTicksMax;
+        using CancellationTokenSource probeDeadline = _s.CreateDeadline(window);
         using var probe = CancellationTokenSource.CreateLinkedTokenSource(ct, probeDeadline.Token);
         Task<(NodeId Node, IReadOnlyList<ObjectLocation>? Locations)>[] calls = [.. perNode.Select(p => LocateOnAsync(p.Key, p.Value, probe.Token))];
-        try
+        Task all = Task.WhenAll(calls);
+        if (!all.IsCompleted)
         {
-            await Task.WhenAll(calls).WaitAsync(probe.Token);
-        }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-        {
-            // The probe's own bound passed: what answered by now counts, the rest finishes (and is ignored) later.
+            await Task.WhenAny(all, Task.Delay(window, _s.Time));
+            probe.Cancel(); // the calls still running end now (before their token source is disposed)
         }
 
         ct.ThrowIfCancellationRequested();
