@@ -44,6 +44,13 @@ internal interface IRpcRouter
     /// without reaching a leader that answers then means that no leader with a quorum could be reached.
     /// </summary>
     bool RoutesToGroupLeader { get; }
+
+    /// <summary>
+    /// What this router knows about the group having no leader right now (for example a route discovery in which every node
+    /// that answered knew no leader), or null: used when a request finds no time left for an attempt of its own, because
+    /// the operation's time went into waiting for another request to the same group (a shared session open).
+    /// </summary>
+    Exception? LeaderlessEvidence => null;
 }
 
 /// <summary>One logical request executed by <see cref="RpcInvoker"/> (possibly over several attempts).</summary>

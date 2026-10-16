@@ -367,6 +367,8 @@ internal sealed class RpcInvoker
     {
         // A request issued after its operation's time already ran out (an earlier step used it up) learned nothing about
         // the group: it is reported as the operation's deadline, never as quorum loss.
+        if (!attempted && last is null && !scope.IsAbortedByCaller && request.Router.RoutesToGroupLeader)
+            return request.Router.LeaderlessEvidence;
         if (scope.IsAbortedByCaller || last is DfsQuorumUnavailableException || !attempted)
             return last;
         bool availability = last is null or TimeoutException or RpcConnectionException or (IOException and not DfsException)

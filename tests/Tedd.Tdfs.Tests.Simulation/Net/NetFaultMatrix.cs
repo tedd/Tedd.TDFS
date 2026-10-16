@@ -1015,6 +1015,11 @@ internal static class NetFaultMatrix
                 await context.Cluster.Admin.DrainNodeAsync("n2", ct);
                 await context.Cluster.WaitUntilAsync(async () =>
                 {
+                    // A node an injected fault crashed comes back like any crashed node: a drain completes only once the
+                    // draining node is reachable again and shows it holds nothing any volume keeps (its excess copies are
+                    // deleted from it), which a crashed draining node can never show.
+                    foreach (TestNode crashed in context.Cluster.Nodes.Where(n => n.State == TestNodeState.Crashed).ToArray())
+                        await RestartToleratingInjectedCrashAsync(crashed);
                     if ((await context.Cluster.Inspect.GetVolumeGroupAsync(Vol)).Voters.Contains("n2"))
                         return false;
                     DfsNodeInfo? info = (await context.Cluster.Admin.ListNodesAsync(ct)).FirstOrDefault(n => n.Name == "n2");

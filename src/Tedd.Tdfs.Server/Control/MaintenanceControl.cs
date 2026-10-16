@@ -241,8 +241,21 @@ internal sealed class MaintenanceControl
             RequireMajorityWithout(member, "the control group", [.. control.Conf.Voters]);
         foreach (VolumeRecord volume in state.Volumes.Values)
         {
-            if (volume.Voters.Contains(member.Id))
-                RequireMajorityWithout(member, $"volume '{volume.Name}'", volume.Voters);
+            if (!volume.Voters.Contains(member.Id))
+                continue;
+            RequireMajorityWithout(member, $"volume '{volume.Name}'", volume.Voters);
+
+            // A voter seat is handed over, never given up: without another eligible node of the volume's pool to take it, the
+            // removal would shrink the group below its configured voter count (fewer tolerated failures) — the drain of such
+            // a node stays Draining for the same reason (OPS-001/002, MESH-016).
+            int configured = volume.Creation.Metadata.Voters;
+            int replacements = state.PoolMembers(volume.StoragePool)
+                .Count(m => m.Id != member.Id && m.IsPlacementEligible && !volume.Voters.Contains(m.Id));
+            if (volume.Voters.Count - 1 + replacements < configured)
+            {
+                throw new DfsException(DfsErrorCode.InvalidPolicy,
+                    $"Removing {member.Name} would leave volume '{volume.Name}' with {volume.Voters.Count - 1 + replacements} of its {configured} metadata voters: no other eligible node of pool '{volume.StoragePool}' can take its seat. Add a node first, or remove with force.");
+            }
         }
 
         // 3. No referenced object may lose acknowledged durability with the node gone.

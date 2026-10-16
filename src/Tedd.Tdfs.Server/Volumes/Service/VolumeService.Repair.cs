@@ -427,14 +427,19 @@ internal sealed partial class VolumeService
                     DeleteObjectsResultMessage result;
                     try
                     {
-                        result = await DeleteOnAsync(holder, delete);
+                        result = await DeleteAnsweringAsync(holder, delete);
                     }
-                    catch (DfsException ex) when (ex.ErrorCode is DfsErrorCode.EpochMismatch or DfsErrorCode.StaleIncarnation or DfsErrorCode.AccessDenied)
+                    catch (DeleteAnsweredException answered)
                     {
-                        // Refused before anything was deleted.
+                        // Refused before anything was deleted (epoch, incarnation, access), or failed on the holder (an I/O
+                        // error): either way the request completed and cannot delete anything later, so the holder counts
+                        // again with what it lists (a later inventory removes a copy that did go), and a later pass retries.
                         if (Group.Term == term)
                             SettleDelete(plan.Object, holder);
-                        continue;
+                        if (answered.Failure is DfsException { ErrorCode: DfsErrorCode.EpochMismatch or DfsErrorCode.StaleIncarnation or DfsErrorCode.AccessDenied })
+                            continue;
+                        _s.Debug("repair", NodeServices.Inv($"Volume {Name}: deleting the excess copy of {plan.Object} on {_s.Control.NameOf(holder)} failed: {answered.Failure.Message}"));
+                        return;
                     }
 
                     if (result.Deleted == 0)
@@ -574,15 +579,55 @@ internal sealed partial class VolumeService
     /// </summary>
     private async Task<DeleteObjectsResultMessage> DeleteOnAsync(NodeId node, DeleteObjectsMessage message)
     {
+        try
+        {
+            return await DeleteAnsweringAsync(node, message);
+        }
+        catch (DeleteAnsweredException answered)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(answered.Failure);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// As <see cref="DeleteOnAsync"/>, but a failure the holder answered with (the request completed) is thrown as
+    /// <see cref="DeleteAnsweredException"/>, apart from an unknown outcome (no answer in time, connection lost).
+    /// </summary>
+    private async Task<DeleteObjectsResultMessage> DeleteAnsweringAsync(NodeId node, DeleteObjectsMessage message)
+    {
         TimeSpan timeout = _s.Peers.DefaultCallTimeout * 4;
         using CancellationTokenSource deadline = _s.CreateDeadline(timeout);
         if (node == _s.NodeId)
         {
             // A local deletion that does not finish in time (held at its fault point) is treated like an unanswered remote
-            // one: it may still complete later, its outcome stays unknown.
-            return await _s.Objects.DeleteCopiesAsync(message, CancellationToken.None).WaitAsync(deadline.Token);
+            // one: it may still complete later, its outcome stays unknown. One that failed has completed: answered.
+            Task<DeleteObjectsResultMessage> local = _s.Objects.DeleteCopiesAsync(message, CancellationToken.None);
+            try
+            {
+                return await local.WaitAsync(deadline.Token);
+            }
+            catch (Exception ex) when (local.IsFaulted && ex is DfsException or IOException or UnauthorizedAccessException)
+            {
+                throw new DeleteAnsweredException(ex);
+            }
         }
 
-        return (DeleteObjectsResultMessage)await _s.Peers.CallAsync(node, message, timeout, deadline.Token);
+        IWireMessage reply = await _s.Peers.CallForReplyAsync(node, message, timeout, deadline.Token);
+        return reply switch
+        {
+            DeleteObjectsResultMessage result => result,
+            ErrorReplyMessage error => throw new DeleteAnsweredException(error.ToException()),
+            _ => throw new DfsProtocolException($"Expected DeleteObjectsResult from {_s.Control.NameOf(node)}, received {reply.Type}."),
+        };
+    }
+
+    /// <summary>
+    /// The holder answered an excess-copy deletion with a failure: the request has completed (it can no longer delete
+    /// anything later), so whatever the holder still lists is a real copy.
+    /// </summary>
+    private sealed class DeleteAnsweredException(Exception failure) : Exception(failure.Message, failure)
+    {
+        public Exception Failure { get; } = failure;
     }
 }

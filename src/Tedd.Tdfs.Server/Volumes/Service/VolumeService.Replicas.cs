@@ -458,8 +458,24 @@ internal sealed partial class VolumeService
         if (perNode.Count == 0)
             return;
         ulong term = Group.Term;
-        Task<(NodeId Node, IReadOnlyList<ObjectLocation>? Locations)>[] calls = [.. perNode.Select(p => LocateOnAsync(p.Key, p.Value, ct))];
-        foreach ((NodeId node, IReadOnlyList<ObjectLocation>? locations) in await Task.WhenAll(calls))
+
+        // Best effort and bounded as a whole: a node that cannot be reached (down, or without a link to this leader on a
+        // partial mesh, where even connecting waits for the connect timeout) must not hold up the status request that asked.
+        // One election window: well inside any caller's attempt timeout (which is derived from the same timings).
+        using CancellationTokenSource probeDeadline = _s.CreateDeadline(_s.Timings.Tick * _s.Timings.ElectionTicksMax);
+        using var probe = CancellationTokenSource.CreateLinkedTokenSource(ct, probeDeadline.Token);
+        Task<(NodeId Node, IReadOnlyList<ObjectLocation>? Locations)>[] calls = [.. perNode.Select(p => LocateOnAsync(p.Key, p.Value, probe.Token))];
+        try
+        {
+            await Task.WhenAll(calls).WaitAsync(probe.Token);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // The probe's own bound passed: what answered by now counts, the rest finishes (and is ignored) later.
+        }
+
+        ct.ThrowIfCancellationRequested();
+        foreach ((NodeId node, IReadOnlyList<ObjectLocation>? locations) in calls.Where(c => c.IsCompletedSuccessfully).Select(c => c.Result))
         {
             if (locations is null || !IsLeader || Group.Term != term || control.FindMember(node) is not { IsLive: true } member)
                 continue;
@@ -476,7 +492,7 @@ internal sealed partial class VolumeService
         }
     }
 
-    /// <summary>One <c>LocateObject</c> (or a local lookup); null when the node did not answer.</summary>
+    /// <summary>One <c>LocateObject</c> (or a local lookup); null when the node did not answer (or <paramref name="ct"/> ended the wait).</summary>
     private async Task<(NodeId Node, IReadOnlyList<ObjectLocation>? Locations)> LocateOnAsync(NodeId node, List<ObjectId> objects, CancellationToken ct)
     {
         if (node == _s.NodeId)
@@ -499,8 +515,6 @@ internal sealed partial class VolumeService
         }
         catch (Exception ex) when (ex is DfsException or IOException or TimeoutException or OperationCanceledException or InvalidCastException)
         {
-            if (ct.IsCancellationRequested)
-                throw;
             return (node, null);
         }
     }

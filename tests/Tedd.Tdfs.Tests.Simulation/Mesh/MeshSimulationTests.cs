@@ -764,8 +764,14 @@ public sealed class MeshSimulationTests
             await s.ProbeAsync("paused");
 
             MeshExpectation quorum = MeshOracle.Quorum(s.Net, s.VolumeVoters, "client:p0", MeshCause.MetadataQuorum);
+
+            // The writes of the key are small writes: when the data policy cannot acknowledge one without the paused node (it
+            // is one of the hosts the acknowledged copies/zones need), they fail typed with a placement shortfall, and the new
+            // authority cannot commit `during` either — the OFF-021 comparison needs a write the oracle requires to succeed.
+            MeshExpectation smallWrite = s.Expect(MeshProbeKind.WriteSmall, "p0");
+            var staleCauses = new HashSet<MeshCause>(smallWrite.Causes) { MeshCause.MetadataQuorum, MeshCause.Unreachable };
             bool wrote = false;
-            if (quorum.Outcome == MeshTri.Must)
+            if (quorum.Outcome == MeshTri.Must && smallWrite.Outcome == MeshTri.Must)
             {
                 // Settle the stale write before the new authority's write: wait for the call, then fence its id through
                 // the new authority (resolve: true), so it can never take effect after `during`.
@@ -775,7 +781,7 @@ public sealed class MeshSimulationTests
                 }
                 catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)
                 {
-                    string? why = MeshOracle.CheckFailure(ex, new HashSet<MeshCause> { MeshCause.MetadataQuorum, MeshCause.Unreachable }, mutation: true, s.Policy);
+                    string? why = MeshOracle.CheckFailure(ex, staleCauses, mutation: true, s.Policy);
                     Assert.True(why is null, "write routed to the paused node: " + why);
                 }
 
@@ -808,7 +814,7 @@ public sealed class MeshSimulationTests
                 }
                 catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)
                 {
-                    string? why = MeshOracle.CheckFailure(ex, new HashSet<MeshCause> { MeshCause.MetadataQuorum, MeshCause.Unreachable }, mutation: true, s.Policy);
+                    string? why = MeshOracle.CheckFailure(ex, staleCauses, mutation: true, s.Policy);
                     Assert.True(why is null, "write queued at the paused node: " + why);
                 }
             }

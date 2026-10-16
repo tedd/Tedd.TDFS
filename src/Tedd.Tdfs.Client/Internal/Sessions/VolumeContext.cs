@@ -49,6 +49,11 @@ internal sealed class VolumeContext : IRpcRouter
     private ulong _epoch;
     private string? _leader;
     private string? _lastLeader;   // the last endpoint known as leader (kept while the route is being rediscovered)
+
+    // Set when the latest route discovery found no node that knows a leader (cleared once one is found): an operation whose
+    // deadline expires while it waits for another operation's request to this group (the session open it shares) reports
+    // the group's quorum unavailability rather than a bare deadline (FSD §13).
+    private Exception? _leaderUnknown;
     private VolumeSession? _session;
     private StagingLease? _helperStaging;
     private ITimer? _timer;
@@ -257,6 +262,8 @@ internal sealed class VolumeContext : IRpcRouter
                                 _suspects.Remove(leader);
                             }
 
+                            Volatile.Write(ref _leaderUnknown, null);
+
                             // Candidates still silent while another answered are tried last next time.
                             foreach ((_, string silent) in probes)
                                 OnUnreachable(silent);
@@ -295,6 +302,8 @@ internal sealed class VolumeContext : IRpcRouter
                 Waits.ObserveQuietly(task);
         }
 
+        if (!scope.Token.IsCancellationRequested)
+            Volatile.Write(ref _leaderUnknown, new DfsUnavailableException(DfsErrorCode.NotLeader, $"No node knows a leader of volume '{Name}'."));
         if (last is not null)
             Runtime.Emit("volume.route-unknown", $"No leader of volume '{Name}' is currently known ({last.GetType().Name}).", volume: Name, exception: last);
         return null;
@@ -578,8 +587,11 @@ internal sealed class VolumeContext : IRpcRouter
         return (ReserveOperationIdsResultMessage)await Runtime.Rpc.InvokeAsync(request, scope).ConfigureAwait(false);
     }
 
+    /// <inheritdoc />
+    public Exception? LeaderlessEvidence => Volatile.Read(ref _leaderUnknown);
+
     /// <summary>Acquires <paramref name="gate"/> for <paramref name="scope"/>; an expired or cancelled wait is the scope's classified failure.</summary>
-    private static async ValueTask<AsyncLock.Releaser> LockAsync(AsyncLock gate, OperationScope scope)
+    private async ValueTask<AsyncLock.Releaser> LockAsync(AsyncLock gate, OperationScope scope)
     {
         try
         {
@@ -587,7 +599,8 @@ internal sealed class VolumeContext : IRpcRouter
         }
         catch (OperationCanceledException) when (scope.Token.IsCancellationRequested)
         {
-            throw scope.NotTransmittedFailure(null);
+            // Nothing of this operation was transmitted; the request it waited for may still be looking for a leader.
+            throw scope.NotTransmittedFailure(Volatile.Read(ref _leaderUnknown));
         }
     }
 

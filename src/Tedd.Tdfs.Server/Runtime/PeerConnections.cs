@@ -97,6 +97,28 @@ internal sealed class PeerConnections
         return await CallOnAsync(connection, request, timeout ?? DefaultCallTimeout, () => Drop(peer, connection), ct);
     }
 
+    /// <summary>
+    /// As <see cref="CallAsync"/>, but an error reply is returned as the <see cref="ErrorReplyMessage"/> instead of being thrown,
+    /// so the caller can tell "the peer answered: the request completed with this failure" from a call whose outcome is unknown
+    /// (no reply, connection lost), which still throws.
+    /// </summary>
+    public async Task<IWireMessage> CallForReplyAsync(NodeId peer, IWireMessage request, TimeSpan? timeout = null, CancellationToken ct = default)
+    {
+        IRpcConnection connection = await GetAsync(peer, ct);
+        ReadOnlyMemory<byte> reply;
+        try
+        {
+            reply = await connection.CallAsync(MessageCodec.Encode(request), timeout ?? DefaultCallTimeout, ct);
+        }
+        catch (RpcConnectionException ex)
+        {
+            Drop(peer, connection);
+            throw new DfsUnavailableException(DfsErrorCode.NodeUnavailable, "The peer connection failed: " + ex.Message, ex);
+        }
+
+        return MessageCodec.Decode(reply.Span);
+    }
+
     /// <summary>Sends a request to an endpoint (seed or leader hint) and returns its decoded reply.</summary>
     public async Task<IWireMessage> CallEndpointAsync(string endpoint, IWireMessage request, TimeSpan? timeout = null, CancellationToken ct = default)
     {
@@ -220,7 +242,7 @@ internal sealed class PeerConnections
         if (slot.Connection is { IsOpen: true } open)
             return open;
         if (slot.Connecting is { } pending)
-            return await pending;
+            return await pending.WaitAsync(ct); // joining another caller's connect never outlasts this caller's own deadline
         long now = _s.Time.GetTimestamp();
         if (slot.RetryAfter > now)
             throw new DfsUnavailableException(DfsErrorCode.NodeUnavailable, $"Connecting to {label} is backing off after {slot.Failures} failure(s).");
