@@ -16,8 +16,9 @@ namespace Tedd.Tdfs.Server.Volumes.Service;
 /// Availability: when no control leader is known (no control decision can commit) or it cannot be reached within the
 /// barrier timeout, the local state is used as is: a revocation the local replica cannot learn of could only have been
 /// committed by a quorum this node is cut off from. After such a timeout, later barriers proceed at once for at most one
-/// barrier timeout, but only while the local control replica still hears nothing from that leader: once its messages
-/// arrive again, every barrier asks it again.
+/// barrier timeout while the local control replica still hears nothing from that leader; when it does hear the leader (a
+/// one-way cut: requests to the leader are lost, its messages arrive), they wait until everything the leader announced as
+/// committed is applied locally instead of asking it again. After the cool-down every barrier asks the leader again.
 /// </remarks>
 internal sealed class ControlBarrier
 {
@@ -88,8 +89,20 @@ internal sealed class ControlBarrier
         // leader again (a volume leader cut off from the control leader would otherwise add a whole barrier timeout to each
         // of its proposals). As soon as the control leader's messages arrive again the barrier runs again: a revocation it
         // committed meanwhile must be seen before the next decision (SEC-006), not only after the cool-down elapsed.
-        if (leader == _unreachableLeader && _s.Time.GetTimestamp() < _unreachableUntil && !group.Node.HasRecentLeaderContact)
+        if (leader == _unreachableLeader && _s.Time.GetTimestamp() < _unreachableUntil)
+        {
+            if (!group.Node.HasRecentLeaderContact)
+                return;
+
+            // Within the cool-down the leader is heard but cannot be asked (a one-way cut: its appends and heartbeats arrive,
+            // requests to it do not). Its messages carry what it committed, so the local replica applying everything the
+            // leader announced as committed is the barrier available here; asking again would only add another barrier
+            // timeout to every request until the cut heals (MESH-010).
+            using CancellationTokenSource heard = _s.CreateDeadline(Timeout);
+            await group.WaitForAppliedAsync(group.CommitIndex, heard.Token);
             return;
+        }
+
         ulong local = control.State.AppliedIndex;
         using CancellationTokenSource deadline = _s.CreateDeadline(Timeout);
         IWireMessage reply;
