@@ -882,9 +882,12 @@ Reply to `RegisterIncarnationMessage` (sent after the registration is committed 
 
 A security or administrative event (denied request, failed authentication, snapshot deletion) observed by a node that does
 not lead the control group, forwarded to the control leader, which records it as an `AppendAudit` control entry (node →
-control leader; members only; SEC-016). Every node bounds what it reports and forwards with the same token bucket as the
-leader's own audit records (bursts of 20, 10 per second); floods are dropped, and a forwarding failure drops the node's
-backlog (best effort). The leader cuts each field to 512 characters. Records never carry payload bytes or secrets.
+control leader; members only; SEC-016). The sending node keeps the record queued until the leader reports it committed
+and retries otherwise (after a lost result the event may be recorded twice, never lost). Denials by authenticated
+principals are not rate limited; unauthenticated events (failed handshakes) pass the sending node's token bucket (burst
+100, 20 per second), and the number suppressed is itself audited. Every node's queue is bounded (1024 records, 64 per
+principal): events over a bound are counted into one `audit:aggregated` record per principal and outcome whose scope
+carries `events=N`. The leader cuts each field to 512 characters. Records never carry payload bytes or secrets.
 Errors: NotLeader (with a hint), AccessDenied (not a member).
 
 | # | Field | Wire type | Meaning |
@@ -897,11 +900,11 @@ Errors: NotLeader (with a hint), AccessDenied (not a member).
 
 #### `AuditEventResult` = 23 (`AuditEventResultMessage`)
 
-Reply to `AuditEventMessage`, sent once the record is applied (or dropped).
+Reply to `AuditEventMessage`, sent once the record is applied (or after half a peer call timeout).
 
 | # | Field | Wire type | Meaning |
 |---|---|---|---|
-| 1 | `Accepted` | `bool` | True when the record was committed to the audit log (false: dropped by the flood bound or not committed in time). |
+| 1 | `Accepted` | `bool` | True when the record was committed to the audit log (false: not committed in time; the sender retries). |
 | 2 | — | `extensions` | Terminal extension block. |
 
 ### 9.3 Sessions and outcomes

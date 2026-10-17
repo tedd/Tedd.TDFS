@@ -1395,12 +1395,22 @@ internal sealed class VolumeContext : IRpcRouter
 
     // ------------------------------------------------------------------------------------------------ keep-alive
 
+    /// <summary>
+    /// Starts (or re-times) the renewal timer: a third of the lease (or session timeout), shortened on a slow link so that
+    /// a renewal still reaches the leader within the lease after one adaptive reply timeout of waiting for the previous one
+    /// (the period plus the leader's reply timeout stays within two thirds of the lease); never below a sixth of the lease
+    /// (renewals do not turn into a stream when replies are slow) nor 50 ms.
+    /// </summary>
     private void EnsureKeepAlive(VolumeSession session)
     {
         TimeSpan lease = session.LeaseDuration > TimeSpan.Zero ? session.LeaseDuration : Runtime.Capabilities.LeaseDuration;
         TimeSpan timeout = session.SessionTimeout > TimeSpan.Zero ? session.SessionTimeout : lease;
         TimeSpan basis = lease < timeout ? lease : timeout;
-        TimeSpan period = TimeSpan.FromTicks(Math.Max(basis.Ticks / 3, TimeSpan.FromMilliseconds(50).Ticks));
+        long periodTicks = basis.Ticks / 3;
+        TimeSpan reply = LeaderReplyTimeout();
+        if (reply > TimeSpan.Zero && (basis.Ticks * 2 / 3) - reply.Ticks < periodTicks)
+            periodTicks = (basis.Ticks * 2 / 3) - reply.Ticks;
+        TimeSpan period = TimeSpan.FromTicks(Math.Max(periodTicks, Math.Max(basis.Ticks / 6, TimeSpan.FromMilliseconds(50).Ticks)));
         lock (_sync)
         {
             if (_stopped)
@@ -1475,6 +1485,10 @@ internal sealed class VolumeContext : IRpcRouter
             }
 
             Process(session, result, updates);
+
+            // The leader's round trips may have changed (a link that became slow): re-time the renewals accordingly.
+            if (!session.IsExpired)
+                EnsureKeepAlive(session);
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
@@ -1489,27 +1503,23 @@ internal sealed class VolumeContext : IRpcRouter
     }
 
     /// <summary>
-    /// Half a renewal period (at least 50 ms), so that several attempts fit in one renewal; but never below three round trips
-    /// of the current leader's connection: a leader that answers slowly (high-latency link) is still renewed with, while a
-    /// silent one (paused, partitioned) is left for its successor within the lease.
+    /// Half a renewal period (at least 50 ms), so that several attempts fit in one renewal. The invoker raises it to the
+    /// leader's adaptive reply timeout (<see cref="RttEstimator"/>): a leader that answers slowly (high-latency link) is
+    /// still renewed with, while a silent one (paused, partitioned) is left for its successor within the lease.
     /// </summary>
     private TimeSpan KeepAliveAttemptTimeout()
     {
         TimeSpan period;
-        string? leader;
         lock (_sync)
-        {
             period = _timerPeriod;
-            leader = _leader ?? _lastLeader;
-        }
-
         TimeSpan half = period / 2;
-        TimeSpan attempt = half > TimeSpan.FromMilliseconds(50) ? half : TimeSpan.FromMilliseconds(50);
-        if (leader is not null && Runtime.Pool.TryGetOpen(leader, out ClientConnection connection) && connection.RoundTrip * 3 > attempt)
-            attempt = connection.RoundTrip * 3;
-        return attempt;
+        return half > TimeSpan.FromMilliseconds(50) ? half : TimeSpan.FromMilliseconds(50);
     }
 
+    /// <summary>
+    /// The budget of one renewal: two renewal periods, but at least two of the leader's adaptive reply timeouts (a retry
+    /// after a lost renewal still fits on a slow link); never past the operation timeout.
+    /// </summary>
     private TimeSpan KeepAliveTimeout()
     {
         TimeSpan period;
@@ -1517,7 +1527,19 @@ internal sealed class VolumeContext : IRpcRouter
             period = _timerPeriod;
         TimeSpan max = Runtime.Options.OperationTimeout;
         TimeSpan budget = period * 2;
+        TimeSpan slow = LeaderReplyTimeout() * 2;
+        if (slow > budget)
+            budget = slow;
         return budget < max ? budget : max;
+    }
+
+    /// <summary>The adaptive reply timeout of the current (or last known) leader's endpoint (zero while unknown).</summary>
+    private TimeSpan LeaderReplyTimeout()
+    {
+        string? leader;
+        lock (_sync)
+            leader = _leader ?? _lastLeader;
+        return leader is null ? TimeSpan.Zero : Runtime.Pool.RttOf(leader).ReplyTimeout;
     }
 
     private void Process(VolumeSession session, KeepAliveResultMessage result, HandlePinUpdate[] sentUpdates)

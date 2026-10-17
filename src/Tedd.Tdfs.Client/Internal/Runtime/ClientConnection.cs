@@ -9,18 +9,28 @@ namespace Tedd.Tdfs.Client.Internal.Runtime;
 /// One authenticated connection of the client to a node (live or backup): the transport connection plus the handshake
 /// outcome (PROTOCOL.md §3). Requests are multiplexed by the transport; a connection is never shared between clients.
 /// </summary>
+/// <remarks>
+/// A call waits for its reply for its attempt timeout, but the transport keeps waiting for a late reply for the call's
+/// liveness horizon (<see cref="LivenessHorizon"/>): a late reply still updates the endpoint's round-trip estimate
+/// (<see cref="Rtt"/>) and shows that the connection is alive, merely slow. The connection is declared dead (and removed
+/// from the pool) only when a call's whole horizon passed without any reply on the connection since the call was sent
+/// (silently dead links, NET-016), never because one short attempt (a keep-alive, a lease-granting request) timed out on a
+/// link whose latency grew (NET-013).
+/// </remarks>
 internal sealed class ClientConnection
 {
+    private readonly ClientRuntime _runtime;
+    private long _abandonedBytes;
     private int _poisoned;
     private int _closed;
     private long _lastReply;
-    private long _roundTripTicks;
 
-    private ClientConnection(IRpcConnection raw, string endpoint, HelloChallengeMessage challenge, HelloResultMessage result, long openedAt,
-        TimeSpan handshakeRoundTrip)
+    private ClientConnection(ClientRuntime runtime, IRpcConnection raw, string endpoint, HelloChallengeMessage challenge, HelloResultMessage result,
+        long openedAt, RttEstimator rtt)
     {
+        _runtime = runtime;
         _lastReply = openedAt;
-        _roundTripTicks = handshakeRoundTrip.Ticks > 0 ? handshakeRoundTrip.Ticks : 0;
+        Rtt = rtt;
         Raw = raw;
         Endpoint = endpoint;
         Challenge = challenge;
@@ -53,13 +63,45 @@ internal sealed class ClientConnection
     public long LastReply => Volatile.Read(ref _lastReply);
 
     /// <summary>
-    /// Smoothed round-trip time of the requests answered on this connection, starting from the handshake's: how long a slow
-    /// but answering server takes, so that short attempts (keep-alives) are not cut below it.
+    /// The round-trip estimate of the endpoint (shared with its earlier and later connections), fed by every reply on this
+    /// connection, late ones included: how long a slow but answering server takes, so that waits are not cut below it.
     /// </summary>
-    public TimeSpan RoundTrip => TimeSpan.FromTicks(Volatile.Read(ref _roundTripTicks));
+    public RttEstimator Rtt { get; }
+
+    /// <summary>Smoothed round-trip time of the endpoint (zero while unknown).</summary>
+    public TimeSpan RoundTrip => Rtt.Smoothed;
+
+    /// <summary>
+    /// <paramref name="configured"/> attempt timeout raised to the endpoint's adaptive reply timeout (a few smoothed round
+    /// trips plus their deviation), never past <paramref name="limit"/> (what the operation has left for the attempt).
+    /// </summary>
+    public TimeSpan AdaptAttemptTimeout(TimeSpan configured, TimeSpan limit) => Rtt.Adapt(configured, limit);
+
+    /// <summary>
+    /// How long a call with <paramref name="attemptTimeout"/> keeps waiting for a late reply before its silence counts as
+    /// evidence that the connection is dead: one and a half attempt timeouts, at least two adaptive reply timeouts, and at
+    /// least the default patience of a single request (a third of the operation timeout) — a short attempt gives up early
+    /// to fail over, but does not condemn a connection that a default request would still be waiting on.
+    /// </summary>
+    public TimeSpan LivenessHorizon(TimeSpan attemptTimeout)
+    {
+        TimeSpan horizon = attemptTimeout + (attemptTimeout / 2);
+        TimeSpan adaptive = Rtt.ReplyTimeout * 2;
+        if (adaptive > horizon)
+            horizon = adaptive;
+        TimeSpan patience = TimeSpan.FromTicks(Math.Max(_runtime.Options.OperationTimeout.Ticks / 3, TimeSpan.FromMilliseconds(100).Ticks));
+        return patience > horizon ? patience : horizon;
+    }
+
+    /// <summary>
+    /// Bytes of requests this connection still carries that nobody waits for any more (their caller timed out or stopped
+    /// waiting, for example an upload to a replica that was not needed once the policy was met elsewhere): what the link
+    /// may still be busy with before a new request gets through. Uploads use it to apply backpressure to a congested target.
+    /// </summary>
+    public long AbandonedBytes => Interlocked.Read(ref _abandonedBytes);
 
     /// <summary>Records that a reply arrived on this connection at <paramref name="timestamp"/>.</summary>
-    public void NoteReply(long timestamp)
+    private void NoteReply(long timestamp)
     {
         long current = Volatile.Read(ref _lastReply);
         while (timestamp > current)
@@ -71,37 +113,198 @@ internal sealed class ClientConnection
         }
     }
 
-    /// <summary>Records a reply at <paramref name="timestamp"/> to a request sent at <paramref name="sentAt"/> (both time-provider timestamps).</summary>
-    public void NoteReply(long timestamp, long sentAt, TimeProvider time)
+    /// <summary>
+    /// Sends <paramref name="frame"/> and decodes the reply (see <see cref="StartCall"/>). Transport failures
+    /// (<see cref="TimeoutException"/>, <see cref="RpcConnectionException"/>) and cancellation propagate unchanged.
+    /// </summary>
+    public async Task<IWireMessage> CallAsync(ReadOnlyMemory<byte> frame, TimeSpan timeout, CancellationToken ct)
     {
-        ArgumentNullException.ThrowIfNull(time);
-        NoteReply(timestamp);
-        long sample = time.GetElapsedTime(sentAt, timestamp).Ticks;
-        if (sample < 0)
-            return;
-        long current = Volatile.Read(ref _roundTripTicks);
-        while (true)
+        ReadOnlyMemory<byte> reply = await StartCall(frame, timeout, ct).ConfigureAwait(false);
+        return MessageCodec.Decode(reply.Span);
+    }
+
+    /// <summary>
+    /// Starts a call whose reply is awaited for <paramref name="timeout"/> (then <see cref="TimeoutException"/>) or until
+    /// <paramref name="ct"/> fires; the returned task carries the raw reply (used when the caller must know whether it was
+    /// sent: a call refused before sending completes faulted with <see cref="RpcConnectionException"/> at once). The
+    /// transport keeps waiting for a late reply up to <see cref="LivenessHorizon"/> after the caller stopped waiting. When
+    /// <paramref name="extendUpTo"/> is given and the endpoint's round-trip estimate grew while the call was waiting (a late
+    /// reply of an earlier call showed the link became slow), the wait is extended to the new adaptive reply timeout, up to
+    /// that bound, instead of giving up on a reply that is merely slow.
+    /// </summary>
+    public Task<ReadOnlyMemory<byte>> StartCall(ReadOnlyMemory<byte> frame, TimeSpan timeout, CancellationToken ct, TimeSpan? extendUpTo = null)
+    {
+        if (ct.IsCancellationRequested)
+            return Task.FromCanceled<ReadOnlyMemory<byte>>(ct);
+        TimeProvider time = _runtime.Time;
+        long sentAt = time.GetTimestamp();
+        TimeSpan horizon = LivenessHorizon(timeout);
+        Task<ReadOnlyMemory<byte>> raw = Raw.CallAsync(frame, horizon, CancellationToken.None);
+        if (raw.IsCompleted)
         {
-            long smoothed = current == 0 ? sample : current + ((sample - current) / 4);
-            long seen = Interlocked.CompareExchange(ref _roundTripTicks, smoothed, current);
-            if (seen == current)
-                return;
-            current = seen;
+            Observe(raw, sentAt);
+            return raw;
+        }
+
+        _ = raw.ContinueWith(static (t, s) =>
+        {
+            (ClientConnection connection, long sent) = ((ClientConnection, long))s!;
+            connection.Observe(t, sent);
+        }, (this, sentAt), CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        var wait = new AttemptWait(this, raw, frame.Length, ct, sentAt, timeout, extendUpTo is { } bound && bound > timeout ? bound : timeout,
+            $"No reply from {Endpoint} within {timeout}; the request may have been executed.");
+        wait.Start(time);
+        return wait.Task;
+    }
+
+    /// <summary>
+    /// Learns from a finished transport call: a reply (in time or late) is a round-trip sample and proof of life; a call
+    /// whose whole liveness horizon passed with no reply on the connection since it was sent declares the connection dead.
+    /// </summary>
+    private void Observe(Task<ReadOnlyMemory<byte>> raw, long sentAt)
+    {
+        TimeProvider time = _runtime.Time;
+        if (raw.IsCompletedSuccessfully)
+        {
+            long now = time.GetTimestamp();
+            NoteReply(now);
+            Rtt.Sample(time.GetElapsedTime(sentAt, now), now);
+            return;
+        }
+
+        Exception? error = raw.Exception?.GetBaseException();
+        if (error is TimeoutException && LastReply < sentAt && IsUsable)
+        {
+            _runtime.Emit("connection.silent", $"No reply on the connection to {Endpoint} for {time.GetElapsedTime(sentAt)}: it is declared dead and replaced.");
+            _runtime.Pool.Invalidate(this);
         }
     }
 
     /// <summary>
-    /// Sends <paramref name="frame"/> and decodes the reply. Transport failures (<see cref="TimeoutException"/>,
-    /// <see cref="RpcConnectionException"/>) and cancellation propagate unchanged.
+    /// The caller's wait for one call: completed by the call, by the attempt timer (<see cref="TimeoutException"/>; the call
+    /// keeps running) or by the caller's token, always without a synchronization context (ARCHITECTURE §9.6). When the
+    /// timer fires while the round-trip estimate now asks for a longer wait (up to the extension bound), it is re-armed.
     /// </summary>
-    public async Task<IWireMessage> CallAsync(ReadOnlyMemory<byte> frame, TimeSpan timeout, CancellationToken ct)
+    private sealed class AttemptWait
     {
-        ReadOnlyMemory<byte> reply = await Raw.CallAsync(frame, timeout, ct).ConfigureAwait(false);
-        return MessageCodec.Decode(reply.Span);
-    }
+        private readonly TaskCompletionSource<ReadOnlyMemory<byte>> _source = new(TaskCreationOptions.None);
+        private readonly ClientConnection _connection;
+        private readonly Task<ReadOnlyMemory<byte>> _call;
+        private readonly int _bytes;
+        private readonly CancellationToken _ct;
+        private readonly long _sentAt;
+        private readonly TimeSpan _timeout;
+        private readonly TimeSpan _extendUpTo;
+        private readonly string _timeoutMessage;
+        private TimeProvider? _time;
+        private ITimer? _timer;
+        private CancellationTokenRegistration _registration;
+        private int _done;
+        private int _phase; // 0: waited for, 1: abandoned (counted in the connection's abandoned bytes), 2: the call finished
 
-    /// <summary>Starts a call; the returned task carries the raw reply (used when the caller must know whether it was sent).</summary>
-    public Task<ReadOnlyMemory<byte>> StartCall(ReadOnlyMemory<byte> frame, TimeSpan timeout, CancellationToken ct) => Raw.CallAsync(frame, timeout, ct);
+        public AttemptWait(ClientConnection connection, Task<ReadOnlyMemory<byte>> call, int bytes, CancellationToken ct, long sentAt, TimeSpan timeout,
+            TimeSpan extendUpTo, string timeoutMessage)
+        {
+            _connection = connection;
+            _call = call;
+            _bytes = bytes;
+            _ct = ct;
+            _sentAt = sentAt;
+            _timeout = timeout;
+            _extendUpTo = extendUpTo;
+            _timeoutMessage = timeoutMessage;
+        }
+
+        public Task<ReadOnlyMemory<byte>> Task => _source.Task;
+
+        public void Start(TimeProvider time)
+        {
+            _time = time;
+            _timer = time.CreateTimer(static s => ((AttemptWait)s!).OnTimer(), this, ClientRuntime.Positive(_timeout), Timeout.InfiniteTimeSpan);
+            if (_ct.CanBeCanceled)
+                _registration = _ct.UnsafeRegister(static s => ((AttemptWait)s!).Finish(Outcome.Cancelled), this);
+            _ = _call.ContinueWith(static (_, s) => ((AttemptWait)s!).OnCallFinished(), this, CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            if (Volatile.Read(ref _done) != 0)
+                Cleanup();
+        }
+
+        private void OnTimer()
+        {
+            if (Volatile.Read(ref _done) != 0)
+                return;
+            if (_extendUpTo > _timeout && _time is { } time && _timer is { } timer)
+            {
+                TimeSpan wanted = _connection.Rtt.Adapt(_timeout, _extendUpTo);
+                TimeSpan left = wanted - time.GetElapsedTime(_sentAt);
+                if (left > TimeSpan.FromMilliseconds(1))
+                {
+                    try
+                    {
+                        timer.Change(left, Timeout.InfiniteTimeSpan);
+                        return;
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        return; // finished meanwhile
+                    }
+                }
+            }
+
+            Finish(Outcome.TimedOut);
+        }
+
+        private void OnCallFinished()
+        {
+            if (Interlocked.Exchange(ref _phase, 2) == 1)
+                Interlocked.Add(ref _connection._abandonedBytes, -_bytes);
+            Finish(Outcome.Completed);
+        }
+
+        private void Finish(Outcome outcome)
+        {
+            if (Interlocked.Exchange(ref _done, 1) != 0)
+                return;
+            Cleanup();
+            if (outcome != Outcome.Completed && Interlocked.CompareExchange(ref _phase, 1, 0) == 0)
+                Interlocked.Add(ref _connection._abandonedBytes, _bytes);
+            ContextFree.Run(static p =>
+            {
+                (AttemptWait wait, Outcome how) = p;
+                switch (how)
+                {
+                    case Outcome.TimedOut:
+                        wait._source.TrySetException(new TimeoutException(wait._timeoutMessage));
+                        break;
+                    case Outcome.Cancelled:
+                        wait._source.TrySetCanceled(wait._ct);
+                        break;
+                    default:
+                        Task<ReadOnlyMemory<byte>> call = wait._call;
+                        if (call.IsCompletedSuccessfully)
+                            wait._source.TrySetResult(call.Result);
+                        else if (call.IsCanceled)
+                            wait._source.TrySetCanceled(wait._ct.IsCancellationRequested ? wait._ct : CancellationToken.None);
+                        else
+                            wait._source.TrySetException(call.Exception!.InnerExceptions);
+                        break;
+                }
+            }, (this, outcome));
+        }
+
+        private void Cleanup()
+        {
+            _timer?.Dispose();
+            _registration.Unregister();
+        }
+
+        private enum Outcome
+        {
+            Completed,
+            TimedOut,
+            Cancelled,
+        }
+    }
 
     /// <summary>Declares the connection dead (silently dead links, protocol violations) and closes it in the background.</summary>
     public void Poison()
@@ -135,12 +338,19 @@ internal sealed class ClientConnection
     /// </summary>
     /// <exception cref="DfsClusterIdentityException">The node belongs to another cluster.</exception>
     /// <exception cref="DfsAuthenticationException">Authentication failed in either direction.</exception>
-    public static async Task<ClientConnection> OpenAsync(ClientRuntime runtime, string endpoint, Guid expectedClusterId, TimeSpan timeout, CancellationToken ct)
+    /// <param name="runtime">The client runtime.</param>
+    /// <param name="endpoint">The node's endpoint.</param>
+    /// <param name="expectedClusterId">The cluster the node must belong to (empty: any).</param>
+    /// <param name="timeout">Longest wait for each handshake reply.</param>
+    /// <param name="rtt">The endpoint's round-trip estimate (the handshake's round trips are samples of it).</param>
+    /// <param name="ct">Cancels the connect.</param>
+    public static async Task<ClientConnection> OpenAsync(ClientRuntime runtime, string endpoint, Guid expectedClusterId, TimeSpan timeout, RttEstimator rtt,
+        CancellationToken ct)
     {
         IRpcConnection raw = await runtime.Transport.ConnectAsync(endpoint, ct).ConfigureAwait(false);
         try
         {
-            return await AuthenticateAsync(runtime, raw, endpoint, expectedClusterId, timeout, ct).ConfigureAwait(false);
+            return await AuthenticateAsync(runtime, raw, endpoint, expectedClusterId, timeout, rtt, ct).ConfigureAwait(false);
         }
         catch
         {
@@ -157,14 +367,17 @@ internal sealed class ClientConnection
             : ValueTask.CompletedTask;
 
     private static async Task<ClientConnection> AuthenticateAsync(ClientRuntime runtime, IRpcConnection raw, string endpoint, Guid expectedClusterId,
-        TimeSpan timeout, CancellationToken ct)
+        TimeSpan timeout, RttEstimator rtt, CancellationToken ct)
     {
         DfsCredentials credentials = runtime.Options.Credentials;
         var hello = new HelloMessage(expectedClusterId, ProtocolInfo.MinSupportedVersion, ProtocolInfo.CurrentVersion, ClientRuntime.SupportedFeatures,
             PeerRole.Client, runtime.Options.ClientName, null, 0, credentials.Principal, runtime.Random.NextBytes(ProtocolInfo.NonceSize));
         byte[] helloFrame = MessageCodec.Encode(hello);
         await HitAsync(runtime, FaultStage.F03, FaultSites.ClientRequestSend, endpoint, 0, ct).ConfigureAwait(false);
+        long helloSentAt = runtime.Time.GetTimestamp();
         ReadOnlyMemory<byte> challengeReply = await raw.CallAsync(helloFrame, timeout, ct).ConfigureAwait(false);
+        long challengeAt = runtime.Time.GetTimestamp();
+        rtt.Sample(runtime.Time.GetElapsedTime(helloSentAt, challengeAt), challengeAt);
         await HitAsync(runtime, FaultStage.F14, FaultSites.ClientReplyReceived, endpoint, 0, ct).ConfigureAwait(false);
         IWireMessage challengeMessage = MessageCodec.Decode(challengeReply.Span);
         if (challengeMessage is ErrorReplyMessage error)
@@ -192,7 +405,8 @@ internal sealed class ClientConnection
         await HitAsync(runtime, FaultStage.F03, FaultSites.ClientRequestSend, endpoint, 1, ct).ConfigureAwait(false);
         long proofSentAt = runtime.Time.GetTimestamp();
         ReadOnlyMemory<byte> resultReply = await raw.CallAsync(MessageCodec.Encode(new HelloProofMessage(proof)), timeout, ct).ConfigureAwait(false);
-        TimeSpan handshakeRoundTrip = runtime.Time.GetElapsedTime(proofSentAt);
+        long resultAt = runtime.Time.GetTimestamp();
+        rtt.Sample(runtime.Time.GetElapsedTime(proofSentAt, resultAt), resultAt);
         await HitAsync(runtime, FaultStage.F14, FaultSites.ClientReplyReceived, endpoint, 1, ct).ConfigureAwait(false);
         CryptographicOperations.ZeroMemory(proof);
         IWireMessage resultMessage = MessageCodec.Decode(resultReply.Span);
@@ -212,6 +426,6 @@ internal sealed class ClientConnection
 
         raw.Identity = new RpcPeerIdentity(challenge.ServerName, challenge.ServerNodeId, challenge.ServerIncarnation, null,
             IsNode: challenge.ServerRole == PeerRole.Node, IsBackup: challenge.ServerRole == PeerRole.Backup);
-        return new ClientConnection(raw, endpoint, challenge, result, runtime.Time.GetTimestamp(), handshakeRoundTrip);
+        return new ClientConnection(runtime, raw, endpoint, challenge, result, runtime.Time.GetTimestamp(), rtt);
     }
 }

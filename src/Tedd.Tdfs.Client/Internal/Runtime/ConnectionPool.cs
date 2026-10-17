@@ -6,13 +6,15 @@ namespace Tedd.Tdfs.Client.Internal.Runtime;
 /// Authenticated connections of one client, pooled per endpoint (ARCHITECTURE §9.1). Concurrent callers share one
 /// connection per endpoint and one in-progress connect; dead pooled connections (closed by either side, or declared dead
 /// after a timeout on a silently dead link) are detected and replaced, and a connect stuck on a lost handshake message is
-/// abandoned once it outlived a patient caller's wait, or a wait of many round trips of the endpoint's previous connection.
+/// abandoned once it outlived a patient caller's wait, or a wait of many round trips of the endpoint. Each endpoint keeps
+/// one round-trip estimate across its connections (<see cref="RttEstimator"/>): waits for a connection never cut below
+/// the handshake's round trips.
 /// A caller whose wait outlives a failed connect it joined (started by another caller) makes one fresh attempt. Thread-safe.
 /// </summary>
 internal sealed class ConnectionPool
 {
     /// <summary>
-    /// Round trips of the endpoint's previous connection a caller must have waited before it may abandon a pending connect:
+    /// Smoothed round trips of the endpoint a caller must have waited before it may abandon a pending connect:
     /// the handshake takes two, so a connect still pending after this many has lost a message rather than being slow.
     /// </summary>
     private const int StuckHandshakeRoundTrips = 8;
@@ -75,6 +77,7 @@ internal sealed class ConnectionPool
     {
         ArgumentNullException.ThrowIfNull(endpoint);
         long waitStarted = _runtime.Time.GetTimestamp();
+        waitTimeout = ConnectWait(endpoint, scope, waitTimeout);
         var attempt = new JoinedConnect();
         try
         {
@@ -91,6 +94,38 @@ internal sealed class ConnectionPool
         }
 
         return await GetOnceAsync(endpoint, scope, waitTimeout, waitStarted, new JoinedConnect()).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The wait for a connection to <paramref name="endpoint"/>: <paramref name="waitTimeout"/>, but when no usable connection
+    /// is pooled at least the handshake's two round trips at the endpoint's adaptive reply timeout (a link whose latency
+    /// grew is reconnected over, not given up on below its round trip), never past what the operation has left.
+    /// </summary>
+    private TimeSpan ConnectWait(string endpoint, OperationScope scope, TimeSpan waitTimeout)
+    {
+        RttEstimator rtt;
+        lock (_sync)
+        {
+            Slot slot = SlotOf(endpoint);
+            if (slot.Connection is { IsUsable: true })
+                return waitTimeout;
+            rtt = slot.Rtt;
+        }
+
+        TimeSpan handshake = rtt.ReplyTimeout * 2;
+        if (handshake <= waitTimeout)
+            return waitTimeout;
+        TimeSpan remaining = scope.Remaining;
+        TimeSpan wait = handshake < remaining ? handshake : remaining;
+        return wait > waitTimeout ? wait : waitTimeout;
+    }
+
+    /// <summary>The round-trip estimate of <paramref name="endpoint"/> (shared by its successive connections).</summary>
+    public RttEstimator RttOf(string endpoint)
+    {
+        ArgumentNullException.ThrowIfNull(endpoint);
+        lock (_sync)
+            return SlotOf(endpoint).Rtt;
     }
 
     /// <summary>Whether a <see cref="GetOnceAsync"/> call waited for a connect another caller had started.</summary>
@@ -186,11 +221,12 @@ internal sealed class ConnectionPool
     }
 
     /// <summary>
-    /// A shared connect that outlived the whole wait of a patient caller is presumably stuck on a lost handshake message (a
+    /// A shared connect that outlived the whole wait of a patient caller without any handshake reply arriving during it (a
+    /// reply is a round-trip sample of the endpoint, <see cref="RttEstimator.LastSampleAt"/>) is presumably stuck on a lost handshake message (a
     /// black-holed or partitioned link that may have healed since): it is abandoned so the next caller starts a fresh
     /// connect instead of waiting for the stuck one until the connect timeout. A caller is patient when it waited at least a
-    /// tenth of the connect timeout, or at least <see cref="StuckHandshakeRoundTrips"/> round trips of the endpoint's previous
-    /// connection (a handshake takes two). Callers with shorter waits never abandon a connect, so a slow but progressing
+    /// tenth of the connect timeout, or at least <see cref="StuckHandshakeRoundTrips"/> smoothed round trips of the endpoint
+    /// (a handshake takes two). Callers with shorter waits never abandon a connect, so a slow but progressing
     /// handshake over a high-latency link is not restarted over and over.
     /// </summary>
     private void AbandonIfStuck(string endpoint, Task<ClientConnection> pending, TimeSpan waited)
@@ -199,9 +235,9 @@ internal sealed class ConnectionPool
         lock (_sync)
         {
             if (_slots.TryGetValue(endpoint, out Slot? slot) && ReferenceEquals(slot.Pending, pending)
-                && _runtime.Time.GetElapsedTime(slot.PendingStarted) >= waited
+                && _runtime.Time.GetElapsedTime(Math.Max(slot.PendingStarted, slot.Rtt.LastSampleAt)) >= waited
                 && (waited >= _runtime.Options.ConnectTimeout / 10
-                    || (slot.LastRoundTrip > TimeSpan.Zero && waited >= slot.LastRoundTrip * StuckHandshakeRoundTrips)))
+                    || (slot.Rtt.Smoothed > TimeSpan.Zero && waited >= slot.Rtt.Smoothed * StuckHandshakeRoundTrips)))
             {
                 abandon = slot.PendingAbandon;
                 slot.Pending = null;
@@ -226,12 +262,11 @@ internal sealed class ConnectionPool
         connection.Poison();
     }
 
-    /// <summary>Removes the pooled <paramref name="connection"/> of <paramref name="slot"/>, remembering its round trip.</summary>
+    /// <summary>Removes the pooled <paramref name="connection"/> of <paramref name="slot"/> (its round trips stay in the slot's estimate).</summary>
     private static void Forget(Slot slot, ClientConnection connection)
     {
-        if (connection.RoundTrip > TimeSpan.Zero)
-            slot.LastRoundTrip = connection.RoundTrip;
-        slot.Connection = null;
+        if (ReferenceEquals(slot.Connection, connection))
+            slot.Connection = null;
     }
 
     /// <summary>Closes every connection; later requests fail with <see cref="ObjectDisposedException"/>.</summary>
@@ -277,7 +312,7 @@ internal sealed class ConnectionPool
         {
             try
             {
-                opened = await ClientConnection.OpenAsync(_runtime, endpoint, _runtime.ExpectedClusterIdForConnections, timeout, deadline.Token)
+                opened = await ClientConnection.OpenAsync(_runtime, endpoint, _runtime.ExpectedClusterIdForConnections, timeout, slot.Rtt, deadline.Token)
                     .ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (deadline.IsCancellationRequested)
@@ -330,7 +365,7 @@ internal sealed class ConnectionPool
         public Task<ClientConnection>? Pending;
         public CancellationTokenSource? PendingAbandon;
         public long PendingStarted;
-        public TimeSpan LastRoundTrip; // of the endpoint's previous connection (zero when none was ever open)
+        public readonly RttEstimator Rtt = new(); // of the endpoint, across its connections (handshakes and replies)
         public long LostAt;            // when a pooled connection was last lost (0: never)
     }
 }
