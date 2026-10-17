@@ -356,6 +356,7 @@ internal sealed partial class RpcDispatcher : IRpcHandler
         string? volume = (message as IVolumeRequest)?.Header.Volume;
         string? path = Volumes.Service.RequestFaultInfo.PathOf(message);
         IWireMessage result;
+        long auditMark = _s.Control.AuditSequence;
         try
         {
             if (observed)
@@ -389,6 +390,11 @@ internal sealed partial class RpcDispatcher : IRpcHandler
 
         if (!expectsReply)
             return null;
+
+        // A denied client request is answered once the denial is in the audit log (SEC-016/018): the audit records reported
+        // while it was served are committed first (bounded wait; they stay queued when the control group is unavailable).
+        if (!state.Identity.IsNode && result is ErrorReplyMessage { Code: DfsErrorCode.AccessDenied } && _s.Control.AuditSequence > auditMark)
+            await _s.Control.WaitForAuditsAsync(_s.Control.AuditSequence);
         if (observed)
         {
             try

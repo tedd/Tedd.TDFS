@@ -414,6 +414,23 @@ check against `ExpectedClusterId` if set; protocol version negotiation; authenti
 then routes: metadata to the volume leader (leader hints from `NotLeader` errors; refresh map on epoch change), data
 to storage nodes. Connections are pooled per endpoint and reused; dead pooled connections are detected and replaced.
 
+**Adaptive waits.** Every endpoint has one round-trip estimate (`RttEstimator`: Jacobson/Karels smoothed RTT and mean
+deviation) shared by its successive connections and fed by every reply — the handshake's, and replies that arrive after
+their attempt stopped waiting. A reply wait is the configured attempt timeout (operation third, a third of the lease for
+lease-granting requests, half a renewal period for keep-alives) raised to the adaptive reply timeout
+`srtt + max(4·rttvar, srtt)`, bounded by what the operation (mutation retry budget) has left; a wait still running when
+a late reply raised the estimate is extended the same way. Waiting for a connection allows the handshake's two round
+trips; a shared connect is abandoned as stuck only when no handshake reply arrived during a patient caller's whole wait.
+The transport keeps a call open after its caller stopped waiting, up to the call's liveness horizon (1.5 attempt
+timeouts, at least two adaptive reply timeouts and a third of the operation timeout): a connection is declared dead
+only when such a horizon passes without any reply on it since the call was sent (silently dead links, NET-016), never
+because a short attempt timed out on a link whose latency grew (NET-013). With no samples, or a fast link, the
+configured waits apply unchanged, so failover speed is unaffected. Keep-alive renewals are re-timed from the leader's
+reply timeout (period ≤ ⅔·lease − reply timeout, at least ⅙·lease) and their budget covers two reply timeouts. Requests a connection still
+carries that nobody waits for any more count as its abandoned bytes; an upload sends no further copy to a target with
+two chunks of abandoned uploads while the other targets meet the policy (backpressure on a congested replica, whose
+copies are left to repair), so a slow replica's link is not flooded and does not delay other requests to that node.
+
 ### 9.2 Retries
 Only SDK-internal idempotent operations are retried automatically (same operation id). Retries use bounded
 exponential backoff with jitter (seeded `IRandomSource`) and respect the operation deadline. Application
@@ -543,6 +560,16 @@ implements partitions, asymmetric cuts, black holes, reply drops, duplication an
   admin-supplied passphrase; backup nodes hold their own KEK (config) and escrow. Missing key material →
   `DfsRecoveryKeyMissingException`, never a "verified" backup (RST-005).
 * Diagnostics/audit never contain payload bytes or secrets (SDK-016, SEC-016).
+* **Audit pipeline** (`ControlHost.Audit.cs`): security events (denials, failed handshakes, recovery-point deletions)
+  are queued on the observing node and committed as `AppendAudit` control entries — proposed on the control leader,
+  forwarded with `AuditEvent` from other nodes — and retried until committed (an unknown outcome may audit an event
+  twice, never lose it). Denials by authenticated principals are never dropped by a rate limit: each is one entry, and
+  the RPC dispatcher answers an `AccessDenied` client request only after the audit records reported while serving it
+  are committed (bounded wait; read-your-writes for the auditor, SEC-018), which also back-pressures a principal that
+  keeps sending denied requests. Floods stay bounded (SEC-014): unauthenticated events pass a token bucket (burst 100,
+  20/s), the queue holds at most 1024 records (64 per principal), and what exceeds a bound is counted into one explicit
+  `audit:aggregated` entry per principal and outcome (`events=N`), never silently discarded. `AuditLog` on the control
+  leader reads after a ReadIndex barrier.
 
 ---
 

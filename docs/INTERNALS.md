@@ -198,7 +198,12 @@ internal sealed class ControlHost
     Task<ApplyOutcome> ProposeAsync(ControlCommand command, CancellationToken ct = default);
     DfsUnavailableException NotLeader(); string? ResolveEndpoint(NodeId node); string NameOf(NodeId node);
     ClusterMapData BuildClusterMap(); DfsServerCapabilities BuildCapabilities(); bool IsReachable(NodeId node);
-    void ReportSecurityEvent(string operation, string outcome, string scope, string principal = "-"); // rate limited audit (forwarded to the control leader, AuditEvent)
+    // Audit pipeline (ControlHost.Audit.cs): queued, retried until committed (proposed on the control leader, forwarded
+    // with AuditEvent elsewhere); never rate-dropped for authenticated principals; unauthenticated events pass a token
+    // bucket; over the queue bounds events are counted into explicit `audit:aggregated` entries (events=N).
+    void ReportSecurityEvent(string operation, string outcome, string scope, string principal = "-");
+    Task ReportSecurityEventAndWaitAsync(string operation, string outcome, string scope, string principal = "-"); // until committed (bounded)
+    long AuditSequence; Task<bool> WaitForAuditsAsync(long sequence);  // RpcDispatcher: AccessDenied replies wait for their audit records
 }
 // ControlStateMachine.Changed (event Action<ulong>, the applied index) fires after each applied command or restored checkpoint.
 
@@ -364,9 +369,11 @@ installed/aborted/rejected, verification failures, checkpoints written) for suit
 ```
 Internal/Runtime/   ClientRuntime (options, transport, time, random, faults, mutations, lifecycle: in-flight tracking,
                     shutdown, Abandon), OperationScope (deadline, caller/kill tokens, F00/F01 hits, classification of
-                    never-transmitted failures), ConnectionPool, ClientConnection (handshake, cluster identity, protocol
-                    version, poisoning of stale connections), ClusterMapCache (map, pools, discovery order), Waits
-                    (TimeProvider delays/waits without sync context), LockedRandom
+                    never-transmitted failures), ConnectionPool (per-endpoint slot: pooled connection, shared connect,
+                    RttEstimator), ClientConnection (handshake, cluster identity, protocol version, attempt waits with
+                    late-reply observation, liveness horizon, abandoned bytes, poisoning of stale connections),
+                    RttEstimator (per-endpoint smoothed RTT + deviation, adaptive reply timeout), ClusterMapCache (map,
+                    pools, discovery order), Waits (TimeProvider delays/waits without sync context), LockedRandom
 Internal/Rpc/       RpcInvoker (routing, NotLeader redirects, retries with the same op id, per-attempt and per-operation
                     deadlines, unknown-outcome resolution via QueryOperation(resolve)), RpcRequest, Routers (control
                     leader, any node)
@@ -375,7 +382,8 @@ Internal/Sessions/  VolumeContext (volume binding id/epoch, leader routing via G
                     VolumeSession (session id, reserved sequence blocks, ack watermark, the session's volume binding),
                     VolumeBinding (expected volume id/epoch carried by every request about something a session owns,
                     and by every transmission of one operation id)
-Internal/Data/      DataPlane (HRW upload with fallback, receipts until the ack policy is met, grace for extra copies;
+Internal/Data/      DataPlane (HRW upload with fallback, receipts until the ack policy is met, grace for extra copies,
+                    no extra copy to a congested target while the others meet the policy;
                     verified range reads with replica failover and LocateObject; never zero-fill), ContentLayout (chunking
                     at ChunkSize boundaries, inline-permission from the voters' failure domains), StagingLease
 Internal/Overlay/   StagedOverlay (sorted buffered / uploaded ranges, staged length, truncation point, snapshot/restore)

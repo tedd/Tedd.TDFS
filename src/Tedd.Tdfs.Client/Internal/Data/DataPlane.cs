@@ -75,10 +75,18 @@ internal sealed class DataPlane
 
         ulong epoch = lease.PlacementEpoch;
         IReadOnlyList<PlacementNode> nodes = _runtime.Map.PoolNodes(pool);
-        IReadOnlyList<PlacementNode> order = Placement.FallbackOrder(obj, epoch, nodes);
         IReadOnlyList<PlacementNode> targets = Placement.SelectTargets(obj, epoch, policy, nodes);
         int requiredCopies = policy.DurableCopiesBeforeAck;
         int requiredZones = policy.DurableZonesBeforeAck;
+
+        // Backpressure on a congested target (NET-013): a node whose connection still carries earlier uploads nobody waits for
+        // (they were not needed once the policy was met elsewhere) gets no further copy while the other targets can meet the
+        // policy without it; its copies are repair's job. Otherwise every chunk would queue another object on its slow link,
+        // so outstanding requests to it would grow with the file and its link would delay everything else sent to the node
+        // (keep-alives and metadata requests to a slow leader). Congested nodes come last among fallbacks too.
+        long congestion = CongestionLimit();
+        IReadOnlyList<PlacementNode> order = [.. Placement.FallbackOrder(obj, epoch, nodes).OrderBy(n => IsCongested(n, congestion) ? 1 : 0)];
+        var deferred = new List<PlacementNode>();
 
         var receipts = new List<ObjectReceipt>();
         var holders = new List<DfsTopologyLabels>();
@@ -103,7 +111,28 @@ internal sealed class DataPlane
         try
         {
             foreach (PlacementNode target in targets)
-                Start(target);
+            {
+                if (IsCongested(target, congestion))
+                    deferred.Add(target);
+                else
+                    Start(target);
+            }
+
+            if (deferred.Count > 0)
+            {
+                (int startedCopies, int startedZones) = CountDomains([.. pending.Select(p => p.Node.Labels)]);
+                if (startedCopies < requiredCopies || startedZones < requiredZones)
+                {
+                    // The others cannot meet the policy alone: the congested targets are needed after all.
+                    foreach (PlacementNode target in deferred)
+                        Start(target);
+                }
+                else
+                {
+                    _runtime.Emit("upload.target-congested", $"Object {obj}: no copy to {string.Join(", ", deferred.Select(d => d.Name))} (earlier uploads to it are still outstanding); the other targets meet the policy.",
+                        operation, volume: volume.Name);
+                }
+            }
 
             while (true)
             {
@@ -297,6 +326,17 @@ internal sealed class DataPlane
             return started > 0;
         }
     }
+
+    /// <summary>Abandoned upload bytes on a target's connection that make it congested: two chunks.</summary>
+    private long CongestionLimit() => 2L * ContentLayout.ChunkSize(_runtime.Capabilities);
+
+    /// <summary>
+    /// True when the pooled connection to <paramref name="node"/> still carries at least <paramref name="limit"/> bytes of
+    /// requests nobody waits for any more (<see cref="ClientConnection.AbandonedBytes"/>).
+    /// </summary>
+    private bool IsCongested(PlacementNode node, long limit) =>
+        _runtime.Map.EndpointOf(node.Id) is { } endpoint && _runtime.Pool.TryGetOpen(endpoint, out ClientConnection connection)
+        && connection.AbandonedBytes >= limit;
 
     /// <summary>True for a storage node's refusal of an object for lack of capacity.</summary>
     private static bool IsCapacityRefusal(Exception ex) => ex is DfsException { ErrorCode: DfsErrorCode.CapacityExhausted };

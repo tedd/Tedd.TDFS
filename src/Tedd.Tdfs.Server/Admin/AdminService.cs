@@ -117,6 +117,12 @@ internal sealed partial class AdminService
             {
                 RequireClusterAdmin(principal);
                 int max = message.ReadBody<AdminAuditLogRequestBody>().Max;
+
+                // On the control leader (where clients send it) the read follows a ReadIndex barrier, so it contains every
+                // record committed before it, including the denials answered just before (read-your-writes); another node
+                // answers from its applied view.
+                if (Control is { IsLeader: true, Group: { } group })
+                    await group.ReadIndexAsync(ct);
                 IEnumerable<AuditEntry> entries = State.Audit;
                 if (max >= 0 && State.Audit.Count > max)
                     entries = State.Audit.Skip(State.Audit.Count - max);

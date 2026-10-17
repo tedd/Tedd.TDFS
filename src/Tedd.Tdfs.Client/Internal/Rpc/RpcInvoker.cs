@@ -143,6 +143,11 @@ internal sealed class RpcInvoker
                 break;
             }
 
+            // Never wait for a reply less than the endpoint's round trips allow (a slow link answers late, not never); the
+            // configured attempt timeout stays the floor, and the operation's own bound the ceiling.
+            TimeSpan attemptLimit = ClientRuntime.Positive(mutation ? budget - scope.Elapsed : scope.Remaining);
+            attemptTimeout = connection.AdaptAttemptTimeout(attemptTimeout, attemptLimit);
+
             DfsOperationKind wireKind = WireKindOf(message, request);
             try
             {
@@ -163,7 +168,7 @@ internal sealed class RpcInvoker
 
             byte[] frame = MessageCodec.Encode(message);
             long sentAt = _runtime.Time.GetTimestamp();
-            Task<ReadOnlyMemory<byte>> pending = connection.StartCall(frame, attemptTimeout, scope.Token);
+            Task<ReadOnlyMemory<byte>> pending = connection.StartCall(frame, attemptTimeout, scope.Token, attemptLimit);
 
             // A call refused before sending (connection closed) transmitted nothing. A call that completed as cancelled may
             // already have handed its frame to the transport (the caller's token can fire while the call starts), so it
@@ -180,16 +185,15 @@ internal sealed class RpcInvoker
             try
             {
                 raw = await pending.ConfigureAwait(false);
-                connection.NoteReply(_runtime.Time.GetTimestamp(), sentAt, _runtime.Time);
             }
             catch (OperationCanceledException) when (scope.Token.IsCancellationRequested)
             {
                 // The operation ended (deadline, caller or shutdown) while this attempt was outstanding. When the attempt had
                 // also run for its whole timeout, the connection did not answer in time: it is treated exactly like an attempt
-                // timeout (a silently dead link must not stay pooled), whichever of the two timers happened to fire first.
+                // timeout, whichever of the two timers happened to fire first (the connection itself is declared dead only
+                // when its late-reply horizon passes in silence, see ClientConnection).
                 if (_runtime.Time.GetElapsedTime(sentAt) >= attemptTimeout)
                 {
-                    _runtime.Pool.Invalidate(connection);
                     request.Router.OnUnreachable(endpoint);
                     _runtime.Emit("rpc.attempt-failed", $"{request.Name} to {endpoint}: no reply within the attempt timeout ({attemptTimeout}).",
                         request.Operation, request.Transaction, scope.Volume);
@@ -206,7 +210,11 @@ internal sealed class RpcInvoker
             catch (Exception ex) when (ex is TimeoutException or RpcConnectionException or IOException or ObjectDisposedException)
             {
                 last = ex;
-                if (ex is not TimeoutException || IsSilent(connection, attemptTimeout))
+
+                // A reply timeout alone does not show that the connection is dead: requests multiplexed on it can wait at a
+                // busy server, or the link's latency grew past the estimate. The connection keeps waiting for the late reply
+                // and is declared dead only when its liveness horizon passes without any reply (ClientConnection).
+                if (ex is not TimeoutException)
                     _runtime.Pool.Invalidate(connection);
                 request.Router.OnUnreachable(endpoint);
                 _runtime.Emit("rpc.attempt-failed", $"{request.Name} to {endpoint}: {ex.GetType().Name}.", request.Operation, request.Transaction, scope.Volume,
@@ -419,15 +427,16 @@ internal sealed class RpcInvoker
         await scope.HitAsync(FaultStage.F03, FaultSites.ClientRequestSend, kind, null, occurrence, obj).ConfigureAwait(false);
         ct.ThrowIfCancellationRequested();
         ReadOnlyMemory<byte> raw;
-        long sentAt = _runtime.Time.GetTimestamp();
+        TimeSpan limit = ClientRuntime.Positive(scope.Remaining);
+        timeout = connection.AdaptAttemptTimeout(ClientRuntime.Positive(timeout), limit);
         try
         {
-            raw = await connection.StartCall(MessageCodec.Encode(message), ClientRuntime.Positive(timeout), ct).ConfigureAwait(false);
-            connection.NoteReply(_runtime.Time.GetTimestamp(), sentAt, _runtime.Time);
+            raw = await connection.StartCall(MessageCodec.Encode(message), ClientRuntime.Positive(timeout), ct, limit).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is TimeoutException or RpcConnectionException or IOException)
         {
-            if (ex is not TimeoutException || IsSilent(connection, timeout))
+            // As for InvokeAsync: a timeout leaves the connection's own liveness horizon to decide whether it is dead.
+            if (ex is not TimeoutException)
                 _runtime.Pool.Invalidate(connection);
             if (ex is TimeoutException)
                 _runtime.NoteUnresponsive(endpoint);
@@ -440,15 +449,6 @@ internal sealed class RpcInvoker
         _runtime.Map.MarkGood(endpoint);
         return reply;
     }
-
-    /// <summary>
-    /// True when <paramref name="connection"/> delivered no reply for one and a half attempt timeouts. A single reply timeout
-    /// does not show that a connection is dead: requests multiplexed on it can wait at a busy server (a leader waiting for its
-    /// quorum or its control barrier) while it keeps answering others, and closing it would fail every request in flight on
-    /// it. A connection that stays silent that long is declared dead and replaced (silently dead links, NET-016).
-    /// </summary>
-    private bool IsSilent(ClientConnection connection, TimeSpan attemptTimeout) =>
-        _runtime.Time.GetElapsedTime(connection.LastReply) >= attemptTimeout + (attemptTimeout / 2);
 
     private IWireMessage Succeeded(RpcRequest request, string endpoint, IWireMessage reply)
     {
