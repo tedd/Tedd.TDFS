@@ -333,7 +333,8 @@ public sealed partial class TestNode : IFaultTarget, IObjectStoreAccess
         lock (_gate)
             _view = view;
         cluster.Record($"node {Name}: start #{start.ToString(CultureInfo.InvariantCulture)}");
-        await PortAllocator.WaitUntilFreeAsync(Options.ListenEndpoint, TimeSpan.FromSeconds(10), cluster.Runtime);
+        if (await PortAllocator.WaitUntilFreeAsync(Options.ListenEndpoint, PortAllocator.ReleaseTimeout, cluster.Runtime) is { } portWait)
+            cluster.Record($"node {Name}: {portWait}");
 
         NodeHost host;
         try

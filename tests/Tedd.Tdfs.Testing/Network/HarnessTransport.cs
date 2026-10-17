@@ -31,6 +31,7 @@ internal sealed class HarnessTransportFactory : IRpcTransportFactory
             sim.SetClock(localName, clock);
         string endpoint = string.IsNullOrEmpty(listenEndpoint) ? ConnectOnlyEndpoint(localName) : listenEndpoint;
         IRpcTransport inner = Inner.Create(localName, endpoint);
+        PortAllocator.TrackListener(endpoint, inner); // a later incarnation on this endpoint waits for its listener's release
         var transport = new HarnessTransport(this, inner, localName);
         Fabric.AddTransport(transport);
         return transport;

@@ -67,3 +67,13 @@ Distributed filesystem with a .NET client SDK. Requirements: `docs/spec/distribu
 - Test suite namespaces (`Tedd.Tdfs.Tests.<Level>.File`, `.Lock`, `.Net`, `.Tx`, `.Str` ...) shadow framework types and
   helper names inside the test assemblies: write `System.IO.File`, `System.Threading.Lock` etc. explicitly there, and do not
   name helper methods after a suite (e.g. a helper `Net(...)`).
+- Planned QUIC ports come only from `PortAllocator.Allocate()`: it also reserves each port machine-wide (named mutex
+  `Global\Tedd.Tdfs.TestPort.<port>`) so a parallel test process cannot take a stopped node's port before its restart.
+  An in-process QUIC transport keeps its UDP port until MsQuic finished closing every connection (~3 s, longer under
+  load), and a handshake left half-open when the listener stopped (owned by MsQuic's internal stateless registration,
+  not ours) keeps it up to ~13 s (MsQuic's default 10 s handshake idle timeout + closing), even after
+  `NativeResourcesReleased`. A start on a reused endpoint therefore goes through `PortAllocator.WaitUntilFreeAsync`
+  (earlier transports tracked by `HarnessTransportFactory`; waits for their release, then up to 20 s for the port) and
+  traces which process holds a port that stayed bound.
+- Test hosts do not register the Microsoft.Testing.Platform telemetry extension (`Directory.Build.targets`): its HTTP
+  uploads start OS thread-pool threads mid-test and broke process-wide thread/handle measurements (PERF-013).
