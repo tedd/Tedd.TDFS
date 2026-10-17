@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Collections.Frozen;
 using System.Collections.Immutable;
 using Tedd.Tdfs.Protocol;
+using Tedd.Tdfs.Server.Volumes.State;
 
 namespace Tedd.Tdfs.Server.Volumes.Commands;
 
@@ -20,6 +21,11 @@ internal static partial class CommandCodec
 
     private static readonly FrozenDictionary<VolumeCommandKind, CommandBodyReader> Readers = BuildReaders();
 
+    /// <summary>Command extension carrying <see cref="VolumeCommand.FencingFallback"/> (negative controls only).</summary>
+    private const uint FencingFallbackExtension = 1;
+
+    private static readonly FrozenSet<uint> UnderstoodExtensions = FrozenSet.ToFrozenSet([FencingFallbackExtension]);
+
     /// <summary>Encodes a command.</summary>
     public static byte[] Encode(VolumeCommand command)
     {
@@ -32,7 +38,19 @@ internal static partial class CommandCodec
         w.WriteBool(command.Op is not null);
         command.Op?.Write(ref w);
         command.WriteBody(ref w);
-        w.WriteNoExtensions();
+        if (command.FencingFallback is { } fallback)
+        {
+            var ext = new ArrayBufferWriter<byte>(32);
+            var e = new WireWriter(ext);
+            e.WriteVarUInt(fallback.Inode);
+            e.WriteString(fallback.Stream);
+            w.WriteExtensions([new WireExtension(FencingFallbackExtension, false, ext.WrittenMemory.ToArray())]);
+        }
+        else
+        {
+            w.WriteNoExtensions();
+        }
+
         return buffer.WrittenSpan.ToArray();
     }
 
@@ -50,9 +68,17 @@ internal static partial class CommandCodec
         DateTimeOffset time = r.ReadDateTimeOffset();
         OperationHeader? op = r.ReadBool() ? OperationHeader.Read(ref r) : null;
         VolumeCommand body = reader(ref r);
-        r.ReadExtensions();
+        StreamKey? fallback = null;
+        r.ReadExtensions(UnderstoodExtensions, ext =>
+        {
+            if (ext.FieldId == FencingFallbackExtension)
+            {
+                var e = new WireReader(ext.Value.Span, WireLimits.Default);
+                fallback = new StreamKey(e.ReadVarUInt(), e.ReadString());
+            }
+        });
         r.EnsureEnd();
-        return body with { LeaderTime = time, Op = op };
+        return body with { LeaderTime = time, Op = op, FencingFallback = fallback };
     }
 
     /// <summary>The kind of an encoded command without decoding the body (null when malformed).</summary>

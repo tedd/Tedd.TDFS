@@ -135,6 +135,7 @@ internal sealed partial class VolumeService
             .Select(h => h.Id)];
         if (handles.Length > 0)
         {
+            RememberEndedWriters(s, handles);
             await ProposeHousekeepingAsync(new ExpireHandlesCommand(handles));
             foreach (ulong id in handles)
                 _handleRenewals.Remove(id);
@@ -152,6 +153,13 @@ internal sealed partial class VolumeService
             foreach (ulong id in pins)
                 _pinRenewals.Remove(id);
         }
+
+        s = State;
+        ImmutableArray<string> expiredSnapshots = [.. s.Snapshots.Values
+            .Where(x => !x.Hold && x.ExpiresUtc is { } expires && expires <= wall)
+            .Select(x => x.Name)];
+        if (expiredSnapshots.Length > 0)
+            await ProposeHousekeepingAsync(new ExpireSnapshotsCommand(expiredSnapshots));
 
         s = State;
         TimeSpan stale = _s.Timings.SessionTimeout + _s.Timings.SessionTimeout;
@@ -182,7 +190,7 @@ internal sealed partial class VolumeService
         if (keyVersion > (s.KeyVersions.IsEmpty ? 0 : s.KeyVersions.Max))
             await ProposeHousekeepingAsync(new RotateDataKeyCommand(keyVersion));
 
-        await MaintainTransactionsAsync(wall);
+        await MaintainTransactionsAsync();
 
         if (IsLeader && _readyTerm == Group.Term)
             ResumeRestores();

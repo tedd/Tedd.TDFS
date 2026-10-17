@@ -29,6 +29,12 @@ internal sealed class BackupServices
 
     public NodeEnvironment Env { get; }
 
+    /// <summary>
+    /// The software release this backup node runs as: its protocol range and the highest format of a durable image it
+    /// opens (production: this build; the harness emulates the releases of the compatibility window, FMT-010).
+    /// </summary>
+    public Runtime.NodeRelease Release => Env.Release ?? Runtime.NodeRelease.Current;
+
     public INodeLoop Loop { get; }
 
     public TimeProvider Time => Env.Time;

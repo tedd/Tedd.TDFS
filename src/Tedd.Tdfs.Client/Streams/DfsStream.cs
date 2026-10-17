@@ -1262,7 +1262,9 @@ public sealed class DfsStream : Stream, ILeaseHolder
             long objectOffset = 0;
             for (int i = first; i < last; i++)
             {
-                overlay.ReplaceWithUploaded(pieces[i].Offset, pieces[i].Bytes.Length, uploaded, objectOffset, _canRead ? pieces[i].Bytes.ToArray() : null);
+                // The bytes are not kept: a readable writer reads its uploaded ranges back with its staging capability
+                // (ReadUploadedAsync), so client memory stays bounded by the buffer, not the file (FSD §6.3/§15, PERF-003).
+                overlay.ReplaceWithUploaded(pieces[i].Offset, pieces[i].Bytes.Length, uploaded, objectOffset);
                 objectOffset += pieces[i].Bytes.Length;
             }
 

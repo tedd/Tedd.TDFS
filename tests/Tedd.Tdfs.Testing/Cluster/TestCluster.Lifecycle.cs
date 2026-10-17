@@ -68,7 +68,10 @@ public sealed partial class TestCluster
         string dataRoot = Path.Combine(root, SafeFolderName(testName),
             string.Create(CultureInfo.InvariantCulture, $"{seed:x16}-p{Environment.ProcessId}-{instance}"));
         var random = new SeededRandom(seed);
-        var fabric = new NetworkFabric(runtime, options.Transport, random.Fork("fabric"));
+        var fabric = new NetworkFabric(runtime, options.Transport, random.Fork("fabric"))
+        {
+            UsesDatagramRelays = options.QuicDatagramInterposer && options.Transport == TransportKind.Quic && runtime.Scheduler is null,
+        };
         var cluster = new TestCluster(options, runtime, fabric, seed, random, dataRoot, parent: null, namePrefix: "n", backupPrefix: "b")
         {
             StartOptions = start ?? HarnessStartOptions.Default,
@@ -427,6 +430,7 @@ public sealed partial class TestCluster
             Faults = Faults.Injector,
             Log = log,
             LoopFactory = Runtime.CreateLoopFactory(log),
+            Release = ReleaseOf(node.SoftwareVersion),
         };
     }
 
@@ -754,6 +758,8 @@ public sealed partial class TestCluster
         if (_outOfProcess is { } launcher)
             await launcher.DisposeAsync();
         await Fabric.DisposeTransportsAsync(this);
+        if (_parent is null)
+            await Fabric.DisposeRelaysAsync();
 
         _liveCertificate?.Certificate.Dispose();
         _backupCertificate?.Certificate.Dispose();

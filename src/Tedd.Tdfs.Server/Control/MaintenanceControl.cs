@@ -28,6 +28,10 @@ internal sealed class MaintenanceControl
     private readonly NodeServices _s;
     private readonly Dictionary<NodeId, (ReportUsageMessage Report, long At)> _nodes = [];
     private readonly Dictionary<VolumeId, (VolumeUsageReport Report, NodeId From, long At)> _volumes = [];
+
+    /// <summary>Sequence number of the latest accepted summary per volume (orders summaries for migration completion).</summary>
+    private readonly Dictionary<VolumeId, ulong> _volumeSeq = [];
+    private ulong _reportSeq;
     private readonly Dictionary<NodeId, ulong> _scrubRequests = [];
     private readonly HashSet<VolumeId> _completing = [];
     private readonly HashSet<NodeId> _draining = [];
@@ -82,6 +86,7 @@ internal sealed class MaintenanceControl
             }
 
             _volumes[volume.Volume] = (volume, report.Node, now);
+            _volumeSeq[volume.Volume] = ++_reportSeq;
             if (volume.CompletedMigration is { } completed && record.MigrationTarget is { } target && completed == target)
                 CompleteMigration(record, target);
         }
@@ -368,6 +373,8 @@ internal sealed class MaintenanceControl
             {
                 // The policy transition is a reconfiguration of the volume (fault site F21 on the control leader).
                 await _s.HitAsync(FaultStage.F21, FaultSites.Reconfiguration, record.Name, DfsOperationKind.PolicyChange, detail: "complete-policy-migration");
+                if (!await CompletionStillHoldsAsync(record.Id, target))
+                    return;
                 using CancellationTokenSource deadline = _s.CreateDeadline();
                 ApplyOutcome outcome = await _s.Control.ProposeAsync(new CompletePolicyMigrationCommand(_s.Control.NewHeader(), record.Id, target), deadline.Token);
                 if (outcome.IsSuccess)
@@ -378,6 +385,46 @@ internal sealed class MaintenanceControl
                 _completing.Remove(record.Id);
             }
         });
+    }
+
+    /// <summary>
+    /// Re-validates a migration completion at the transition point (FSD §10.2: never declared effective before the migration
+    /// finished; CHA-002): the decision rests only on a summary the volume leader built after this point, never on one taken
+    /// before a holder (or a whole zone) was lost meanwhile. Summaries of one node are sequential (the next one is built only
+    /// after the reply to the previous one), so the second summary of the same sender accepted from here on was built after
+    /// this point; it must still report the migration complete, and the target must still be pending in the control state.
+    /// </summary>
+    private async Task<bool> CompletionStillHoldsAsync(VolumeId volume, DfsStoragePolicy target)
+    {
+        ulong from = _volumeSeq.GetValueOrDefault(volume);
+        long started = _s.Time.GetTimestamp();
+        NodeId? sender = null;
+        ulong first = 0;
+        TimeSpan budget = Freshness * 2;
+        while (_s.Control.IsLeader && _s.Time.GetElapsedTime(started) < budget)
+        {
+            ResetIfNewTerm();
+            if (State.FindVolume(volume) is not { } current || current.MigrationTarget != target)
+                return false;
+            ulong seq = _volumeSeq.GetValueOrDefault(volume);
+            if (seq > from && _volumes.TryGetValue(volume, out (VolumeUsageReport Report, NodeId From, long At) latest))
+            {
+                if (sender is null || sender != latest.From)
+                {
+                    sender = latest.From;
+                    first = seq;
+                }
+                else if (seq > first)
+                {
+                    return latest.Report.CompletedMigration == target;
+                }
+            }
+
+            // Timer-completed waits only (a delay completed by cancelling its token may resume off the node loop).
+            await Task.Delay(_s.Timings.InventoryInterval / 4, _s.Time);
+        }
+
+        return false;
     }
 
     private static IEnumerable<DfsStoragePolicy> PoliciesOf(VolumeRecord volume)
@@ -427,6 +474,7 @@ internal sealed class MaintenanceControl
         _term = term;
         _nodes.Clear();
         _volumes.Clear();
+        _volumeSeq.Clear();
         _scrubRequests.Clear();
         _scrubCounter = 0;
     }

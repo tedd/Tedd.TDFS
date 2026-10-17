@@ -6,6 +6,7 @@ using Tedd.Tdfs.Consensus;
 using Tedd.Tdfs.Server.Raft;
 using Tedd.Tdfs.Server.Runtime;
 using Tedd.Tdfs.Server.Volumes;
+using Tedd.Tdfs.Server.Volumes.Apply;
 using Tedd.Tdfs.Storage;
 
 namespace Tedd.Tdfs.Server;
@@ -74,11 +75,17 @@ public sealed partial class NodeInspector
     public Task<VolumeStateInspection?> GetVolumeStateAsync(string volume) => _loop.InvokeAsync(() =>
         S.Volumes.TryGet(volume)?.StateMachine is IVolumeStateInspection inspection ? inspection.Inspect() : null);
 
-    /// <summary>Bytes held under open staging sessions.</summary>
+    /// <summary>
+    /// Bytes of unpublished uploads stored on this node: copies of hosted volumes bound to an open staging session and not
+    /// referenced by any root of this replica's applied state.
+    /// </summary>
     public Task<long> GetStagedBytesAsync() => _loop.InvokeAsync(() =>
-        S.Volumes.Hosts.Select(h => h.StateMachine).OfType<IVolumeStateInspection>().Sum(i => i.StagedBytes));
+    {
+        IReadOnlyList<ObjectRecordInfo> records = S.ObjectStore.List();
+        return S.Volumes.Hosts.Select(h => h.StateMachine).OfType<VolumeStateMachine>().Sum(sm => sm.LocalStagedBytes(records));
+    });
 
-    /// <summary>Bytes retained only by pins.</summary>
+    /// <summary>Bytes the current namespaces no longer reference that snapshots or pins retain.</summary>
     public Task<long> GetPinnedBytesAsync() => _loop.InvokeAsync(() =>
         S.Volumes.Hosts.Select(h => h.StateMachine).OfType<IVolumeStateInspection>().Sum(i => i.PinnedBytes));
 

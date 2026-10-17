@@ -234,6 +234,7 @@ public sealed class FmtIntegrationTests
                 await vol.Files.WriteAllBytesAsync(path, bytes, Ct);
 
             DfsSnapshotInfo snapshot = await vol.Snapshots.CreateAsync("fmt010-src", null, Ct);
+            await vol.Backups.RequestSyncAsync(b0.TargetName, "fmt010-src", Ct);   // registered without an automatic schedule
             DfsBackupCheckpoint checkpoint = await vol.Backups.AwaitBackupSnapshotAsync(b0.TargetName, "fmt010-src", TimeSpan.FromSeconds(120), Ct);
             Assert.True(checkpoint.IsExactSnapshot);
             Assert.Equal(snapshot.Boundary, checkpoint.CoveredCommit);

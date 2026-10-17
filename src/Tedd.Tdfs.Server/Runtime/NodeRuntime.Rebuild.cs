@@ -38,7 +38,7 @@ internal sealed partial class NodeRuntime
         NodeServices s = Services;
         // Presents the release this node runs (like a seed join), not the build's full feature set and protocol range.
         var credentials = new NodeCredentials(Guid.Empty, s.NodeName, NodeId.New(s.Random), 0, s.BootId, s.Keys.NodeAuthKey, s.Release.Features,
-            s.Release.ProtocolMin, s.Release.ProtocolMax);
+            s.Release.ProtocolMin, s.Release.ProtocolMax) { TransportCertificate = s.TransportIdentity?.LocalCertificate };
         ulong incarnation = 0;
         ulong controlIndex = 0;
         bool answered = false;

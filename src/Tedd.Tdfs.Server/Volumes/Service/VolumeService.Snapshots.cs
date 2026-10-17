@@ -71,7 +71,10 @@ internal sealed partial class VolumeService
         IWireMessage reply = await MutateAsync(context, request, DfsOperationKind.DeleteSnapshot,
             (op, _) => Task.FromResult<VolumeCommand>(Stamp(new DeleteSnapshotCommand(request.Name), op)), cleanup: true);
         // Answered once the record is in the audit log (read-your-writes for the deleting administrator's auditor).
-        await _s.Control.ReportSecurityEventAndWaitAsync("volume:delete snapshot", reply is ErrorReplyMessage error ? "failed:" + error.Code : "ok",
+        // A protected recovery point that is not deleted (no permission, retention) is a refused attempt (SEC-018).
+        string outcome = reply is not ErrorReplyMessage error ? "ok"
+            : (error.Code is DfsErrorCode.AccessDenied or DfsErrorCode.RetentionProtected ? "refused:" : "failed:") + error.Code;
+        await _s.Control.ReportSecurityEventAndWaitAsync("volume:delete snapshot", outcome,
             "volume=" + Name + " snapshot=" + request.Name, principal);
         return reply;
     }

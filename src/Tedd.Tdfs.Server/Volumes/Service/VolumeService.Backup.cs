@@ -328,8 +328,11 @@ internal sealed partial class VolumeService
         {
             if (commit.IsNone)
                 throw new ArgumentException("CommitToken.None is not a commit boundary.");
-            if (commit.ClusterId != state.Config.ClusterId || commit.VolumeId != state.Config.Id)
-                throw new ArgumentException($"The commit token {commit} belongs to another volume; it cannot be compared with volume '{Name}'.");
+            // A token of another history is a typed, non-retryable identity error, never "not reached yet" (SNP-010).
+            if (commit.ClusterId != state.Config.ClusterId)
+                throw new DfsClusterIdentityException($"The commit token {commit} was issued by another cluster; it cannot be compared with volume '{Name}'.");
+            if (commit.VolumeId != state.Config.Id)
+                throw new DfsCrossVolumeException($"The commit token {commit} belongs to another volume; it cannot be compared with volume '{Name}'.");
             if (commit.VolumeEpoch != state.Config.Epoch)
                 throw new DfsEpochMismatchException($"The commit token {commit} belongs to epoch {commit.VolumeEpoch} of volume '{Name}' (now epoch {state.Config.Epoch}).");
         }

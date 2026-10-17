@@ -14,7 +14,10 @@ namespace Tedd.Tdfs.Server.Data;
 /// report tells the leader the node is up and holds nothing). The decision is the leader's (unreachable from every root,
 /// unprotected at the GC watermark, staging session closed); this node only deletes a reported copy whose record still
 /// matches the decision's (object, staging) pair, and ignores decisions of a superseded volume epoch. Every completed
-/// report is one GC sweep on this node (fault site <c>gc.sweep</c>, hit before anything is deleted). Runs on the node loop.
+/// report is one GC sweep on this node (fault site <c>gc.sweep</c>, hit before anything is deleted). The sweep runs beside
+/// the reporting: a slow or stalled sweep never holds up the next inventories, which keep replica health, staged-bytes
+/// accounting and holder liveness current (OPS-005); while a sweep of a volume runs, later reports of that volume skip theirs
+/// (their decisions are taken again by the next report). Runs on the node loop.
 /// </summary>
 internal sealed class InventoryReporter
 {
@@ -25,6 +28,12 @@ internal sealed class InventoryReporter
     private ulong _reports;
     private bool _running;
     private bool _again;
+
+    /// <summary>Volumes whose GC sweep is running.</summary>
+    private readonly HashSet<VolumeId> _sweeping = [];
+
+    /// <summary>The node that accepted the last inventory page of each volume (its leader then).</summary>
+    private readonly Dictionary<VolumeId, NodeId> _accepted = [];
 
     public InventoryReporter(NodeServices services)
     {
@@ -134,12 +143,30 @@ internal sealed class InventoryReporter
             last = await SendAsync(volume, message);
         }
 
-        if (last is null)
+        if (last is null || !_sweeping.Add(volume.Id))
             return;
+        InventoryReportResultMessage decision = last;
+        _s.Jobs.Run("gc-sweep", async () =>
+        {
+            try
+            {
+                await SweepAsync(volume, decision);
+            }
+            finally
+            {
+                _sweeping.Remove(volume.Id);
+            }
+        });
+    }
 
-        // One GC sweep per completed report, whether or not it deletes anything (fault site F20 on the sweeping node).
+    /// <summary>
+    /// One GC sweep per completed report, whether or not it deletes anything (fault site F20 on the sweeping node): deletes
+    /// the copies the leader's decision lists whose stored record still matches it.
+    /// </summary>
+    private async Task SweepAsync(VolumeRecord volume, InventoryReportResultMessage last)
+    {
         await _s.HitAsync(FaultStage.F20, FaultSites.GcSweep, volume.Name, DfsOperationKind.Gc, detail: _s.NodeName);
-        if (last.Delete.Count == 0 || _s.Control.State.FindVolume(volume.Id) is not { } current || last.VolumeEpoch < current.Epoch)
+        if (_s.IsStopping || last.Delete.Count == 0 || _s.Control.State.FindVolume(volume.Id) is not { } current || last.VolumeEpoch < current.Epoch)
             return;
 
         int deleted = 0;
@@ -160,7 +187,12 @@ internal sealed class InventoryReporter
         }
     }
 
-    /// <summary>Sends one page to the volume leader: the local service when this node leads, else the leader or a voter.</summary>
+    /// <summary>
+    /// Sends one page to the volume leader: the local service when this node leads, else the leader this node knows of (it
+    /// may host no replica of the group), the node that accepted this volume's last page, then the voters. A candidate that
+    /// cannot be reached (crashed, partitioned) is skipped like one answering <c>NotLeader</c>: a non-member always trying a
+    /// dead voter first would never report again, and its copies would stop counting (PERF-010).
+    /// </summary>
     private async Task<InventoryReportResultMessage> SendAsync(VolumeRecord volume, InventoryReportMessage message)
     {
         using CancellationTokenSource deadline = _s.CreateDeadline();
@@ -170,6 +202,8 @@ internal sealed class InventoryReporter
         var candidates = new List<NodeId>();
         if (_s.Raft.LeaderOf(volume.GroupName) is { } known)
             candidates.Add(known);
+        if (_accepted.TryGetValue(volume.Id, out NodeId previous))
+            candidates.Add(previous);
         candidates.AddRange(volume.Voters);
         var tried = new HashSet<NodeId>();
         Exception? lastFailure = null;
@@ -180,13 +214,22 @@ internal sealed class InventoryReporter
                 continue;
             try
             {
-                return (InventoryReportResultMessage)await _s.Peers.CallAsync(node, message, ct: deadline.Token);
+                var result = (InventoryReportResultMessage)await _s.Peers.CallAsync(node, message, ct: deadline.Token);
+                _accepted[volume.Id] = node;
+                return result;
             }
             catch (DfsUnavailableException ex) when (ex.ErrorCode == DfsErrorCode.NotLeader)
             {
                 lastFailure = ex;
                 if (ex.LeaderHint is { } hint && MemberAt(hint) is { } hinted && !tried.Contains(hinted))
                     candidates.Insert(i + 1, hinted);
+            }
+            catch (Exception ex) when ((ex is DfsUnavailableException or IOException or TimeoutException) && !deadline.IsCancellationRequested)
+            {
+                // Unreachable or unavailable: ask the next candidate.
+                lastFailure = ex;
+                if (_accepted.TryGetValue(volume.Id, out NodeId stale) && stale == node)
+                    _accepted.Remove(volume.Id);
             }
         }
 

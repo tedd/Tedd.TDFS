@@ -301,6 +301,14 @@ internal sealed class RpcInvoker
                 continue;
             }
 
+            if (!mutation && !error.Retryable && error.Code is DfsErrorCode.Unavailable or DfsErrorCode.NodeUnavailable)
+            {
+                // The serving node itself reports a dependency it could not reach and asks not to retry (for example a backup
+                // host none of whose endpoints answered a restore): a definite failure, not a sign of a missing leader.
+                request.OnDefinite?.Invoke();
+                throw ErrorOf(error, request);
+            }
+
             switch (error.Code)
             {
                 case DfsErrorCode.NotLeader:

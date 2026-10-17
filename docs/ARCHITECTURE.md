@@ -240,7 +240,7 @@ Command catalogue (all deterministic):
 `InitVolume`, `OpenSession`, `KeepAlive(session, handleIds, pinIndexUpdates)`, `ExpireSessions(list, leaderTime)`,
 `ExpireHandles(list)`, `OpenHandle`, `CloseHandle`, `CreateStaging`, `CloseStaging`, `CommitFile`,
 `WriteAll`, `Append`, `Copy`, `Move`, `Delete`, `CreateDirectory`, `SetPolicy`, `SetAcl`, `TxBegin`, `TxCommit`,
-`TxAbort`, `TxAcquireReservation`, `CreateSnapshot`, `DeleteSnapshot`, `SetSnapshotRetention`, `AcquirePin`,
+`TxAbort`, `TxAcquireReservation`, `CreateSnapshot`, `DeleteSnapshot`, `SetSnapshotRetention`, `ExpireSnapshots`, `AcquirePin`,
 `ReleasePin`, `FenceOperation`, `ReclaimDetached`, `PruneDerefLog`, `RecordBackupProgress`, `AbandonTransferLineage`,
 `RotateDataKey`, `MigratePolicy`.
 
@@ -326,7 +326,9 @@ Commit-and-snapshot variants put both in one entry. `MinimumCommit` → leader w
 cluster/volume/epoch, else rejected) before proposing. Default label `FilesystemConsistent`; `ApplicationConsistent`
 only when every declared adapter's prepare succeeded (adapters run client-side: prepare → snapshot → resume; abort
 path always resumes; resume failure is reported but the snapshot remains). Snapshot deletion removes the retention
-reference only; GC decides reclamation. Restore creates a **new volume** (new VolumeId, epoch 1) whose initial state
+reference only; GC decides reclamation. A snapshot whose retention expiry passed (and that is not held) is removed by the
+leader's maintenance (`ExpireSnapshots`, decided against the leader time in the entry): retention was its last obligation
+(CHA-014); readers and transfers keep their pinned roots. Restore creates a **new volume** (new VolumeId, epoch 1) whose initial state
 is the snapshot root with objects copied (server-side object copy to new ids owned by the new volume).
 
 Checkpoint serialization stores each distinct inode version `(InodeId, Revision)` once, then the current root and each

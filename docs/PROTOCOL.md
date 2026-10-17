@@ -97,7 +97,7 @@ count × ( varuint32 fieldId, u8 flags, bytes value )      flags: bit 0 = Requir
 ```
 
 * Field ids are unique within one block (duplicates are malformed). Version 1 defined **no** extension fields; fields added since are listed with their message (`RestoreSnapshot` field 1 `StoragePool`, `HelloChallenge` field 1 `ServerBootId`,
-  `RegisterIncarnation` field 1 `Release`, `RaftBatch` field 1 `CapabilityClock`).
+  `Hello` field 1 `TransportCertificate`, `RegisterIncarnation` field 1 `Release`, `RaftBatch` field 1 `CapabilityClock`).
 * An **unknown optional** extension is preserved on the decoded record (`Extensions`) and re-emitted when the record is
   re-encoded (for example when a node forwards a request), and is otherwise ignored (FMT-003).
 * An **unknown required** extension makes the whole message fail with `Unsupported` (FMT-002): a receiver never
@@ -716,7 +716,13 @@ First message on every connection (client → server, node → node). Declares t
 | 9 | `Principal` | `string?` | Principal to authenticate (clients only). |
 | 10 | `Nonce` | `bytes[32]` | Fresh random nonce of exactly `ProtocolInfo.NonceSize` bytes. |
 | 11 | `BootId` | `u128` | Process boot id of a node peer (0 for clients): random per process start, registered with the incarnation; a process with the registered incarnation but another boot id is a cloned disk and is fenced (`StaleIncarnation`, RSY-021). |
-| 12 | — | `extensions` | Terminal extension block. |
+| 12 | — | `extensions` | Terminal extension block (field 1, see below). |
+
+Extension fields (added after v1 shipped, §2.5):
+
+| Field id | Flags | Value | Meaning |
+|---|---|---|---|
+| 1 `TransportCertificate` | Optional | `bytes[32]` SPKI SHA-256, `timestamp` NotBefore, `timestamp` NotAfter | The certificate a node peer's transport listener presents (QUIC; absent for clients, backup peers and transports without certificates). TLS authenticates only the listening side of a connection, so a node whose transport pins server certificates also checks node peers on connections they open: their hello must declare a certificate whose SPKI pin it trusts and that is valid on its clock, else the handshake is refused with `AuthenticationFailed` (a member restarted with an unknown or expired certificate is never a trusted member, SEC-001). Bound into the transcript, so the node proof covers it. |
 
 #### `HelloChallenge` = 11 (`HelloChallengeMessage`)
 
@@ -3184,7 +3190,7 @@ Replica health of a volume (mirrors the SDK's `DfsReplicaHealth`).
 | 6 | `RepairBacklogBytes` | `varint` | Bytes waiting for repair. |
 | 7 | `PendingGcObjects` | `varint` | Objects waiting for garbage collection. |
 | 8 | `StagedBytes` | `varint` | Bytes in open staging sessions. |
-| 9 | `PinnedBytes` | `varint` | Bytes protected only by pins. |
+| 9 | `PinnedBytes` | `varint` | Bytes the current namespace no longer references that snapshots or pins (reader, transfer, version-pinned handles) retain. |
 | 10 | — | `extensions` | Terminal extension block. |
 
 #### `RequestHeader`

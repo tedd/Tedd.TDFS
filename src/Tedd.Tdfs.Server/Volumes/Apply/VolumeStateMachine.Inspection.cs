@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using Tedd.Tdfs.Server.Volumes.State;
+using Tedd.Tdfs.Storage;
 
 namespace Tedd.Tdfs.Server.Volumes.Apply;
 
@@ -9,8 +10,33 @@ internal sealed partial class VolumeStateMachine
     public VolumeStateInspection Inspect() => InspectState(_state);
 
     /// <inheritdoc />
-    /// <remarks>The replicated state records no upload sizes (they live on storage nodes until published): always 0.</remarks>
+    /// <remarks>
+    /// The replicated state records no upload sizes (they live on storage nodes until published): always 0. A node's stored
+    /// staged bytes are <see cref="LocalStagedBytes"/>.
+    /// </remarks>
     public long StagedBytes => 0;
+
+    /// <summary>
+    /// Bytes of the given stored copies of this volume that are unpublished uploads at the applied state: not referenced by
+    /// any root and bound to an open staging session (GC-015: a node's space held by uncommitted uploads).
+    /// </summary>
+    public long LocalStagedBytes(IEnumerable<ObjectRecordInfo> records)
+    {
+        ArgumentNullException.ThrowIfNull(records);
+        VolumeState s = _state;
+        HashSet<ObjectId>? reachable = null;
+        long total = 0;
+        foreach (ObjectRecordInfo record in records)
+        {
+            if (record.Volume != s.Config.Id || !s.Staging.TryGetValue(record.Staging.Value, out StagingRecord? staging) || !staging.IsOpen)
+                continue;
+            reachable ??= Reachable(s);
+            if (!reachable.Contains(record.Id))
+                total += record.Length;
+        }
+
+        return total;
+    }
 
     /// <inheritdoc />
     public long PinnedBytes => ComputePinnedBytes(_state);
@@ -108,17 +134,16 @@ internal sealed partial class VolumeStateMachine
     private static IReadOnlyList<ExtentInspection> Extents(StreamRecord stream)
         => stream.IsInline ? [] : stream.Extents.Select(e => new ExtentInspection(e.Offset, e.Length, e.Object, e.ObjectOffset, e.ObjectLength)).ToArray();
 
-    /// <summary>Bytes of objects referenced only through pins (pinned roots and version-pinned handles).</summary>
+    /// <summary>
+    /// Bytes of objects the current namespace no longer references that are retained only for history: snapshot retention
+    /// references, pinned roots (reader, enumeration and transfer pins) and version-pinned handles (GC-015, OPS-005: the
+    /// space a volume holds beyond its visible files).
+    /// </summary>
     internal static long ComputePinnedBytes(VolumeState s)
     {
         var live = new HashSet<ObjectId>();
         foreach (InodeRecord n in s.Inodes.Values)
             live.UnionWith(n.Objects());
-        foreach (SnapshotRecord snap in s.Snapshots.Values)
-        {
-            foreach (InodeRecord n in snap.Root.Values)
-                live.UnionWith(n.Objects());
-        }
 
         var pinned = new Dictionary<ObjectId, long>();
         void Add(InodeRecord n)
@@ -133,6 +158,12 @@ internal sealed partial class VolumeStateMachine
                         pinned[e.Object] = e.ObjectLength;
                 }
             }
+        }
+
+        foreach (SnapshotRecord snap in s.Snapshots.Values)
+        {
+            foreach (InodeRecord n in snap.Root.Values)
+                Add(n);
         }
 
         foreach (PinRecord p in s.Pins.Values)

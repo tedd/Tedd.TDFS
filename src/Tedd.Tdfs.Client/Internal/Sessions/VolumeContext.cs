@@ -49,6 +49,7 @@ internal sealed class VolumeContext : IRpcRouter
     private ulong _epoch;
     private string? _leader;
     private string? _lastLeader;   // the last endpoint known as leader (kept while the route is being rediscovered)
+    private long _leaderLearnedAt; // client clock timestamp when _leader was learned
 
     // Set when the latest route discovery found no node that knows a leader (cleared once one is found): an operation whose
     // deadline expires while it waits for another operation's request to this group (the session open it shares) reports
@@ -118,8 +119,13 @@ internal sealed class VolumeContext : IRpcRouter
             return Runtime.BackupHostEndpoint;
         lock (_sync)
         {
-            if (_leader is not null)
-                return _leader;
+            // A cached leader whose connection was lost since it was learned (the node restarted, or every node did) is
+            // rediscovered before the next transmission instead of being asked first: after a restart it may well no
+            // longer lead, and a transmission answered NotLeader still counts as possibly executed (PROTOCOL.md §5.1), so
+            // an avoidable redirect would turn a definite answer (an expired id, MUT-013) into an unknown outcome.
+            if (_leader is { } cached && !Runtime.Pool.LostSince(cached, _leaderLearnedAt))
+                return cached;
+            _leader = null;
         }
 
         return await RefreshRouteAsync(scope, attemptTimeout).ConfigureAwait(false);
@@ -134,6 +140,7 @@ internal sealed class VolumeContext : IRpcRouter
             {
                 _leader = hint;
                 _lastLeader = hint;
+                _leaderLearnedAt = Runtime.Time.GetTimestamp();
                 return;
             }
 
@@ -259,6 +266,7 @@ internal sealed class VolumeContext : IRpcRouter
                             {
                                 _leader = leader;
                                 _lastLeader = leader;
+                                _leaderLearnedAt = Runtime.Time.GetTimestamp();
                                 _suspects.Remove(leader);
                             }
 
@@ -779,6 +787,8 @@ internal sealed class VolumeContext : IRpcRouter
         {
             IWireMessage reply = await Runtime.Rpc.InvokeAsync(request, scope).ConfigureAwait(false);
             Finish(request, sdkAllocated, keepProtected);
+            // Every completed mutation is traced under its stable operation id, however many transmissions it took (OPS-007).
+            Runtime.Emit("operation.completed", $"{name} completed after {request.Transmissions} transmission(s).", request.Operation, transaction, Name);
             return new Bound<TReply>((TReply)reply, pinned ?? default, sent);
         }
         catch (DfsCommitOutcomeUnknownException)

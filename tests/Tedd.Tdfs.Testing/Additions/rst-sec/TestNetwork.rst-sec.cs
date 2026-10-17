@@ -26,9 +26,12 @@ public sealed partial class TestNetwork
     /// <b>below</b> the transport's integrity protection (SEC-011).
     /// </summary>
     /// <remarks>
-    /// For <see cref="TransportKind.Quic"/> the harness's datagram interposer (between the sender's and receiver's UDP
-    /// sockets) applies <paramref name="mode"/> to the encrypted QUIC packet(s) carrying the matched frame, after
-    /// encryption; the receiver's TLS 1.3 AEAD/QUIC packet protection must detect it. For
+    /// For <see cref="TransportKind.Quic"/> the harness's datagram interposer (a UDP relay between the sender's and receiver's
+    /// sockets, enabled by <see cref="TestClusterOptions.QuicDatagramInterposer"/>) applies <paramref name="mode"/> to the
+    /// next data-bearing encrypted QUIC datagram of the connection after the matched frame was handed to the transport, after
+    /// encryption; the receiver's TLS 1.3 AEAD/QUIC packet protection must reject it (a <see cref="TransportTamper.Replay"/>
+    /// duplicates the datagram: QUIC's packet-number duplicate detection discards the copy) and QUIC's loss recovery
+    /// retransmits the data, so the exchange completes unaltered or fails closed. For
     /// <see cref="TransportKind.InMemory"/> (and the deterministic simulated network) the harness applies the same
     /// mutation to the frame's protected envelope after the sender's integrity protection (MAC) is applied, so the
     /// receiver's integrity check must detect it. The application-level frame is never mutated before protection, so a
@@ -41,9 +44,10 @@ public sealed partial class TestNetwork
     /// <see cref="TransportTamper.Truncate"/>, <see cref="TransportTamper.AppendGarbage"/> or
     /// <see cref="TransportTamper.Scramble"/> fails the receiver's integrity check, so nothing reaches the receiving
     /// application and the connection is torn down (a fatal integrity error); a <see cref="TransportTamper.Replay"/>ed
-    /// transmission is discarded by the receiver's anti-replay check, so the original is delivered exactly once. QUIC
-    /// tampering needs a datagram interposer between MsQuic sockets, which this harness does not provide: the call throws
-    /// <see cref="NotSupportedException"/> for <see cref="TransportKind.Quic"/> rather than fabricating evidence.</para>
+    /// transmission is discarded by the receiver's anti-replay check, so the original is delivered exactly once. For QUIC
+    /// the rule's match count rises only when an encrypted datagram was really altered. A QUIC cluster created without
+    /// <see cref="TestClusterOptions.QuicDatagramInterposer"/> has no interposer: the call throws
+    /// <see cref="NotSupportedException"/> rather than fabricating evidence.</para>
     /// </remarks>
     public MessageRule TamperNext(MessageFilter filter, TransportTamper mode, int count = 1)
     {
@@ -51,10 +55,10 @@ public sealed partial class TestNetwork
         if (!Enum.IsDefined(mode))
             throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown tamper mode.");
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(count);
-        if (Fabric.Kind == TransportKind.Quic)
+        if (Fabric.Kind == TransportKind.Quic && !Fabric.UsesDatagramRelays)
         {
             throw new NotSupportedException(
-                "Tampering below QUIC packet protection requires a UDP datagram interposer between the MsQuic sockets, which the harness does not provide.");
+                "Tampering below QUIC packet protection requires the harness's UDP datagram interposer: create the cluster with TestClusterOptions.QuicDatagramInterposer = true.");
         }
 
         return AddRule(new MessageRule(filter, count, MessageRuleKind.Tamper, tamper: mode));

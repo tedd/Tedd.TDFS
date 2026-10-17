@@ -366,6 +366,7 @@ public sealed class PerfPerformanceTests
             // Backup barrier, measured separately.
             await vol.Snapshots.CreateAsync("perf004-s1", null, Ct);
             var backupTimer = Stopwatch.StartNew();
+            await vol.Backups.RequestSyncAsync(b0.TargetName, "perf004-s1", Ct);   // registered without an automatic schedule
             await vol.Backups.AwaitBackupSnapshotAsync(b0.TargetName, "perf004-s1", TimeSpan.FromSeconds(60), Ct);
             TimeSpan backupLatency = backupTimer.Elapsed;
 

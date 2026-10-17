@@ -110,6 +110,8 @@ internal sealed partial class RpcDispatcher
         {
             if (!HandshakeAuth.VerifyNodeProof(_s.Keys.NodeAuthKey, transcript, proof.Proof.Span))
                 return Refuse(state, DfsErrorCode.AuthenticationFailed, "Node authentication failed.", hello.Name);
+            if (UntrustedTransportCertificate(hello) is { } untrusted)
+                return Refuse(state, DfsErrorCode.AuthenticationFailed, untrusted, hello.Name);
             NodeId id = hello.NodeId!.Value;
             MemberRecord? member = _s.Control.State.FindMember(id);
             if (member is not null)
@@ -159,6 +161,27 @@ internal sealed partial class RpcDispatcher
         DfsPermissions clusterPermissions = _s.Control.State.IsClusterAdmin(principal) ? DfsPermissions.ClusterAdmin : DfsPermissions.None;
         return new HelloResultMessage(true, DfsErrorCode.None, string.Empty, principal, clusterPermissions, capabilities,
             HandshakeAuth.ComputeServerMac(verifier, transcript));
+    }
+
+    /// <summary>
+    /// Why a node peer's declared transport certificate is not trusted here, or null when it is (or this node's transport
+    /// pins nothing). TLS authenticates only the listening side of a QUIC connection, so a node that opens connections is
+    /// otherwise trusted on the cluster secret alone: with pinning, its hello must declare (covered by the node proof) a
+    /// certificate whose SPKI this node trusts and that is valid now — a member restarted with an unknown or expired
+    /// certificate is never a trusted member (SEC-001).
+    /// </summary>
+    private string? UntrustedTransportCertificate(HelloMessage hello)
+    {
+        if (_s.TransportIdentity is not { PinsPeers: true } identity)
+            return null;
+        if (hello.TransportCertificate is not { } declared)
+            return $"Node {hello.Name} declares no transport certificate; this node accepts only node peers with a trusted certificate.";
+        if (!identity.TrustsPin(declared.SpkiSha256))
+            return $"The transport certificate of node {hello.Name} is not trusted by this cluster.";
+        DateTimeOffset now = _s.Time.GetUtcNow();
+        if (now < declared.NotBefore || now > declared.NotAfter)
+            return $"The transport certificate of node {hello.Name} is not valid now (valid {declared.NotBefore:O} to {declared.NotAfter:O}).";
+        return null;
     }
 
     private HelloResultMessage Refuse(ConnectionState state, DfsErrorCode code, string message, string? who)

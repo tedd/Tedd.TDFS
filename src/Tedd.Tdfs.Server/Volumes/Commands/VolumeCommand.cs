@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using Tedd.Tdfs.Protocol;
+using Tedd.Tdfs.Server.Volumes.State;
 
 namespace Tedd.Tdfs.Server.Volumes.Commands;
 
@@ -42,6 +43,7 @@ internal enum VolumeCommandKind : ushort
     AcquirePin = 403,
     ReleasePin = 404,
     ExpirePins = 405,
+    ExpireSnapshots = 406,
 
     PruneDerefLog = 500,
     RestoreChunk = 510,
@@ -182,6 +184,13 @@ internal abstract record VolumeCommand
 
     /// <summary>Path for fault contexts, when the command addresses one.</summary>
     public virtual string? Path => null;
+
+    /// <summary>
+    /// Negative controls only (<see cref="SafetyMutations.SkipFencingCheck"/>, MUT-001): the stream of a writable handle that
+    /// has ended, as the leader remembered it, so the mutant can publish through the stale handle without any handle-validity
+    /// or generation check. Never set otherwise. Encoded as optional command extension 1.
+    /// </summary>
+    public StreamKey? FencingFallback { get; init; }
 
     /// <summary>Writes the command-specific body.</summary>
     internal abstract void WriteBody(ref WireWriter w);

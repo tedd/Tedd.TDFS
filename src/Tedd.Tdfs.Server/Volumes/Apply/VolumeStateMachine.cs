@@ -175,6 +175,7 @@ internal sealed partial class VolumeStateMachine : IReplicatedStateMachine, ICom
         AcquirePinCommand c => ApplyAcquirePin(s, ctx, c),
         ReleasePinCommand c => ApplyReleasePin(s, ctx, c),
         ExpirePinsCommand c => ApplyExpirePins(s, ctx, c),
+        ExpireSnapshotsCommand c => ApplyExpireSnapshots(s, ctx, c),
 
         PruneDerefLogCommand c => ApplyPrune(s, ctx, c),
         RestoreChunkCommand c => ApplyRestoreChunk(s, ctx, c),

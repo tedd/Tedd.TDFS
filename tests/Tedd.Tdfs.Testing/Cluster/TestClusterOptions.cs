@@ -72,6 +72,13 @@ public sealed record TestClusterOptions
     public bool OutOfProcess { get; init; } = false;
 
     /// <summary>
+    /// QUIC only: every connection a fabric transport opens runs through its own UDP relay in the harness, which forwards the
+    /// encrypted datagrams unchanged unless <see cref="TestNetwork.TamperNext"/> arms it to alter one (SEC-011: tampering
+    /// below QUIC packet protection). Off by default (one extra loopback hop per connection).
+    /// </summary>
+    public bool QuicDatagramInterposer { get; init; } = false;
+
+    /// <summary>
     /// The software release every live node of the cluster is created and bootstrapped by (null: the build under test);
     /// set by <see cref="VersionedClusterTest.RunAsync"/> (FMT suite).
     /// </summary>
