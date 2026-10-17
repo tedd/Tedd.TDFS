@@ -1,6 +1,6 @@
 # Tedd.TDFS — Release evidence (VER-07)
 
-**Build:** `main` @ 65ec067 (plus the fixes listed in §6 once merged) · **Date:** 2026-10-17 ·
+**Build:** `main` @ da5e67d · **Date:** 2026-10-17 ·
 **Environment:** Windows 11 Pro 10.0.26200, .NET SDK 10.0.401 (`net10.0`), 32 logical cores, 128 GB RAM, MsQuic
 (Schannel) via Tedd.Quicly 0.2.2.
 
@@ -12,15 +12,16 @@ exploration bounds actually exercised.
 
 | Project | Level | Run | Passed | Failed | Skipped |
 |---|---|---|---|---|---|
-| `Tedd.Tdfs.Tests.Unit` | U (+ internal component tests) | 5,128 | 5,128 | 0 | 0 |
-| `Tedd.Tdfs.Tests.Simulation` | S (deterministic and in-process multi-node) | 3,435 | 3,434 | 1 | 0 |
-| `Tedd.Tdfs.Tests.Integration` | I / H (real QUIC, real disks, real processes) | 472 | 458 | 2 | 12 |
+| `Tedd.Tdfs.Tests.Unit` | U (+ internal component tests) | 5,130 | 5,130 | 0 | 0 |
+| `Tedd.Tdfs.Tests.Simulation` | S (deterministic and in-process multi-node) | 3,435 | 3,435 | 0 | 0 |
+| `Tedd.Tdfs.Tests.Integration` | I / H (real QUIC, real disks, real processes) | 472 | 460 | 0 | 12 |
 | `Tedd.Tdfs.Tests.Performance` | P | 16 | 16 | 0 | 0 |
 | `Tedd.Tdfs.Tests.Models` | M (bounded model checking) | 57 | 57 | 0 | 0 |
-| **Total** | | **9,108** | **9,093** | **3** | **12** |
+| **Total** | | **9,110** | **9,098** | **0** | **12** |
 
-The three failures and their status are in §6. Wall time of a full run: Unit 7 min, Simulation 27 min, Integration
-10 min, Performance 2 min, Models 18 min.
+Every executed test passes; the 12 skips are hardware-rig rows (§5). Restart-heavy integration tests were additionally
+run 700 times across 4 parallel processes and PERF-013 10 times with no failure. Wall time of a full run: Unit 7 min,
+Simulation 27 min, Integration 11 min, Performance 2 min, Models 14–18 min.
 
 ## 2. Requirement and catalog coverage
 
@@ -91,8 +92,10 @@ The three failures and their status are in §6. Wall time of a full run: Unit 7 
 
 | Item | Status |
 |---|---|
-| NET-013 slow-leader-node: reply/connect timeouts do not adapt to a sudden 400 ms one-way latency, so lease-granting calls end as outcome-unknown | Fix in progress (RTT-adaptive timeouts) |
-| SEC-018: under a flood of denied admin attempts the audit rate limiter drops some denial entries | Fix in progress (no silent audit loss) |
+| NET-013 slow-leader-node: timeouts did not adapt to a sudden 400 ms one-way latency | **Fixed**: per-endpoint smoothed RTT/variance timeouts, silence-window liveness, RTT-aware keep-alives, upload backpressure |
+| SEC-018: under a flood of denied attempts some denial audit entries were dropped | **Fixed**: lossless queued audit with explicit aggregation records; denials replied only after their audit entry commits |
+| DSK-014 restart on the same QUIC port intermittently failed with `ADDRESS_IN_USE` | **Fixed** (harness): MsQuic keeps a crashed node's port bound until half-open handshakes time out (10–13 s); restarts wait for release, ports are reserved machine-wide |
+| PERF-013 thread growth | **Resolved**: caused by the test platform's telemetry uploader, now disabled for test hosts; no product leak |
 | Old data-key versions are never retired; node-local key files keep keys of deleted volumes | Known limitation |
 | Object encoding 2 (per-volume keys) has no minimum-reader marker, so an older build would refuse rather than be blocked up front (FMT-006 intent) | Known limitation |
 | A node restarted on an empty replacement disk is fenced as a stale incarnation; it must be removed and re-added under a new node id | By design for now; documented in OPERATIONS §6 |
