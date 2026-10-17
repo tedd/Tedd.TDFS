@@ -672,7 +672,8 @@ public sealed partial class TestCluster
         };
 
         Record($"foreign node {name}: start on {listenEndpoint} (cluster {clusterId})");
-        await PortAllocator.WaitUntilFreeAsync(listenEndpoint, TimeSpan.FromSeconds(10), Runtime); // the displaced node's listener
+        if (await PortAllocator.WaitUntilFreeAsync(listenEndpoint, PortAllocator.ReleaseTimeout, Runtime) is { } portWait) // the displaced node's listener
+            Record($"foreign node {name}: {portWait}");
         NodeHost host = await NodeHost.StartAsync(options, environment, ct);
         var foreign = new ForeignNode(name, host, clusterId);
         lock (_gate)

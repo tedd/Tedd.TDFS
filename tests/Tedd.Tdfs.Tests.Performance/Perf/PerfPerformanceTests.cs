@@ -1083,10 +1083,17 @@ public sealed class PerfPerformanceTests
 
     /// <summary>
     /// Repeats cancelled reads and writes, unknown-outcome writes, connection resets and failing stream disposals. After
-    /// safe cleanup (lease expiry), no handles, open staging sessions or pins remain, and live memory and thread count at
-    /// the end of the soak stay within 16 MiB / 8 threads of the early sample; cancellations surface only as cancellation
-    /// or unknown outcome, and the file holds exactly the last confirmed write or one of the later unknown-outcome writes.
+    /// safe cleanup (lease expiry), no handles, open staging sessions or pins remain, and live memory, thread count and
+    /// active timers (pending delays, keep-alives, retry and reply-timeout waits) at the end of the soak stay within
+    /// 16 MiB / 8 threads / 16 timers of the early sample; cancellations surface only as cancellation or unknown outcome,
+    /// and the file holds exactly the last confirmed write or one of the later unknown-outcome writes.
     /// </summary>
+    /// <remarks>
+    /// Threads are counted for the whole process, which only measures the product and the harness because the test host is
+    /// hermetic: the test platform's telemetry extension is not registered (see Directory.Build.targets). With it, its HTTP
+    /// uploads started operating-system thread-pool threads (proxy discovery, DNS) in the middle of the soak and the count
+    /// rose by ten threads that retired again a minute later.
+    /// </remarks>
     [Fact, Catalog("PERF-013", "P", "INV-16", "INV-17")]
     public async Task PERF_013_CancellationAndFailureLeakSoak()
     {
@@ -1105,7 +1112,7 @@ public sealed class PerfPerformanceTests
             var possible = new List<byte[]> { last };
             // u0 opens its session up front, so the dropped replies below hit the WriteAll itself, not session setup.
             await unknownClient.GetVolume(Vol).Files.WriteAllBytesAsync("/perf013/u-init", TestData.Bytes(13_999, 100), Ct);
-            var samples = new List<(int Iteration, long Live, int Threads)>();
+            var samples = new List<(int Iteration, long Live, int Threads, int PoolThreads, long Timers)>();
 
             for (int i = 1; i <= iterations; i++)
             {
@@ -1159,18 +1166,24 @@ public sealed class PerfPerformanceTests
                     Assert.DoesNotContain(state.Handles, h => !h.Expired);
                     Assert.DoesNotContain(state.Staging, s => s.Open);
                     Assert.Empty(state.Pins);
-                    samples.Add((i, PerfHelpers.LiveBytes(), Process.GetCurrentProcess().Threads.Count));
+                    long live = PerfHelpers.LiveBytes();
+                    using Process process = Process.GetCurrentProcess();
+                    samples.Add((i, live, process.Threads.Count, ThreadPool.ThreadCount, Timer.ActiveCount));
                 }
             }
 
-            (int _, long earlyLive, int earlyThreads) = samples[0];
-            (int _, long lateLive, int lateThreads) = samples[^1];
+            (int _, long earlyLive, int earlyThreads, int earlyPool, long earlyTimers) = samples[0];
+            (int _, long lateLive, int lateThreads, int latePool, long lateTimers) = samples[^1];
             PerfHelpers.Report("perf013.live-memory.early", earlyLive / 1048576.0, "MiB", context);
             PerfHelpers.Report("perf013.live-memory.late", lateLive / 1048576.0, "MiB", context);
             PerfHelpers.Report("perf013.threads.early", earlyThreads, "threads", context);
             PerfHelpers.Report("perf013.threads.late", lateThreads, "threads", context);
+            PerfHelpers.Report("perf013.timers.early", earlyTimers, "timers", context);
+            PerfHelpers.Report("perf013.timers.late", lateTimers, "timers", context);
             Assert.True(lateLive - earlyLive <= 16L << 20, $"live memory grew by {lateLive - earlyLive} bytes over the soak");
-            Assert.True(lateThreads - earlyThreads <= 8, $"thread count grew from {earlyThreads} to {lateThreads}");
+            Assert.True(lateThreads - earlyThreads <= 8,
+                $"thread count grew from {earlyThreads} to {lateThreads} (thread-pool threads {earlyPool} -> {latePool})");
+            Assert.True(lateTimers - earlyTimers <= 16, $"active timers grew from {earlyTimers} to {lateTimers} over the soak");
 
             byte[] final = await vol.Files.ReadAllBytesAsync("/perf013/file", Ct);
             Assert.True(possible.Any(p => p.AsSpan().SequenceEqual(final)),

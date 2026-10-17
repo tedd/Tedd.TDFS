@@ -142,6 +142,12 @@ internal sealed class QuiclyRpcTransport : IRpcTransport, IRpcTransportControl, 
     /// Completes once disposal has released every native MsQuic resource of this transport (the registration close,
     /// which waits for MsQuic to finish closing every connection, runs in the background after <see cref="DisposeAsync"/>).
     /// </summary>
+    /// <remarks>
+    /// The listen port can stay bound a while longer: MsQuic creates the connection for an arriving Initial under its own
+    /// internal registration and moves it to this transport's registration only when the listener accepts it, so a
+    /// handshake left half-open when the listener stopped keeps the UDP binding until MsQuic's default handshake idle
+    /// timeout (10 s) and the closing period end. An in-process restart on the same port waits for the port itself.
+    /// </remarks>
     internal Task NativeResourcesReleased => _nativeReleased.Task;
 
     /// <summary>True when no client buffer pool exists or it has been disposed (every client peer returned its memory).</summary>

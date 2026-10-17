@@ -320,7 +320,8 @@ public sealed partial class TestBackupNode : IFaultTarget, IObjectStoreAccess
         lock (_gate)
             _view = view;
         cluster.Record($"backup {Name}: start #{start.ToString(CultureInfo.InvariantCulture)}");
-        await PortAllocator.WaitUntilFreeAsync(Options.ListenEndpoint, TimeSpan.FromSeconds(10), cluster.Runtime);
+        if (await PortAllocator.WaitUntilFreeAsync(Options.ListenEndpoint, PortAllocator.ReleaseTimeout, cluster.Runtime) is { } portWait)
+            cluster.Record($"backup {Name}: {portWait}");
 
         BackupNodeHost host;
         try

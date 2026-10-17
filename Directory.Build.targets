@@ -1,0 +1,14 @@
+<Project>
+  <!--
+    Test hosts run hermetically: the Microsoft.Testing.Platform telemetry extension (pulled in by
+    Microsoft.Testing.Extensions.CodeCoverage) is not registered. Left on, it sends Application Insights telemetry over
+    HTTP from inside the test process while tests run: system proxy discovery (WinHTTP, RPC to the DHCP client) and DNS
+    resolution start operating-system thread-pool threads and open handles at arbitrary moments of a test, which corrupts
+    the process-wide resource measurements of the performance suite (PERF-013 saw +10 threads, +140 handles that
+    belonged to neither the product nor the harness) and adds network traffic no test controls. Removed here (after the
+    package props added the hook) rather than through TESTINGPLATFORM_TELEMETRY_OPTOUT, which every runner would need.
+  -->
+  <ItemGroup Condition="'$(IsTestProject)' == 'true'">
+    <TestingPlatformBuilderHook Remove="98058041-B5B6-4A75-9834-58E6DF796A22" />
+  </ItemGroup>
+</Project>

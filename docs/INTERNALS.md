@@ -412,7 +412,8 @@ Simulation/    SimScheduler, SimNodeLoop, SimTimeProvider, SimNetwork (determini
 Inspection/    ClusterInspector (harness ground truth from node inspectors)
 Protocol/      RawProtocolClient
 Internal/      ClusterRuntime (realtime vs deterministic execution context), out-of-process launcher (HostProcess runs
-               src/Tedd.Tdfs.Host), PortAllocator, HarnessNodeLog
+               src/Tedd.Tdfs.Host), PortAllocator (planned QUIC ports, reserved machine-wide; a start on a reused
+               endpoint waits for the earlier transport's listener release), HarnessNodeLog
 Raft/          RaftSimulation
 History/, Models/, Catalog/, Data/   (implemented)
 Additions/     suite-requested additions (partials), one folder per suite group

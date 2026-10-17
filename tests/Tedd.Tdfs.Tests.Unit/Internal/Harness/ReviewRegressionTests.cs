@@ -382,6 +382,30 @@ public sealed class ReviewRegressionTests
         Assert.All(ports, p => Assert.InRange(p, 1024, 32767));
     }
 
+    [Fact]
+    public void PlannedQuicPorts_AreReservedMachineWide()
+    {
+        // A stopped node's port is free until its restart binds it again: another test process must not allocate it
+        // meanwhile. Each issued port holds a named system reservation, which another allocator opens instead of creating.
+        int port = PortAllocator.Allocate();
+        using var other = new System.Threading.Mutex(false, PortAllocator.ReservationPrefix + port.ToString(System.Globalization.CultureInfo.InvariantCulture), out bool createdNew);
+        Assert.False(createdNew, $"port {port} was handed out without a machine-wide reservation");
+    }
+
+    [Fact]
+    public void BoundUdpPort_OwnerIsNamedInTheTrace()
+    {
+        // A start whose port stayed bound names the process holding it, so the trace tells a lingering listener of this
+        // process from another program.
+        Assert.SkipUnless(OperatingSystem.IsWindows(), "the owner lookup uses the Windows IP helper tables");
+        using var socket = new System.Net.Sockets.Socket(System.Net.Sockets.AddressFamily.InterNetwork, System.Net.Sockets.SocketType.Dgram, System.Net.Sockets.ProtocolType.Udp);
+        socket.Bind(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0));
+        int port = ((System.Net.IPEndPoint)socket.LocalEndPoint!).Port;
+        string owners = UdpPortOwners.Describe(port);
+        Assert.Contains($"pid {Environment.ProcessId} (", owners, StringComparison.Ordinal);
+        Assert.Contains("this process", owners, StringComparison.Ordinal);
+    }
+
     // ------------------------------------------------------------------------------------------------ helpers
 
     private static string NewScratchDirectory(string purpose)
