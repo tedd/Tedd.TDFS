@@ -125,6 +125,51 @@ public sealed class ContentAlgebraTests
         return (large is { Count: > 0 } || (small?.Any(s => s is ExtentRef) ?? false), small?.Any(s => s is InlineSegment) ?? false);
     }
 
+    // Three positions cover equality, adjacency, containment, and partial overlap in either order.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void AllThreeByteTwoEditPublicationsMatchArraySemantics(bool inline)
+    {
+        const int width = 3;
+        StreamChange Write(int start, int length, ulong source) => inline
+            ? Inline(start, Enumerable.Range(0, length).Select(i => ObjectByte(Obj(source), i + 1)).ToArray())
+            : DataChange(start, length, Obj(source), 1, 1, width + 1);
+
+        IEnumerable<StreamChange> Edits(ulong source)
+        {
+            for (int start = 0; start < width; start++)
+                for (int length = 1; start + length <= width; length++)
+                {
+                    yield return Zero(start, length);
+                    yield return Write(start, length, source);
+                }
+        }
+
+        StreamRecord initial = ContentAlgebra.Apply(null, -1, [Write(0, width, 1)], width, inline, width, 1).Stream!;
+        byte[] original = Enumerable.Range(0, width).Select(i => ObjectByte(Obj(1), i + 1)).ToArray();
+        foreach (StreamChange first in Edits(2))
+        foreach (StreamChange second in Edits(3))
+        for (int cut = 0; cut <= width; cut++)
+        for (int length = 0; length <= width + 1; length++)
+        {
+            byte[] expected = new byte[width + 1];
+            Array.Copy(original, expected, cut);
+            ApplyBytes(first, 2);
+            ApplyBytes(second, 3);
+            ContentResult result = ContentAlgebra.Apply(initial, cut, [first, second], length, inline, width + 1, 2);
+            Assert.True(result.Stream is not null, result.Message);
+            Assert.Equal(expected[..length], Materialize(result.Stream));
+            Assert.Equal(original, Materialize(initial));
+
+            void ApplyBytes(StreamChange edit, ulong source)
+            {
+                for (int i = 0; i < edit.Length; i++)
+                    expected[edit.Offset + i] = edit.ChangeKind == RangeChangeKind.Zero ? (byte)0 : ObjectByte(Obj(source), i + 1);
+            }
+        }
+    }
+
     [Fact]
     public void TruncateThenExtendLeavesAHole()
     {

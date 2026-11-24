@@ -251,7 +251,8 @@ public sealed partial class DfsDirectoryClient
                 {
                     // Later pages read the version pinned by the first one, in the volume that answered it.
                     binding ??= page.PinnedAt.IsNone ? Context.CurrentBinding : new VolumeBinding(page.PinnedAt.VolumeId, page.PinnedAt.VolumeEpoch);
-                    if (page.EnumerationPin != 0)
+                    // A snapshot listing borrows the view's pin. The view owns its renewal and release.
+                    if (page.EnumerationPin != 0 && page.EnumerationPin != Pin)
                     {
                         pin = page.EnumerationPin;
                         Context.RegisterPin(pin, Context.CurrentSession, holder);

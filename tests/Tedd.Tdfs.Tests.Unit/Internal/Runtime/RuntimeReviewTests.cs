@@ -210,7 +210,8 @@ public sealed class RuntimeReviewTests
         follower.Medium.Faults.FailNextFlushes = 1;
         for (int i = 0; i < 10; i++)
             Assert.True((await ProposeAsync(leader.Host!, group, "after-" + i, Ct)).IsSuccess);
-        Assert.Equal(0, follower.Medium.Faults.FailNextFlushes);
+        await RuntimeCluster.WaitUntilAsync(() => Task.FromResult(follower.Medium.Faults.FailNextFlushes == 0),
+            "the follower attempted its journal flush");
         follower.Medium.Faults.Reset();
 
         (long count, string hash, _) = await RuntimeVolumeTests.VolumeSummaryAsync(leader.Host!, "vol");

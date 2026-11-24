@@ -319,9 +319,13 @@ public sealed class SimSchedulerTests
         var s = new SimScheduler(3, new SimSchedulerOptions { StallGracePeriod = TimeSpan.FromSeconds(5) });
         SimNodeLoop loop = s.LoopFactory.Create("n0");
         bool done = false;
+        var fired = new TaskCompletionSource();
+        using var timer = new Timer(_ => fired.SetResult(), null, Timeout.Infinite, Timeout.Infinite);
         loop.Post(async () =>
         {
-            await Task.Delay(20, TestContext.Current.CancellationToken);
+            // Arm the real timer on the next loop turn, after the await has captured the node context.
+            loop.Post(() => timer.Change(0, Timeout.Infinite));
+            await fired.Task;
             done = true;
         });
 

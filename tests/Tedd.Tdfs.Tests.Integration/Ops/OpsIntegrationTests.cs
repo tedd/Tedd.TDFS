@@ -44,9 +44,11 @@ public sealed class OpsIntegrationTests
             {
                 // (1) Observation creates no durability evidence.
                 NodeCounters before = await cluster.Inspect.GetTotalCountersAsync();
+                long initialCalls = poller.Calls;
                 await Task.Delay(TimeSpan.FromSeconds(2), Ct);
+                await cluster.WaitUntilAsync(() => Task.FromResult(poller.Calls - initialCalls > 20),
+                    TimeSpan.FromSeconds(30), "more than 20 successful health calls during the observation window", Ct);
                 NodeCounters after = await cluster.Inspect.GetTotalCountersAsync();
-                Assert.True(poller.Calls > 20, $"the poller must have been busy ({poller.Calls} calls)");
                 Assert.Equal(before.ReceiptsIssued, after.ReceiptsIssued);
                 Assert.Equal(before.ObjectPuts, after.ObjectPuts);
                 Assert.Equal(before.ObjectBytesStored, after.ObjectBytesStored);
