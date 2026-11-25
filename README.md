@@ -1,124 +1,117 @@
 # Tedd.TDFS
 
-Tedd's Distributed File System: a self-contained, replicated, strongly consistent filesystem for .NET, used directly
-from a client library. There is no mount, FUSE driver or external coordination service; applications use familiar file
-operations and ordinary `System.IO.Stream` consumers.
+Tedd.TDFS is a replicated filesystem for .NET applications. Connect to a cluster over QUIC, open a named volume, and read or write paths through a C# client. Files open as ordinary `System.IO.Stream` instances. Each volume has its own namespace, permissions, transactions, and snapshots.
 
-* **Strong consistency.** Every volume's metadata is a Raft group; reads are linearizable, writes are durable when they
-  return, and explicit transactions are strictly serializable.
-* **Replicated, zone-aware storage.** Immutable data extents placed by deterministic rendezvous hashing across failure
-  domains, with separate *target* and *acknowledged* copy counts, repair, rebalance, scrubbing and safe garbage
-  collection.
-* **Familiar API.** `DfsStream : Stream`, `ReadAllText`/`WriteAllBytes`/`Copy`/`Move`/`Delete`, version-pinned
-  directory enumeration, `FileMode`/`FileAccess`/`FileShare` semantics with cluster-enforced sharing and writer fencing.
-* **NTFS-style permissions.** Owners, allow/deny ACEs for users and groups, inheritance flags, canonical evaluation order.
-* **Alternate data streams.** `"/dir/file.txt:stream"`, removed together with their file.
-* **Volumes and storage pools.** Volumes are separate namespaces; pools pin a volume's (or a policy's) data to a set of
-  nodes.
-* **Snapshots and late-sync backups.** O(1) immutable snapshots, commit-and-snapshot, application-consistent snapshot
-  adapters, and independent read-only backup hosts that receive complete snapshots incrementally.
-* **Secure by default.** QUIC (TLS 1.3) transport via [Tedd.Quicly](https://www.nuget.org/packages/Tedd.Quicly.Core),
-  challenge-response authentication, server-side authorization on every path, encryption at rest.
+[Project website](https://tedd.no/Tedd.TDFS/) · [API reference](docs/API.md) · [Operations guide](docs/OPERATIONS.md)
 
-Requirements and design: [FSD](docs/spec/distributed-filesystem-fsd.md), [addendum](docs/spec/fsd-addendum-acl-pools-streams.md),
-[test plan](docs/spec/distributed-filesystem-test-plan.md), [architecture](docs/ARCHITECTURE.md),
-[protocol](docs/PROTOCOL.md), [API contract](docs/API.md), [internals](docs/INTERNALS.md),
-[operations guide](docs/OPERATIONS.md).
+## How a write becomes durable
 
-## Quick start (client)
+For a file stored outside metadata, the client first stages immutable data on storage nodes. The volume's policy sets how many distinct hosts and zones must acknowledge durable copies. The volume's Raft group then commits the metadata revision that makes those bytes visible. Small files can be stored inline in the metadata revision.
+
+The default storage policy targets three copies in three zones and requires two copies in two zones before acknowledgement. Background repair fills the remaining target. A metadata quorum is also required. Stream writes stay private until a flush, explicit commit, or successful disposal. Use a transaction to publish changes to several files together.
+
+## Run a local node
+
+Use a .NET SDK compatible with [global.json](global.json) (10.0.401 or a later .NET 10 feature band or patch) and a host with MsQuic support. The example uses an available UDP port 7100 on loopback. Start from a fresh checkout in a directory where you can create a private sibling directory named `tdfs-demo`.
+
+```sh
+git clone https://github.com/tedd/Tedd.TDFS.git
+cd Tedd.TDFS
+dotnet build src/Tedd.Tdfs.Host -c Release
+mkdir ../tdfs-demo
+dotnet src/Tedd.Tdfs.Host/bin/Release/net10.0/Tedd.Tdfs.Host.dll bootstrap --name n0 --listen quic://127.0.0.1:7100 --storage ../tdfs-demo/data --out ../tdfs-demo/node.json > ../tdfs-demo/bootstrap.json
+dotnet src/Tedd.Tdfs.Host/bin/Release/net10.0/Tedd.Tdfs.Host.dll node --config ../tdfs-demo/node.json
+```
+
+Wait for `TDFS-READY` and leave the host running. Bootstrap creates the node configuration, development certificate, and a summary containing the generated admin secret and certificate pin. Keep the demo directory private. To restart this node, repeat only the last command.
+
+## Write and read a file
+
+In a second terminal, start in the repository root. Create a console application and reference the client SDK from the checkout.
+
+```sh
+dotnet new console -f net10.0 -o ../tdfs-demo/client
+dotnet add ../tdfs-demo/client/client.csproj reference src/Tedd.Tdfs.Client/Tedd.Tdfs.Client.csproj
+```
+
+Replace the demo client's `Program.cs` with the following code. It uses the bootstrap identity to provision a volume with one voter and one data copy, suitable for a single development node.
 
 ```csharp
+using System.Text.Json;
 using Tedd.Tdfs;
 
+using var bootstrap = JsonDocument.Parse(File.ReadAllText("../bootstrap.json"));
+var settings = bootstrap.RootElement;
 await using var client = await DfsClient.ConnectAsync(new DfsClientOptions
 {
-    SeedEndpoints = ["quic://10.0.0.11:7100", "quic://10.0.0.12:7100"],
-    Credentials = new DfsCredentials("app", secret),
-    Security = new DfsTransportSecurity { PinnedSpkiSha256 = [clusterCertificatePin] },
-}, ct);
+    SeedEndpoints = ["quic://127.0.0.1:7100"],
+    ExpectedClusterId = settings.GetProperty("clusterId").GetGuid(),
+    Credentials = new DfsCredentials("admin", settings.GetProperty("adminSecret").GetString()!),
+    Security = new DfsTransportSecurity
+    {
+        PinnedSpkiSha256 = [Convert.FromHexString(settings.GetProperty("certificatePin").GetString()!)],
+    },
+});
 
-DfsVolume volume = client.GetVolume("application");
-await volume.Directories.CreateDirectoryAsync("/documents", ct);
-await volume.Files.WriteAllTextAsync("/documents/settings.json", "{\"enabled\":true}", ct);
-
-await using (Stream input = await volume.Files.OpenReadAsync("/documents/settings.json", ct))
-using (var reader = new StreamReader(input))
-    Console.WriteLine(await reader.ReadToEndAsync(ct));
-
-// Atomic multi-file update
-await using (DfsTransaction tx = await volume.Transactions.BeginAsync(ct: ct))
+if (!(await client.Admin.ListVolumesAsync()).Contains("demo"))
 {
-    await tx.Files.WriteAllTextAsync("/state/balance.json", balanceJson, ct);
-    await tx.Files.WriteAllTextAsync("/state/ledger.json", ledgerJson, ct);
-    CommitToken committed = await tx.CommitAsync(ct);
+    await client.Admin.CreateVolumeAsync(new DfsVolumeSpec
+    {
+        Name = "demo",
+        Metadata = new DfsMetadataPolicy { Voters = 1 },
+        DefaultPolicy = new DfsStoragePolicy
+        {
+            TargetCopies = 1, TargetDistinctZones = 1,
+            DurableCopiesBeforeAck = 1, DurableZonesBeforeAck = 1,
+        },
+    });
 }
 
-// Snapshot, then read it
-await volume.Snapshots.CreateAsync("nightly-2026-10-16", ct: ct);
-await using DfsSnapshotView view = await volume.Snapshots.OpenAsync("nightly-2026-10-16", ct);
-byte[] old = await view.Files.ReadAllBytesAsync("/documents/settings.json", ct);
+var volume = client.GetVolume("demo");
+await volume.Files.WriteAllTextAsync("/hello.txt", "Hello from TDFS");
+Console.WriteLine(await volume.Files.ReadAllTextAsync("/hello.txt"));
 ```
 
-Write semantics worth knowing (FSD §5.4, §6.3):
-
-* Stream writes are private until `Flush`/`FlushAsync`, `CommitAsync` or a successful `Dispose`; a flush publishes one
-  complete revision and returns only after the volume's durability policy is met. `DfsWriteMode.WriteThrough` publishes
-  every write call.
-* `WriteAll*`, `Copy` and the `Append*` helpers are atomic and durable on return and preserve the destination's inode.
-* `ExistsAsync` returns `false` only for genuine absence; permission, connectivity and integrity failures throw.
-* A possibly-committed operation whose reply was lost surfaces as `DfsCommitOutcomeUnknownException` carrying its
-  operation id; resolve it with `volume.QueryOperationAsync(id, resolve: true)`. It is never reported as a failure.
-
-## Running a cluster
-
-`src/Tedd.Tdfs.Host` builds the server executable (`Tedd.Tdfs.Host`). A three-node cluster in one minute:
-
-```bash
-dotnet build src/Tedd.Tdfs.Host -c Release
+```sh
+cd ../tdfs-demo/client
+dotnet run
 ```
 
-```bash
-Tedd.Tdfs.Host bootstrap --name n0 --listen quic://10.0.0.11:7100 --storage /var/lib/tdfs/n0 --out /etc/tdfs/n0.json --zone z1
-```
+The client prints `Hello from TDFS`. Stop the host with Ctrl+C. For a replicated deployment, join nodes in distinct failure domains and give each application a principal with the volume permissions it needs. The [operations guide](docs/OPERATIONS.md) covers membership, grants, storage pools, and recovery.
 
-```bash
-Tedd.Tdfs.Host node --config /etc/tdfs/n0.json
-```
+## Working with volumes
 
-`bootstrap` prints the new cluster id, the certificate pin and the generated `admin` secret. Add more nodes with
-`joinSeeds`, create volumes and principals with `DfsAdminClient`, and register backup hosts — see
-[docs/OPERATIONS.md](docs/OPERATIONS.md).
+- **Files and directories.** Open files with .NET access and sharing modes, enumerate a version-pinned directory, or address an alternate data stream as `/path/file:stream`. Volume grants and NTFS-style access control lists govern access.
+- **Transactions.** Use `volume.Transactions.BeginAsync()` to group reads and writes within a volume. A successful commit publishes all changes at one strictly serializable boundary.
+- **Snapshots and backups.** Open a snapshot to read an immutable version of the volume. Use `CommitWithSnapshotAsync` to capture a transaction's exact commit. An independent backup host can receive snapshots incrementally and serve read-only recovery points.
+- **Lost replies.** A `DfsCommitOutcomeUnknownException` carries the operation ID. Call `volume.QueryOperationAsync(id, resolve: true)` to determine the outcome before retrying a mutation.
 
 ## Repository layout
 
-| Path | Contents |
-|---|---|
-| `src/Tedd.Tdfs.Core` | Identifiers, paths, errors, policies, ACL evaluator, wire codec, protocol messages |
-| `src/Tedd.Tdfs.Transport` | RPC transport: Tedd.Quicly (QUIC) and in-memory |
-| `src/Tedd.Tdfs.Client` | The SDK (`DfsClient`, `DfsStream`, transactions, snapshots, backups, admin) |
-| `src/Tedd.Tdfs.Storage` | Local storage engine: journals, packed object segments, checkpoints, encryption |
-| `src/Tedd.Tdfs.Consensus` | Pure Raft core |
-| `src/Tedd.Tdfs.Server` | Node runtime, control and volume state machines, data plane, maintenance, backup |
-| `src/Tedd.Tdfs.Host` | Server executable |
-| `tests/Tedd.Tdfs.Testing` | Test harness: in-process and deterministic clusters, fault injection, checkers |
-| `tests/Tedd.Tdfs.Tests.*` | Unit, Simulation, Integration, Models and Performance suites |
+| Project under `src/` | Responsibility |
+| --- | --- |
+| `Tedd.Tdfs.Client` | Application and administration APIs |
+| `Tedd.Tdfs.Host` | Live node and backup host executable |
+| `Tedd.Tdfs.Server` | Cluster membership, volume state, placement, repair, and backups |
+| `Tedd.Tdfs.Consensus` | Raft elections, replication, and snapshots |
+| `Tedd.Tdfs.Storage` | Journals, object storage, checkpoints, and encryption |
+| `Tedd.Tdfs.Transport` | QUIC and in-memory RPC transports |
+| `Tedd.Tdfs.Core` | Shared types, access rules, wire codec, and protocol messages |
 
-## Building and testing
+## Build and test
 
-```bash
+From the repository root, build the solution and run the unit suite.
+
+```sh
 dotnet build Tedd.Tdfs.slnx
-```
-
-```bash
 dotnet test --project tests/Tedd.Tdfs.Tests.Unit
 ```
 
-The acceptance suites implement every named case of the [test plan](docs/spec/distributed-filesystem-test-plan.md)
-(586) and the addendum (78), plus a 2–10 node mesh matrix (`MESH-*`). Tests run in-process clusters over an in-memory
-transport, a deterministic simulator (seeded, replayable), or real QUIC and disks. Set `TDFS_TEST_ROOT` to choose where
-test clusters keep their data. The `Simulation` and `Models` projects take tens of minutes; `Performance` tests print
-their measurements.
+The `tests/` directory also contains integration, deterministic simulation, model, and performance suites. Set `TDFS_TEST_ROOT` to select the directory for test cluster data.
 
-## License
+## Reference
 
-See [LICENSE](LICENSE).
+- [Architecture](docs/ARCHITECTURE.md), [wire protocol](docs/PROTOCOL.md), and [implementation internals](docs/INTERNALS.md)
+- [Filesystem specification](docs/spec/distributed-filesystem-fsd.md) and [ACL, pool, and stream semantics](docs/spec/fsd-addendum-acl-pools-streams.md)
+- [Test plan](docs/spec/distributed-filesystem-test-plan.md)
+- [Apache License 2.0](LICENSE)

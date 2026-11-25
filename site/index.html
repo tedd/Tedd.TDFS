@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f8f5">
+  <meta name="description" content="Tedd.TDFS is a replicated filesystem for .NET with Raft metadata, zone-aware storage, transactions, and snapshots. Run a local node and write your first file.">
+  <title>Tedd.TDFS · A replicated filesystem for .NET</title>
+  <link rel="canonical" href="https://tedd.no/Tedd.TDFS/">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body id="top">
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="bar">
+    <div class="wrap bar-inner">
+      <a class="brand" href="#top" aria-label="Tedd.TDFS home"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span> TEDD <b>/</b> TDFS</a>
+      <nav aria-label="Main navigation">
+        <a href="#filesystem">Filesystem</a>
+        <a href="#quick-start">Quick start</a>
+        <a class="source" href="https://github.com/tedd/Tedd.TDFS">GitHub <span aria-hidden="true">↗</span></a>
+      </nav>
+    </div>
+  </header>
+  <main id="main">
+    <section class="hero">
+      <div class="wrap split">
+        <div class="intro">
+          <h1>A replicated filesystem <em>for .NET.</em></h1>
+          <p>Read and write files through familiar C# streams. Tedd.TDFS coordinates revisions with Raft and keeps durable copies across the hosts and zones you choose.</p>
+          <div class="actions">
+            <a class="button" href="#quick-start">Run a local node <span aria-hidden="true">↓</span></a>
+            <a class="text-link" href="https://github.com/tedd/Tedd.TDFS/blob/deploy/docs/API.md">Explore the API <span aria-hidden="true">↗</span></a>
+          </div>
+        </div>
+        <figure class="topology">
+          <figcaption><span class="window-dots" aria-hidden="true">● ● ●</span> Replica placement</figcaption>
+          <div class="topology-body">
+            <div class="extent"><span class="micro">File extent</span><code>/archive/events.log</code></div>
+            <div class="stem" aria-hidden="true"></div>
+            <ul class="zones" aria-label="Example target placement">
+              <li><span class="disk" aria-hidden="true"></span><strong>node-01</strong><span>Zone A</span></li>
+              <li><span class="disk" aria-hidden="true"></span><strong>node-02</strong><span>Zone B</span></li>
+              <li><span class="disk" aria-hidden="true"></span><strong>node-03</strong><span>Zone C</span></li>
+            </ul>
+          </div>
+          <p class="diagram-note">Default policy · Target three zones, acknowledge data after two.</p>
+        </figure>
+      </div>
+    </section>
+    <section class="wrap section" id="filesystem" aria-labelledby="filesystem-heading">
+      <p class="kicker">Filesystem semantics</p>
+      <h2 id="filesystem-heading">From write to recovery.</h2>
+      <div class="features">
+        <article><span class="symbol" aria-hidden="true">{ }</span><h3>Publish a revision</h3><p>Buffer writes privately in a stream. Flush or close it to publish a durable revision. Readers see a complete version of the file.</p></article>
+        <article><span class="symbol" aria-hidden="true">⇄</span><h3>Commit files together</h3><p>Group updates to multiple paths in one volume. A strictly serializable transaction publishes all of its changes at a single commit boundary.</p></article>
+        <article><span class="symbol" aria-hidden="true">◷</span><h3>Read a recovery point</h3><p>Open a read-only snapshot while the live volume keeps changing. An independent backup host can receive complete snapshots incrementally.</p></article>
+      </div>
+    </section>
+    <section class="start" id="quick-start" aria-labelledby="start-heading">
+      <div class="wrap split">
+        <div>
+          <p class="kicker">Quick start</p>
+          <h2 id="start-heading">Write your first file.</h2>
+          <ol class="steps">
+            <li>Build the host with the .NET 10 SDK.</li>
+            <li>Bootstrap a local node, then wait for <code>TDFS-READY</code>.</li>
+            <li>Connect with the generated certificate pin and create a single-copy demo volume.</li>
+          </ol>
+          <a class="button" href="https://github.com/tedd/Tedd.TDFS/blob/deploy/README.md#run-a-local-node">Follow the local setup <span aria-hidden="true">↗</span></a>
+        </div>
+        <figure class="code-window">
+          <figcaption><span>Client example</span><span>C#</span></figcaption>
+          <pre><code><span class="kw">var</span> volume = client.GetVolume(<span class="str">"demo"</span>);
+<span class="kw">await</span> volume.Files.WriteAllTextAsync(
+    <span class="str">"/hello.txt"</span>, <span class="str">"Hello from TDFS"</span>);
+
+<span class="kw">var</span> text = <span class="kw">await</span> volume.Files
+    .ReadAllTextAsync(<span class="str">"/hello.txt"</span>);
+Console.WriteLine(text);</code></pre>
+          <div class="output"><span class="micro">Output</span><samp>Hello from TDFS</samp></div>
+        </figure>
+      </div>
+    </section>
+    <section class="wrap section" aria-labelledby="docs-heading">
+      <h2 id="docs-heading">Documentation</h2>
+      <div class="resources">
+        <a href="https://github.com/tedd/Tedd.TDFS/blob/deploy/docs/ARCHITECTURE.md"><strong>Architecture <span aria-hidden="true">↗</span></strong><span>Raft groups, data placement, and commit ordering</span></a>
+        <a href="https://github.com/tedd/Tedd.TDFS/blob/deploy/docs/API.md"><strong>Client API <span aria-hidden="true">↗</span></strong><span>Files, sharing, transactions, and snapshots</span></a>
+        <a href="https://github.com/tedd/Tedd.TDFS/blob/deploy/docs/OPERATIONS.md"><strong>Operations <span aria-hidden="true">↗</span></strong><span>Cluster membership, access control, and recovery</span></a>
+      </div>
+    </section>
+  </main>
+  <footer><div class="wrap bar-inner"><a class="brand" href="#top">TEDD <b>/</b> TDFS</a><a href="https://github.com/tedd/Tedd.TDFS/blob/deploy/LICENSE">Apache License 2.0</a></div></footer>
+</body>
+</html>
