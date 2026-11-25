@@ -265,7 +265,7 @@ internal sealed class BackupDispatcher : IRpcHandler
     /// <summary>The refusal of a request a backup node never serves.</summary>
     private Exception Refusal(MessageType type) => type switch
     {
-        MessageType.OpenHandle or MessageType.CloseHandle or MessageType.CreateStaging or MessageType.CommitFile or MessageType.WriteAll
+        MessageType.ExportOpen or MessageType.ExportControl or MessageType.OpenHandle or MessageType.CloseHandle or MessageType.CreateStaging or MessageType.CommitFile or MessageType.WriteAll
             or MessageType.Append or MessageType.Copy or MessageType.Move or MessageType.Delete or MessageType.CreateDirectory or MessageType.SetPolicy
             or MessageType.SetAccess or MessageType.SetAccessControl or MessageType.SetOwner or MessageType.TxBegin or MessageType.TxOp
             or MessageType.TxCommit or MessageType.TxAbort or MessageType.CreateSnapshot or MessageType.RestoreSnapshot or MessageType.RestoreVolume

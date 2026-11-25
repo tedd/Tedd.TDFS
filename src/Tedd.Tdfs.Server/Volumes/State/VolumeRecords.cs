@@ -111,6 +111,13 @@ internal sealed record HandleRecord(ulong Id, ulong Inode, string Stream, ulong 
     bool IsWriter, ulong WriterGeneration, HandleView View, InodeRecord? PinnedInode, ulong PinId, ulong OpenedIndex, DfsFileSystemRights GrantedRights,
     bool IsAppend)
 {
+    public ulong ExportRoot { get; init; }
+    public bool DeleteAccess { get; init; }
+    public bool DeleteOnClose { get; init; }
+    // The requesting handle closed while another handle still held the inode.
+    public ulong CommittedDeleteRoot { get; init; }
+    public bool SharedWriter => IsWriter && (Share & FileShare.Write) != 0;
+
     /// <summary>The (inode, stream) key of the handle.</summary>
     public StreamKey Key => new(Inode, Stream);
 

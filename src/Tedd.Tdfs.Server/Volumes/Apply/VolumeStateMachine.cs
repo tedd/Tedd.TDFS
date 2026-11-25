@@ -154,6 +154,8 @@ internal sealed partial class VolumeStateMachine : IReplicatedStateMachine, ICom
         MoveCommand c => ApplyMove(s, ctx, c),
         DeleteCommand c => ApplyDelete(s, ctx, c),
 
+        ExportOpenCommand c => ApplyExportOpen(s, ctx, c),
+        ExportControlCommand c => ApplyExportControl(s, ctx, c.Request),
         OpenHandleCommand c => ApplyOpenHandle(s, ctx, c),
         CloseHandleCommand c => ApplyCloseHandle(s, ctx, c),
         CreateStagingCommand c => ApplyCreateStaging(s, ctx, c),

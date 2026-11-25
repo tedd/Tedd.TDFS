@@ -18,11 +18,11 @@ internal sealed partial class VolumeStateMachine
     /// access and share bits, no Inheritable, mode/access combinations (FSD §6.1), no FileShare.Write on writable handles,
     /// no VersionPinned writable handles, supported options only. Returns the error, or null.
     /// </summary>
-    public static (DfsErrorCode Code, string Message)? ValidateOpen(FileMode mode, FileAccess access, FileShare share, FileOptions options, bool versionPinned)
+    public static (DfsErrorCode Code, string Message)? ValidateOpen(FileMode mode, FileAccess access, FileShare share, FileOptions options, bool versionPinned, bool export = false, bool directory = false)
     {
         if (mode is < FileMode.CreateNew or > FileMode.Append)
             return (DfsErrorCode.InvalidArgument, $"FileMode {(int)mode} is not defined.");
-        if (access is not (FileAccess.Read or FileAccess.Write or FileAccess.ReadWrite))
+        if (!(export && access == 0) && access is not (FileAccess.Read or FileAccess.Write or FileAccess.ReadWrite))
             return (DfsErrorCode.InvalidArgument, $"FileAccess {(int)access} is not defined.");
         if ((share & ~DefinedShareBits) != 0)
             return (DfsErrorCode.InvalidArgument, $"FileShare 0x{(int)share:X} has undefined bits.");
@@ -31,15 +31,15 @@ internal sealed partial class VolumeStateMachine
         bool writable = (access & FileAccess.Write) != 0;
         switch (mode)
         {
-            case FileMode.CreateNew or FileMode.Create when !writable:
+            case FileMode.CreateNew or FileMode.Create when !writable && !directory && !(export && mode == FileMode.CreateNew):
                 return (DfsErrorCode.InvalidArgument, $"{mode} requires write access.");
-            case FileMode.Truncate when access != FileAccess.Write:
+            case FileMode.Truncate when !writable || (!export && access != FileAccess.Write):
                 return (DfsErrorCode.InvalidArgument, "Truncate requires write-only access.");
             case FileMode.Append when access != FileAccess.Write:
                 return (DfsErrorCode.InvalidArgument, "Append is write-only.");
         }
 
-        if (writable && (share & FileShare.Write) != 0)
+        if (!export && writable && (share & FileShare.Write) != 0)
             return (DfsErrorCode.InvalidArgument, "A writable handle may not grant FileShare.Write (multiple writers are not supported).");
         if (versionPinned && writable)
             return (DfsErrorCode.InvalidArgument, "VersionPinned is restricted to read-only handles.");
@@ -48,14 +48,17 @@ internal sealed partial class VolumeStateMachine
         return null;
     }
 
-    private static (VolumeState, VolumeApplyResult) ApplyOpenHandle(VolumeState s, ApplyContext ctx, OpenHandleCommand c)
+    private static (VolumeState, VolumeApplyResult) ApplyOpenHandle(VolumeState s, ApplyContext ctx, OpenHandleCommand c, ExportOpenMessage? export = null)
     {
-        if (ValidateOpen(c.Mode, c.Access, c.Share, c.Options, c.VersionPinned) is { } invalid)
+        if (ValidateOpen(c.Mode, c.Access, c.Share, c.Options, c.VersionPinned, export is not null, export?.Directory == true) is { } invalid)
             throw Fail(invalid.Code, invalid.Message);
         bool writable = (c.Access & FileAccess.Write) != 0;
         bool readable = (c.Access & FileAccess.Read) != 0;
-        RequireGrant(ctx, writable ? DfsPermissions.Write : DfsPermissions.Read, "open");
-        if (readable && writable)
+        bool directory = export?.Directory == true;
+        bool delete = (export?.DesiredAccess & DfsOpenAccess.Delete) == DfsOpenAccess.Delete;
+        if (writable || delete)
+            RequireGrant(ctx, DfsPermissions.Write, "open");
+        if (readable || (!writable && !delete))
             RequireGrant(ctx, DfsPermissions.Read, "open");
         string path = NormalizePath(c.FilePath);
         (string filePath, string? streamName) = DfsStreamPath.Split(path);
@@ -86,9 +89,9 @@ internal sealed partial class VolumeStateMachine
             // Creating is a mutation whatever the requested access (OpenOrCreate with read access creates too): it needs the
             // volume Write grant as well as the ACL right (ACL-06).
             RequireGrant(ctx, DfsPermissions.Write, $"create '{path}'");
-            Require(ctx, res.ParentChainNearestFirst(), DfsFileSystemRights.CreateFiles, $"create '{path}'");
+            Require(ctx, res.ParentChainNearestFirst(), directory ? DfsFileSystemRights.CreateDirectories : DfsFileSystemRights.CreateFiles, $"create '{path}'");
             (s, ulong id) = AllocateInode(s);
-            inode = NewInode(s, ctx, id, InodeKind.File, res.Parent!, res.Name, c.StoragePolicy ?? res.Parent!.PolicyName);
+            inode = NewInode(s, ctx, id, directory ? InodeKind.Directory : InodeKind.File, res.Parent!, res.Name, c.StoragePolicy ?? res.Parent!.PolicyName);
             if (stream.Length > 0)
                 inode = inode with { Streams = inode.Streams.Add(stream, StreamRecord.Empty(ctx.Index)) };
             s = Link(s, ctx, res.Parent!, inode);
@@ -97,10 +100,14 @@ internal sealed partial class VolumeStateMachine
         else
         {
             inode = res.Target!;
+            stream = inode.StreamName(stream);
             IReadOnlyList<InodeRecord> chain = res.ChainNearestFirst();
-            if (inode.IsDirectory && stream.Length == 0)
+            RequireAvailable(s, inode.Id);
+            if (directory && !inode.IsDirectory)
+                throw Fail(DfsErrorCode.DirectoryNotFound, $"'{path}' is a file.");
+            if (!directory && inode.IsDirectory && stream.Length == 0)
                 throw Fail(DfsErrorCode.IsADirectory, $"'{path}' is a directory.");
-            bool streamExists = inode.Streams.ContainsKey(stream);
+            bool streamExists = directory || inode.Streams.ContainsKey(stream);
             if (c.Mode == FileMode.CreateNew && streamExists)
                 throw Fail(DfsErrorCode.AlreadyExists, $"'{path}' already exists.");
             if (!streamExists)
@@ -129,9 +136,15 @@ internal sealed partial class VolumeStateMachine
             }
 
             var key = new StreamKey(inode.Id, stream);
+            if (s.Root.ExportProfile != DfsExportProfile.Disabled)
+            {
+                foreach (HandleRecord other in HandlesOf(s, inode.Id))
+                    if ((delete && !other.Share.HasFlag(FileShare.Delete)) || (other.DeleteAccess && !c.Share.HasFlag(FileShare.Delete)))
+                        throw Fail(DfsErrorCode.SharingViolation, $"Delete reservation conflicts with handle {other.Id}.");
+            }
             foreach (HandleRecord active in HandlesOf(s, key))
             {
-                if (!Compatible(active, c.Access, c.Share))
+                if (!Compatible(active, c.Access, c.Share, delete))
                 {
                     bool writers = writable && active.IsWriter;
                     throw Fail(writers ? DfsErrorCode.WriterConflict : DfsErrorCode.SharingViolation,
@@ -141,7 +154,7 @@ internal sealed partial class VolumeStateMachine
 
             // A transaction's writer reservation acts like a writer that shares reading (LOCK-01): no other writer, and
             // readers must let it write.
-            if (ReservationHolder(s, ctx, key) is { } holder && (writable || (c.Share & FileShare.Write) == 0))
+            if (ReservationHolder(s, ctx, key) is { } holder && (writable || delete || (c.Share & FileShare.Write) == 0))
             {
                 throw Fail(writable ? DfsErrorCode.WriterConflict : DfsErrorCode.SharingViolation,
                     $"'{path}' is reserved for writing by transaction {holder.Id}.");
@@ -164,6 +177,23 @@ internal sealed partial class VolumeStateMachine
         }
 
         // Allocate the handle with its writer generation, lease and pin.
+        if (export is not null)
+        {
+            var chain = new NamespaceView(s.Inodes).ChainOf(inode.Id)!;
+            if (delete)
+            {
+                RequireDelete(ctx, chain, "open for deletion");
+            }
+            if (export.DeleteOnClose)
+            {
+                if (!delete || inode.Id == export.Root.Directory.Value)
+                    throw Fail(DfsErrorCode.AccessDenied, "Delete-on-close requires delete access to a child of the mapping.");
+                if (!inode.Children.IsEmpty)
+                    throw Fail(DfsErrorCode.DirectoryNotEmpty, "Only empty directories support delete-on-close.");
+            }
+            if (!writable && !readable && !delete)
+                Require(ctx, chain, DfsFileSystemRights.ReadAttributes, "metadata open");
+        }
         var streamKey = new StreamKey(inode.Id, stream);
         ulong generation = 0;
         if (writable)
@@ -178,7 +208,7 @@ internal sealed partial class VolumeStateMachine
         (s, PinRecord pin) = AddPin(s, PinKind.Handle, session.Id, session.Principal, ctx.Index, pinIndex, handleId, null, 0, string.Empty, null, null);
         DfsFileSystemRights granted = RightsOf(ctx, new NamespaceView(s.Inodes).ChainOf(inode.Id) ?? [inode]);
         var handle = new HandleRecord(handleId, inode.Id, stream, session.Id, session.Principal, c.Mode, c.Access, c.Share, writable, generation, handleView,
-            c.VersionPinned ? inode : null, pin.Id, ctx.Index, granted, c.Mode == FileMode.Append);
+            c.VersionPinned ? inode : null, pin.Id, ctx.Index, granted, c.Mode == FileMode.Append) { ExportRoot = export?.Root.Directory.Value ?? 0, DeleteAccess = delete, DeleteOnClose = export?.DeleteOnClose == true };
         s = s with { NextHandleId = handleId + 1, Handles = s.Handles.Add(handleId, handle) };
 
         FileInfoData info = Describe(s, inode, path, streamName);
@@ -196,7 +226,7 @@ internal sealed partial class VolumeStateMachine
             return (s, VolumeApplyResult.Ok(new CloseHandleResultMessage(false, s.TokenAt(ctx.Index))));
         }
 
-        if (!string.Equals(h.Principal, principal, StringComparison.Ordinal))
+        if (!string.Equals(h.Principal, principal, StringComparison.Ordinal) || (h.ExportRoot != 0 && h.Session != ctx.Op?.RequestSession))
             throw Fail(DfsErrorCode.InvalidHandle, $"Handle {c.Handle} belongs to another principal.");
         bool generationMatches = c.Generation == h.WriterGeneration;
         s = ReleaseHandle(s, h, ctx.Index);
@@ -216,7 +246,7 @@ internal sealed partial class VolumeStateMachine
         {
             if (!s.Handles.TryGetValue(c.Handle, out HandleRecord? h))
                 throw Fail(!s.IssuedHandle(c.Handle) ? DfsErrorCode.InvalidHandle : DfsErrorCode.LeaseLost, $"Handle {c.Handle} is not active.");
-            if (!string.Equals(h.Principal, principal, StringComparison.Ordinal))
+            if (!string.Equals(h.Principal, principal, StringComparison.Ordinal) || (h.ExportRoot != 0 && h.Session != ctx.Op?.RequestSession))
                 throw Fail(DfsErrorCode.InvalidHandle, $"Handle {c.Handle} belongs to another principal.");
             if (!h.IsWriter)
                 throw Fail(DfsErrorCode.AccessDenied, $"Handle {c.Handle} is not writable.");

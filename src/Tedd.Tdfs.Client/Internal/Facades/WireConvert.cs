@@ -12,11 +12,11 @@ internal static class WireConvert
     public static DfsFileInfo ToFileInfo(FileInfoData info, CommitToken observedAt, long? lengthOverride = null) =>
         new(info.Path, info.Inode, info.Revision, lengthOverride ?? info.Length, info.CreatedUtc, info.ModifiedUtc, info.Owner,
             new DfsInodeAccess(info.OwnerOnly, info.ReadOnlyForOthers), info.StoragePolicy.Length == 0 ? DefaultPolicyName : info.StoragePolicy,
-            info.IsInline, info.IsSparse, info.ExtentCount, observedAt, info.IsStream, info.StreamName, info.StreamCount);
+            info.IsInline, info.IsSparse, info.ExtentCount, observedAt, info.IsStream, info.StreamName, info.StreamCount) { BasicInformation = BasicInformationCodec.FromExtensions(info.Extensions) };
 
     /// <summary>Public directory metadata.</summary>
     public static DfsDirectoryInfo ToDirectoryInfo(FileInfoData info, CommitToken observedAt) =>
-        new(info.Path, info.Inode, info.Revision, info.CreatedUtc, info.ModifiedUtc, info.Owner, info.EntryCount, observedAt);
+        new(info.Path, info.Inode, info.Revision, info.CreatedUtc, info.ModifiedUtc, info.Owner, info.EntryCount, observedAt) { BasicInformation = BasicInformationCodec.FromExtensions(info.Extensions) };
 
     /// <summary>Public directory entry (path combined with the listed directory).</summary>
     public static DfsEntryInfo ToEntry(string directory, DirectoryEntryData entry) =>

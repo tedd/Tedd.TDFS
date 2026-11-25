@@ -78,7 +78,7 @@ internal static class Validation
             throw new ArgumentNullException(parameter);
         if (!Enum.IsDefined(options.Mode))
             throw new ArgumentException($"Unknown FileMode value {(int)options.Mode}.", parameter);
-        if (options.Access is not (FileAccess.Read or FileAccess.Write or FileAccess.ReadWrite))
+        if (!(options.ExportRoot is not null && options.Access == 0) && options.Access is not (FileAccess.Read or FileAccess.Write or FileAccess.ReadWrite))
             throw new ArgumentException($"Unknown FileAccess value {(int)options.Access}.", parameter);
         if ((options.Share & ~KnownShareBits) != 0)
             throw new ArgumentException($"Unknown FileShare bits 0x{(int)(options.Share & ~KnownShareBits):x}.", parameter);
@@ -99,13 +99,14 @@ internal static class Validation
         bool writable = (options.Access & FileAccess.Write) != 0;
         switch (options.Mode)
         {
-            case FileMode.CreateNew or FileMode.Create when !writable:
+            case FileMode.CreateNew or FileMode.Create when !writable && !options.Directory && !(options.ExportRoot is not null && options.Mode == FileMode.CreateNew):
                 throw new ArgumentException($"FileMode.{options.Mode} requires write access.", parameter);
-            case FileMode.Truncate or FileMode.Append when options.Access != FileAccess.Write:
+            case FileMode.Truncate when !writable || (options.ExportRoot is null && options.Access != FileAccess.Write):
+            case FileMode.Append when options.Access != FileAccess.Write:
                 throw new ArgumentException($"FileMode.{options.Mode} requires FileAccess.Write (and no read access).", parameter);
         }
 
-        if (writable && (options.Share & FileShare.Write) != 0)
+        if (options.ExportRoot is null && writable && (options.Share & FileShare.Write) != 0)
             throw new ArgumentException("A writable handle cannot grant FileShare.Write (single writer per file).", parameter);
         if (options.ReadView == DfsReadView.VersionPinned && writable)
             throw new ArgumentException("A version-pinned view is read-only; open writable handles with DfsReadView.Live.", parameter);

@@ -19,6 +19,8 @@ internal sealed partial class NodeRuntime
         router.Register<QueryOperationMessage>((svc, ctx, m) => svc.QueryOperationAsync(ctx, m));
         router.Register<ReserveOperationIdsMessage>((svc, ctx, m) => svc.ReserveOperationIdsAsync(ctx, m));
 
+        router.Register<ExportOpenMessage>((svc, ctx, m) => svc.ExportOpenAsync(ctx, m));
+        router.Register<ExportControlMessage>((svc, ctx, m) => svc.ExportControlAsync(ctx, m));
         router.Register<OpenHandleMessage>((svc, ctx, m) => svc.OpenHandleAsync(ctx, m));
         router.Register<CloseHandleMessage>((svc, ctx, m) => svc.CloseHandleAsync(ctx, m));
         router.Register<ReadRangeMessage>((svc, ctx, m) => svc.ReadRangeAsync(ctx, m));

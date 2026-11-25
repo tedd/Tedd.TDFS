@@ -48,6 +48,9 @@ internal sealed record VolumeState
     /// <summary>Current writer fencing generation of every stream that ever had a writer (LOCK-04, ADS-05).</summary>
     public ImmutableSortedDictionary<StreamKey, ulong> WriterGenerations { get; init; } = ImmutableSortedDictionary.Create<StreamKey, ulong>(StreamKeyComparer.Instance);
 
+    /// <summary>Live directory mappings and the index at which each was registered. Snapshot restore creates an unmapped volume.</summary>
+    public ImmutableSortedDictionary<ulong, ulong> ExportRoots { get; init; } = ImmutableSortedDictionary<ulong, ulong>.Empty;
+
     /// <summary>Next inode id (allocated monotonically, never reused).</summary>
     public ulong NextInodeId { get; init; } = InodeRecord.RootId + 1;
 

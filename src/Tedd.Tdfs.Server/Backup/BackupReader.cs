@@ -442,12 +442,12 @@ internal sealed class BackupReader
         bool more = false;
         foreach (KeyValuePair<string, ulong> child in directory.Children)
         {
-            if (after is not null && string.CompareOrdinal(child.Key, after) <= 0)
+            if (after is not null && directory.Children.KeyComparer.Compare(child.Key, after) <= 0)
                 continue;
             if (root.GetValueOrDefault(child.Value) is not { } node)
                 continue;
             bool include = node.IsDirectory ? (m.Kinds & WireEntryKinds.Directories) != 0 : (m.Kinds & WireEntryKinds.Files) != 0;
-            if (!include || !VolumeService.Matches(m.Pattern, child.Key))
+            if (!include || !VolumeService.Matches(m.Pattern, child.Key, directory.ExportProfile == DfsExportProfile.Windows))
                 continue;
             if (page.Count == m.PageSize)
             {

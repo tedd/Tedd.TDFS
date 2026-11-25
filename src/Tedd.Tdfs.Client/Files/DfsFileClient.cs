@@ -59,8 +59,17 @@ public sealed partial class DfsFileClient
     {
         using OperationScope scope = Begin(DfsOperationKind.Open, path, ct);
         await scope.StartedAsync().ConfigureAwait(false);
-        string p = Validation.FilePath(path);
         ArgumentNullException.ThrowIfNull(options);
+        bool export = options.ExportRoot is not null;
+        if ((options.Directory || options.DeleteOnClose || options.DesiredAccess.HasValue) && !export)
+            throw new ArgumentException("Directory and desired access require an export mapping.", nameof(options));
+        if (export && (IsReadOnly || IsTransactionBound || options.ReadView != DfsReadView.Live))
+            throw new NotSupportedException("Export handles require a writable live volume facade.");
+        if (options.DesiredAccess is { } desired)
+            options = options with { Access = (FileAccess)((int)desired & 3) };
+        if (export && options.Access.HasFlag(FileAccess.Write) && options.Share.HasFlag(FileShare.Write))
+            options = options with { WriteMode = DfsWriteMode.WriteThrough };
+        string p = options.Directory ? Validation.Path(path) : Validation.FilePath(path);
 
         // A read-only facade (snapshot view, backup host) refuses every writer open as such, whatever else is wrong with it.
         bool writable = (options.Access & FileAccess.Write) != 0;
@@ -118,12 +127,22 @@ public sealed partial class DfsFileClient
         VolumeContext.Bound<OpenHandleResultMessage> bound;
         try
         {
-            bound = await Context.MutateBoundAsync<OpenHandleResultMessage>(scope, "OpenHandle", options.OperationId,
-                header => new OpenHandleMessage(header, path, options.Mode, options.Access, options.Share, options.Options, pinned, writeThrough,
-                    WirePolicy(options.StoragePolicy)),
-                path, TxId, binding: Bound, grantsLease: true).ConfigureAwait(false);
+            OpenHandleMessage Open(RequestHeader header) => new(header, path, options.Mode, options.Access, options.Share, options.Options,
+                pinned, writeThrough, WirePolicy(options.StoragePolicy));
+            if (options.ExportRoot is { } root)
+            {
+                var exported = await Context.MutateBoundAsync<ExportOpenResultMessage>(scope, "ExportOpen", options.OperationId,
+                    header => new ExportOpenMessage(Open(header), root, options.DesiredAccess ?? (DfsOpenAccess)options.Access, options.Directory, options.DeleteOnClose),
+                    path, rebindable: false, binding: new VolumeBinding(root.Volume.VolumeId, root.Volume.VolumeEpoch), grantsLease: true).ConfigureAwait(false);
+                bound = new(exported.Reply.Open, exported.Binding, exported.Session);
+            }
+            else
+            {
+                bound = await Context.MutateBoundAsync<OpenHandleResultMessage>(scope, "OpenHandle", options.OperationId, Open,
+                    path, TxId, binding: Bound, grantsLease: true).ConfigureAwait(false);
+            }
         }
-        catch (DfsCommitOutcomeUnknownException unknown) when (options.Mode == FileMode.Open && (options.Access & FileAccess.Write) == 0)
+        catch (DfsCommitOutcomeUnknownException unknown) when (!options.DeleteOnClose && options.Mode == FileMode.Open && (options.Access & FileAccess.Write) == 0)
         {
             // A read-only open of an existing file has no namespace effect: an unanswered one is the caller's cancellation
             // (or the client's disposal) or an availability failure. A handle it may have created expires with its lease.
@@ -137,7 +156,12 @@ public sealed partial class DfsFileClient
         // The handle belongs to the session and volume the open was addressed to: every request through it carries that
         // binding, and its lease is renewed with that session.
         var stream = new DfsStream(Context, Transaction, opened.Handle, opened.Info, path, options.ReadView, options.WriteMode, options.Access, options.Share,
-            options.Mode == FileMode.Append, opened.WriterGeneration, options.BufferSize, opened.Token, snapshotPin: 0, bound.Binding);
+            options.Mode == FileMode.Append, opened.WriterGeneration, options.BufferSize, opened.Token, snapshotPin: 0, bound.Binding)
+        {
+            CreateResult = opened.Created ? DfsCreateResult.Created : opened.Truncated ? DfsCreateResult.Truncated : DfsCreateResult.Opened,
+            ExportRoot = options.ExportRoot,
+            DesiredAccess = options.DesiredAccess ?? (DfsOpenAccess)options.Access,
+        };
         if ((bound.Session ?? Context.CurrentSession) is { } session)
             Context.RegisterHandle(opened.Handle, session, stream);
         Transaction?.Register(stream);

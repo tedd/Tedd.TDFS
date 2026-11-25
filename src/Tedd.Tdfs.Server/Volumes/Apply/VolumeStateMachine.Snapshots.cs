@@ -107,8 +107,10 @@ internal sealed partial class VolumeStateMachine
             case PinKind.Enumeration:
             {
                 RequireGrant(ctx, DfsPermissions.Read, "enumerate");
-                if (s.Find(c.Directory) is not { IsDirectory: true })
+                if (s.Find(c.Directory) is not { IsDirectory: true } directory)
                     throw Fail(DfsErrorCode.DirectoryNotFound, $"Directory inode {c.Directory} does not exist.");
+                if (BlocksDirectoryRead(s, directory))
+                    throw Fail(DfsErrorCode.SharingViolation, "An open reservation prevents enumeration.");
                 (s, PinRecord pin) = AddPin(s, PinKind.Enumeration, session, principal, ctx.Index, ctx.Index, 0, null, c.Directory, c.Binding, s.Inodes, null);
                 return (s, VolumeApplyResult.Ok(null, pin));
             }

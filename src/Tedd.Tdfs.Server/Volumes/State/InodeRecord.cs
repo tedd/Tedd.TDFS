@@ -115,6 +115,14 @@ internal sealed record InodeRecord(ulong Id, InodeKind Kind, ulong Revision, ulo
     DfsSecurityDescriptor Security, string PolicyName, ulong ParentId, string Name, ImmutableSortedDictionary<string, StreamRecord> Streams,
     ImmutableSortedDictionary<string, ulong> Children)
 {
+    public DfsExportProfile ExportProfile { get; init; }
+    public DateTimeOffset? AccessedUtc { get; init; }
+    public DateTimeOffset? ChangedUtc { get; init; }
+    public FileAttributes? DosAttributes { get; init; }
+    public bool HasExportMetadata => ExportProfile != DfsExportProfile.Disabled || AccessedUtc.HasValue || ChangedUtc.HasValue || DosAttributes.HasValue;
+    public DfsBasicInformation BasicInformation => new(CreatedUtc, ModifiedUtc, AccessedUtc ?? CreatedUtc, ChangedUtc ?? ModifiedUtc,
+        DosAttributes ?? (IsDirectory ? FileAttributes.Directory : FileAttributes.Normal));
+
     /// <summary>Root inode id.</summary>
     public const ulong RootId = 1;
 
@@ -149,6 +157,10 @@ internal sealed record InodeRecord(ulong Id, InodeKind Kind, ulong Revision, ulo
 
     /// <summary>The stream with <paramref name="name"/>, or null.</summary>
     public StreamRecord? GetStream(string name) => Streams.GetValueOrDefault(name);
+
+    /// <summary>Stored spelling used for reservations, locks and generations.</summary>
+    public string StreamName(string name) => name.Length != 0 && ExportProfile == DfsExportProfile.Windows
+        && Streams.TryGetKey(name, out string? stored) ? stored : name;
 
     /// <summary>Every distinct object referenced by any stream.</summary>
     public IEnumerable<ObjectId> Objects()

@@ -361,7 +361,7 @@ internal sealed partial class VolumeService
         Resolution res = new NamespaceView(tx.Inodes).Resolve(filePath);
         if (res.Found && tx.BaseInodes.ContainsKey(res.Target!.Id))
         {
-            var key = new StreamKey(res.Target.Id, stream ?? DfsStreamPath.DefaultStreamName);
+            var key = new StreamKey(res.Target.Id, res.Target.StreamName(stream ?? DfsStreamPath.DefaultStreamName));
             if (!tx.Reserved.Contains(key))
                 keys.Add(key);
         }

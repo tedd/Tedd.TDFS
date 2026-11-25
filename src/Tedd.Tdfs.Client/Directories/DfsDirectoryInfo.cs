@@ -17,4 +17,7 @@ public sealed record DfsDirectoryInfo(
     DateTimeOffset ModifiedUtc,
     string Owner,
     int EntryCount,
-    CommitToken ObservedAt);
+    CommitToken ObservedAt)
+{
+    public DfsBasicInformation? BasicInformation { get; init; }
+}

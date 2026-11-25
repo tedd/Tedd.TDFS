@@ -23,10 +23,10 @@ internal static class ProtocolFeatures
     public const string NextFormat = "test.next-format";
 
     /// <summary>Every feature this build supports (ordinal set).</summary>
-    public static IReadOnlySet<string> Supported { get; } = new[] { Probe, IrreversibleProbe }.ToFrozenSet(StringComparer.Ordinal);
+    public static IReadOnlySet<string> Supported { get; } = new[] { Probe, IrreversibleProbe, DfsExportRoot.ClusterFeature }.ToFrozenSet(StringComparer.Ordinal);
 
     /// <summary>Features that can never be deactivated once active (every known one, supported or not).</summary>
-    public static IReadOnlySet<string> Irreversible { get; } = new[] { IrreversibleProbe, NextFormat }.ToFrozenSet(StringComparer.Ordinal);
+    public static IReadOnlySet<string> Irreversible { get; } = new[] { IrreversibleProbe, NextFormat, DfsExportRoot.ClusterFeature }.ToFrozenSet(StringComparer.Ordinal);
 
     /// <summary>
     /// The minimum-reader marker (<see cref="Superblock.MinSoftwareVersion"/>) every node durably records once the irreversible
@@ -35,7 +35,7 @@ internal static class ProtocolFeatures
     /// </summary>
     public static int ReaderMarkerOf(string feature) => feature switch
     {
-        IrreversibleProbe => Superblock.BaseSoftwareVersion + 1,
+        DfsExportRoot.ClusterFeature or IrreversibleProbe => Superblock.BaseSoftwareVersion + 1,
         NextFormat => Superblock.BaseSoftwareVersion + 2,
         _ => 0,
     };

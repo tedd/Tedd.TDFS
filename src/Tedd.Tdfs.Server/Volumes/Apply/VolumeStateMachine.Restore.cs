@@ -167,7 +167,7 @@ internal sealed partial class VolumeStateMachine
         ulong next = InodeRecord.RootId + 1;
         foreach (InodeRecord n in restore.Staged.Values)
         {
-            var streams = ImmutableSortedDictionary.CreateBuilder<string, StreamRecord>(StringComparer.Ordinal);
+            var streams = ImmutableSortedDictionary.CreateBuilder<string, StreamRecord>(n.Streams.KeyComparer);
             foreach (KeyValuePair<string, StreamRecord> pair in n.Streams)
                 streams[pair.Key] = pair.Value with { Revision = ctx.Index, CreatedIndex = ctx.Index };
             inodes[n.Id] = n with { Revision = ctx.Index, MetadataRevision = ctx.Index, CreatedIndex = ctx.Index, Streams = streams.ToImmutable() };

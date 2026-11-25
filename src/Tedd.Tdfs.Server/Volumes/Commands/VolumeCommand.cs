@@ -21,6 +21,8 @@ internal enum VolumeCommandKind : ushort
     CreateDirectory = 100,
     Move = 101,
     Delete = 102,
+    ExportControl = 103,
+    ExportOpen = 209,
 
     OpenHandle = 200,
     CloseHandle = 201,

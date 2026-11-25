@@ -32,6 +32,11 @@ public sealed class CommandCodecTests
         PublishSpec spec = Spec(20, 4, false, 3, DataChange(0, 10, Obj(1), 4), Zero(10, 2), Inline(12, [1, 2, 3])) with { Policy = "pair" };
         VolumeCommand command = kind switch
         {
+            VolumeCommandKind.ExportOpen => new ExportOpenCommand(new ExportOpenMessage(new OpenHandleMessage(new RequestHeader("vol"), "/file",
+                FileMode.Open, FileAccess.Read, FileShare.Delete, 0, false, false, null), new DfsExportRoot(default, new InodeId(7)), DfsOpenAccess.Read, false),
+                TimeSpan.FromSeconds(3)),
+            VolumeCommandKind.ExportControl => new ExportControlCommand(new ExportControlMessage(new RequestHeader("vol"), ExportControlKind.Disposition,
+                new HandleId(1), Flag: true)),
             VolumeCommandKind.OpenSession => new OpenSessionCommand("c", new UInt128(1, 2), TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), 7, TimeSpan.FromSeconds(3)),
             VolumeCommandKind.KeepAlive => new KeepAliveCommand(3, [1, 2], [new PinAdvance(1, 9)], [4]),
             VolumeCommandKind.ExpireSessions => new ExpireSessionsCommand([1, 5]),

@@ -249,11 +249,11 @@ Command catalogue (all deterministic):
 * `OpenHandle` performs, in one entry: path resolution, permission check, `FileMode` semantics (create / truncate),
   sharing check against **all** active handles on the inode in **both directions** (LOCK-002), writer exclusivity
   (one writable handle or tx reservation per inode — LOCK-01), and allocates the handle with a lease and a pin.
-  Writable handles requesting `FileShare.Write` are rejected; `FileShare.Inheritable` and unknown bits are rejected.
+  Standard writable handles use exclusive writer reservations; `FileShare.Inheritable` and unknown bits are rejected.
 * Writable opens increment the inode's `WriterGeneration` and bind it to the handle.
 * Every publication (`CommitFile`, `Append` via handle, `SetLength`, tx commit touching the inode) carries
   `(HandleId, WriterGeneration)` and is rejected unless the handle is active and the generation equals the inode's
-  current generation (LOCK-04). A rejected publication → `LeaseLost` (the SDK faults the stream).
+  current generation for exclusive writers (LOCK-04). A shared writer validates the session, live handle and its own generation. A rejected publication → `LeaseLost` (the SDK faults the stream).
 * Leases: the client renews with `KeepAlive` every `LeaseDuration/3`. The **leader** tracks renewals with its
   monotonic clock and proposes `ExpireHandles` after `LeaseDuration` without renewal. A newly elected leader treats
   every lease as renewed at its election (conservative). Expiry releases sharing reservations and writer
@@ -262,6 +262,15 @@ Command catalogue (all deterministic):
 * Delete/rename-over of an inode with open handles requires all of them to have `FileShare.Delete`; the inode is
   then detached (no path) and remains readable/writable through existing handles; writes never recreate the path;
   the inode is reclaimed (`ReclaimDetached`) after the last handle closes or expires (NS-06, OPEN-017).
+
+A volume defaults to `DfsExportProfile.Disabled`. Export opens use the same replicated handle table as native
+opens. The leader resolves the directory identity and the requested path in the same state-machine decision.
+For a handle rename it checks membership of the source inode and resolves the destination under the handle's root.
+Delete disposition survives session expiry and checkpoint recovery. A pending directory must be empty.
+
+Compatible shared writers commit range writes under the leader's existing per-stream publication lock.
+The leader computes the resulting length from the current revision and the written range. Explicit changes of
+length and atomic appends share this ordering. No additional lock acquisition RPC is required for standard opens.
 
 ### 5.4 Publication (FSD §10.3)
 

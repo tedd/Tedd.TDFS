@@ -1011,6 +1011,49 @@ Reply to `ReserveOperationIdsMessage`: sequences `[FirstSequence, FirstSequence 
 
 ### 9.4 Namespace and files
 
+#### `ExportOpen` = 174 (`ExportOpenMessage`)
+
+Opens a live object within a directory mapping. The leader validates the volume incarnation, desired access and profile during apply.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Open` | OpenHandle body | File mode, data access, share mask and request header. |
+| 2 | `Root` | CommitToken + InodeId | Cluster, volume incarnation and directory identity. |
+| 3 | `DesiredAccess` | enum | Read, write and delete bits. Zero requests metadata only. |
+| 4 | `Directory` | bool | Require a directory. |
+| 5 | `DeleteOnClose` | bool | Mark the inode delete-pending in the open decision. |
+
+#### `ExportOpenResult` = 175 (`ExportOpenResultMessage`)
+
+Returns the open decision under the original operation ID.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Open` | OpenHandleResult body | Granted handle, metadata, fencing generation and create result. |
+
+#### `ExportControl` = 176 (`ExportControlMessage`)
+
+Changes a volume profile or acts on an export handle in the issuing session.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Header` | RequestHeader | Volume, session and operation. |
+| 2 | `Action` | enum | Configure, Bind, Disposition, Rename or SetBasicInformation. |
+| 3 | `Handle` | HandleId | Handle for an object operation. |
+| 4 | `Profile` | enum | Disabled, CaseSensitive or Windows for Configure. |
+| 5 | `Destination` | string | Mapping-relative destination for Rename or live directory path for Bind. |
+| 6 | `Flag` | bool | Overwrite for Rename or pending for Disposition. |
+| 7 | `Information` | optional basic information | Four optional UTC timestamps in creation, modification, access and change order, followed by signed DOS attributes (-1 preserves attributes). |
+
+#### `ExportControlResult` = 177 (`ExportControlResultMessage`)
+
+Acknowledges a committed control operation.
+
+| # | Field | Wire type | Meaning |
+|---|---|---|---|
+| 1 | `Token` | CommitToken | Commit token (registration token for Bind). |
+| 2 | `Directory` | InodeId | Registered directory for Bind, zero otherwise. |
+
 #### `OpenHandle` = 40 (`OpenHandleMessage`)
 
 Opens a handle on a file (client → volume leader; one committed `OpenHandle` entry). Performs path resolution, permission check, `FileMode` semantics (create/truncate), sharing checks against every active handle in both directions, writer exclusivity, and allocates the handle with a lease (and, for version-pinned reads, a pin). Writable opens increment the inode writer generation. Creating/truncating opens must carry an operation id; retries return the stored outcome. Transaction-bound opens (header transaction set) are private to the transaction. Errors: FileNotFound, DirectoryNotFound, AlreadyExists, IsADirectory, AccessDenied, SharingViolation, WriterConflict, InvalidArgument (unknown mode/access/share/options bits, Inheritable, writable handle granting FileShare.Write, VersionPinned on a writable handle), InvalidPath, LimitExceeded (handles per session).

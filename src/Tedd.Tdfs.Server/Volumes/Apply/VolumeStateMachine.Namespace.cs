@@ -70,7 +70,7 @@ internal sealed partial class VolumeStateMachine
         return (s, current);
     }
 
-    private static (VolumeState, VolumeApplyResult) ApplyMove(VolumeState s, ApplyContext ctx, MoveCommand c)
+    private static (VolumeState, VolumeApplyResult) ApplyMove(VolumeState s, ApplyContext ctx, MoveCommand c, ulong actingHandle = 0)
     {
         RequireGrant(ctx, DfsPermissions.Write, "move");
         string source = NormalizePath(c.Source);
@@ -96,7 +96,8 @@ internal sealed partial class VolumeStateMachine
 
         Resolution dst = view.Resolve(destination);
         RequireTraverse(s, ctx, dst);
-        if (dst.Found && dst.Target!.Id == node.Id)
+        bool sameInode = dst.Found && dst.Target!.Id == node.Id;
+        if (sameInode && node.Name == dst.Name)
         {
             // Renaming an entry onto itself (identical normalized name): nothing changes.
             (VolumeState same, SnapshotInfoData? sameSnap) = SnapshotInSameEntry(s, ctx, c.SnapshotName);
@@ -113,8 +114,19 @@ internal sealed partial class VolumeStateMachine
         if (node.IsDirectory && view.IsAncestorOrSelf(node.Id, dstParent.Id))
             throw Fail(DfsErrorCode.InvalidArgument, $"'{source}' cannot be moved into its own subtree.");
 
+        if (s.Root.ExportProfile != DfsExportProfile.Disabled)
+        {
+            foreach (HandleRecord h in s.Handles.Values)
+            {
+                ulong root = h.CommittedDeleteRoot != 0 ? h.CommittedDeleteRoot : h.DeleteOnClose ? h.ExportRoot : 0;
+                if (root != 0 && view.IsAncestorOrSelf(node.Id, h.Inode) && !view.IsAncestorOrSelf(node.Id, root)
+                    && (view.ChainOf(dstParent.Id)?.FirstOrDefault(n => s.ExportRoots.ContainsKey(n.Id))?.Id != root))
+                    throw Fail(DfsErrorCode.SharingViolation, "A delete-pending object would leave its export mapping.");
+            }
+        }
         InodeRecord? replaced = null;
-        if (dst.Found)
+        RequireAvailable(s, dstParent.Id);
+        if (dst.Found && !sameInode)
         {
             InodeRecord existing = dst.Target!;
             if (!c.Overwrite)
@@ -125,12 +137,13 @@ internal sealed partial class VolumeStateMachine
         }
 
         IReadOnlyList<InodeRecord> srcChain = src.ChainNearestFirst();
-        RequireDelete(ctx, srcChain, $"move '{source}'");
+        if (actingHandle == 0)
+            RequireDelete(ctx, srcChain, $"move '{source}'");
         Require(ctx, dst.ParentChainNearestFirst(), node.IsDirectory ? DfsFileSystemRights.CreateDirectories : DfsFileSystemRights.CreateFiles,
             $"move into '{DfsPath.GetParent(destination)}'");
         if (replaced is not null)
             RequireDelete(ctx, dst.ChainNearestFirst(), $"replace '{destination}'");
-        RequireDeleteSharing(s, node.Id, $"move '{source}'");
+        RequireDeleteSharing(s, node.Id, $"move '{source}'", actingHandle);
         if (replaced is not null)
             RequireDeleteSharing(s, replaced.Id, $"replace '{destination}'");
 
@@ -139,6 +152,8 @@ internal sealed partial class VolumeStateMachine
         srcParent = Touch(srcParent with { Children = srcParent.Children.Remove(src.Name) }, ctx);
         s = Put(s, srcParent);
         InodeRecord targetParent = s.Inodes[dstParent.Id];
+        if (replaced is not null)
+            targetParent = targetParent with { Children = targetParent.Children.Remove(replaced.Name) };
         targetParent = Touch(targetParent with { Children = targetParent.Children.SetItem(dst.Name, node.Id) }, ctx);
         s = Put(s, targetParent);
         InodeRecord moved = TouchMetadata(node with { ParentId = targetParent.Id, Name = dst.Name }, ctx);
@@ -177,6 +192,7 @@ internal sealed partial class VolumeStateMachine
             if (!target.Streams.TryGetValue(stream, out StreamRecord? existingStream))
                 return Absent(s, ctx, c.SnapshotName);
             RequireDelete(ctx, chain, $"delete stream '{path}'");
+            stream = target.StreamName(stream);
             var key = new StreamKey(target.Id, stream);
             if (HandlesOf(s, key).FirstOrDefault(h => (h.Share & FileShare.Delete) == 0) is { } blocking)
                 throw Fail(DfsErrorCode.SharingViolation, $"Deleting '{path}': handle {blocking.Id} does not grant FileShare.Delete.");

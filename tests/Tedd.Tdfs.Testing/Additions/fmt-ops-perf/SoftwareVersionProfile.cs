@@ -152,8 +152,8 @@ public sealed record SoftwareVersionProfile(
     /// <summary>The cached built-in profiles (one instance each, see the identity contract above).</summary>
     private static class Profiles
     {
-        private static readonly IReadOnlySet<string> CurrentFeatures = Set(ProbeFeature, IrreversibleProbeFeature);
-        private static readonly IReadOnlySet<string> CurrentIrreversible = Set(IrreversibleProbeFeature);
+        private static readonly IReadOnlySet<string> CurrentFeatures = Set(ProbeFeature, IrreversibleProbeFeature, DfsExportRoot.ClusterFeature);
+        private static readonly IReadOnlySet<string> CurrentIrreversible = Set(IrreversibleProbeFeature, DfsExportRoot.ClusterFeature);
 
         public static readonly SoftwareVersionProfile Current = new("Current", Protocol.ProtocolInfo.MinSupportedVersion, Protocol.ProtocolInfo.CurrentVersion,
             CurrentDiskFormat, IrreversibleProbeMarker, CurrentFeatures, CurrentIrreversible, IsEmulated: false);
@@ -165,7 +165,7 @@ public sealed record SoftwareVersionProfile(
             Set(), Set(), IsEmulated: true);
 
         public static readonly SoftwareVersionProfile Next = new("Next", Protocol.ProtocolInfo.MinSupportedVersion, Protocol.ProtocolInfo.CurrentVersion + 1,
-            CurrentDiskFormat, NextFeatureMarker, Set(ProbeFeature, IrreversibleProbeFeature, NextFeature), Set(IrreversibleProbeFeature, NextFeature),
+            CurrentDiskFormat, NextFeatureMarker, Set(ProbeFeature, IrreversibleProbeFeature, NextFeature, DfsExportRoot.ClusterFeature), Set(IrreversibleProbeFeature, NextFeature, DfsExportRoot.ClusterFeature),
             IsEmulated: true);
 
         public static readonly IReadOnlyList<SoftwareVersionProfile> Window = [Previous, Current];

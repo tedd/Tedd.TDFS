@@ -27,11 +27,11 @@ internal sealed partial class VolumeStateMachine
                 : Fail(DfsErrorCode.LeaseLost, $"Handle {handleId} is no longer active (closed or its lease expired).");
         }
 
-        if (!string.Equals(h.Principal, principal, StringComparison.Ordinal))
+        if (!string.Equals(h.Principal, principal, StringComparison.Ordinal) || (h.ExportRoot != 0 && h.Session != ctx.Op?.RequestSession))
             throw Fail(DfsErrorCode.InvalidHandle, $"Handle {handleId} belongs to another principal.");
         if (!h.IsWriter)
             throw Fail(DfsErrorCode.AccessDenied, $"Handle {handleId} was not opened for writing.");
-        if (!skipFencing && (generation != h.WriterGeneration || s.WriterGenerationOf(h.Key) != h.WriterGeneration))
+        if (!skipFencing && (generation != h.WriterGeneration || (!h.SharedWriter && s.WriterGenerationOf(h.Key) != h.WriterGeneration)))
             throw Fail(DfsErrorCode.LeaseLost, $"Writer generation {generation} of handle {handleId} is stale (current {s.WriterGenerationOf(h.Key)}).");
         return h;
     }
@@ -190,6 +190,7 @@ internal sealed partial class VolumeStateMachine
         (string filePath, string? streamName) = DfsStreamPath.Split(path);
         string stream = streamName ?? DfsStreamPath.DefaultStreamName;
         (s, InodeRecord inode, bool created) = ResolveOrCreateFile(s, ctx, path, filePath, stream, create: true, c.CreateParents, c.StoragePolicy, append: false);
+        stream = inode.StreamName(stream);
         if (c.ExpectedRevision != 0)
         {
             // A conditional replacement needs the expected revision to be current; an absent file or stream has none, so a
@@ -231,6 +232,7 @@ internal sealed partial class VolumeStateMachine
             (string filePath, string? streamName) = DfsStreamPath.Split(path);
             stream = streamName ?? DfsStreamPath.DefaultStreamName;
             (s, inode, created) = ResolveOrCreateFile(s, ctx, path, filePath, stream, c.CreateIfMissing, createParents: false, c.StoragePolicy, append: true);
+            stream = inode.StreamName(stream);
             RequireImplicitWriter(s, ctx, new StreamKey(inode.Id, stream), $"append to '{path}'");
         }
 
@@ -453,6 +455,8 @@ internal sealed partial class VolumeStateMachine
         if (!src.Found)
             throw Fail(DfsErrorCode.FileNotFound, $"'{source}' does not exist.");
         InodeRecord from = src.Target!;
+        RequireAvailable(s, from.Id);
+        sourceStream = from.StreamName(sourceStream);
         if (from.IsDirectory && sourceStreamName is null)
             throw Fail(DfsErrorCode.IsADirectory, $"'{source}' is a directory.");
         if (!from.Streams.ContainsKey(sourceStream))
@@ -487,6 +491,7 @@ internal sealed partial class VolumeStateMachine
         if (dst.Found)
         {
             to = dst.Target!;
+            destinationStream = to.StreamName(destinationStream);
             if (to.Id == from.Id)
                 throw Fail(DfsErrorCode.InvalidArgument, $"'{source}' cannot be copied onto its own file '{destination}'.");
             if (to.IsDirectory && destinationStreamName is null)

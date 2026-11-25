@@ -63,12 +63,14 @@ public sealed class DfsStream : Stream, ILeaseHolder
         ReadView = readView;
         WriteMode = writeMode;
         Access = access;
+        DesiredAccess = (DfsOpenAccess)access;
         Share = share;
         IsAppend = isAppend;
         IsTransactionBound = transaction is not null;
         WriterGeneration = writerGeneration;
-        _canRead = (access & FileAccess.Read) != 0;
-        _canWrite = (access & FileAccess.Write) != 0;
+        bool dataStream = info.Kind != WireEntryKind.Directory || info.IsStream;
+        _canRead = dataStream && (access & FileAccess.Read) != 0;
+        _canWrite = dataStream && (access & FileAccess.Write) != 0;
         _bufferSize = bufferSize;
         _policyName = info.StoragePolicy;
         _knownLength = info.Length;
@@ -84,6 +86,42 @@ public sealed class DfsStream : Stream, ILeaseHolder
             _overlay = new StagedOverlay(info.Length);
         if (isAppend)
             _position = info.Length;
+    }
+
+    /// <summary>The namespace effect reported by the open decision.</summary>
+    public DfsCreateResult CreateResult { get; internal init; }
+
+    /// <summary>Identity of the mapping that granted this handle.</summary>
+    public DfsExportRoot? ExportRoot { get; internal init; }
+
+    private bool SharedWriter => _canWrite && (Share & FileShare.Write) != 0;
+
+    public Task SetDeletePendingAsync(bool pending, CancellationToken ct = default) =>
+        ControlAsync(ExportControlKind.Disposition, "", pending, null, ct);
+
+    /// <summary>Renames this inode within the original mapping. The destination is relative to the same directory identity.</summary>
+    public Task RenameAsync(string destination, bool overwrite = false, CancellationToken ct = default) =>
+        ControlAsync(ExportControlKind.Rename, destination, overwrite, null, ct);
+
+    public Task SetBasicInformationAsync(DfsBasicInformation information, CancellationToken ct = default) =>
+        ControlAsync(ExportControlKind.SetBasicInformation, "", false, information ?? throw new ArgumentNullException(nameof(information)), ct);
+
+    private async Task ControlAsync(ExportControlKind action, string path, bool flag, DfsBasicInformation? information, CancellationToken ct)
+    {
+        using AsyncGate.Scope gate = _gate.Enter(action.ToString());
+        ct.ThrowIfCancellationRequested();
+        ThrowIfFaulted();
+        if (action == ExportControlKind.Rename)
+            path = Validation.Path(path);
+        if (ExportRoot is null)
+            throw new NotSupportedException("The handle has no export mapping.");
+        using OperationScope scope = Begin(DfsOperationKind.ExportControl, ct);
+        await scope.StartedAsync().ConfigureAwait(false);
+        await scope.ValidatedAsync().ConfigureAwait(false);
+        var reply = await _volume.MutateAsync<ExportControlResultMessage>(scope, action.ToString(), null,
+            header => new ExportControlMessage(header, action, _handle, Destination: path, Flag: flag, Information: information),
+            Path, rebindable: false, binding: _binding).ConfigureAwait(false);
+        _lastToken = reply.Token;
     }
 
     /// <summary>Path at open time (informational; the handle follows the inode across renames).</summary>
@@ -103,6 +141,9 @@ public sealed class DfsStream : Stream, ILeaseHolder
 
     /// <summary>Granted access.</summary>
     public FileAccess Access { get; }
+
+    /// <summary>Independent read, write and delete access requested at open.</summary>
+    public DfsOpenAccess DesiredAccess { get; internal init; }
 
     /// <summary>Sharing granted to other handles.</summary>
     public FileShare Share { get; }
@@ -157,7 +198,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
         get
         {
             ThrowIfDisposed();
-            return _overlay is not null ? _overlay.Length : GetLength();
+            return _overlay is not null && !SharedWriter ? _overlay.Length : GetLength();
         }
     }
 
@@ -287,7 +328,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
         int got;
         try
         {
-            if (_overlay is not null)
+            if (_overlay is not null && !SharedWriter)
             {
                 (temp, got) = await ReadStagedAsync(position, want, scope).ConfigureAwait(false);
             }
@@ -637,7 +678,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
                 return Task.CompletedTask;
             }
 
-            long offset = IsAppend ? _overlay!.Length : _position;
+            long offset = IsAppend ? (SharedWriter ? 0 : _overlay!.Length) : _position;
             long maximum = _volume.MaxFileLength;
             if (offset > maximum - owned.Length)
                 throw new DfsLimitExceededException(nameof(DfsVolumeLimits.MaxFileLength), maximum, offset + owned.Length);
@@ -664,8 +705,11 @@ public sealed class DfsStream : Stream, ILeaseHolder
             // Transaction-bound writes cannot overlap the transaction's commit (TX-017).
             using DfsTransaction.TransactionOperation? transaction = _transaction?.Enter();
             StagedOverlay overlay = _overlay!;
-            long offset = IsAppend ? overlay.Length : _position;
             StagedOverlay.Snapshot before = overlay.Capture();
+            // Shared appends stage a relative suffix. Only the leader knows the current EOF.
+            if (SharedWriter && IsAppend)
+                overlay.Reset(0);
+            long offset = IsAppend ? overlay.Length : _position;
             long positionBefore = _position;
 
             // Staged synchronously (before any await): the bytes now belong to the stream.
@@ -675,7 +719,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
             {
                 if (WriteMode == DfsWriteMode.WriteThrough)
                 {
-                    using OperationScope scope = Begin(DfsOperationKind.CommitFile, ct);
+                    using OperationScope scope = Begin(IsAppend && SharedWriter ? DfsOperationKind.Append : DfsOperationKind.CommitFile, ct);
                     await scope.HitAsync(FaultStage.F00, FaultSites.ClientOperationStart).ConfigureAwait(false);
                     await scope.HitAsync(FaultStage.F01, FaultSites.ClientValidated).ConfigureAwait(false);
                     scope.ThrowIfCancelled();
@@ -714,7 +758,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
         {
             SeekOrigin.Begin => 0,
             SeekOrigin.Current => _position,
-            SeekOrigin.End => _overlay?.Length ?? CurrentLengthForSeek(),
+            SeekOrigin.End => !SharedWriter && _overlay is not null ? _overlay.Length : CurrentLengthForSeek(),
             _ => throw new ArgumentException($"Invalid seek origin {origin}.", nameof(origin)),
         };
         long target;
@@ -795,7 +839,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
                 await scope.HitAsync(FaultStage.F00, FaultSites.ClientOperationStart).ConfigureAwait(false);
                 await scope.HitAsync(FaultStage.F01, FaultSites.ClientValidated).ConfigureAwait(false);
                 scope.ThrowIfCancelled();
-                await PublishAsync(scope, null).ConfigureAwait(false);
+                await PublishAsync(scope, null, explicitLength: SharedWriter).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -816,7 +860,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
             ThrowIfFaulted();
             ct.ThrowIfCancellationRequested();
             _transaction?.ThrowIfNotActive();
-            if (_overlay is not null || ReadView == DfsReadView.VersionPinned)
+            if ((_overlay is not null && !SharedWriter) || ReadView == DfsReadView.VersionPinned)
             {
                 long length = _overlay?.Length ?? _knownLength;
                 gate.Dispose();
@@ -892,7 +936,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
             scope.ThrowIfCancelled();
             GetInfoResultMessage result = await GetHandleInfoAsync(scope).ConfigureAwait(false);
             FileInfoData info = result.Info!;
-            long? length = _overlay?.Length ?? (ReadView == DfsReadView.VersionPinned ? _knownLength : null);
+            long? length = (SharedWriter ? null : _overlay?.Length) ?? (ReadView == DfsReadView.VersionPinned ? _knownLength : null);
             return WireConvert.ToFileInfo(info, result.ObservedAt, length);
         }
     }
@@ -1089,10 +1133,10 @@ public sealed class DfsStream : Stream, ILeaseHolder
     /// Publishes the staged view with one <c>CommitFile</c> (inline when the result fits the inline threshold and the
     /// policy allows it, otherwise after uploading every buffered range), then makes it the new base.
     /// </summary>
-    private async Task<CommitToken> PublishAsync(OperationScope scope, DfsMutationOptions? options)
+    private async Task<CommitToken> PublishAsync(OperationScope scope, DfsMutationOptions? options, bool explicitLength = false)
     {
         StagedOverlay overlay = _overlay!;
-        if (!overlay.IsDirty && options?.CommitSnapshotName is null)
+        if (!explicitLength && !overlay.IsDirty && options?.CommitSnapshotName is null)
             return _lastToken;
 
         VolumeEntry entry = await EnsureEntryAsync(scope).ConfigureAwait(false);
@@ -1143,9 +1187,20 @@ public sealed class DfsStream : Stream, ILeaseHolder
 
             long truncateTo = overlay.TruncateTo;
             StagingId stagingId = receipts.Count > 0 ? staging!.Id : default;
-            result = await _volume.MutateAsync<CommitFileResultMessage>(scope, "CommitFile", options?.OperationId,
-                header => new CommitFileMessage(header, _handle, WriterGeneration, 0, truncateTo, newLength, changes, receipts, stagingId,
-                    options?.CommitSnapshotName), Path, _transaction?.Id, rebindable: false, binding: _binding).ConfigureAwait(false);
+            if (IsAppend && SharedWriter && changes.Count > 0)
+            {
+                var appended = await _volume.MutateAsync<AppendResultMessage>(scope, "Append", options?.OperationId,
+                    header => new AppendMessage(header, "", _handle, WriterGeneration, newLength, changes, receipts, stagingId,
+                        false, null, options?.CommitSnapshotName), Path, rebindable: false, binding: _binding).ConfigureAwait(false);
+                _position = appended.NewLength;
+                result = new CommitFileResultMessage(appended.Inode, appended.Revision, appended.NewLength, appended.Token, appended.Snapshot);
+            }
+            else
+            {
+                result = await _volume.MutateAsync<CommitFileResultMessage>(scope, "CommitFile", options?.OperationId,
+                    header => new CommitFileMessage(header, _handle, WriterGeneration, 0, explicitLength ? newLength : truncateTo, newLength, changes, receipts,
+                        stagingId, options?.CommitSnapshotName), Path, _transaction?.Id, rebindable: false, binding: _binding).ConfigureAwait(false);
+            }
         }
         catch
         {
@@ -1450,13 +1505,16 @@ public sealed class DfsStream : Stream, ILeaseHolder
             return;
         _volume.UnregisterHandle(_handle);
         if (_runtime.IsDisposed)
+        {
+            ObjectDisposedException.ThrowIf(ExportRoot is not null, _runtime);
             return;
+        }
         OperationScope scope;
         try
         {
             scope = Begin(DfsOperationKind.CloseHandle, ct);
         }
-        catch (ObjectDisposedException)
+        catch (ObjectDisposedException) when (ExportRoot is null)
         {
             return; // the client is being disposed: the handle expires with its lease
         }
@@ -1472,7 +1530,7 @@ public sealed class DfsStream : Stream, ILeaseHolder
         {
             await _volume.CloseHandleAsync(_handle, WriterGeneration, _transaction?.Id, scope, _binding).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OutOfMemoryException)
+        catch (Exception ex) when (ex is not OutOfMemoryException && ExportRoot is null)
         {
             // The leader expires the handle after its lease when the close cannot be delivered (PUB-017).
             _runtime.Emit("stream.close-failed", $"Closing handle {_handle.Value} failed ({ex.GetType().Name}); it expires with its lease.",

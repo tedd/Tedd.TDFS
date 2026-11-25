@@ -37,4 +37,7 @@ public sealed record DfsFileInfo(
     CommitToken ObservedAt,
     bool IsStream = false,
     string? StreamName = null,
-    int StreamCount = 0);
+    int StreamCount = 0)
+{
+    public DfsBasicInformation? BasicInformation { get; init; }
+}

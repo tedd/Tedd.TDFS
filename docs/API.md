@@ -367,6 +367,10 @@ public enum DfsReadView { Live, VersionPinned }
 
 public sealed record DfsOpenOptions
 {
+    public DfsExportRoot? ExportRoot { get; init; }
+    public DfsOpenAccess? DesiredAccess { get; init; }
+    public bool Directory { get; init; }
+    public bool DeleteOnClose { get; init; }
     public FileMode Mode { get; init; } = FileMode.Open;
     public FileAccess Access { get; init; } = FileAccess.Read;
     public FileShare Share { get; init; } = FileShare.Read;
@@ -384,6 +388,40 @@ public sealed record DfsMutationOptions
     public string? CommitSnapshotName { get; init; }                  // commit-and-snapshot in the same decision
 }
 ```
+
+#### Live subtree exports
+
+After activating the cluster format with `client.Admin.SetFeatureAsync(DfsExportRoot.ClusterFeature, true)`, an administrator selects a volume profile with `volume.ConfigureExportsAsync(DfsExportProfile.Windows)` or
+`DfsExportProfile.CaseSensitive`. As an administrator, bind the mapping to a live directory once and persist the returned
+`DfsExportRoot` with the gateway configuration. Every path supplied with that root starts at the mapping.
+
+```csharp
+var root = await volume.BindExportAsync("/accounts");
+await using var file = await volume.Files.OpenAsync("/ledger", new DfsOpenOptions
+{
+    ExportRoot = root,
+    Mode = FileMode.OpenOrCreate,
+    DesiredAccess = DfsOpenAccess.Read | DfsOpenAccess.Write | DfsOpenAccess.Delete,
+    Share = FileShare.ReadWrite | FileShare.Delete
+});
+DfsCreateResult effect = file.CreateResult;
+await file.RenameAsync("/ledger-current");
+```
+
+Use `DfsOpenAccess.None` for a metadata-only reservation and `Directory = true` for directory opens.
+`CreateResult` reports `Created`, `Opened`, or `Truncated` from the committed decision.
+`DeleteOnClose` sets disposition during the open. An existing handle can change its own disposition with
+`SetDeletePendingAsync(bool)`. The last close or lease expiry completes deletion by inode identity.
+A handle rename accepts a destination in its original live mapping. Opening the replacement at an old pathname
+requires a new handle.
+
+Writable export opens granting `FileShare.Write` use write-through. Each completed write or length change is
+visible to subsequent live reads, and append selects the end of the stream at the leader. A flush on a clean
+shared writer has no pending data. Exclusive writers retain the selected publication mode.
+
+`SetBasicInformationAsync` updates the supplied creation, modification, access and change times and DOS attributes.
+Read `BasicInformation` from file or directory information. Access time reflects the stored value
+(initially creation time). Supported attributes are ReadOnly, Hidden, System, Archive, Normal and Directory.
 
 ### B.3 File facade
 

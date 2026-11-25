@@ -80,11 +80,12 @@ internal sealed partial class VolumeStateMachine
         ImmutableSortedSet<StreamKey> reservations = tx.Reservations;
         foreach (StreamKey key in OrEmpty(c.Streams))
         {
+            RequireAvailable(s, key.Inode);
             if (reservations.Contains(key))
                 continue;
             foreach (HandleRecord h in HandlesOf(s, key))
             {
-                if (h.IsWriter || (h.Share & FileShare.Write) == 0)
+                if (h.IsWriter || h.DeleteAccess || (h.Share & FileShare.Write) == 0)
                 {
                     throw Fail(DfsErrorCode.SharingViolation,
                         $"Transaction {tx.Id} cannot reserve the stream for writing: handle {h.Id} ({h.Access}, share {h.Share}) is open on it.");

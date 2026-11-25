@@ -210,6 +210,41 @@ internal sealed partial class VolumeService
 
     // ------------------------------------------------------------------------------------------------- OpenHandle / CloseHandle
 
+    private async Task RequireExportFormatAsync(CancellationToken ct)
+    {
+        if (_s.Control.State.Features.Contains(DfsExportRoot.ClusterFeature))
+            return;
+        await Barrier.WaitAsync(ct);
+        if (!_s.Control.State.Features.Contains(DfsExportRoot.ClusterFeature))
+            throw new NotSupportedException($"Activate cluster feature '{DfsExportRoot.ClusterFeature}' before using live exports.");
+    }
+
+    public async Task<IWireMessage> ExportOpenAsync(RpcContext context, ExportOpenMessage request)
+    {
+        await RequireExportFormatAsync(context.Cancellation);
+        if (request.Header.Transaction is not null)
+            throw new ArgumentException("Export reservations require a live volume.");
+        if (request.Open.StoragePolicy is { Length: > 0 } policy && !Record.NamedPolicies.ContainsKey(policy))
+            throw new DfsException(DfsErrorCode.InvalidPolicy, $"Unknown storage policy '{policy}'.");
+        return await MutateAsync(context, request, DfsOperationKind.Open,
+            (op, _) => Task.FromResult<VolumeCommand>(Stamp(new ExportOpenCommand(request, _s.Timings.LeaseDuration), op)),
+            result =>
+            {
+                if (result.Value is OpenValue opened)
+                    RenewHandle(opened.Handle.Id);
+                return result.Reply!;
+            });
+    }
+
+    public async Task<IWireMessage> ExportControlAsync(RpcContext context, ExportControlMessage request)
+    {
+        await RequireExportFormatAsync(context.Cancellation);
+        if (request.Header.Transaction is not null)
+            throw new ArgumentException("Export control operations require a live volume.");
+        return await MutateAsync(context, request, DfsOperationKind.ExportControl,
+            (op, _) => Task.FromResult<VolumeCommand>(Stamp(new ExportControlCommand(request), op)));
+    }
+
     /// <summary><c>OpenHandle</c> (PROTOCOL.md §8.2): one committed entry; the handle's lease starts now.</summary>
     public async Task<IWireMessage> OpenHandleAsync(RpcContext context, OpenHandleMessage request)
     {
@@ -273,7 +308,7 @@ internal sealed partial class VolumeService
                 throw new ArgumentException("A handle read addresses the handle's own stream; Stream is only valid for snapshot reads by inode.");
             ulong applied = await ReadBarrierAsync(ct);
             VolumeState s = State;
-            HandleRecord h = ReadableHandle(s, request.Handle.Value, principal);
+            HandleRecord h = ReadableHandle(s, request.Handle.Value, principal, request.Header.Session);
             if (h.View == HandleView.VersionPinned && h.PinnedInode is { } pinned)
             {
                 stream = pinned.GetStream(h.Stream) ?? throw new DfsLeaseLostException($"The pinned stream of handle {h.Id} does not exist.");
@@ -363,7 +398,7 @@ internal sealed partial class VolumeService
     private TimeSpan CapabilityLifetime => _s.Timings.PinDuration > _s.Timings.LeaseDuration ? _s.Timings.PinDuration : _s.Timings.LeaseDuration;
 
     /// <summary>A readable handle of the caller (InvalidHandle for foreign/never-issued ids, LeaseLost for expired ones).</summary>
-    private static HandleRecord ReadableHandle(VolumeState s, ulong id, string principal)
+    private static HandleRecord ReadableHandle(VolumeState s, ulong id, string principal, ulong session)
     {
         if (!s.Handles.TryGetValue(id, out HandleRecord? h))
         {
@@ -372,7 +407,7 @@ internal sealed partial class VolumeService
             throw new DfsLeaseLostException($"Handle {id} is no longer active (closed or its lease expired).");
         }
 
-        if (!string.Equals(h.Principal, principal, StringComparison.Ordinal))
+        if (!string.Equals(h.Principal, principal, StringComparison.Ordinal) || (h.ExportRoot != 0 && h.Session != session))
             throw new DfsException(DfsErrorCode.InvalidHandle, $"Handle {id} belongs to another principal.");
         if (!h.CanRead)
             throw new UnauthorizedAccessException($"Handle {id} was not opened for reading.");

@@ -16,6 +16,8 @@ internal static partial class CommandCodec
         readers.Add(VolumeCommandKind.Move, MoveCommand.ReadBody);
         readers.Add(VolumeCommandKind.Delete, DeleteCommand.ReadBody);
 
+        readers.Add(VolumeCommandKind.ExportOpen, ExportOpenCommand.ReadBody);
+        readers.Add(VolumeCommandKind.ExportControl, ExportControlCommand.ReadBody);
         readers.Add(VolumeCommandKind.OpenHandle, OpenHandleCommand.ReadBody);
         readers.Add(VolumeCommandKind.CloseHandle, CloseHandleCommand.ReadBody);
         readers.Add(VolumeCommandKind.CreateStaging, CreateStagingCommand.ReadBody);

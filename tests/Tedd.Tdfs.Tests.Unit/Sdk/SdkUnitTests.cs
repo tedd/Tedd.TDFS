@@ -1167,6 +1167,10 @@ public sealed class SdkUnitTests
             return FileAccess.ReadWrite;
         if (t == typeof(FileShare))
             return FileShare.None;
+        if (t == typeof(DfsBasicInformation))
+            return new DfsBasicInformation();
+        if (t == typeof(DfsExportProfile))
+            return DfsExportProfile.Windows;
         if (t == typeof(DfsOpenOptions))
             return new DfsOpenOptions { Mode = FileMode.OpenOrCreate, Access = FileAccess.ReadWrite, Share = FileShare.None };
         if (t == typeof(DfsMutationOptions))

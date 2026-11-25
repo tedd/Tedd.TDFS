@@ -473,7 +473,7 @@ internal sealed partial class VolumeService
                 continue;
             }
 
-            var streams = ImmutableSortedDictionary.CreateBuilder<string, StreamRecord>(StringComparer.Ordinal);
+            var streams = ImmutableSortedDictionary.CreateBuilder<string, StreamRecord>(inode.Streams.KeyComparer);
             foreach (KeyValuePair<string, StreamRecord> pair in inode.Streams)
             {
                 StreamRecord stream = pair.Value;
@@ -550,6 +550,8 @@ internal sealed partial class VolumeService
             WireRestorePhase.Complete => new RestoreCompleteCommand(request.Source, request.InodeCount),
             _ => throw new ArgumentException($"Unknown restore phase {request.Phase}."),
         };
+        if (command is RestoreChunkCommand chunk && chunk.Inodes.Any(n => n.HasExportMetadata))
+            await RequireExportFormatAsync(ct);
         RestoreRecord record;
         if (command is null)
         {

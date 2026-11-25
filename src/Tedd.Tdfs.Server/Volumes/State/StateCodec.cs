@@ -83,7 +83,14 @@ internal static class StateCodec
     public static void WriteInode(ref WireWriter w, InodeRecord n)
     {
         w.WriteVarUInt(n.Id);
-        w.WriteByte((byte)n.Kind);
+        w.WriteByte((byte)((int)n.Kind | (n.HasExportMetadata ? 0x80 : 0)));
+        if (n.HasExportMetadata)
+        {
+            w.WriteDefinedEnum(n.ExportProfile);
+            w.WriteOptionalDateTimeOffset(n.AccessedUtc);
+            w.WriteOptionalDateTimeOffset(n.ChangedUtc);
+            w.WriteVarInt(n.DosAttributes is { } attributes ? (int)attributes : -1);
+        }
         w.WriteVarUInt(n.Revision);
         w.WriteVarUInt(n.MetadataRevision);
         w.WriteVarUInt(n.CreatedIndex);
@@ -111,7 +118,13 @@ internal static class StateCodec
     public static InodeRecord ReadInode(ref WireReader r)
     {
         ulong id = r.ReadVarUInt();
-        var kind = (InodeKind)r.ReadByte();
+        byte tag = r.ReadByte();
+        var kind = (InodeKind)(tag & 0x7f);
+        bool extended = (tag & 0x80) != 0;
+        var profile = extended ? r.ReadEnum<DfsExportProfile>() : DfsExportProfile.Disabled;
+        var accessed = extended ? r.ReadOptionalDateTimeOffset() : null;
+        var changed = extended ? r.ReadOptionalDateTimeOffset() : null;
+        int attributes = extended ? r.ReadVarInt32() : -1;
         if (kind is not (InodeKind.File or InodeKind.Directory))
             throw WireReader.Malformed($"Unknown inode kind {(byte)kind}.");
         ulong revision = r.ReadVarUInt();
@@ -124,24 +137,25 @@ internal static class StateCodec
         ulong parent = r.ReadVarUInt();
         string name = r.ReadString();
         int streamCount = r.ReadCount(10);
-        var streams = ImmutableSortedDictionary.CreateBuilder<string, StreamRecord>(StringComparer.Ordinal);
+        var streams = ImmutableSortedDictionary.CreateBuilder<string, StreamRecord>(profile == DfsExportProfile.Windows ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
         for (int i = 0; i < streamCount; i++)
         {
             string streamName = r.ReadString();
-            streams[streamName] = ReadStream(ref r);
+            streams.Add(streamName, ReadStream(ref r));
         }
 
         int childCount = r.ReadCount(2);
-        var children = ImmutableSortedDictionary.CreateBuilder<string, ulong>(StringComparer.Ordinal);
+        var children = ImmutableSortedDictionary.CreateBuilder<string, ulong>(profile == DfsExportProfile.Windows ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
         for (int i = 0; i < childCount; i++)
         {
             string childName = r.ReadString();
-            children[childName] = r.ReadVarUInt();
+            children.Add(childName, r.ReadVarUInt());
         }
 
         return new InodeRecord(id, kind, revision, created, createdUtc, modifiedUtc, security, policy, parent, name, streams.ToImmutable(), children.ToImmutable())
         {
             MetadataRevision = metadataRevision,
+            ExportProfile = profile, AccessedUtc = accessed, ChangedUtc = changed, DosAttributes = attributes == -1 ? null : (FileAttributes)attributes,
         };
     }
 
@@ -212,7 +226,7 @@ internal static class StateCodec
             AddRoot(intent.Root);
 
         var w = new WireWriter(output);
-        w.WriteByte(CheckpointFormat);
+        w.WriteByte(state.ExportRoots.IsEmpty ? CheckpointFormat : (byte)2);
         WriteConfig(ref w, state.Config);
         w.WriteVarUInt(state.AppliedIndex);
         w.WriteDateTimeOffset(state.LeaderTime);
@@ -341,6 +355,15 @@ internal static class StateCodec
             w.WriteDateTimeOffset(i.CreatedUtc);
         }
 
+        if (!state.ExportRoots.IsEmpty)
+        {
+            w.WriteCount(state.ExportRoots.Count);
+            foreach (var (directory, registeredAt) in state.ExportRoots)
+            {
+                w.WriteVarUInt(directory);
+                w.WriteVarUInt(registeredAt);
+            }
+        }
         w.WriteNoExtensions();
     }
 
@@ -352,7 +375,7 @@ internal static class StateCodec
         {
             var r = new WireReader(data, CheckpointLimits);
             byte format = r.ReadByte();
-            if (format != CheckpointFormat)
+            if (format is not (CheckpointFormat or 2))
                 throw new DfsIntegrityException($"Unsupported volume checkpoint format {format}.");
             VolumeConfig config = ReadConfig(ref r);
             ulong applied = r.ReadVarUInt();
@@ -487,6 +510,13 @@ internal static class StateCodec
                     throw new DfsIntegrityException($"Duplicate restore intent {intent.Operation} in the checkpoint.");
             }
 
+            var exports = ImmutableSortedDictionary.CreateBuilder<ulong, ulong>();
+            if (format == 2)
+            {
+                int mappings = r.ReadCount(2);
+                for (int i = 0; i < mappings; i++)
+                    exports.Add(r.ReadVarUInt(), r.ReadVarUInt());
+            }
             r.ReadExtensions();
             r.EnsureEnd();
             return new VolumeState
@@ -515,6 +545,7 @@ internal static class StateCodec
                 MigrationTarget = migration,
                 Restore = restore,
                 Restores = intents.ToImmutable(),
+                ExportRoots = exports.ToImmutable(),
             };
         }
         catch (DfsProtocolException ex)
@@ -602,7 +633,15 @@ internal static class StateCodec
         w.WriteVarInt((int)h.Share);
         w.WriteBool(h.IsWriter);
         w.WriteVarUInt(h.WriterGeneration);
-        w.WriteByte((byte)h.View);
+        bool extended = h.ExportRoot != 0 || h.CommittedDeleteRoot != 0;
+        w.WriteByte((byte)((int)h.View | (extended ? 0x80 : 0)));
+        if (extended)
+        {
+            w.WriteVarUInt(h.ExportRoot);
+            w.WriteBool(h.DeleteAccess);
+            w.WriteBool(h.DeleteOnClose);
+            w.WriteVarUInt(h.CommittedDeleteRoot);
+        }
         w.WriteBool(h.PinnedInode is not null);
         if (h.PinnedInode is { } pinned)
         {
@@ -628,7 +667,13 @@ internal static class StateCodec
         var share = (FileShare)r.ReadVarInt32();
         bool writer = r.ReadBool();
         ulong generation = r.ReadVarUInt();
-        var view = (HandleView)r.ReadByte();
+        byte tag = r.ReadByte();
+        var view = (HandleView)(tag & 0x7f);
+        bool extended = (tag & 0x80) != 0;
+        ulong root = extended ? r.ReadVarUInt() : 0;
+        bool delete = extended && r.ReadBool();
+        bool disposition = extended && r.ReadBool();
+        ulong committed = extended ? r.ReadVarUInt() : 0;
         InodeRecord? pinned = null;
         if (r.ReadBool())
         {
@@ -642,7 +687,8 @@ internal static class StateCodec
         ulong opened = r.ReadVarUInt();
         var rights = unchecked((DfsFileSystemRights)r.ReadVarUInt32());
         bool append = r.ReadBool();
-        return new HandleRecord(id, inode, stream, session, principal, mode, access, share, writer, generation, view, pinned, pin, opened, rights, append);
+        return new HandleRecord(id, inode, stream, session, principal, mode, access, share, writer, generation, view, pinned, pin, opened, rights, append)
+        { ExportRoot = root, DeleteAccess = delete, DeleteOnClose = disposition, CommittedDeleteRoot = committed };
     }
 
     private static void WriteSession(ref WireWriter w, SessionRecord s)

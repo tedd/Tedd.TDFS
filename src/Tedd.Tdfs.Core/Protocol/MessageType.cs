@@ -307,4 +307,10 @@ public enum MessageType : ushort
     BackupExportRestore = 172,
     /// <summary>Restore-from-backup export reply.</summary>
     BackupExportRestoreResult = 173,
+
+    // Live export profiles and reservations.
+    ExportOpen = 174,
+    ExportOpenResult = 175,
+    ExportControl = 176,
+    ExportControlResult = 177,
 }

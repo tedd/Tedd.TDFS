@@ -78,7 +78,7 @@ internal sealed partial class VolumeStateMachine
     /// Bidirectional share compatibility of a new open with one active handle plus writer exclusivity (LOCK-01/02).
     /// <see cref="FileShare.Delete"/> governs delete/rename only.
     /// </summary>
-    internal static bool Compatible(HandleRecord active, FileAccess access, FileShare share)
+    internal static bool Compatible(HandleRecord active, FileAccess access, FileShare share, bool deleteAccess = false)
     {
         bool newReads = (access & FileAccess.Read) != 0;
         bool newWrites = (access & FileAccess.Write) != 0;
@@ -92,7 +92,7 @@ internal sealed partial class VolumeStateMachine
             return false;
         if (oldWrites && (share & FileShare.Write) == 0)
             return false;
-        return !(newWrites && oldWrites);
+        return (!deleteAccess || (active.Share & FileShare.Delete) != 0) && (!active.DeleteAccess || (share & FileShare.Delete) != 0);
     }
 
     /// <summary>Active handles of an inode (all streams).</summary>
@@ -102,10 +102,14 @@ internal sealed partial class VolumeStateMachine
     internal static IEnumerable<HandleRecord> HandlesOf(VolumeState s, StreamKey key)
         => s.Handles.Values.Where(h => h.Inode == key.Inode && string.Equals(h.Stream, key.Stream, StringComparison.Ordinal));
 
+    internal static bool BlocksDirectoryRead(VolumeState s, InodeRecord directory) =>
+        directory.ExportProfile != DfsExportProfile.Disabled && HandlesOf(s, directory.Id)
+            .Any(h => (h.Stream.Length == 0 && (h.Share & FileShare.Read) == 0) || h.DeleteOnClose || h.CommittedDeleteRoot != 0);
+
     /// <summary>Requires every handle of the inode (any stream) to grant <see cref="FileShare.Delete"/> (NS-06, ADS-015).</summary>
-    internal static void RequireDeleteSharing(VolumeState s, ulong inode, string what)
+    internal static void RequireDeleteSharing(VolumeState s, ulong inode, string what, ulong actingHandle = 0)
     {
-        if (HandlesOf(s, inode).FirstOrDefault(h => (h.Share & FileShare.Delete) == 0) is { } blocking)
+        if (HandlesOf(s, inode).FirstOrDefault(h => h.Id != actingHandle && (h.Share & FileShare.Delete) == 0) is { } blocking)
             throw Fail(DfsErrorCode.SharingViolation, $"{what}: handle {blocking.Id} does not grant FileShare.Delete.");
     }
 
@@ -115,6 +119,7 @@ internal sealed partial class VolumeStateMachine
     /// </summary>
     internal static void RequireImplicitWriter(VolumeState s, ApplyContext ctx, StreamKey key, string what)
     {
+        RequireAvailable(s, key.Inode);
         foreach (HandleRecord h in HandlesOf(s, key))
         {
             if (h.IsWriter)
@@ -152,22 +157,25 @@ internal sealed partial class VolumeStateMachine
         ImmutableSortedDictionary<string, StreamRecord> streams = kind == InodeKind.File
             ? InodeRecord.NoStreams.Add(DfsStreamPath.DefaultStreamName, StreamRecord.Empty(ctx.Index))
             : InodeRecord.NoStreams;
-        _ = s;
-        return new InodeRecord(id, kind, ctx.Index, ctx.Index, ctx.Now, ctx.Now, security, policy, parent.Id, name, streams, InodeRecord.NoChildren)
+        if (parent.ExportProfile == DfsExportProfile.Windows)
+            streams = streams.WithComparers(StringComparer.OrdinalIgnoreCase);
+        return new InodeRecord(id, kind, ctx.Index, ctx.Index, ctx.Now, ctx.Now, security, policy, parent.Id, name, streams, parent.Children.Clear())
         {
             MetadataRevision = ctx.Index,
+            ExportProfile = parent.ExportProfile,
         };
     }
 
     /// <summary>Adds a child entry to a directory (bumping its revision) and stores both records.</summary>
     internal static VolumeState Link(VolumeState s, ApplyContext ctx, InodeRecord parent, InodeRecord child)
     {
+        RequireAvailable(s, parent.Id);
         InodeRecord updatedParent = Touch(parent with { Children = parent.Children.SetItem(child.Name, child.Id) }, ctx);
         return s with { Inodes = s.Inodes.SetItem(updatedParent.Id, updatedParent).SetItem(child.Id, child) };
     }
 
     /// <summary>A new version of an inode modified by the current entry.</summary>
-    internal static InodeRecord Touch(InodeRecord inode, ApplyContext ctx) => inode with { Revision = ctx.Index, ModifiedUtc = ctx.Now };
+    internal static InodeRecord Touch(InodeRecord inode, ApplyContext ctx) => inode with { Revision = ctx.Index, ModifiedUtc = ctx.Now, ChangedUtc = inode.ExportProfile == DfsExportProfile.Disabled ? inode.ChangedUtc : ctx.Now };
 
     /// <summary>A new version of an inode whose own metadata (owner, ACL, policy, name or parent) the current entry changed.</summary>
     internal static InodeRecord TouchMetadata(InodeRecord inode, ApplyContext ctx) => Touch(inode, ctx) with { MetadataRevision = ctx.Index };
@@ -210,7 +218,7 @@ internal sealed partial class VolumeStateMachine
         ImmutableSortedDictionary<StreamKey, ulong> generations = s.WriterGenerations;
         foreach (string stream in inode.Streams.Keys)
             generations = generations.Remove(new StreamKey(inodeId, stream));
-        return s with { Inodes = s.Inodes.Remove(inodeId), Detached = s.Detached.Remove(inodeId), WriterGenerations = generations };
+        return s with { Inodes = s.Inodes.Remove(inodeId), Detached = s.Detached.Remove(inodeId), ExportRoots = s.ExportRoots.Remove(inodeId), WriterGenerations = generations };
     }
 
     /// <summary>
@@ -239,9 +247,25 @@ internal sealed partial class VolumeStateMachine
     /// </summary>
     internal static VolumeState ReleaseHandle(VolumeState s, HandleRecord h, ulong index)
     {
+        // Expiring a batch can transfer a previous handle's disposition to this one.
+        if (s.Root.ExportProfile != DfsExportProfile.Disabled)
+            h = s.Handles.GetValueOrDefault(h.Id) ?? h;
         s = s with { Handles = s.Handles.Remove(h.Id), Pins = s.Pins.Remove(h.PinId) };
         foreach (StagingRecord staging in s.Staging.Values.Where(x => x.Handle == h.Id && x.IsOpen).ToArray())
             s = CloseStaging(s, staging, index);
+        if (h.DeleteOnClose || h.CommittedDeleteRoot != 0)
+        {
+            ulong root = h.CommittedDeleteRoot != 0 ? h.CommittedDeleteRoot : h.ExportRoot;
+            if (HandlesOf(s, h.Inode).FirstOrDefault() is { } remaining)
+                s = s with { Handles = s.Handles.SetItem(remaining.Id, remaining with { CommittedDeleteRoot = root }) };
+            else if (s.Find(h.Inode) is { } target && s.Find(target.ParentId) is { } parent
+                && parent.Children.GetValueOrDefault(target.Name) == target.Id && new NamespaceView(s.Inodes).IsAncestorOrSelf(root, target.Id)
+                && target.Children.IsEmpty)
+            {
+                s = Put(s, parent with { Children = parent.Children.Remove(target.Name), Revision = index, ModifiedUtc = s.LeaderTime, ChangedUtc = s.LeaderTime });
+                s = Reclaim(s, target.Id, index);
+            }
+        }
         if (s.Detached.Contains(h.Inode) && !s.Handles.Values.Any(x => x.Inode == h.Inode))
             s = Reclaim(s, h.Inode, index);
         return s;
@@ -314,7 +338,7 @@ internal sealed partial class VolumeStateMachine
         DfsSecurityDescriptor security = inode.Security;
         bool ownerOnly = Matches(security, DfsSecurityDescriptor.FromAccessFlags(security.Owner, true, false));
         bool readOnly = !ownerOnly && Matches(security, DfsSecurityDescriptor.FromAccessFlags(security.Owner, false, true));
-        string streamName = stream ?? DfsStreamPath.DefaultStreamName;
+        string streamName = inode.StreamName(stream ?? DfsStreamPath.DefaultStreamName);
         StreamRecord? s = inode.GetStream(streamName);
         bool isStream = streamName.Length > 0;
         long length = s?.Length ?? 0;
@@ -325,6 +349,7 @@ internal sealed partial class VolumeStateMachine
             inode.PolicyName, s?.IsInline ?? false, s?.IsSparse ?? false, s is null || s.IsInline ? 0 : s.Extents.Count,
             inode.IsDirectory ? inode.Children.Count : 0, inode.IsDirectory && !isStream ? 0 : generation)
         {
+            Extensions = inode.HasExportMetadata ? [BasicInformationCodec.Extension(inode.BasicInformation)] : [],
             IsStream = isStream,
             StreamName = isStream ? streamName : null,
             StreamCount = inode.NamedStreamCount,

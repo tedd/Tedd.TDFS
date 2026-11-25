@@ -3,6 +3,18 @@ namespace Tedd.Tdfs;
 /// <summary>Options for <see cref="DfsFileClient.OpenAsync(string, DfsOpenOptions, CancellationToken)"/>.</summary>
 public sealed record DfsOpenOptions
 {
+    /// <summary>Directory mapping for a live export reservation. Paths are absolute within this root.</summary>
+    public DfsExportRoot? ExportRoot { get; init; }
+
+    /// <summary>Desired access for an export open. Defaults to Access when omitted.</summary>
+    public DfsOpenAccess? DesiredAccess { get; init; }
+
+    /// <summary>Open or create a directory within the mapping.</summary>
+    public bool Directory { get; init; }
+
+    /// <summary>Set delete disposition in the open decision. Requires delete access on the base inode.</summary>
+    public bool DeleteOnClose { get; init; }
+
     /// <summary>Open mode.</summary>
     public FileMode Mode { get; init; } = FileMode.Open;
 

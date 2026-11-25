@@ -101,7 +101,7 @@ internal sealed partial class VolumeService
                 throw new DfsLeaseLostException($"Handle {request.Handle.Value} is no longer active.");
             }
 
-            if (!string.Equals(h.Principal, principal, StringComparison.Ordinal))
+            if (!string.Equals(h.Principal, principal, StringComparison.Ordinal) || (h.ExportRoot != 0 && h.Session != request.Header.Session))
                 throw new DfsException(DfsErrorCode.InvalidHandle, $"Handle {h.Id} belongs to another principal.");
             RenewHandle(h.Id);
             InodeRecord inode = h.View == HandleView.VersionPinned && h.PinnedInode is { } pinned ? pinned
@@ -213,6 +213,8 @@ internal sealed partial class VolumeService
         }
 
         InodeRecord directory = ResolveListedDirectory(root, path, ids, admin, principal);
+        if (snapshotPin == 0 && VolumeStateMachine.BlocksDirectoryRead(State, directory))
+            throw new DfsSharingViolationException(DfsErrorCode.SharingViolation, "An open reservation prevents enumeration.");
         string binding = Binding(directory.Id, request.Pattern, request.Kinds, principal, snapshotPin);
         List<DirectoryEntryData> page = Page(root, directory, request.Pattern, request.Kinds, null, request.PageSize, out bool more);
         if (!more)
@@ -268,7 +270,7 @@ internal sealed partial class VolumeService
             ? d
             : throw new DfsPinExpiredException(DfsErrorCode.ContinuationExpired, "The enumerated directory is not in the pinned version.");
         string? resolved = new NamespaceView(root).PathOf(directoryId);
-        if (resolved is not null && !string.Equals(resolved, path, StringComparison.Ordinal))
+        if (resolved is not null && new NamespaceView(root).Resolve(path).Target?.Id != directoryId)
             throw new DfsPinExpiredException(DfsErrorCode.ContinuationExpired, "The continuation belongs to another directory.");
         RenewPin(pin.Id);
         List<DirectoryEntryData> page = Page(root, directory, request.Pattern, request.Kinds, after, request.PageSize, out bool more);
@@ -315,12 +317,12 @@ internal sealed partial class VolumeService
         more = false;
         foreach (KeyValuePair<string, ulong> child in directory.Children)
         {
-            if (after is not null && string.CompareOrdinal(child.Key, after) <= 0)
+            if (after is not null && directory.Children.KeyComparer.Compare(child.Key, after) <= 0)
                 continue;
             if (root.GetValueOrDefault(child.Value) is not { } node)
                 continue;
             bool include = node.IsDirectory ? (kinds & WireEntryKinds.Directories) != 0 : (kinds & WireEntryKinds.Files) != 0;
-            if (!include || !Matches(pattern, child.Key))
+            if (!include || !Matches(pattern, child.Key, directory.ExportProfile == DfsExportProfile.Windows))
                 continue;
             if (page.Count == pageSize)
             {
@@ -355,7 +357,7 @@ internal sealed partial class VolumeService
     }
 
     /// <summary>Ordinal wildcard match ('*' any run, '?' one character).</summary>
-    internal static bool Matches(string pattern, string name)
+    internal static bool Matches(string pattern, string name, bool ignoreCase = false)
     {
         int p = 0;
         int n = 0;
@@ -363,7 +365,7 @@ internal sealed partial class VolumeService
         int mark = 0;
         while (n < name.Length)
         {
-            if (p < pattern.Length && (pattern[p] == '?' || pattern[p] == name[n]))
+            if (p < pattern.Length && (pattern[p] == '?' || pattern[p] == name[n] || (ignoreCase && char.ToUpperInvariant(pattern[p]) == char.ToUpperInvariant(name[n]))))
             {
                 p++;
                 n++;

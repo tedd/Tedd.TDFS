@@ -50,8 +50,19 @@ internal sealed partial class VolumeService
                     throw new ArgumentException(appendError);
                 }
 
-                PublishPlan plan = await PlanAsync(stream, request.TruncateTo, changes, request.NewLength, policy, pool, op, ct);
-                var spec = new PublishSpec(plan.TruncateTo, request.NewLength, plan.Changes, plan.FinalInline, plan.Derived, request.Staging.Value, plan.LeaderStaging)
+                long length = request.NewLength;
+                long truncate = request.TruncateTo;
+                if (h.SharedWriter)
+                {
+                    if ((changes.Length > 0 && truncate != -1) || (h.IsAppend && (changes.Length > 0 || truncate >= 0)))
+                        throw new ArgumentException("Use a range write, a distinct length change, or the atomic append operation.");
+                    length = changes.Length > 0 ? Math.Max(stream.Length, changes.Max(c => checked(c.Offset + c.Length)))
+                        : truncate < 0 ? stream.Length : length;
+                    if (changes.IsEmpty && truncate >= 0 && truncate != length)
+                        throw new ArgumentException("A length change requires an exact final length.");
+                }
+                PublishPlan plan = await PlanAsync(stream, truncate, changes, length, policy, pool, op, ct);
+                var spec = new PublishSpec(plan.TruncateTo, length, plan.Changes, plan.FinalInline, h.SharedWriter ? stream.Revision : plan.Derived, request.Staging.Value, plan.LeaderStaging)
                 {
                     Policy = inode.PolicyName,
                 };
@@ -107,7 +118,7 @@ internal sealed partial class VolumeService
             (string filePath, string? streamName) = DfsStreamPath.Split(path);
             string stream = streamName ?? DfsStreamPath.DefaultStreamName;
             Resolution res = new NamespaceView(State.Inodes).Resolve(filePath);
-            IDisposable? hold = res.Found ? await LockStreamAsync(new StreamKey(res.Target!.Id, stream), ct) : null;
+            IDisposable? hold = res.Found ? await LockStreamAsync(new StreamKey(res.Target!.Id, res.Target.StreamName(stream)), ct) : null;
             try
             {
                 res = new NamespaceView(State.Inodes).Resolve(filePath);
@@ -160,7 +171,7 @@ internal sealed partial class VolumeService
                 Resolution res = new NamespaceView(State.Inodes).Resolve(filePath);
                 parent = res.Parent;
                 if (res.Found)
-                    key = new StreamKey(res.Target!.Id, streamName ?? DfsStreamPath.DefaultStreamName);
+                    key = new StreamKey(res.Target!.Id, res.Target.StreamName(streamName ?? DfsStreamPath.DefaultStreamName));
             }
 
             IDisposable? hold = key is { } k ? await LockStreamAsync(k, ct) : null;
@@ -250,7 +261,7 @@ internal sealed partial class VolumeService
         DfsStoragePolicy policy, string pool, OperationHeader op, CancellationToken ct, string? onlyStream = null, bool replaceWeakExtents = false)
     {
         bool inlineAllowed = InlineAllowed(policy);
-        KeyValuePair<string, StreamRecord>[] work = [.. inode.Streams.Where(p => (onlyStream is null || string.Equals(p.Key, onlyStream, StringComparison.Ordinal))
+        KeyValuePair<string, StreamRecord>[] work = [.. inode.Streams.Where(p => (onlyStream is null || inode.Streams.KeyComparer.Compare(p.Key, onlyStream) == 0)
             && (p.Value is { IsInline: true, Length: > 0 } ? !inlineAllowed
                 : replaceWeakExtents && !p.Value.IsInline && p.Value.Extents.Any(e => !MeetsPolicy(e, policy, pool))))];
         if (work.Length == 0 || !DryRun(command).IsSuccess)

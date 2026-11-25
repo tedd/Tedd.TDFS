@@ -4,6 +4,26 @@ How to deploy, administer, back up and recover a Tedd.TDFS cluster. Behaviour re
 [FSD](spec/distributed-filesystem-fsd.md) and [addendum](spec/fsd-addendum-acl-pools-streams.md) and designed in
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
+## Configuring a live export
+
+After upgrading the cluster and its backup readers, activate the export format once with
+`await client.Admin.SetFeatureAsync(DfsExportRoot.ClusterFeature, true)`. Activation checks member capabilities
+and permanently requires servers that understand the format. Activate it on a recovery cluster before restoring a snapshot containing export metadata. The per-volume profile remains independently configurable.
+
+The default volume profile is `Disabled`. An administrator can enable `CaseSensitive` for scoped handles and
+shared writers, or `Windows` for those contracts with ordinal case-insensitive, case-preserving names.
+Close live handles and finish active
+transactions before changing the profile. The change traverses the live inode tree in one replicated decision.
+If directory entries or named streams collide under the selected comparison, activation fails atomically.
+Rename the colliding entries in the current profile and retry. Existing snapshots retain their captured namespace.
+
+Register each mapping as a cluster administrator. A nested registered directory starts a separate mapping. Switching an active profile to Disabled clears its registrations.
+Store the cluster, volume incarnation and directory identity returned by `BindExportAsync` with the export.
+Volume grants and inode ACLs authorize each request. The gateway selects the registered root for its export.
+Reuse this mapping after gateway restarts. Rebind explicitly when exporting a replacement directory or a restored
+volume. Gateways and pods using TDFS must submit opens and namespace changes to the volume service so they
+participate in the same reservation table.
+
 ## 1. Components
 
 | Process | Command | Role |

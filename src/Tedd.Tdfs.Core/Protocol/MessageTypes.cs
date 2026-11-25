@@ -58,7 +58,8 @@ public static class MessageTypes
         MessageType.KeepAlive or MessageType.KeepAliveResult => DfsOperationKind.KeepAlive,
         MessageType.QueryOperation or MessageType.QueryOperationResult => DfsOperationKind.QueryOperation,
 
-        MessageType.OpenHandle or MessageType.OpenHandleResult => DfsOperationKind.Open,
+        MessageType.ExportControl or MessageType.ExportControlResult => DfsOperationKind.ExportControl,
+        MessageType.ExportOpen or MessageType.ExportOpenResult or MessageType.OpenHandle or MessageType.OpenHandleResult => DfsOperationKind.Open,
         MessageType.CloseHandle or MessageType.CloseHandleResult => DfsOperationKind.CloseHandle,
         MessageType.ReadRange or MessageType.ReadRangeResult => DfsOperationKind.Read,
         MessageType.GetInfo or MessageType.GetInfoResult => DfsOperationKind.GetInfo,

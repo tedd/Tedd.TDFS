@@ -93,4 +93,6 @@ public enum DfsOperationKind
     KeyRotation,
     /// <summary>Administrative operation.</summary>
     Admin,
+    /// <summary>Live export profile, mapping or handle operation.</summary>
+    ExportControl,
 }

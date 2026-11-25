@@ -302,7 +302,7 @@ internal sealed class BackupRestoreCoordinator
                 continue;
             }
 
-            var streams = ImmutableSortedDictionary.CreateBuilder<string, StreamRecord>(StringComparer.Ordinal);
+            var streams = ImmutableSortedDictionary.CreateBuilder<string, StreamRecord>(inode.Streams.KeyComparer);
             foreach (KeyValuePair<string, StreamRecord> pair in inode.Streams)
             {
                 StreamRecord stream = pair.Value;

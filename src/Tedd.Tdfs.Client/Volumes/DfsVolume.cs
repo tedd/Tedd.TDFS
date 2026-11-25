@@ -56,6 +56,32 @@ public sealed class DfsVolume
     /// <summary>Late-sync backup targets.</summary>
     public DfsBackupClient Backups { get; }
 
+    /// <summary>Changes the replicated export policy. Changing profiles requires an administrator and a quiescent volume.</summary>
+    public async Task ConfigureExportsAsync(DfsExportProfile profile, CancellationToken ct = default)
+    {
+        if (IsReadOnly)
+            throw new DfsReadOnlyException("Configure exports on the live volume.");
+        using OperationScope scope = Runtime.BeginOperation(DfsOperationKind.ExportControl, Name, null, ct);
+        await scope.StartedAsync().ConfigureAwait(false);
+        await scope.ValidatedAsync().ConfigureAwait(false);
+        await Context.MutateAsync<ExportControlResultMessage>(scope, "ConfigureExports", null,
+            header => new ExportControlMessage(header, ExportControlKind.Configure, Profile: profile)).ConfigureAwait(false);
+    }
+
+    /// <summary>Resolves a live directory once. Persist the returned identity with the export mapping.</summary>
+    public async Task<DfsExportRoot> BindExportAsync(string path, CancellationToken ct = default)
+    {
+        if (IsReadOnly)
+            throw new DfsReadOnlyException("Live exports require a live volume.");
+        using OperationScope scope = Runtime.BeginOperation(DfsOperationKind.ExportControl, Name, path, ct);
+        await scope.StartedAsync().ConfigureAwait(false);
+        path = Validation.DirectoryPath(path);
+        await scope.ValidatedAsync().ConfigureAwait(false);
+        var result = await Context.MutateAsync<ExportControlResultMessage>(scope, "BindExport", null,
+            header => new ExportControlMessage(header, ExportControlKind.Bind, Destination: path), path).ConfigureAwait(false);
+        return new DfsExportRoot(result.Token, result.Directory);
+    }
+
     /// <summary>Reads the volume's metadata (from its leader, with the last commit).</summary>
     public async Task<DfsVolumeInfo> GetInfoAsync(CancellationToken ct = default)
     {

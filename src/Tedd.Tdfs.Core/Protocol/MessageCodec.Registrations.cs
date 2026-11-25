@@ -35,6 +35,10 @@ public static partial class MessageCodec
         Register<ReserveOperationIdsMessage>();
         Register<ReserveOperationIdsResultMessage>();
         Register<OpenHandleMessage>();
+        Register<ExportOpenMessage>();
+        Register<ExportControlMessage>();
+        Register<ExportOpenResultMessage>();
+        Register<ExportControlResultMessage>();
         Register<OpenHandleResultMessage>();
         Register<CloseHandleMessage>();
         Register<CloseHandleResultMessage>();
