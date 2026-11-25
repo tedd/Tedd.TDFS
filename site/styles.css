@@ -71,6 +71,9 @@ figcaption { display: flex; align-items: center; gap: 1rem; padding: .7rem 1.1re
 h2 { font-size: clamp(2.15rem, 4vw, 3.5rem); letter-spacing: -.055em; font-weight: 600; }
 .features, .resources { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: clamp(1.2rem, 3vw, 3rem); margin-top: 2.4rem; }
 .features article, .resources a { border-top: 1px solid var(--line); padding-top: 1.15rem; }
+.export-note { display: flex; flex-wrap: wrap; align-items: baseline; gap: 1rem 3rem; margin-top: 2.4rem; padding-top: 1.15rem; border-top: 1px solid var(--line); }
+.export-note > div { flex: 1 1 36rem; max-width: 72ch; }
+.export-note p { margin: .6rem 0 0; color: var(--muted); }
 .symbol { display: block; color: var(--teal); font: 1.8rem var(--mono); margin-bottom: 1rem; }
 h3 { font-size: 1.3rem; margin-bottom: .65rem; }
 article p, .steps, .resources a > span { color: var(--muted); }

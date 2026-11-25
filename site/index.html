@@ -51,10 +51,18 @@
       <p class="kicker">Filesystem semantics</p>
       <h2 id="filesystem-heading">From write to recovery.</h2>
       <div class="features">
-        <article><span class="symbol" aria-hidden="true">{ }</span><h3>Publish a revision</h3><p>Buffer writes privately in a stream. Flush or close it to publish a durable revision. Readers see a complete version of the file.</p></article>
+        <article><span class="symbol" aria-hidden="true">{ }</span><h3>Publish a revision</h3><p>By default, a stream buffers writes privately. Flush or close it to publish a durable revision. Readers see a complete version of the file.</p></article>
         <article><span class="symbol" aria-hidden="true">⇄</span><h3>Commit files together</h3><p>Group updates to multiple paths in one volume. A strictly serializable transaction publishes all of its changes at a single commit boundary.</p></article>
         <article><span class="symbol" aria-hidden="true">◷</span><h3>Read a recovery point</h3><p>Open a read-only snapshot while the live volume keeps changing. An independent backup host can receive complete snapshots incrementally.</p></article>
       </div>
+      <aside class="export-note" aria-labelledby="export-heading">
+        <div>
+          <h3 id="export-heading">Live directory exports for SMB gateways</h3>
+          <p>Bind a share to a directory identity. The volume leader enforces sharing across clients and tracks the opened file through rename and delete-on-close. Shared writers publish each write through the leader. The Windows profile adds case-insensitive names and preserves their spelling.</p>
+          <p>Exports are opt-in per volume. Standard opens incur no additional cross-node lock request.</p>
+        </div>
+        <a class="text-link" href="https://github.com/tedd/Tedd.TDFS/blob/main/docs/OPERATIONS.md#configuring-a-live-export">Configure an export <span aria-hidden="true">↗</span></a>
+      </aside>
     </section>
     <section class="start" id="quick-start" aria-labelledby="start-heading">
       <div class="wrap split">

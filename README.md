@@ -8,7 +8,7 @@ Tedd.TDFS is a replicated filesystem for .NET applications. Connect to a cluster
 
 For a file stored outside metadata, the client first stages immutable data on storage nodes. The volume's policy sets how many distinct hosts and zones must acknowledge durable copies. The volume's Raft group then commits the metadata revision that makes those bytes visible. Small files can be stored inline in the metadata revision.
 
-The default storage policy targets three copies in three zones and requires two copies in two zones before acknowledgement. Background repair fills the remaining target. A metadata quorum is also required. Stream writes stay private until a flush, explicit commit, or successful disposal. Use a transaction to publish changes to several files together.
+The default storage policy targets three copies in three zones and requires two copies in two zones before acknowledgement. Background repair fills the remaining target. A metadata quorum is also required. By default, stream writes stay private until a flush, explicit commit, or successful disposal. Use a transaction to publish changes to several files together.
 
 ## Run a local node
 
@@ -85,6 +85,20 @@ The client prints `Hello from TDFS`. Stop the host with Ctrl+C. For a replicated
 - **Transactions.** Use `volume.Transactions.BeginAsync()` to group reads and writes within a volume. A successful commit publishes all changes at one strictly serializable boundary.
 - **Snapshots and backups.** Open a snapshot to read an immutable version of the volume. Use `CommitWithSnapshotAsync` to capture a transaction's exact commit. An independent backup host can receive snapshots incrementally and serve read-only recovery points.
 - **Lost replies.** A `DfsCommitOutcomeUnknownException` carries the operation ID. Call `volume.QueryOperationAsync(id, resolve: true)` to determine the outcome before retrying a mutation.
+
+## Live directory exports for SMB gateways
+
+Exports are disabled by default. Standard file access uses the existing open and lease protocol with no additional cross-node lock request. An administrator can activate the export format once for the cluster, then enable exports on individual volumes. Format activation permanently requires compatible servers.
+
+| Volume profile | Behavior |
+| --- | --- |
+| `Disabled` | Standard TDFS opens and case-sensitive names. |
+| `CaseSensitive` | Directory-scoped opens, shared writers, and handle-based rename and delete-on-close. |
+| `Windows` | The same export operations with case-insensitive lookup that preserves spelling. Existing collisions such as `A` and `a` must be resolved before activation. |
+
+Bind each share to a directory identity. The volume leader resolves paths beneath that directory, checks read, write, and delete reservations, and returns whether the open created, opened, or truncated the object. Delete-on-close follows the opened inode through a rename. A replacement at its old path survives the last close or gateway lease expiry.
+
+Writable export handles that grant `FileShare.Write` use write-through. The leader orders offset writes, appends, and length changes, so other live handles can read an acknowledged write before the writer closes. Gateways can also store timestamps and DOS attributes on the inode. [Export configuration](docs/OPERATIONS.md#configuring-a-live-export) · [C# open example](docs/API.md#live-subtree-exports)
 
 ## Repository layout
 
